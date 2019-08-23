@@ -1,0 +1,25 @@
+name: musl
+description: An implementation of the C/POSIX standard library
+version: 1.1.23
+release: 1
+home: https://www.musl-libc.org
+sources:
+  - url: '{{.Home}}/releases/musl-{{.Version}}.tar.gz'
+    blake2: a
+packages:
+  - name: musl
+    files:
+      - bin/ldd
+      - lib/libc.so
+      - "lib/ld-musl-$(arch).so.1"
+  - name: musl-dev
+    files:
+      - include
+      - lib/*.a
+      - lib/*.o
+build: |
+  cd_unpacked_src
+  printf '%s\n' "{{.Version}}"
+  unset CFLAGS CXXFLAGS
+  ./configure --prefix=/
+  make
