@@ -27,6 +27,10 @@ type getter interface {
 }
 
 func (s *Spec) fetchHTTP(client getter, url string, localName string) error {
+	logrus.WithFields(logrus.Fields{
+		"filename": localName,
+		"URL":      url,
+	}).Debug("downloading")
 	resp, err := client.Get(url)
 	if err != nil {
 		return err
@@ -92,16 +96,21 @@ func (s *Spec) getLocalFilePath(p string) (string, error) {
 }
 
 func checkBlake2SumFromFile(filename string, blake2 string) error {
+	logrus.WithFields(logrus.Fields{
+		"filename": filename,
+		"expected": blake2,
+	}).Debug("validating")
 	sum, err := computeBlake2FromFile(filename)
 	if err != nil {
 		return err
 	}
 	if sum != blake2 {
-		return fmt.Errorf(
-			"file: %s, expected: %s, actual %s",
-			path.Base(filename),
-			blake2,
-			sum)
+		logrus.WithFields(logrus.Fields{
+			"filename": filename,
+			"expected": blake2,
+			"actual":   sum,
+		}).Error("blake2 sum mismatch")
+		return fmt.Errorf("blake2 sum mismatch")
 	}
 	return nil
 }
@@ -117,8 +126,7 @@ func (s *Spec) FetchSource(source *Source) error {
 	switch URL.Scheme {
 	case "http", "https":
 		fetch = func(filename string) error {
-			client := new(http.Client)
-			return s.fetchHTTP(client, source.URL, filename)
+			return s.fetchHTTP(s.HTTPClient, source.URL, filename)
 		}
 	case "":
 		return fmt.Errorf("missing protocol scheme")
@@ -139,9 +147,7 @@ func (s *Spec) FetchSource(source *Source) error {
 	}
 	finfo, _ := os.Stat(localName)
 	if finfo != nil {
-		if err := checkBlake2SumFromFile(localName, source.Blake2); err != nil {
-			return err
-		}
+		return checkBlake2SumFromFile(localName, source.Blake2)
 	}
 	if err = fetch(localName); err != nil {
 		return err

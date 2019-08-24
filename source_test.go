@@ -6,7 +6,6 @@ import (
 	"io"
 	"io/ioutil"
 	"net/http"
-	"net/url"
 	"os"
 	"strings"
 	"testing"
@@ -34,8 +33,8 @@ func TestComputeBlake2(t *testing.T) {
 			"testdata/spec.yaml",
 			nil,
 			false,
-			"b659c4e02c1b52eb988e02ac38b9398107dfa6c8c2611a025204f1d7053403fa104a" +
-				"118ffb75d77c467e7c5d82b549cbc8a2fe303839d0c03d609afe47c5f968",
+			"b4fc6c456ba6c0405e2197b86ddb8d5cad819dbc5e67991a9cc3da85ae355dab" +
+				"b0a3307b5e66970192d925c8abd4e02f0b7c7ac20fe21348d515b413f3ce4fd6",
 			"",
 		},
 		{
@@ -81,21 +80,6 @@ func Test_computeBlake2FromFile(t *testing.T) {
 }
 
 func Test_ensureSourceCache(t *testing.T) {
-	t.Run("should fail if given a bad directory", func(t *testing.T) {
-		assert := assert.New(t)
-		spec, _ := NewSpec("testdata/spec.yaml")
-		tempdir, err := ioutil.TempDir("", "Test_ensureSourceCache")
-		if err != nil {
-			t.Error(err)
-		}
-		defer os.RemoveAll(tempdir)
-		if err := os.Chmod(tempdir, 0555); err != nil {
-			t.Error(err)
-		}
-		spec.SourceCache = tempdir + "/cache"
-		err = spec.ensureSourceCache()
-		assert.Error(err)
-	})
 	t.Run("should fail if directory is a file", func(t *testing.T) {
 		assert := assert.New(t)
 		spec, _ := NewSpec("testdata/spec.yaml")
@@ -132,7 +116,7 @@ func (s *serverErrHTTP) Get(string) (*http.Response, error) {
 
 func (b *badHTTP) Get(string) (*http.Response, error) {
 	var resp http.Response
-	return &resp, &url.Error{}
+	return &resp, fmt.Errorf("transit error")
 }
 
 func (g *goodHTTP) Get(string) (*http.Response, error) {
@@ -191,6 +175,17 @@ func Test_fetchHttp(t *testing.T) {
 	})
 }
 
+func Test_checkBlake2SumFromFile(t *testing.T) {
+	t.Run("should not fail when file sum matches", func(t *testing.T) {
+		assert := assert.New(t)
+		err := checkBlake2SumFromFile(
+			"testdata/spec.yaml",
+			"b4fc6c456ba6c0405e2197b86ddb8d5cad819dbc5e67991a9cc3da85ae355dab"+
+				"b0a3307b5e66970192d925c8abd4e02f0b7c7ac20fe21348d515b413f3ce4fd6")
+		assert.Nil(err)
+	})
+}
+
 type fetchSourceTest struct {
 	shouldErr    bool
 	preExistFile bool
@@ -201,11 +196,13 @@ type fetchSourceTest struct {
 	sourceCache  string
 	localName    string
 	errMsg       string
+	client       getter
 }
 
 func setupFetchSource(t *testing.T, tt fetchSourceTest, filePath string) (func(t *testing.T), *Spec) {
 	spec, _ := NewSpec("testdata/spec.yaml")
 	spec.SourceCache = tt.sourceCache
+	spec.HTTPClient = tt.client
 	if tt.preExistFile {
 		if err := os.MkdirAll(spec.SourceCache, 0755); err != nil {
 			return func(*testing.T) {
@@ -224,7 +221,8 @@ func setupFetchSource(t *testing.T, tt fetchSourceTest, filePath string) (func(t
 		}
 	}, spec
 }
-func TestFetchSources(t *testing.T) {
+
+func TestFetchSource(t *testing.T) {
 	var fetchSourceTests = []fetchSourceTest{
 		{
 			true,
@@ -236,6 +234,7 @@ func TestFetchSources(t *testing.T) {
 			"testdata/src",
 			"",
 			"parse ://blergh: missing protocol scheme",
+			&goodHTTP{},
 		},
 		{
 			true,
@@ -247,6 +246,7 @@ func TestFetchSources(t *testing.T) {
 			"testdata/src",
 			"",
 			"missing protocol scheme",
+			&goodHTTP{},
 		},
 		{
 			true,
@@ -258,6 +258,7 @@ func TestFetchSources(t *testing.T) {
 			"testdata/src",
 			"",
 			"unsupported protocol scheme: gxp",
+			&goodHTTP{},
 		},
 		{
 			true,
@@ -269,6 +270,7 @@ func TestFetchSources(t *testing.T) {
 			"testdata/src",
 			"",
 			"no path element detected",
+			&goodHTTP{},
 		},
 		{
 			true,
@@ -279,25 +281,12 @@ func TestFetchSources(t *testing.T) {
 			"not_a_valid_blake2_sum",
 			"testdata/src",
 			"blargh",
-			"file: blargh, expected: not_a_valid_blake2_sum, actual " +
-				"d6c9a3102ee1fe35f542bdf8690462e47271fa6339b0682219b864a95a0d8fef" +
-				"7f3f3b190758ec3a92cf8a643ab9cdbd6166ec9a5d765d3f0de06cee5979c926",
+			"blake2 sum mismatch",
+			&goodHTTP{},
 		},
 		{
 			true,
-			true,
-			0200,
-			"if file exists but has unreadable permissions, should error",
-			"https://blergh/blargh",
-			"d6c9a3102ee1fe35f542bdf8690462e47271fa6339b0682219b864a95a0d8fef7f3f" +
-				"3b190758ec3a92cf8a643ab9cdbd6166ec9a5d765d3f0de06cee5979c926",
-			"testdata/src",
-			"blargh",
-			"testdata/src/blargh: permission denied",
-		},
-		{
-			true,
-			true,
+			false,
 			0644,
 			"http errors should cause it to fail",
 			"https://blergh/blargh",
@@ -305,7 +294,33 @@ func TestFetchSources(t *testing.T) {
 				"3b190758ec3a92cf8a643ab9cdbd6166ec9a5d765d3f0de06cee5979c926",
 			"testdata/src",
 			"blargh",
-			"Get https://blergh/blargh: dial tcp: lookup blergh: no such host",
+			"transit error",
+			&badHTTP{},
+		},
+		{
+			true,
+			false,
+			0644,
+			"after successful download, should check blake2 sum again",
+			"https://blergh/blargh",
+			"not_a_valid_blake2_sum",
+			"testdata/src",
+			"blargh",
+			"blake2 sum mismatch",
+			&goodHTTP{},
+		},
+		{
+			false,
+			false,
+			0644,
+			"after successful download, should check blake2 sum again, but succeed",
+			"https://blergh/blargh",
+			"c3f4db476d1b1504092b4b3756e9b5ef1d658f609e55361e77de6b74d9d77a28" +
+				"be46411fd3ce158048c77714925207e47960f3dc0f399f1b8dcbb7e70333dc66",
+			"testdata/src",
+			"blargh",
+			"",
+			&goodHTTP{},
 		},
 		{
 			true,
@@ -313,12 +328,12 @@ func TestFetchSources(t *testing.T) {
 			0644,
 			"if the source cache directory cannot be created it should error",
 			"https://blergh/blargh",
-			"d6c9a3102ee1fe35f542bdf8690462e47271fa6339b0682219b864a95a0d8fef7f3f" +
-				"3b190758ec3a92cf8a643ab9cdbd6166ec9a5d765d3f0de06cee5979c926",
+			"c3f4db476d1b1504092b4b3756e9b5ef1d658f609e55361e77de6b74d9d77a28" +
+				"be46411fd3ce158048c77714925207e47960f3dc0f399f1b8dcbb7e70333dc66",
 			"/etc/resolv.conf/src",
 			"blargh",
-
 			"/etc/resolv.conf/src: not a directory",
+			&goodHTTP{},
 		},
 	}
 	for _, tt := range fetchSourceTests {
@@ -333,8 +348,9 @@ func TestFetchSources(t *testing.T) {
 			if tt.shouldErr {
 				if err == nil {
 					t.Errorf("expected an error but didn't receive one")
+				} else {
+					assert.Contains(err.Error(), tt.errMsg)
 				}
-				assert.Contains(err.Error(), tt.errMsg)
 			} else {
 				assert.NoError(err)
 				finfo, err := os.Stat(filePath)
@@ -343,4 +359,26 @@ func TestFetchSources(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestFetchSources(t *testing.T) {
+	t.Run("testing multiple sources", func(t *testing.T) {
+		assert := assert.New(t)
+		spec, _ := NewSpec("testdata/spec.yaml")
+		spec.HTTPClient = &goodHTTP{}
+		spec.Sources = []Source{
+			{
+				"://blergh",
+				"not_a_valid_blake2_sum",
+				"blergh",
+			},
+			{
+				"https://blargh/blergh",
+				"",
+				"blergh",
+			},
+		}
+		errors := spec.FetchSources()
+		assert.Len(errors, 2)
+	})
 }
