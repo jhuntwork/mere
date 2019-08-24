@@ -1,0 +1,29 @@
+version: 2.1
+executors:
+  go-build-essential:
+    docker:
+      - image: mere/go-build-essential
+        environment:
+          GOPATH: "/tmp/gopath"
+          PATH: "/tmp/gopath/bin:/local/bin:/local/sbin:/bin:/sbin"
+jobs:
+  lint:
+    executor: go-build-essential
+    steps:
+      - checkout
+      - run:
+          name: lint
+          command: make lint
+  test:
+    executor: go-build-essential
+    steps:
+      - checkout
+      - run:
+          name: test
+          command: make test
+workflows:
+  version: 2
+  workflow:
+    jobs:
+      - lint
+      - test
