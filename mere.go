@@ -2,7 +2,6 @@ package mere
 
 import (
 	"bytes"
-	"encoding/json"
 	"fmt"
 	"io/ioutil"
 	"os/user"
@@ -10,6 +9,8 @@ import (
 
 	"github.com/alecthomas/jsonschema"
 	"github.com/ghodss/yaml"
+	http "github.com/hashicorp/go-retryablehttp"
+	jsoniter "github.com/json-iterator/go"
 	validate "github.com/qri-io/jsonschema"
 )
 
@@ -35,6 +36,7 @@ type Spec struct {
 	Test        string    `json:"test,omitempty"`
 	Install     string    `json:"install,omitempty"`
 	Packages    []Package `json:"packages"`
+	HTTPClient  getter    `json:"-"`
 }
 
 func render(v string, spec *Spec) (string, error) {
@@ -56,6 +58,7 @@ func NewSpec(path string) (*Spec, error) {
 	reflector.ExpandedStruct = true
 	rs := &validate.RootSchema{}
 	schema := reflector.Reflect(&Spec{})
+	var json = jsoniter.ConfigCompatibleWithStandardLibrary
 	schemaBytes, _ := json.Marshal(schema)
 	if err := json.Unmarshal(schemaBytes, rs); err != nil {
 		return nil, err
@@ -114,5 +117,6 @@ func NewSpec(path string) (*Spec, error) {
 		user, _ := user.Current()
 		spec.SourceCache = user.HomeDir + "/.mere/src"
 	}
+	spec.HTTPClient = http.NewClient()
 	return spec, nil
 }
