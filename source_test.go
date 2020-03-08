@@ -33,8 +33,7 @@ func TestComputeBlake2(t *testing.T) {
 			"testdata/spec.yaml",
 			nil,
 			false,
-			"b4fc6c456ba6c0405e2197b86ddb8d5cad819dbc5e67991a9cc3da85ae355dab" +
-				"b0a3307b5e66970192d925c8abd4e02f0b7c7ac20fe21348d515b413f3ce4fd6",
+			"7cb98c9f584b1b9aae64e4c069d6d0b584d3fdb673e03c6478ae06cd15141acd",
 			"",
 		},
 		{
@@ -46,6 +45,7 @@ func TestComputeBlake2(t *testing.T) {
 			"this is a mock failure",
 		},
 	}
+
 	for _, tt := range computeBlake2Tests {
 		tt := tt
 		t.Run(tt.desc, func(t *testing.T) {
@@ -111,6 +111,7 @@ func (s *serverErrHTTP) Get(string) (*http.Response, error) {
 	var resp http.Response
 	resp.StatusCode = 500
 	resp.Body = ioutil.NopCloser(bytes.NewBufferString(""))
+
 	return &resp, nil
 }
 
@@ -123,6 +124,7 @@ func (g *goodHTTP) Get(string) (*http.Response, error) {
 	var resp http.Response
 	resp.StatusCode = 200
 	resp.Body = ioutil.NopCloser(bytes.NewBufferString("content"))
+
 	return &resp, nil
 }
 
@@ -180,8 +182,7 @@ func Test_checkBlake2SumFromFile(t *testing.T) {
 		assert := assert.New(t)
 		err := checkBlake2SumFromFile(
 			"testdata/spec.yaml",
-			"b4fc6c456ba6c0405e2197b86ddb8d5cad819dbc5e67991a9cc3da85ae355dab"+
-				"b0a3307b5e66970192d925c8abd4e02f0b7c7ac20fe21348d515b413f3ce4fd6")
+			"7cb98c9f584b1b9aae64e4c069d6d0b584d3fdb673e03c6478ae06cd15141acd")
 		assert.Nil(err)
 	})
 }
@@ -203,18 +204,21 @@ func setupFetchSource(t *testing.T, tt fetchSourceTest, filePath string) (func(t
 	spec, _ := NewSpec("testdata/spec.yaml")
 	spec.SourceCache = tt.sourceCache
 	spec.HTTPClient = tt.client
+
 	if tt.preExistFile {
 		if err := os.MkdirAll(spec.SourceCache, 0755); err != nil {
 			return func(*testing.T) {
 				t.Error(err)
 			}, spec
 		}
+
 		if err := ioutil.WriteFile(filePath, []byte("Blah blah blah"), tt.preExistMode); err != nil {
 			return func(*testing.T) {
 				t.Error(err)
 			}, spec
 		}
 	}
+
 	return func(t *testing.T) {
 		if strings.Contains(spec.SourceCache, "testdata") {
 			os.RemoveAll(spec.SourceCache)
@@ -222,6 +226,12 @@ func setupFetchSource(t *testing.T, tt fetchSourceTest, filePath string) (func(t
 	}, spec
 }
 
+// nolint funlen
+/*
+  The default length of 60 lines seems generally reasonable. But in this case, the concise
+  nature of table driven unit tests alongside the goal of more complete coverage outweigh
+  the goal of short function length.
+*/
 func TestFetchSource(t *testing.T) {
 	var fetchSourceTests = []fetchSourceTest{
 		{
@@ -233,7 +243,7 @@ func TestFetchSource(t *testing.T) {
 			"",
 			"testdata/src",
 			"",
-			"parse ://blergh: missing protocol scheme",
+			"missing protocol schem",
 			&goodHTTP{},
 		},
 		{
@@ -290,8 +300,7 @@ func TestFetchSource(t *testing.T) {
 			0644,
 			"http errors should cause it to fail",
 			"https://blergh/blargh",
-			"d6c9a3102ee1fe35f542bdf8690462e47271fa6339b0682219b864a95a0d8fef7f3f" +
-				"3b190758ec3a92cf8a643ab9cdbd6166ec9a5d765d3f0de06cee5979c926",
+			"2d49316473cb68324b3f807c6d88c5618f6a422801f52ee3f6b3c29784504fc0",
 			"testdata/src",
 			"blargh",
 			"transit error",
@@ -315,8 +324,7 @@ func TestFetchSource(t *testing.T) {
 			0644,
 			"after successful download, should check blake2 sum again, but succeed",
 			"https://blergh/blargh",
-			"c3f4db476d1b1504092b4b3756e9b5ef1d658f609e55361e77de6b74d9d77a28" +
-				"be46411fd3ce158048c77714925207e47960f3dc0f399f1b8dcbb7e70333dc66",
+			"2d49316473cb68324b3f807c6d88c5618f6a422801f52ee3f6b3c29784504fc0",
 			"testdata/src",
 			"blargh",
 			"",
@@ -328,14 +336,14 @@ func TestFetchSource(t *testing.T) {
 			0644,
 			"if the source cache directory cannot be created it should error",
 			"https://blergh/blargh",
-			"c3f4db476d1b1504092b4b3756e9b5ef1d658f609e55361e77de6b74d9d77a28" +
-				"be46411fd3ce158048c77714925207e47960f3dc0f399f1b8dcbb7e70333dc66",
+			"2d49316473cb68324b3f807c6d88c5618f6a422801f52ee3f6b3c29784504fc0",
 			"/etc/resolv.conf/src",
 			"blargh",
 			"/etc/resolv.conf/src: not a directory",
 			&goodHTTP{},
 		},
 	}
+
 	for _, tt := range fetchSourceTests {
 		tt := tt
 		t.Run(tt.desc, func(t *testing.T) {

@@ -39,16 +39,52 @@ type Spec struct {
 	HTTPClient  getter    `json:"-"`
 }
 
-func render(v string, spec *Spec) (string, error) {
+func (s *Spec) render(v string) (string, error) {
 	tl, err := template.New("").Parse(v)
 	if err != nil {
 		return "", err
 	}
+
 	buf := new(bytes.Buffer)
-	if err = tl.Execute(buf, spec); err != nil {
+	if err = tl.Execute(buf, s); err != nil {
 		return "", err
 	}
+
 	return buf.String(), nil
+}
+
+func (s *Spec) renderAll() error {
+	var err error
+
+	// render values for possible template strings of specific fields.
+	// Currently supported: sources[].url, packages[].files[], build, test and install.
+	for i := 0; i < len(s.Sources); i++ {
+		if s.Sources[i].URL, err = s.render(s.Sources[i].URL); err != nil {
+			return err
+		}
+	}
+
+	for i := 0; i < len(s.Packages); i++ {
+		for ii := 0; ii < len(s.Packages[i].Files); ii++ {
+			if s.Packages[i].Files[ii], err = s.render(s.Packages[i].Files[ii]); err != nil {
+				return err
+			}
+		}
+	}
+
+	if s.Build, err = s.render(s.Build); err != nil {
+		return err
+	}
+
+	if s.Test, err = s.render(s.Test); err != nil {
+		return err
+	}
+
+	if s.Install, err = s.render(s.Install); err != nil {
+		return err
+	}
+
+	return nil
 }
 
 // NewSpec constructs and validates new Spec structs from a given file.
@@ -58,7 +94,9 @@ func NewSpec(path string) (*Spec, error) {
 	reflector.ExpandedStruct = true
 	rs := &validate.RootSchema{}
 	schema := reflector.Reflect(&Spec{})
+
 	var json = jsoniter.ConfigCompatibleWithStandardLibrary
+
 	schemaBytes, _ := json.Marshal(schema)
 	if err := json.Unmarshal(schemaBytes, rs); err != nil {
 		return nil, err
@@ -68,10 +106,12 @@ func NewSpec(path string) (*Spec, error) {
 	if err != nil {
 		return nil, err
 	}
+
 	jsondata, err := yaml.YAMLToJSON(data)
 	if err != nil {
 		return nil, err
 	}
+
 	// validate the data according to the schema
 	if errors, err := rs.ValidateBytes(jsondata); err != nil || len(errors) > 0 {
 		if err == nil {
@@ -82,41 +122,27 @@ func NewSpec(path string) (*Spec, error) {
 					msg = (msg + ", ")
 				}
 			}
+
 			err = fmt.Errorf(msg)
 		}
+
 		return nil, err
 	}
+
 	if err := json.Unmarshal(jsondata, spec); err != nil {
 		return nil, err
 	}
 
-	// render values for possible template strings of specific fields.
-	// Currently supported: sources[].url, packages[].files[], build, test and install.
-	for i := 0; i < len(spec.Sources); i++ {
-		if spec.Sources[i].URL, err = render(spec.Sources[i].URL, spec); err != nil {
-			return nil, err
-		}
-	}
-	for i := 0; i < len(spec.Packages); i++ {
-		for ii := 0; ii < len(spec.Packages[i].Files); ii++ {
-			if spec.Packages[i].Files[ii], err = render(spec.Packages[i].Files[ii], spec); err != nil {
-				return nil, err
-			}
-		}
-	}
-	if spec.Build, err = render(spec.Build, spec); err != nil {
+	if err = spec.renderAll(); err != nil {
 		return nil, err
 	}
-	if spec.Test, err = render(spec.Test, spec); err != nil {
-		return nil, err
-	}
-	if spec.Install, err = render(spec.Install, spec); err != nil {
-		return nil, err
-	}
+
 	if spec.SourceCache == "" {
 		user, _ := user.Current()
 		spec.SourceCache = user.HomeDir + "/.mere/src"
 	}
+
 	spec.HTTPClient = http.NewClient()
+
 	return spec, nil
 }
