@@ -1,19 +1,15 @@
 BINARIES := $(patsubst cmd/%,bin/%,$(wildcard cmd/*))
-GOLANGCI-LINT-VRS := 'v1.17.1'
+GOLANGCI-LINT-VRS := "1.23.8"
 
 .PHONY: all clean test lint
 
 all: $(BINARIES)
 	@echo "built all applications"
 
-staticcheck:
-	@command -v staticcheck >/dev/null || go get honnef.co/go/tools/cmd/staticcheck
-	@staticcheck ./...
-
-lint: staticcheck
-	@command -v golangci-lint >/dev/null || \
+lint:
+	@[ "$$(golangci-lint --version | awk '{print $$4}')" = "${GOLANGCI-LINT-VRS}" ] || \
 	    curl -L -q https://install.goreleaser.com/github.com/golangci/golangci-lint.sh \
-		| sh -s -- -b $$(go env GOPATH)/bin ${GOLANGCI-LINT-VERS}
+		| sh -s -- -b $$(go env GOPATH)/bin v${GOLANGCI-LINT-VRS}
 	@golangci-lint run --deadline 30m --enable-all
 
 test:

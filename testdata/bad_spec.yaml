@@ -5,7 +5,7 @@ release: "Should be an integer"
 home: https://www.musl-libc.org
 sources:
   - url: '{{.Home}}/releases/musl-{{.Version}}.tar.gz'
-    blake2: 0f65fe41fc353e52c55667bb9e2b27bfcc8476f2c413e9437d272ee3194a4e3146d05ec04a25d16b8f577c19b82d16b1424c3e022e783d2b4da98de3658d363d
+    blake2: 0d5708a7f5234e38340fa66bc68e223fedace9c64f9135115117e72581e98f2d
 packages:
   - name: musl
     files:

@@ -5,7 +5,7 @@ release: 1
 home: https://www.musl-libc.org
 sources:
   - url: '{{.Home}}/releases/musl-{{.Version}}.tar.gz'
-    blake2: 0251604697f6e243d173c6a72d0a24ddbbce298f8e3a53d9d3a18d7f5ebf19f4e85584a494639c2470530b61c3189150bfaed3376e31acf4e1b2daa1c30860dc
+    blake2: 8bb1662bdf17ab22d010976b5af5c77e07b12324318757c75e32db2834cdc790
 packages:
   - name: musl
     files:
