@@ -12,7 +12,7 @@ lint:
 		| sh -s -- -b $$(go env GOPATH)/bin v${GOLANGCI-LINT-VRS}
 	@golangci-lint run --deadline 30m --enable-all
 
-test:
+test: lint
 	@go test -v -coverprofile coverage.out ./...
 	@go tool cover -func=coverage.out
 	@go tool cover -html=coverage.out -o coverage.html
