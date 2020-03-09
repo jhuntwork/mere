@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"strings"
 
+	rhttp "github.com/hashicorp/go-retryablehttp"
 	"github.com/sirupsen/logrus"
 	"golang.org/x/crypto/blake2b"
 )
@@ -20,22 +21,25 @@ const hashSize = 32
 
 // Source defines the properties needed to retrieve and validate a source file.
 type Source struct {
-	URL       string `json:"url"`
-	Blake2    string `json:"blake2" jsonschema:"minLength=64,maxLength=64"`
-	LocalName string `json:"localName,omitempty"`
+	URL        string `json:"url"`
+	Blake2     string `json:"blake2" jsonschema:"minLength=64,maxLength=64"`
+	LocalName  string `json:"localName,omitempty"`
+	httpclient getter
+	fetch      func() error
+	savePath   string
 }
 
 type getter interface {
 	Get(string) (*http.Response, error)
 }
 
-func (s *Spec) fetchHTTP(client getter, url string, localName string) error {
+func (s *Source) fetchHTTP() error {
 	logrus.WithFields(logrus.Fields{
-		"filename": localName,
-		"URL":      url,
+		"filename": s.savePath,
+		"URL":      s.URL,
 	}).Debug("downloading")
 
-	resp, err := client.Get(url)
+	resp, err := s.httpclient.Get(s.URL)
 	if err != nil {
 		return err
 	}
@@ -45,7 +49,7 @@ func (s *Spec) fetchHTTP(client getter, url string, localName string) error {
 		return fmt.Errorf("%s", http.StatusText(resp.StatusCode))
 	}
 
-	f, err := os.Create(localName)
+	f, err := os.Create(s.savePath)
 	if err != nil {
 		return err
 	}
@@ -81,13 +85,13 @@ func computeBlake2FromFile(filename string) (string, error) {
 
 type mkdirall func(string, os.FileMode) error
 
-func (s *Spec) ensureSourceCache(md mkdirall) error {
-	finfo, err := os.Stat(s.SourceCache)
+func ensureDir(md mkdirall, path string) error {
+	finfo, err := os.Stat(path)
 	if err != nil {
 		if os.IsNotExist(err) {
-			logrus.Debugf("Creating source cache directory: %s", s.SourceCache)
+			logrus.Debugf("Creating source cache directory: %s", path)
 
-			if err := md(s.SourceCache, 0755); err != nil {
+			if err := md(path, 0755); err != nil {
 				return err
 			}
 
@@ -98,21 +102,10 @@ func (s *Spec) ensureSourceCache(md mkdirall) error {
 	}
 
 	if !finfo.IsDir() {
-		return fmt.Errorf("%s exists but is not a directory", s.SourceCache)
+		return fmt.Errorf("%s exists but is not a directory", path)
 	}
 
 	return nil
-}
-
-func (s *Spec) getLocalFilePath(p string) (string, error) {
-	localName, _ := filepath.Abs(strings.Join([]string{s.SourceCache, path.Base(p)}, "/"))
-
-	absSourcePath, _ := filepath.Abs(s.SourceCache)
-	if localName == absSourcePath {
-		return "", fmt.Errorf("no path element detected")
-	}
-
-	return localName, nil
 }
 
 func checkBlake2SumFromFile(filename string, blake2 string) error {
@@ -139,72 +132,62 @@ func checkBlake2SumFromFile(filename string, blake2 string) error {
 	return nil
 }
 
-type validatedSource struct {
-	savePath string
-	fetch    func(string) error
-}
-
-func (s *Spec) validateSource(source *Source) (validatedSource, error) {
+func (s *Source) validateSource(cache string) error {
 	var localName string
 
-	var validated validatedSource
-
-	var fetch func(string) error
-
-	parsedURL, err := url.Parse(source.URL)
+	parsedURL, err := url.Parse(s.URL)
 	if err != nil {
-		return validated, err
+		return err
 	}
 
 	switch parsedURL.Scheme {
 	case "http", "https":
-		fetch = func(filename string) error {
-			return s.fetchHTTP(s.HTTPClient, source.URL, filename)
-		}
+		s.fetch = s.fetchHTTP
 	case "":
-		return validated, fmt.Errorf("missing protocol scheme")
+		return fmt.Errorf("missing protocol scheme")
 	default:
-		return validated, fmt.Errorf("unsupported protocol scheme: %s", parsedURL.Scheme)
+		return fmt.Errorf("unsupported protocol scheme: %s", parsedURL.Scheme)
 	}
 
-	if source.LocalName == "" {
+	if s.LocalName == "" {
 		localName = parsedURL.Path
 	} else {
-		localName = source.LocalName
+		localName = s.LocalName
 	}
 
-	savePath, err := s.getLocalFilePath(localName)
-	if err != nil {
-		return validated, err
+	savePath, _ := filepath.Abs(strings.Join([]string{cache, path.Base(localName)}, "/"))
+
+	absSourcePath, _ := filepath.Abs(cache)
+	if savePath == absSourcePath {
+		return fmt.Errorf("no path element detected")
 	}
 
-	validated.fetch = fetch
-	validated.savePath = savePath
+	s.savePath = savePath
 
-	return validated, nil
+	return nil
 }
 
-// FetchSource retrieves a single defined Source and validates its integrity.
-func (s *Spec) FetchSource(source *Source) error {
-	if err := s.ensureSourceCache(os.MkdirAll); err != nil {
+// Fetch retrieves a single defined Source and validates its integrity.
+func (s *Source) Fetch(cache string) error {
+	if err := ensureDir(os.MkdirAll, cache); err != nil {
 		return err
 	}
 
-	validatedURL, err := s.validateSource(source)
+	err := s.validateSource(cache)
 	if err != nil {
 		return err
 	}
 
-	finfo, _ := os.Stat(validatedURL.savePath)
+	finfo, _ := os.Stat(s.savePath)
 	if finfo != nil {
-		return checkBlake2SumFromFile(validatedURL.savePath, source.Blake2)
+		return checkBlake2SumFromFile(s.savePath, s.Blake2)
 	}
 
-	if err = validatedURL.fetch(validatedURL.savePath); err != nil {
+	if err = s.fetch(); err != nil {
 		return err
 	}
 
-	if err := checkBlake2SumFromFile(validatedURL.savePath, source.Blake2); err != nil {
+	if err := checkBlake2SumFromFile(s.savePath, s.Blake2); err != nil {
 		return err
 	}
 
@@ -217,7 +200,11 @@ func (s *Spec) FetchSources() []error {
 
 	for _, source := range s.Sources {
 		source := source
-		if err := s.FetchSource(&source); err != nil {
+		if source.httpclient == nil {
+			source.httpclient = rhttp.NewClient()
+		}
+
+		if err := source.Fetch(s.SourceCache); err != nil {
 			errors = append(errors, err)
 		}
 	}

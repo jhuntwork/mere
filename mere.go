@@ -9,7 +9,6 @@ import (
 
 	"github.com/alecthomas/jsonschema"
 	"github.com/ghodss/yaml"
-	http "github.com/hashicorp/go-retryablehttp"
 	jsoniter "github.com/json-iterator/go"
 	validate "github.com/qri-io/jsonschema"
 )
@@ -36,7 +35,6 @@ type Spec struct {
 	Test        string    `json:"test,omitempty"`
 	Install     string    `json:"install,omitempty"`
 	Packages    []Package `json:"packages"`
-	HTTPClient  getter    `json:"-"`
 }
 
 func (s *Spec) render(v string) (string, error) {
@@ -152,8 +150,6 @@ func NewSpec(path string) (*Spec, error) {
 		user, _ := user.Current()
 		spec.SourceCache = user.HomeDir + "/.mere/src"
 	}
-
-	spec.HTTPClient = http.NewClient()
 
 	return spec, nil
 }

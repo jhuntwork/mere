@@ -77,19 +77,19 @@ func badMkdirAll(string, os.FileMode) error {
 	return fmt.Errorf("MkdirAll failed")
 }
 
-func Test_ensureSourceCache(t *testing.T) {
+func Test_ensureDir(t *testing.T) {
 	t.Run("should fail if directory is a file", func(t *testing.T) {
 		assert := assert.New(t)
 		spec, _ := NewSpec("testdata/spec.yaml")
 		spec.SourceCache = "testdata/spec.yaml"
-		err := spec.ensureSourceCache(os.MkdirAll)
+		err := ensureDir(os.MkdirAll, spec.SourceCache)
 		assert.EqualError(err, "testdata/spec.yaml exists but is not a directory")
 	})
 	t.Run("should fail if directory cannot be created", func(t *testing.T) {
 		assert := assert.New(t)
 		spec, _ := NewSpec("testdata/spec.yaml")
 		spec.SourceCache = "testdata/src/test"
-		err := spec.ensureSourceCache(badMkdirAll)
+		err := ensureDir(badMkdirAll, spec.SourceCache)
 		assert.EqualError(err, "MkdirAll failed")
 	})
 	t.Run("should create a directory if it doesn't exist", func(t *testing.T) {
@@ -99,7 +99,7 @@ func Test_ensureSourceCache(t *testing.T) {
 		spec, _ := NewSpec("testdata/spec.yaml")
 		spec.SourceCache = dir
 		defer os.RemoveAll(dir)
-		err := spec.ensureSourceCache(os.MkdirAll)
+		err := ensureDir(os.MkdirAll, spec.SourceCache)
 		assert.NoError(err)
 		finfo, err := os.Stat(dir)
 		assert.NoError(err)
@@ -136,7 +136,9 @@ func Test_fetchHttp(t *testing.T) {
 	t.Run("should fail if there is an http error", func(t *testing.T) {
 		assert := assert.New(t)
 		spec, _ := NewSpec("testdata/spec.yaml")
-		err := spec.fetchHTTP(&badHTTP{}, spec.Sources[0].URL, "testdata/test1")
+		spec.Sources[0].savePath = "testdata/test1"
+		spec.Sources[0].httpclient = &badHTTP{}
+		err := spec.Sources[0].fetchHTTP()
 		if err == nil {
 			t.Error("expected an error but did not receive one")
 		}
@@ -145,7 +147,9 @@ func Test_fetchHttp(t *testing.T) {
 	t.Run("should fail if there is a server error", func(t *testing.T) {
 		assert := assert.New(t)
 		spec, _ := NewSpec("testdata/spec.yaml")
-		err := spec.fetchHTTP(&serverErrHTTP{}, spec.Sources[0].URL, "testdata/test2")
+		spec.Sources[0].savePath = "testdata/test2"
+		spec.Sources[0].httpclient = &serverErrHTTP{}
+		err := spec.Sources[0].fetchHTTP()
 		if err == nil {
 			t.Error("expected an error but did not receive one")
 		}
@@ -154,7 +158,9 @@ func Test_fetchHttp(t *testing.T) {
 	t.Run("should fail when unable to open a file for writing", func(t *testing.T) {
 		assert := assert.New(t)
 		spec, _ := NewSpec("testdata/spec.yaml")
-		err := spec.fetchHTTP(&goodHTTP{}, spec.Sources[0].URL, "/dev/null/test3")
+		spec.Sources[0].savePath = "/dev/null/test3"
+		spec.Sources[0].httpclient = &goodHTTP{}
+		err := spec.Sources[0].fetchHTTP()
 		if err == nil {
 			t.Error("expected an error but did not receive one")
 		}
@@ -169,7 +175,9 @@ func Test_fetchHttp(t *testing.T) {
 		}
 		tmpfileName := tmpfile.Name()
 		defer os.Remove(tmpfileName)
-		err = spec.fetchHTTP(&goodHTTP{}, spec.Sources[0].URL, tmpfileName)
+		spec.Sources[0].savePath = tmpfileName
+		spec.Sources[0].httpclient = &goodHTTP{}
+		err = spec.Sources[0].fetchHTTP()
 		assert.NoError(err)
 		actual, err := ioutil.ReadFile(tmpfileName)
 		if err != nil {
@@ -208,10 +216,9 @@ type sourceTest struct {
 	client       getter
 }
 
-func setupFetchSource(t *testing.T, tt sourceTest, filePath string) (func(t *testing.T), *Spec) {
+func setupSource(t *testing.T, tt sourceTest, filePath string) (func(t *testing.T), *Spec) {
 	spec, _ := NewSpec("testdata/spec.yaml")
 	spec.SourceCache = tt.sourceCache
-	spec.HTTPClient = tt.client
 
 	if tt.preExistFile {
 		if err := os.MkdirAll(spec.SourceCache, 0755); err != nil {
@@ -322,10 +329,15 @@ func TestFetchSource(t *testing.T) {
 		t.Run(tt.description, func(t *testing.T) {
 			assert := assert.New(t)
 			filePath := strings.Join([]string{tt.sourceCache, tt.localName}, "/")
-			tearDown, spec := setupFetchSource(t, tt, filePath)
+			tearDown, spec := setupSource(t, tt, filePath)
 			defer tearDown(t)
-			source := Source{tt.url, tt.blake2, tt.localName}
-			err := spec.FetchSource(&source)
+			source := Source{
+				URL:        tt.url,
+				Blake2:     tt.blake2,
+				LocalName:  tt.localName,
+				httpclient: tt.client,
+			}
+			err := source.Fetch(spec.SourceCache)
 			if tt.errMsg != "" {
 				if err == nil {
 					t.Errorf("expected an error but didn't receive one")
@@ -346,17 +358,16 @@ func TestFetchSources(t *testing.T) {
 	t.Run("testing multiple sources", func(t *testing.T) {
 		assert := assert.New(t)
 		spec, _ := NewSpec("testdata/spec.yaml")
-		spec.HTTPClient = &goodHTTP{}
 		spec.Sources = []Source{
 			{
-				"://blergh",
-				"not_a_valid_blake2_sum",
-				"blergh",
+				URL:       "://blergh",
+				Blake2:    "not_a_valid_blake2_sum",
+				LocalName: "blergh",
 			},
 			{
-				"https://blargh/blergh",
-				"",
-				"blergh",
+				URL:        "https://blargh/blergh",
+				LocalName:  "blergh",
+				httpclient: &goodHTTP{},
 			},
 		}
 		errors := spec.FetchSources()
