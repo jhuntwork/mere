@@ -79,13 +79,15 @@ func computeBlake2FromFile(filename string) (string, error) {
 	return ComputeBlake2(f)
 }
 
-func (s *Spec) ensureSourceCache() error {
+type mkdirall func(string, os.FileMode) error
+
+func (s *Spec) ensureSourceCache(md mkdirall) error {
 	finfo, err := os.Stat(s.SourceCache)
 	if err != nil {
 		if os.IsNotExist(err) {
 			logrus.Debugf("Creating source cache directory: %s", s.SourceCache)
 
-			if err := os.MkdirAll(s.SourceCache, 0755); err != nil {
+			if err := md(s.SourceCache, 0755); err != nil {
 				return err
 			}
 
@@ -137,53 +139,72 @@ func checkBlake2SumFromFile(filename string, blake2 string) error {
 	return nil
 }
 
-// FetchSource retrieves a single defined Source and validates its integrity.
-func (s *Spec) FetchSource(source *Source) error {
+type validatedSource struct {
+	savePath string
+	fetch    func(string) error
+}
+
+func (s *Spec) validateSource(source *Source) (validatedSource, error) {
 	var localName string
+
+	var validated validatedSource
 
 	var fetch func(string) error
 
-	URL, err := url.Parse(source.URL)
+	parsedURL, err := url.Parse(source.URL)
 	if err != nil {
-		return err
+		return validated, err
 	}
 
-	switch URL.Scheme {
+	switch parsedURL.Scheme {
 	case "http", "https":
 		fetch = func(filename string) error {
 			return s.fetchHTTP(s.HTTPClient, source.URL, filename)
 		}
 	case "":
-		return fmt.Errorf("missing protocol scheme")
+		return validated, fmt.Errorf("missing protocol scheme")
 	default:
-		return fmt.Errorf("unsupported protocol scheme: %s", URL.Scheme)
-	}
-
-	if err := s.ensureSourceCache(); err != nil {
-		return err
+		return validated, fmt.Errorf("unsupported protocol scheme: %s", parsedURL.Scheme)
 	}
 
 	if source.LocalName == "" {
-		localName = URL.Path
+		localName = parsedURL.Path
 	} else {
 		localName = source.LocalName
 	}
 
-	localName, err = s.getLocalFilePath(localName)
+	savePath, err := s.getLocalFilePath(localName)
+	if err != nil {
+		return validated, err
+	}
+
+	validated.fetch = fetch
+	validated.savePath = savePath
+
+	return validated, nil
+}
+
+// FetchSource retrieves a single defined Source and validates its integrity.
+func (s *Spec) FetchSource(source *Source) error {
+	if err := s.ensureSourceCache(os.MkdirAll); err != nil {
+		return err
+	}
+
+	validatedURL, err := s.validateSource(source)
 	if err != nil {
 		return err
 	}
 
-	finfo, _ := os.Stat(localName)
+	finfo, _ := os.Stat(validatedURL.savePath)
 	if finfo != nil {
-		return checkBlake2SumFromFile(localName, source.Blake2)
+		return checkBlake2SumFromFile(validatedURL.savePath, source.Blake2)
 	}
 
-	if err = fetch(localName); err != nil {
+	if err = validatedURL.fetch(validatedURL.savePath); err != nil {
 		return err
 	}
 
-	if err := checkBlake2SumFromFile(localName, source.Blake2); err != nil {
+	if err := checkBlake2SumFromFile(validatedURL.savePath, source.Blake2); err != nil {
 		return err
 	}
 

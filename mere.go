@@ -87,29 +87,30 @@ func (s *Spec) renderAll() error {
 	return nil
 }
 
-// NewSpec constructs and validates new Spec structs from a given file.
-func NewSpec(path string) (*Spec, error) {
-	spec := new(Spec)
+type jsonIterator interface {
+	Marshal(interface{}) ([]byte, error)
+	Unmarshal([]byte, interface{}) error
+}
+
+func (s *Spec) validateSchema(path string, json jsonIterator) error {
 	reflector := new(jsonschema.Reflector)
 	reflector.ExpandedStruct = true
 	rs := &validate.RootSchema{}
 	schema := reflector.Reflect(&Spec{})
 
-	var json = jsoniter.ConfigCompatibleWithStandardLibrary
-
 	schemaBytes, _ := json.Marshal(schema)
 	if err := json.Unmarshal(schemaBytes, rs); err != nil {
-		return nil, err
+		return err
 	}
 
 	data, err := ioutil.ReadFile(path)
 	if err != nil {
-		return nil, err
+		return err
 	}
 
 	jsondata, err := yaml.YAMLToJSON(data)
 	if err != nil {
-		return nil, err
+		return err
 	}
 
 	// validate the data according to the schema
@@ -126,14 +127,24 @@ func NewSpec(path string) (*Spec, error) {
 			err = fmt.Errorf(msg)
 		}
 
+		return err
+	}
+
+	if err := json.Unmarshal(jsondata, s); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+// NewSpec constructs and validates new Spec structs from a given file.
+func NewSpec(path string) (*Spec, error) {
+	spec := new(Spec)
+	if err := spec.validateSchema(path, jsoniter.ConfigCompatibleWithStandardLibrary); err != nil {
 		return nil, err
 	}
 
-	if err := json.Unmarshal(jsondata, spec); err != nil {
-		return nil, err
-	}
-
-	if err = spec.renderAll(); err != nil {
+	if err := spec.renderAll(); err != nil {
 		return nil, err
 	}
 
