@@ -4,8 +4,8 @@ version: 1.1.23
 release: "Should be an integer"
 home: https://www.musl-libc.org
 sources:
-  - url: '{{.Home}}/releases/musl-{{.Version}}.tar.gz'
-    blake2: 0d5708a7f5234e38340fa66bc68e223fedace9c64f9135115117e72581e98f2d
+  - url: "{{.Home}}/releases/musl-{{.Version}}.tar.gz"
+    b3sum: 0d5708a7f5234e38340fa66bc68e223fedace9c64f9135115117e72581e98f2d
 packages:
   - name: musl
     files:

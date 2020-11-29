@@ -1,20 +1,23 @@
 package mere
 
 import (
+	"errors"
 	"fmt"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
 )
 
-// nolint funlen
+var errFetchSources = errors.New("failure running fetchSources")
+
+//nolint:funlen
 /*
   The default length of 60 lines seems generally reasonable. But in this case, the concise
   nature of table driven unit tests alongside the goal of more complete coverage outweigh
   the goal of short function length.
 */
 func TestNewSpecErrors(t *testing.T) {
-	var newSpecTests = []struct {
+	newSpecTests := []struct {
 		description string
 		filename    string
 		errMsg      string
@@ -26,18 +29,19 @@ func TestNewSpecErrors(t *testing.T) {
 		},
 		{
 			description: "Should fail when spec file contains invalid YAML",
-			filename:    "testdata/invalid_yaml.txt",
-			errMsg:      "yaml: line 3: could not find expected ':'",
+			filename:    "testdata/bad_yaml.txt",
+			errMsg:      "yaml: line 2: could not find expected ':'",
 		},
 		{
 			description: "Should fail when spec file doesn't match the schema",
 			filename:    "testdata/bad_spec.yaml",
-			errMsg:      "spec failed validation: /release: type should be integer",
+			errMsg:      "invalid spec file: testdata/bad_spec.yaml\n\trelease: Invalid type. Expected: integer, given: string",
 		},
 		{
 			description: "Should fail when spec file doesn't contain all required fields",
-			filename:    "testdata/missing_spec.yaml",
-			errMsg:      `spec failed validation: /: "version" value is required, /: "release" value is required`,
+			filename:    "testdata/bad_template_missing_fields_spec.yaml",
+			errMsg: "invalid spec file: testdata/bad_template_missing_fields_spec.yaml\n\t(root): " +
+				"version is required\n\t(root): release is required",
 		},
 		{
 			description: "Should fail when spec file has unparseable template values",
@@ -65,62 +69,39 @@ func TestNewSpecErrors(t *testing.T) {
 			errMsg:      `template: :1:17: executing "" at <.Versio>: can't evaluate field Versio in type *mere.Spec`,
 		},
 		{
-			description: "Should fail when spec file has bad blake2 value",
-			filename:    "testdata/invalid_blake2_spec.yaml",
-			errMsg:      "spec failed validation: /sources/0/blake2: min length of 64 characters required: a",
+			description: "Should fail when spec file has bad b3sum value",
+			filename:    "testdata/bad_b3sum_spec.yaml",
+			errMsg: "invalid spec file: testdata/bad_b3sum_spec.yaml\n\tsources.0.b3sum: " +
+				"String length must be greater than or equal to 64",
 		},
 	}
-
-	for _, tt := range newSpecTests {
-		tt := tt
-		t.Run(tt.description, func(t *testing.T) {
+	for _, test := range newSpecTests {
+		test := test
+		t.Run(test.description, func(t *testing.T) {
 			assert := assert.New(t)
-			_, err := NewSpec(tt.filename)
-			assert.EqualError(err, tt.errMsg)
+			_, err := NewSpec(test.filename)
+			assert.EqualError(err, test.errMsg)
 		})
 	}
 }
 
-type badUnmarshal struct {
-	count int
-}
+type badUnmarshal struct{}
+
+var errUnmarshal = errors.New("failed to Unmarshal")
 
 func (b *badUnmarshal) Marshal(interface{}) ([]byte, error) {
 	return []byte{}, nil
 }
-func (b *badUnmarshal) Unmarshal([]byte, interface{}) error {
-	if b.count > 0 {
-		b.count--
-		return nil
-	}
 
-	return fmt.Errorf("failed to Unmarshal")
+func (b *badUnmarshal) Unmarshal([]byte, interface{}) error {
+	return fmt.Errorf("%w", errUnmarshal)
 }
 
 func Test_validateSchema(t *testing.T) {
-	var tests = []struct {
-		description string
-		errMsg      string
-	}{
-		{
-			description: "errors from first Unmarshal should fail the validation",
-			errMsg:      "failed to Unmarshal",
-		},
-		{
-			description: "errors from second Unmarshal should fail the validation",
-			errMsg:      "failed to Unmarshal",
-		},
-	}
-
-	for idx, tt := range tests {
-		tt := tt
-		idx := idx
-
-		t.Run(tt.description, func(t *testing.T) {
-			assert := assert.New(t)
-			spec := Spec{}
-			err := spec.validateSchema("testdata/spec.yaml", &badUnmarshal{count: idx})
-			assert.EqualError(err, tt.errMsg)
-		})
-	}
+	t.Run("errors from Unmarshal should fail the validation", func(t *testing.T) {
+		assert := assert.New(t)
+		spec := Spec{}
+		err := spec.validateSchema("testdata/spec.yaml", &badUnmarshal{})
+		assert.EqualError(err, "failed to Unmarshal")
+	})
 }

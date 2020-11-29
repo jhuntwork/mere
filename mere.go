@@ -2,16 +2,25 @@ package mere
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"io/ioutil"
+	"os"
 	"os/user"
 	"text/template"
 
 	"github.com/alecthomas/jsonschema"
 	"github.com/ghodss/yaml"
 	jsoniter "github.com/json-iterator/go"
-	validate "github.com/qri-io/jsonschema"
+	"github.com/xeipuuv/gojsonschema"
 )
+
+const (
+	configDir = "/.mere"
+	srcDir    = "/src"
+)
+
+var errValidate = errors.New("invalid spec file")
 
 // Package defines the properties needed to create an individual package.
 type Package struct {
@@ -23,29 +32,36 @@ type Package struct {
 // Spec contains the properties needed to build one or more packages
 // from the same source code.
 type Spec struct {
-	Name        string    `json:"name"`
-	Description string    `json:"description"`
-	Home        string    `json:"home"`
-	Version     string    `json:"version"`
-	Release     int64     `json:"release"`
-	Sources     []Source  `json:"sources"`
-	SourceCache string    `json:"sourceCache,omitempty"`
-	BuildDeps   string    `json:"buildDeps,omitempty"`
-	Build       string    `json:"build,omitempty"`
-	Test        string    `json:"test,omitempty"`
-	Install     string    `json:"install,omitempty"`
-	Packages    []Package `json:"packages"`
+	Name         string    `json:"name"`
+	Description  string    `json:"description"`
+	Home         string    `json:"home"`
+	Version      string    `json:"version"`
+	Release      int64     `json:"release"`
+	Sources      []Source  `json:"sources"`
+	BuildDeps    string    `json:"buildDeps,omitempty"`
+	Build        string    `json:"build,omitempty"`
+	Test         string    `json:"test,omitempty"`
+	Install      string    `json:"install,omitempty"`
+	Packages     []Package `json:"packages"`
+	sourceCache  string
+	buildContext string
+	workingDir   string
+	buildOrder   []map[string]string
+	printHook    func(string)
+	tempDirFunc  func(string, string) (string, error)
+	symlinkFunc  func(string, string) error
+	sourcesFunc  func([]Source, string, transportCreator) []error
 }
 
 func (s *Spec) render(v string) (string, error) {
 	tl, err := template.New("").Parse(v)
 	if err != nil {
-		return "", err
+		return "", fmt.Errorf("%w", err)
 	}
 
 	buf := new(bytes.Buffer)
 	if err = tl.Execute(buf, s); err != nil {
-		return "", err
+		return "", fmt.Errorf("%w", err)
 	}
 
 	return buf.String(), nil
@@ -91,48 +107,51 @@ type jsonIterator interface {
 }
 
 func (s *Spec) validateSchema(path string, json jsonIterator) error {
+	// Create a reflector to build a JSON Schema from the Spec definition.
 	reflector := new(jsonschema.Reflector)
 	reflector.ExpandedStruct = true
-	rs := &validate.RootSchema{}
-	schema := reflector.Reflect(&Spec{})
+	schema := gojsonschema.NewGoLoader(reflector.Reflect(&Spec{}))
 
-	schemaBytes, _ := json.Marshal(schema)
-	if err := json.Unmarshal(schemaBytes, rs); err != nil {
-		return err
-	}
-
-	data, err := ioutil.ReadFile(path)
+	yamldata, err := ioutil.ReadFile(path)
 	if err != nil {
-		return err
+		return fmt.Errorf("%w", err)
 	}
 
-	jsondata, err := yaml.YAMLToJSON(data)
+	jsondata, err := yaml.YAMLToJSON(yamldata)
 	if err != nil {
-		return err
+		return fmt.Errorf("%w", err)
 	}
 
-	// validate the data according to the schema
-	if errors, err := rs.ValidateBytes(jsondata); err != nil || len(errors) > 0 {
-		if err == nil {
-			msg := "spec failed validation: "
-			for i := 0; i < len(errors); i++ {
-				msg = (msg + errors[i].PropertyPath + ": " + errors[i].Message)
-				if i != (len(errors) - 1) {
-					msg = (msg + ", ")
-				}
+	data := gojsonschema.NewBytesLoader(jsondata)
+	result, _ := gojsonschema.Validate(schema, data)
+
+	if !result.Valid() {
+		var msg string
+		for idx, err := range result.Errors() {
+			if idx > 0 {
+				msg = fmt.Sprintf("%s\n\t%s", msg, err)
+			} else {
+				msg = err.String()
 			}
-
-			err = fmt.Errorf(msg)
 		}
 
-		return err
+		return fmt.Errorf("%w: %s\n\t%s", errValidate, path, msg)
 	}
 
 	if err := json.Unmarshal(jsondata, s); err != nil {
-		return err
+		return fmt.Errorf("%w", err)
 	}
 
 	return nil
+}
+
+// SetPrintHook sets a function to use as a callback for handling output.
+// The default hook is essentially a no-op.
+func (s *Spec) SetPrintHook(fn func(string)) {
+	s.printHook = fn
+	for idx := range s.Sources {
+		s.Sources[idx].printHook = fn
+	}
 }
 
 // NewSpec constructs and validates new Spec structs from a given file.
@@ -146,10 +165,27 @@ func NewSpec(path string) (*Spec, error) {
 		return nil, err
 	}
 
-	if spec.SourceCache == "" {
+	if spec.sourceCache == "" {
 		user, _ := user.Current()
-		spec.SourceCache = user.HomeDir + "/.mere/src"
+		spec.sourceCache = user.HomeDir + configDir + srcDir
 	}
-
+	spec.tempDirFunc = ioutil.TempDir
+	spec.symlinkFunc = os.Symlink
+	spec.SetPrintHook(func(output string) {})
+	spec.sourcesFunc = fetchSources
+	spec.buildOrder = []map[string]string{
+		{
+			"name": "build",
+			"cmd":  spec.Build,
+		},
+		{
+			"name": "test",
+			"cmd":  spec.Test,
+		},
+		{
+			"name": "install",
+			"cmd":  spec.Install,
+		},
+	}
 	return spec, nil
 }
