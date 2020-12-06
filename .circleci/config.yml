@@ -17,7 +17,7 @@ jobs:
       - checkout
       - run:
           name: test
-          command: make test
+          command: make test && bash <(curl -s https://codecov.io/bash)
 workflows:
   version: 2
   workflow:
