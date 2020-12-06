@@ -4,8 +4,8 @@ version: 1.1.23
 release: 1
 home: https://www.musl-libc.org
 sources:
-  - url: '{{.Home}}/releases/musl-{{.Version}}.tar.gz'
-    blake2: 8bb1662bdf17ab22d010976b5af5c77e07b12324318757c75e32db2834cdc790
+  - url: "{{.Home}}/releases/musl-{{.Version}}.tar.gz"
+    b3sum: f4180967749450bb98528b77f7cb27c6ce551f6677b34c782354d77cfe4a7efb
 packages:
   - name: musl
     files:
@@ -18,8 +18,7 @@ packages:
       - lib/*.a
       - lib/*.o
 build: |
-  cd_unpacked_src
-  printf '%s\n' "{{.Version}}"
-  unset CFLAGS CXXFLAGS
-  ./configure --prefix=/
-  make
+  printf 'Name: %s, Version: %s\n' "{{.Name}}" "{{.Version}}"
+  env
+install: |
+  echo "this is an install"

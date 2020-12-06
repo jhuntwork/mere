@@ -4,8 +4,8 @@ version: 1.1.23
 release: 1
 home: https://www.musl-libc.org
 sources:
-  - url: '{{.Home}}/releases/musl-{{.Version}}.tar.gz'
-    blake2: a
+  - url: "{{.Home}}/releases/musl-{{.Version}}.tar.gz"
+    b3sum: a
 packages:
   - name: musl
     files:
