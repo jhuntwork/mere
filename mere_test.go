@@ -17,6 +17,7 @@ var errFetchSources = errors.New("failure running fetchSources")
   the goal of short function length.
 */
 func TestNewSpecErrors(t *testing.T) {
+	t.Parallel()
 	newSpecTests := []struct {
 		description string
 		filename    string
@@ -78,6 +79,7 @@ func TestNewSpecErrors(t *testing.T) {
 	for _, test := range newSpecTests {
 		test := test
 		t.Run(test.description, func(t *testing.T) {
+			t.Parallel()
 			assert := assert.New(t)
 			_, err := NewSpec(test.filename)
 			assert.EqualError(err, test.errMsg)
@@ -98,7 +100,9 @@ func (b *badUnmarshal) Unmarshal([]byte, interface{}) error {
 }
 
 func Test_validateSchema(t *testing.T) {
+	t.Parallel()
 	t.Run("errors from Unmarshal should fail the validation", func(t *testing.T) {
+		t.Parallel()
 		assert := assert.New(t)
 		spec := Spec{}
 		err := spec.validateSchema("testdata/spec.yaml", &badUnmarshal{})

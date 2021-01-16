@@ -1,4 +1,4 @@
-run:
+issues:
   max-issues-per-linter: 0
   max-same-issues: 0
 
@@ -7,6 +7,5 @@ linters:
   disable:
     - exhaustivestruct
     - nlreturn
-    - paralleltest
     - testpackage
     - wsl
