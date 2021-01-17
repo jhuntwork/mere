@@ -43,6 +43,7 @@ func (*badReader) Close() error {
 }
 
 func Test_computeB3Sum(t *testing.T) {
+	t.Parallel()
 	computeB3SumTests := []struct {
 		description string
 		shouldErr   bool
@@ -65,6 +66,7 @@ func Test_computeB3Sum(t *testing.T) {
 	for _, test := range computeB3SumTests {
 		test := test
 		t.Run(test.description, func(t *testing.T) {
+			t.Parallel()
 			assert := assert.New(t)
 			var err error
 			if test.filename != "" {
@@ -87,7 +89,9 @@ func Test_computeB3Sum(t *testing.T) {
 }
 
 func Test_computeB3SumFromFile(t *testing.T) {
+	t.Parallel()
 	t.Run("should fail if given a bad file", func(t *testing.T) {
+		t.Parallel()
 		assert := assert.New(t)
 		output, err := computeB3SumFromFile("testdata/no_such_file")
 		assert.Equal("", output)
@@ -100,7 +104,9 @@ func badMkdirAll(string, os.FileMode) error {
 }
 
 func Test_ensureDir(t *testing.T) {
+	t.Parallel()
 	t.Run("should fail if directory is a file", func(t *testing.T) {
+		t.Parallel()
 		assert := assert.New(t)
 		spec, _ := NewSpec("testdata/spec.yaml")
 		spec.sourceCache = "testdata/spec.yaml"
@@ -108,6 +114,7 @@ func Test_ensureDir(t *testing.T) {
 		assert.EqualError(err, "not a directory: testdata/spec.yaml")
 	})
 	t.Run("should fail if directory cannot be created", func(t *testing.T) {
+		t.Parallel()
 		assert := assert.New(t)
 		spec, _ := NewSpec("testdata/spec.yaml")
 		spec.sourceCache = sourceCache + "/test"
@@ -115,6 +122,7 @@ func Test_ensureDir(t *testing.T) {
 		assert.EqualError(err, "failure when running MkdirAll")
 	})
 	t.Run("should create a directory if it doesn't exist", func(t *testing.T) {
+		t.Parallel()
 		dir := sourceCache
 		os.RemoveAll(dir)
 		assert := assert.New(t)
@@ -167,7 +175,9 @@ func (g *goodHTTPBadBody) Get(string) (*http.Response, error) {
 }
 
 func Test_fetchHtestp(t *testing.T) {
+	t.Parallel()
 	t.Run("should fail if there is an http error", func(t *testing.T) {
+		t.Parallel()
 		assert := assert.New(t)
 		spec, _ := NewSpec("testdata/spec.yaml")
 		spec.Sources[0].savePath = "testdata/test1"
@@ -179,6 +189,7 @@ func Test_fetchHtestp(t *testing.T) {
 		assert.Error(err)
 	})
 	t.Run("should fail if there is a server error", func(t *testing.T) {
+		t.Parallel()
 		assert := assert.New(t)
 		spec, _ := NewSpec("testdata/spec.yaml")
 		spec.Sources[0].savePath = "testdata/test2"
@@ -190,6 +201,7 @@ func Test_fetchHtestp(t *testing.T) {
 		assert.EqualError(err, "download error: Internal Server Error")
 	})
 	t.Run("should fail when unable to open a file for writing", func(t *testing.T) {
+		t.Parallel()
 		assert := assert.New(t)
 		spec, _ := NewSpec("testdata/spec.yaml")
 		spec.Sources[0].savePath = "/dev/null/test3"
@@ -201,6 +213,7 @@ func Test_fetchHtestp(t *testing.T) {
 		assert.EqualError(err, "open /dev/null/test3: not a directory")
 	})
 	t.Run("should not fail when content is successfully returned", func(t *testing.T) {
+		t.Parallel()
 		assert := assert.New(t)
 		spec, _ := NewSpec("testdata/spec.yaml")
 		tmpfile, err := ioutil.TempFile("", "")
@@ -222,7 +235,9 @@ func Test_fetchHtestp(t *testing.T) {
 }
 
 func Test_checkB3SumFromFile(t *testing.T) {
+	t.Parallel()
 	t.Run("should not fail when file sum matches", func(t *testing.T) {
+		t.Parallel()
 		assert := assert.New(t)
 		source := Source{printHook: func(string) {}}
 		err := source.checkB3SumFromFile(
@@ -231,6 +246,7 @@ func Test_checkB3SumFromFile(t *testing.T) {
 		assert.Nil(err)
 	})
 	t.Run("should fail when given a bad file", func(t *testing.T) {
+		t.Parallel()
 		assert := assert.New(t)
 		os.RemoveAll(sourceCache)
 		source := Source{printHook: func(string) {}}
@@ -284,32 +300,29 @@ func setupSource(t *testing.T, test sourceTest, filePath string) (func(t *testin
   the goal of short function length.
 */
 func Test_fetchSource(t *testing.T) {
+	t.Parallel()
 	fetchSourceTests := []sourceTest{
 		{
 			description: "should error if URL is unparseable",
 			url:         "://blergh",
-			sourceCache: sourceCache,
 			errMsg:      "missing protocol scheme",
 			client:      &goodHTTP{},
 		},
 		{
 			description: "should error if URL has no scheme",
 			url:         "blergh",
-			sourceCache: sourceCache,
 			errMsg:      "missing protocol scheme",
 			client:      &goodHTTP{},
 		},
 		{
 			description: "should error if URL.Scheme is unsupported",
 			url:         "gxp://blergh/blargh",
-			sourceCache: sourceCache,
 			errMsg:      "unsupported protocol scheme: gxp",
 			client:      &goodHTTP{},
 		},
 		{
 			description: "if there is no path provided it should error",
 			url:         "https://blergh",
-			sourceCache: sourceCache,
 			errMsg:      "no path element detected",
 			client:      &goodHTTP{},
 		},
@@ -318,7 +331,6 @@ func Test_fetchSource(t *testing.T) {
 			preExistFile: true,
 			url:          "https://blergh/blargh",
 			b3sum:        "not_a_valid_b3sum_sum",
-			sourceCache:  sourceCache,
 			localName:    "blargh",
 			errMsg:       "b3sum mismatch",
 			client:       &goodHTTP{},
@@ -327,7 +339,6 @@ func Test_fetchSource(t *testing.T) {
 			description: "http errors should cause it to fail",
 			url:         "https://blergh/blargh",
 			b3sum:       badSpecB3Sum,
-			sourceCache: sourceCache,
 			localName:   "blargh",
 			errMsg:      "transit error",
 			client:      &badHTTP{},
@@ -336,7 +347,6 @@ func Test_fetchSource(t *testing.T) {
 			description: "after successful download, should check b3sum again",
 			url:         "https://blergh/blargh",
 			b3sum:       "not_a_valid_b3sum_sum",
-			sourceCache: sourceCache,
 			localName:   "blargh",
 			errMsg:      "b3sum mismatch",
 			client:      &goodHTTP{},
@@ -345,7 +355,6 @@ func Test_fetchSource(t *testing.T) {
 			description: "after successful download, should check b3sum again, but succeed",
 			url:         "https://blergh/blargh",
 			b3sum:       badSpecB3Sum,
-			sourceCache: sourceCache,
 			localName:   "blargh",
 			client:      &goodHTTP{},
 		},
@@ -362,23 +371,31 @@ func Test_fetchSource(t *testing.T) {
 			description: "if body response fails during read, it should error",
 			url:         "https://blergh/blargh",
 			b3sum:       goodSpecB3Sum,
-			sourceCache: sourceCache,
 			localName:   "blargh",
 			errMsg:      "this is a mock Read failure",
 			client:      &goodHTTPBadBody{},
 		},
 	}
-	for _, test := range fetchSourceTests {
+	for i, test := range fetchSourceTests {
 		test := test
+		i := i
 		t.Run(test.description, func(t *testing.T) {
+			t.Parallel()
 			assert := assert.New(t)
-			filePath := strings.Join([]string{test.sourceCache, test.localName}, "/")
+			var name string
+			if test.localName != "" {
+				name = fmt.Sprintf("test%d", i)
+			}
+			if test.sourceCache == "" {
+				test.sourceCache = fmt.Sprintf("%s%d", sourceCache, i)
+			}
+			filePath := strings.Join([]string{test.sourceCache, name}, "/")
 			tearDown, spec := setupSource(t, test, filePath)
 			defer tearDown(t)
 			source := Source{
 				URL:        test.url,
 				B3Sum:      test.b3sum,
-				LocalName:  test.localName,
+				LocalName:  name,
 				httpclient: test.client,
 				printHook:  mockPrintHook,
 			}
@@ -408,7 +425,9 @@ func mockBadTransportCreator() (*http.Transport, error) {
 }
 
 func Test_fetchSources(t *testing.T) {
+	t.Parallel()
 	t.Run("testing multiple sources", func(t *testing.T) {
+		t.Parallel()
 		assert := assert.New(t)
 		spec, _ := NewSpec("testdata/spec.yaml")
 		spec.sourceCache = sourceCache
@@ -431,6 +450,7 @@ func Test_fetchSources(t *testing.T) {
 		assert.Len(errors, len(spec.Sources))
 	})
 	t.Run("an error should be returned when a transport cannot be created", func(t *testing.T) {
+		t.Parallel()
 		assert := assert.New(t)
 		spec, _ := NewSpec("testdata/spec.yaml")
 		spec.sourceCache = sourceCache
@@ -451,19 +471,23 @@ func Test_fetchSources(t *testing.T) {
 }
 
 func TestExtract(t *testing.T) {
+	t.Parallel()
 	t.Run("Should fail on missing archives", func(t *testing.T) {
+		t.Parallel()
 		assert := assert.New(t)
 		source := Source{savePath: "testdata/no-such-file", printHook: mockPrintHook}
 		err := source.extract("/tmp")
 		assert.EqualError(err, "open testdata/no-such-file: no such file or directory")
 	})
 	t.Run("Should fail on bad archives", func(t *testing.T) {
+		t.Parallel()
 		assert := assert.New(t)
 		source := Source{savePath: "testdata/spec.yaml", printHook: mockPrintHook}
 		err := source.extract("/tmp")
 		assert.EqualError(err, "Not a supported archive")
 	})
 	t.Run("Should extract good archives", func(t *testing.T) {
+		t.Parallel()
 		assert := assert.New(t)
 		source := Source{savePath: "testdata/testarchive.tar.gz", printHook: mockPrintHook}
 		tmpDir, _ := ioutil.TempDir("", "testarchive-*")

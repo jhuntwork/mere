@@ -36,7 +36,9 @@ func mockBadFetchSources(sources []Source, cache string, fn transportCreator) []
 }
 
 func Test_createWorkingDir(t *testing.T) {
+	t.Parallel()
 	t.Run("should return an error if the system call to TempDir fails", func(t *testing.T) {
+		t.Parallel()
 		assert := assert.New(t)
 		spec, err := NewSpec("testdata/spec.yaml")
 		assert.Nil(err)
@@ -45,6 +47,7 @@ func Test_createWorkingDir(t *testing.T) {
 		assert.EqualError(err, "failure running TempDir")
 	})
 	t.Run("should return an error if unable to create new directories inside the tempdir", func(t *testing.T) {
+		t.Parallel()
 		assert := assert.New(t)
 		spec, err := NewSpec("testdata/spec.yaml")
 		assert.Nil(err)
@@ -56,6 +59,7 @@ func Test_createWorkingDir(t *testing.T) {
 
 //nolint:funlen
 func TestBuildSteps(t *testing.T) {
+	t.Parallel()
 	buildStepsTests := []struct {
 		description  string
 		filename     string
@@ -123,6 +127,7 @@ func TestBuildSteps(t *testing.T) {
 	for _, test := range buildStepsTests {
 		test := test
 		t.Run(test.description, func(t *testing.T) {
+			t.Parallel()
 			assert := assert.New(t)
 			spec, err := NewSpec(test.filename)
 			assert.Nil(err)
