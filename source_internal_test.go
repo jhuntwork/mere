@@ -14,25 +14,34 @@ import (
 	"github.com/stretchr/testify/assert"
 )
 
-type badReader struct{}
-
 const (
 	// b3sum of testdata/spec.yaml.
 	goodSpecB3Sum = "8c312c270003dd6c40fc01b048efc664308ecadf14c4bfcee7980fb59bed4d16"
 	// output of goodHTTP.Get function.
-	badSpecB3Sum = "3fba5250be9ac259c56e7250c526bc83bacb4be825f2799d3d59e5b4878dd74e"
-	sourceCache  = "testdata/src"
+	goodHTTPB3Sum = "3fba5250be9ac259c56e7250c526bc83bacb4be825f2799d3d59e5b4878dd74e"
+	fileB3Sum     = "b319b03ad4ff94817e3555791bb67df918cd86466fc14426d4a969d94ded5c37"
+	sourceCache   = "testdata/src"
 )
 
 var (
-	errRead            = errors.New("this is a mock Read failure")
-	errClose           = errors.New("this is a mock Close failure")
-	errMkdirAll        = errors.New("failure when running MkdirAll")
-	errTransit         = errors.New("transit error")
-	errTranportCreator = errors.New("failure when creating transport")
+	errRead     = errors.New("this is a mock Read failure")
+	errClose    = errors.New("this is a mock Close failure")
+	errMkdirAll = errors.New("failure when running MkdirAll")
+	errTransit  = errors.New("transit error")
 )
 
-func mockPrintHook(string) {}
+type (
+	badCopier       struct{}
+	badReader       struct{}
+	badHTTP         struct{}
+	serverErrHTTP   struct{}
+	goodHTTP        struct{}
+	goodHTTPBadBody struct{}
+)
+
+func (badCopier) Copy(dst io.Writer, src io.Reader) (int64, error) {
+	return 0, fmt.Errorf("%w", errRead)
+}
 
 func (*badReader) Read([]byte) (int, error) {
 	return 0, fmt.Errorf("%w", errRead)
@@ -40,6 +49,36 @@ func (*badReader) Read([]byte) (int, error) {
 
 func (*badReader) Close() error {
 	return fmt.Errorf("%w", errClose)
+}
+
+func (s *serverErrHTTP) Get(string) (*http.Response, error) {
+	var resp http.Response
+	resp.StatusCode = 500
+	resp.Body = ioutil.NopCloser(bytes.NewBufferString(""))
+
+	return &resp, nil
+}
+
+func (b *badHTTP) Get(string) (*http.Response, error) {
+	var resp http.Response
+
+	return &resp, fmt.Errorf("%w", errTransit)
+}
+
+func (g *goodHTTP) Get(string) (*http.Response, error) {
+	var resp http.Response
+	resp.StatusCode = 200
+	resp.Body = ioutil.NopCloser(bytes.NewBufferString("content"))
+
+	return &resp, nil
+}
+
+func (g *goodHTTPBadBody) Get(string) (*http.Response, error) {
+	var resp http.Response
+	resp.StatusCode = 200
+	resp.Body = &badReader{}
+
+	return &resp, nil
 }
 
 func Test_computeB3Sum(t *testing.T) {
@@ -105,10 +144,11 @@ func badMkdirAll(string, os.FileMode) error {
 
 func Test_ensureDir(t *testing.T) {
 	t.Parallel()
+	var buf bytes.Buffer
 	t.Run("should fail if directory is a file", func(t *testing.T) {
 		t.Parallel()
 		assert := assert.New(t)
-		spec, _ := NewSpec("testdata/spec.yaml")
+		spec, _ := NewSpec("testdata/spec.yaml", &buf)
 		spec.sourceCache = "testdata/spec.yaml"
 		err := ensureDir(os.MkdirAll, spec.sourceCache)
 		assert.EqualError(err, "not a directory: testdata/spec.yaml")
@@ -116,7 +156,7 @@ func Test_ensureDir(t *testing.T) {
 	t.Run("should fail if directory cannot be created", func(t *testing.T) {
 		t.Parallel()
 		assert := assert.New(t)
-		spec, _ := NewSpec("testdata/spec.yaml")
+		spec, _ := NewSpec("testdata/spec.yaml", &buf)
 		spec.sourceCache = sourceCache + "/test"
 		err := ensureDir(badMkdirAll, spec.sourceCache)
 		assert.EqualError(err, "failure when running MkdirAll")
@@ -126,7 +166,7 @@ func Test_ensureDir(t *testing.T) {
 		dir := sourceCache
 		os.RemoveAll(dir)
 		assert := assert.New(t)
-		spec, _ := NewSpec("testdata/spec.yaml")
+		spec, _ := NewSpec("testdata/spec.yaml", &buf)
 		spec.sourceCache = dir
 		defer os.RemoveAll(dir)
 		err := ensureDir(os.MkdirAll, spec.sourceCache)
@@ -137,85 +177,57 @@ func Test_ensureDir(t *testing.T) {
 	})
 }
 
-type (
-	badHTTP         struct{}
-	serverErrHTTP   struct{}
-	goodHTTP        struct{}
-	goodHTTPBadBody struct{}
-)
-
-func (s *serverErrHTTP) Get(string) (*http.Response, error) {
-	var resp http.Response
-	resp.StatusCode = 500
-	resp.Body = ioutil.NopCloser(bytes.NewBufferString(""))
-
-	return &resp, nil
-}
-
-func (b *badHTTP) Get(string) (*http.Response, error) {
-	var resp http.Response
-
-	return &resp, fmt.Errorf("%w", errTransit)
-}
-
-func (g *goodHTTP) Get(string) (*http.Response, error) {
-	var resp http.Response
-	resp.StatusCode = 200
-	resp.Body = ioutil.NopCloser(bytes.NewBufferString("content"))
-
-	return &resp, nil
-}
-
-func (g *goodHTTPBadBody) Get(string) (*http.Response, error) {
-	var resp http.Response
-	resp.StatusCode = 200
-	resp.Body = &badReader{}
-
-	return &resp, nil
-}
-
-func Test_fetchHtestp(t *testing.T) {
+//nolint:funlen
+func Test_fetchHTTP(t *testing.T) {
+	tests := []struct {
+		description string
+		filename    string
+		client      getter
+		savePath    string
+		errMsg      string
+	}{
+		{
+			description: "should fail if there is an http error",
+			filename:    "testdata/spec.yaml",
+			client:      &badHTTP{},
+			savePath:    "testdata/test1",
+			errMsg:      "transit error",
+		},
+		{
+			description: "should fail if there is a server error",
+			filename:    "testdata/spec.yaml",
+			client:      &serverErrHTTP{},
+			savePath:    "testdata/test2",
+			errMsg:      "download error: Internal Server Error",
+		},
+		{
+			description: "should fail when unable to open a file for writing",
+			filename:    "testdata/spec.yaml",
+			client:      &goodHTTP{},
+			savePath:    "/dev/null/test3",
+			errMsg:      "open /dev/null/test3: not a directory",
+		},
+	}
 	t.Parallel()
-	t.Run("should fail if there is an http error", func(t *testing.T) {
-		t.Parallel()
-		assert := assert.New(t)
-		spec, _ := NewSpec("testdata/spec.yaml")
-		spec.Sources[0].savePath = "testdata/test1"
-		spec.Sources[0].httpclient = &badHTTP{}
-		err := spec.Sources[0].fetchHTTP()
-		if err == nil {
-			t.Error("expected an error but did not receive one")
-		}
-		assert.Error(err)
-	})
-	t.Run("should fail if there is a server error", func(t *testing.T) {
-		t.Parallel()
-		assert := assert.New(t)
-		spec, _ := NewSpec("testdata/spec.yaml")
-		spec.Sources[0].savePath = "testdata/test2"
-		spec.Sources[0].httpclient = &serverErrHTTP{}
-		err := spec.Sources[0].fetchHTTP()
-		if err == nil {
-			t.Error("expected an error but did not receive one")
-		}
-		assert.EqualError(err, "download error: Internal Server Error")
-	})
-	t.Run("should fail when unable to open a file for writing", func(t *testing.T) {
-		t.Parallel()
-		assert := assert.New(t)
-		spec, _ := NewSpec("testdata/spec.yaml")
-		spec.Sources[0].savePath = "/dev/null/test3"
-		spec.Sources[0].httpclient = &goodHTTP{}
-		err := spec.Sources[0].fetchHTTP()
-		if err == nil {
-			t.Error("expected an error but did not receive one")
-		}
-		assert.EqualError(err, "open /dev/null/test3: not a directory")
-	})
+	var buf bytes.Buffer
+	for _, tc := range tests {
+		tc := tc
+		t.Run(tc.description, func(t *testing.T) {
+			t.Parallel()
+			assert := assert.New(t)
+			spec, _ := NewSpec(tc.filename, &buf)
+			spec.Sources[0].savePath = tc.savePath
+			err := spec.Sources[0].fetchHTTP(tc.client)
+			if err == nil {
+				t.Error("expected an error but did not receive one")
+			}
+			assert.EqualError(err, tc.errMsg)
+		})
+	}
 	t.Run("should not fail when content is successfully returned", func(t *testing.T) {
 		t.Parallel()
 		assert := assert.New(t)
-		spec, _ := NewSpec("testdata/spec.yaml")
+		spec, _ := NewSpec("testdata/spec.yaml", &buf)
 		tmpfile, err := ioutil.TempFile("", "")
 		if err != nil {
 			t.Error(err)
@@ -223,8 +235,7 @@ func Test_fetchHtestp(t *testing.T) {
 		tmpfileName := tmpfile.Name()
 		defer os.Remove(tmpfileName)
 		spec.Sources[0].savePath = tmpfileName
-		spec.Sources[0].httpclient = &goodHTTP{}
-		err = spec.Sources[0].fetchHTTP()
+		err = spec.Sources[0].fetchHTTP(&goodHTTP{})
 		assert.NoError(err)
 		actual, err := ioutil.ReadFile(tmpfileName)
 		if err != nil {
@@ -234,12 +245,72 @@ func Test_fetchHtestp(t *testing.T) {
 	})
 }
 
+func Test_fetchFile(t *testing.T) {
+	tests := []struct {
+		description string
+		filename    string
+		savePath    string
+		srcPath     string
+		errMsg      string
+		copier      copier
+	}{
+		{
+			description: "should fail if cannot open the source file",
+			filename:    "testdata/spec_local_file.yaml",
+			srcPath:     "/dev/null/no-such-file",
+			errMsg:      "open /dev/null/no-such-file: not a directory",
+			copier:      copywrapper{},
+		},
+		{
+			description: "should fail if cannot open the destination file",
+			filename:    "testdata/spec_local_file.yaml",
+			savePath:    "/dev/null/no-such-file",
+			errMsg:      "open /dev/null/no-such-file: not a directory",
+			copier:      copywrapper{},
+		},
+		{
+			description: "should fail if encountering an error while copying",
+			filename:    "testdata/spec_local_file.yaml",
+			errMsg:      errRead.Error(),
+			copier:      badCopier{},
+		},
+	}
+	t.Parallel()
+	for _, tc := range tests {
+		tc := tc
+		var buf bytes.Buffer
+		t.Run(tc.description, func(t *testing.T) {
+			t.Parallel()
+			assert := assert.New(t)
+			spec, _ := NewSpec(tc.filename, &buf)
+			tempdir, err := ioutil.TempDir("", "")
+			assert.Nil(err)
+			defer os.RemoveAll(tempdir)
+			spec.sourceCache = tempdir
+			if tc.savePath == "" {
+				spec.Sources[0].savePath = strings.Join([]string{tempdir, "outfile"}, "/")
+			} else {
+				spec.Sources[0].savePath = tc.savePath
+			}
+			if tc.srcPath != "" {
+				spec.Sources[0].srcPath = tc.srcPath
+			}
+			err = spec.Sources[0].fetchFile(tc.copier)
+			if err == nil {
+				t.Error("expected an error but did not receive one")
+			}
+			assert.EqualError(err, tc.errMsg)
+		})
+	}
+}
+
 func Test_checkB3SumFromFile(t *testing.T) {
 	t.Parallel()
 	t.Run("should not fail when file sum matches", func(t *testing.T) {
 		t.Parallel()
+		var buf bytes.Buffer
 		assert := assert.New(t)
-		source := Source{printHook: func(string) {}}
+		source := Source{output: &buf}
 		err := source.checkB3SumFromFile(
 			"testdata/spec.yaml",
 			goodSpecB3Sum)
@@ -247,9 +318,10 @@ func Test_checkB3SumFromFile(t *testing.T) {
 	})
 	t.Run("should fail when given a bad file", func(t *testing.T) {
 		t.Parallel()
+		var buf bytes.Buffer
 		assert := assert.New(t)
 		os.RemoveAll(sourceCache)
-		source := Source{printHook: func(string) {}}
+		source := Source{output: &buf}
 		err := source.checkB3SumFromFile(
 			sourceCache+"/spec.yaml",
 			"not_a_b3sum_sum")
@@ -265,11 +337,16 @@ type sourceTest struct {
 	sourceCache  string
 	localName    string
 	errMsg       string
+	srcPath      string
 	client       getter
 }
 
-func setupSource(t *testing.T, test sourceTest, filePath string) (func(t *testing.T), *Spec) {
-	spec, _ := NewSpec("testdata/spec.yaml")
+func setupsource(t *testing.T, test sourceTest, filePath string) (func(t *testing.T), *Spec) {
+	var buf bytes.Buffer
+	spec, _ := NewSpec("testdata/spec.yaml", &buf)
+	if test.sourceCache == "" {
+		test.sourceCache = sourceCache
+	}
 	spec.sourceCache = test.sourceCache
 
 	if test.preExistFile {
@@ -301,31 +378,7 @@ func setupSource(t *testing.T, test sourceTest, filePath string) (func(t *testin
 */
 func Test_fetchSource(t *testing.T) {
 	t.Parallel()
-	fetchSourceTests := []sourceTest{
-		{
-			description: "should error if URL is unparseable",
-			url:         "://blergh",
-			errMsg:      "missing protocol scheme",
-			client:      &goodHTTP{},
-		},
-		{
-			description: "should error if URL has no scheme",
-			url:         "blergh",
-			errMsg:      "missing protocol scheme",
-			client:      &goodHTTP{},
-		},
-		{
-			description: "should error if URL.Scheme is unsupported",
-			url:         "gxp://blergh/blargh",
-			errMsg:      "unsupported protocol scheme: gxp",
-			client:      &goodHTTP{},
-		},
-		{
-			description: "if there is no path provided it should error",
-			url:         "https://blergh",
-			errMsg:      "no path element detected",
-			client:      &goodHTTP{},
-		},
+	fetchsourceTests := []sourceTest{
 		{
 			description:  "if file exists but has the wrong sum it should error",
 			preExistFile: true,
@@ -338,7 +391,7 @@ func Test_fetchSource(t *testing.T) {
 		{
 			description: "http errors should cause it to fail",
 			url:         "https://blergh/blargh",
-			b3sum:       badSpecB3Sum,
+			b3sum:       goodHTTPB3Sum,
 			localName:   "blargh",
 			errMsg:      "transit error",
 			client:      &badHTTP{},
@@ -354,14 +407,14 @@ func Test_fetchSource(t *testing.T) {
 		{
 			description: "after successful download, should check b3sum again, but succeed",
 			url:         "https://blergh/blargh",
-			b3sum:       badSpecB3Sum,
+			b3sum:       goodHTTPB3Sum,
 			localName:   "blargh",
 			client:      &goodHTTP{},
 		},
 		{
 			description: "if the source cache directory cannot be created it should error",
 			url:         "https://blergh/blargh",
-			b3sum:       badSpecB3Sum,
+			b3sum:       goodHTTPB3Sum,
 			sourceCache: "/dev/null/src",
 			localName:   "blargh",
 			errMsg:      "stat /dev/null/src: not a directory",
@@ -375,36 +428,52 @@ func Test_fetchSource(t *testing.T) {
 			errMsg:      "this is a mock Read failure",
 			client:      &goodHTTPBadBody{},
 		},
+		{
+			description: "test using a local file",
+			url:         "file://./testdata/testarchive.tar.gz",
+			b3sum:       fileB3Sum,
+			localName:   "blargh",
+		},
+		{
+			description: "should fail when using a local file and fetchFile fails",
+			url:         "file://./testdata/testarchive.tar.gz",
+			b3sum:       fileB3Sum,
+			srcPath:     "/dev/null/this-is-not-a-file",
+			errMsg:      "not a directory",
+		},
 	}
-	for i, test := range fetchSourceTests {
-		test := test
+	for i, tc := range fetchsourceTests {
+		tc := tc
 		i := i
-		t.Run(test.description, func(t *testing.T) {
+		t.Run(tc.description, func(t *testing.T) {
 			t.Parallel()
 			assert := assert.New(t)
-			var name string
-			if test.localName != "" {
-				name = fmt.Sprintf("test%d", i)
+			var buf bytes.Buffer
+			if tc.sourceCache == "" {
+				tc.sourceCache = fmt.Sprintf("%s%d", sourceCache, i)
 			}
-			if test.sourceCache == "" {
-				test.sourceCache = fmt.Sprintf("%s%d", sourceCache, i)
-			}
-			filePath := strings.Join([]string{test.sourceCache, name}, "/")
-			tearDown, spec := setupSource(t, test, filePath)
+			filePath := strings.Join([]string{tc.sourceCache, tc.localName}, "/")
+			tearDown, spec := setupsource(t, tc, filePath)
 			defer tearDown(t)
 			source := Source{
-				URL:        test.url,
-				B3Sum:      test.b3sum,
-				LocalName:  name,
-				httpclient: test.client,
-				printHook:  mockPrintHook,
+				URL:       tc.url,
+				B3Sum:     tc.b3sum,
+				LocalName: tc.localName,
+				savePath:  filePath,
+				output:    &buf,
 			}
-			err := source.fetchSource(spec.sourceCache)
-			if test.errMsg != "" {
+			err := source.validateSource()
+			if tc.srcPath != "" {
+				source.srcPath = tc.srcPath
+			}
+			assert.Nil(err)
+			spec.httpclient = tc.client
+			err = source.fetchSource(spec)
+			if tc.errMsg != "" {
 				if err == nil {
 					t.Errorf("expected an error but didn't receive one")
 				} else {
-					assert.Contains(err.Error(), test.errMsg)
+					assert.Contains(err.Error(), tc.errMsg)
 				}
 			} else {
 				assert.NoError(err)
@@ -416,20 +485,61 @@ func Test_fetchSource(t *testing.T) {
 	}
 }
 
-func mockTransportCreator() (*http.Transport, error) {
-	return &http.Transport{}, nil
-}
-
-func mockBadTransportCreator() (*http.Transport, error) {
-	return &http.Transport{}, fmt.Errorf("%w", errTranportCreator)
+func Test_validateSource(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		description string
+		url         string
+		errMsg      string
+	}{
+		{
+			description: "should error if URL is unparseable",
+			url:         "://blergh",
+			errMsg:      "missing protocol scheme",
+		},
+		{
+			description: "should error if URL has no scheme",
+			url:         "blergh",
+			errMsg:      "missing protocol scheme",
+		},
+		{
+			description: "should error if URL.Scheme is unsupported",
+			url:         "gxp://blergh/blargh",
+			errMsg:      "unsupported protocol scheme: gxp",
+		},
+		{
+			description: "if there is no path provided it should error",
+			url:         "https://blergh",
+			errMsg:      "no path element detected",
+		},
+	}
+	for _, tc := range tests {
+		tc := tc
+		t.Run(tc.description, func(t *testing.T) {
+			t.Parallel()
+			assert := assert.New(t)
+			source := Source{
+				URL: tc.url,
+			}
+			err := source.validateSource()
+			if tc.errMsg != "" {
+				if err == nil {
+					t.Errorf("expected an error but didn't receive one")
+				} else {
+					assert.Contains(err.Error(), tc.errMsg)
+				}
+			}
+		})
+	}
 }
 
 func Test_fetchSources(t *testing.T) {
 	t.Parallel()
 	t.Run("testing multiple sources", func(t *testing.T) {
 		t.Parallel()
+		var buf bytes.Buffer
 		assert := assert.New(t)
-		spec, _ := NewSpec("testdata/spec.yaml")
+		spec, _ := NewSpec("testdata/spec.yaml", &buf)
 		spec.sourceCache = sourceCache
 		defer os.RemoveAll(sourceCache)
 		spec.Sources = []Source{
@@ -437,59 +547,40 @@ func Test_fetchSources(t *testing.T) {
 				URL:       "://blergh",
 				B3Sum:     "not_a_valid_b3sum_sum",
 				LocalName: "blergh",
-				printHook: mockPrintHook,
 			},
 			{
-				URL:        "https://blargh/blergh",
-				LocalName:  "blergh",
-				httpclient: &goodHTTP{},
-				printHook:  mockPrintHook,
+				URL:       "://blargh/blergh",
+				LocalName: "blergh",
 			},
 		}
-		errors := fetchSources(spec.Sources, spec.sourceCache, mockTransportCreator)
+		errors := spec.fetchSources()
 		assert.Len(errors, len(spec.Sources))
-	})
-	t.Run("an error should be returned when a transport cannot be created", func(t *testing.T) {
-		t.Parallel()
-		assert := assert.New(t)
-		spec, _ := NewSpec("testdata/spec.yaml")
-		spec.sourceCache = sourceCache
-		defer os.RemoveAll(sourceCache)
-		spec.Sources = []Source{
-			{
-				URL:        "https://blargh/blergh",
-				B3Sum:      "",
-				LocalName:  "blergh",
-				httpclient: &goodHTTP{},
-				printHook:  mockPrintHook,
-			},
-		}
-		errors := fetchSources(spec.Sources, spec.sourceCache, mockBadTransportCreator)
-		assert.Len(errors, 1)
-		assert.EqualError(errors[0], "failure when creating transport")
 	})
 }
 
-func TestExtract(t *testing.T) {
+func Test_extract(t *testing.T) {
 	t.Parallel()
 	t.Run("Should fail on missing archives", func(t *testing.T) {
 		t.Parallel()
+		var buf bytes.Buffer
 		assert := assert.New(t)
-		source := Source{savePath: "testdata/no-such-file", printHook: mockPrintHook}
+		source := Source{savePath: "testdata/no-such-file", output: &buf}
 		err := source.extract("/tmp")
 		assert.EqualError(err, "open testdata/no-such-file: no such file or directory")
 	})
 	t.Run("Should fail on bad archives", func(t *testing.T) {
 		t.Parallel()
+		var buf bytes.Buffer
 		assert := assert.New(t)
-		source := Source{savePath: "testdata/spec.yaml", printHook: mockPrintHook}
+		source := Source{savePath: "testdata/spec.yaml", output: &buf}
 		err := source.extract("/tmp")
 		assert.EqualError(err, "Not a supported archive")
 	})
 	t.Run("Should extract good archives", func(t *testing.T) {
 		t.Parallel()
+		var buf bytes.Buffer
 		assert := assert.New(t)
-		source := Source{savePath: "testdata/testarchive.tar.gz", printHook: mockPrintHook}
+		source := Source{savePath: "testdata/testarchive.tar.gz", output: &buf}
 		tmpDir, _ := ioutil.TempDir("", "testarchive-*")
 		defer os.RemoveAll(tmpDir)
 		err := source.extract(tmpDir)

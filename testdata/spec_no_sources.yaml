@@ -2,10 +2,7 @@ name: musl
 description: An implementation of the C/POSIX standard library
 version: 1.1.23
 release: 1
-home: ://fake
-sources:
-  - url: "{{.Home}}/file"
-    b3sum: f4180967749450bb98528b77f7cb27c6ce551f6677b34c782354d77cfe4a7efb
+home: https://www.musl-libc.org
 packages:
   - name: musl
     files:
@@ -18,7 +15,7 @@ packages:
       - lib/*.a
       - lib/*.o
 build: |
-  printf '%s\n' "{{.Version}}"
-  unset CFLAGS CXXFLAGS
-  ./configure --prefix=/
-  make
+  printf 'Name: %s, Version: %s\n' "{{.Name}}" "{{.Version}}"
+  env
+install: |
+  echo "this is an install"

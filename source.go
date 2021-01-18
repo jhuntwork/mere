@@ -12,7 +12,6 @@ import (
 	"path"
 	"path/filepath"
 	"strings"
-	"time"
 
 	"github.com/codeclysm/extract/v3"
 	"github.com/zeebo/blake3"
@@ -20,7 +19,8 @@ import (
 
 const (
 	errorBoundary = 400
-	timeout       = 30
+	fileProto     = "file"
+	httpProto     = "http"
 )
 
 var (
@@ -28,26 +28,37 @@ var (
 	errNotADir = errors.New("not a directory")
 	errHash    = errors.New("b3sum mismatch")
 	errSource  = errors.New("invalid source definition")
+	errProto   = errors.New("unsupported or missing protocol scheme")
 )
 
 // Source defines the properties needed to retrieve and validate a source file.
 type Source struct {
-	URL        string `json:"url"`
-	B3Sum      string `json:"b3sum" jsonschema:"minLength=64,maxLength=64"`
-	LocalName  string `json:"localName,omitempty"`
-	httpclient getter
-	fetch      func() error
-	savePath   string
-	printHook  func(string)
+	URL       string `json:"url"`
+	B3Sum     string `json:"b3sum" jsonschema:"minLength=64,maxLength=64"`
+	LocalName string `json:"localName,omitempty"`
+	protocol  string
+	savePath  string
+	srcPath   string
+	output    io.Writer
 }
 
 type getter interface {
 	Get(string) (*http.Response, error)
 }
 
-func (source *Source) fetchHTTP() error {
-	source.printHook(fmt.Sprintf("Downloading %s", source.URL))
-	resp, err := source.httpclient.Get(source.URL)
+type copier interface {
+	Copy(io.Writer, io.Reader) (int64, error)
+}
+
+type copywrapper struct{}
+
+func (c copywrapper) Copy(dst io.Writer, src io.Reader) (int64, error) {
+	return io.Copy(dst, src)
+}
+
+func (source *Source) fetchHTTP(g getter) error {
+	fmt.Fprintf(source.output, "Downloading %s", source.URL)
+	resp, err := g.Get(source.URL)
 	if err != nil {
 		return fmt.Errorf("%w", err)
 	}
@@ -63,8 +74,29 @@ func (source *Source) fetchHTTP() error {
 	}
 	defer f.Close()
 
-	source.printHook(fmt.Sprintf("Saving %s", source.savePath))
+	fmt.Fprintf(source.output, "Saving %s", source.savePath)
 	_, err = io.Copy(f, resp.Body)
+	if err != nil {
+		return fmt.Errorf("%w", err)
+	}
+
+	return nil
+}
+
+func (source *Source) fetchFile(c copier) error {
+	src, err := os.Open(source.srcPath)
+	if err != nil {
+		return fmt.Errorf("%w", err)
+	}
+	defer src.Close()
+
+	f, err := os.Create(source.savePath)
+	if err != nil {
+		return fmt.Errorf("%w", err)
+	}
+	defer f.Close()
+
+	_, err = c.Copy(f, src)
 	if err != nil {
 		return fmt.Errorf("%w", err)
 	}
@@ -111,7 +143,7 @@ func ensureDir(md mkdirall, path string) error {
 }
 
 func (source *Source) checkB3SumFromFile(filename string, b3sum string) error {
-	source.printHook(fmt.Sprintf("Validating %s", filename))
+	fmt.Fprintf(source.output, "Validating %s", filename)
 	sum, err := computeB3SumFromFile(filename)
 	if err != nil {
 		return err
@@ -122,15 +154,18 @@ func (source *Source) checkB3SumFromFile(filename string, b3sum string) error {
 	return nil
 }
 
-func (source *Source) validateSource(cache string) error {
+func (source *Source) validateSource() error {
 	parsedURL, err := url.Parse(source.URL)
 	if err != nil {
 		return fmt.Errorf("%w", err)
 	}
 
 	switch parsedURL.Scheme {
-	case "http", "https":
-		source.fetch = source.fetchHTTP
+	case fileProto:
+		source.srcPath = parsedURL.Host + parsedURL.Path
+		source.protocol = fileProto
+	case httpProto, "https":
+		source.protocol = httpProto
 	case "":
 		return fmt.Errorf("%w: missing protocol scheme", errSource)
 	default:
@@ -141,35 +176,37 @@ func (source *Source) validateSource(cache string) error {
 		source.LocalName = parsedURL.Path
 	}
 
-	savePath, _ := filepath.Abs(strings.Join([]string{cache, path.Base(source.LocalName)}, "/"))
-
-	absSourcePath, _ := filepath.Abs(cache)
-	if savePath == absSourcePath {
+	savePath, _ := filepath.Abs("/" + path.Base(source.LocalName))
+	if savePath == "/" {
 		return fmt.Errorf("%w: no path element detected", errSource)
 	}
-
-	source.savePath = savePath
 
 	return nil
 }
 
-func (source *Source) fetchSource(cache string) error {
-	if err := ensureDir(os.MkdirAll, cache); err != nil {
+func (source *Source) fetchSource(spec *Spec) error {
+	if err := ensureDir(os.MkdirAll, spec.sourceCache); err != nil {
 		return err
 	}
 
-	err := source.validateSource(cache)
-	if err != nil {
-		return err
-	}
+	source.savePath = strings.Join([]string{spec.sourceCache, path.Base(source.LocalName)}, "/")
 
 	finfo, _ := os.Stat(source.savePath)
 	if finfo != nil {
 		return source.checkB3SumFromFile(source.savePath, source.B3Sum)
 	}
 
-	if err = source.fetch(); err != nil {
-		return err
+	switch source.protocol {
+	case fileProto:
+		if err := source.fetchFile(copywrapper{}); err != nil {
+			return err
+		}
+	case httpProto:
+		if err := source.fetchHTTP(spec.httpclient); err != nil {
+			return err
+		}
+	default:
+		return fmt.Errorf("%w: %s", errProto, source.protocol)
 	}
 
 	if err := source.checkB3SumFromFile(source.savePath, source.B3Sum); err != nil {
@@ -179,21 +216,10 @@ func (source *Source) fetchSource(cache string) error {
 	return nil
 }
 
-type transportCreator func() (*http.Transport, error)
-
-func fetchSources(sources []Source, cache string, fn transportCreator) []error {
-	errors := make([]error, 0, len(sources))
-	for i := range sources {
-		tr, err := fn()
-		if err != nil {
-			errors = append(errors, err)
-			continue
-		}
-		sources[i].httpclient = &http.Client{
-			Timeout:   time.Second * timeout,
-			Transport: tr,
-		}
-		if err := sources[i].fetchSource(cache); err != nil {
+func (s *Spec) fetchSources() []error {
+	errors := make([]error, 0, len(s.Sources))
+	for i := range s.Sources {
+		if err := s.Sources[i].fetchSource(s); err != nil {
 			errors = append(errors, err)
 		}
 	}
@@ -206,7 +232,7 @@ func (source *Source) extract(dir string) error {
 		return fmt.Errorf("%w", err)
 	}
 	defer f.Close()
-	source.printHook(fmt.Sprintf("Extracting %s", source.savePath))
+	fmt.Fprintf(source.output, "Extracting %s", source.savePath)
 	err = extract.Archive(context.Background(), f, dir, nil)
 	if err != nil {
 		return fmt.Errorf("%w", err)
