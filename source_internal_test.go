@@ -165,12 +165,11 @@ func Test_ensureDir(t *testing.T) {
 	})
 	t.Run("should create a directory if it doesn't exist", func(t *testing.T) {
 		t.Parallel()
-		dir := sourceCache
-		os.RemoveAll(dir)
+		dir, _ := ioutil.TempDir("", "")
+		defer os.RemoveAll(dir)
 		assert := assert.New(t)
 		spec, _ := NewSpec("testdata/spec.yaml", &buf)
-		spec.sourceCache = dir
-		defer os.RemoveAll(dir)
+		spec.sourceCache = dir + "/new"
 		err := ensureDir(os.MkdirAll, spec.sourceCache)
 		assert.NoError(err)
 		finfo, err := os.Stat(dir)
