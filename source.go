@@ -12,8 +12,10 @@ import (
 	"path"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/codeclysm/extract/v3"
+	"github.com/schollz/progressbar/v3"
 	"github.com/zeebo/blake3"
 )
 
@@ -21,6 +23,9 @@ const (
 	errorBoundary = 400
 	fileProto     = "file"
 	httpProto     = "http"
+	width         = 10
+	spinner       = 14
+	throttle      = 60
 )
 
 var (
@@ -42,8 +47,8 @@ type Source struct {
 	output    io.Writer
 }
 
-type getter interface {
-	Get(string) (*http.Response, error)
+type doer interface {
+	Do(*http.Request) (*http.Response, error)
 }
 
 type copier interface {
@@ -56,14 +61,15 @@ func (c copywrapper) Copy(dst io.Writer, src io.Reader) (int64, error) {
 	return io.Copy(dst, src)
 }
 
-func (source *Source) fetchHTTP(g getter) error {
+func (source *Source) fetchHTTP(d doer) error {
 	fmt.Fprintf(source.output, "Downloading %s\n", source.URL)
-	resp, err := g.Get(source.URL)
+	var requestBody io.ReadCloser
+	req, _ := http.NewRequestWithContext(context.Background(), http.MethodGet, source.URL, requestBody)
+	resp, err := d.Do(req)
 	if err != nil {
 		return fmt.Errorf("%w", err)
 	}
 	defer resp.Body.Close()
-
 	if resp.StatusCode >= errorBoundary {
 		return fmt.Errorf("%w: %s", errfetch, http.StatusText(resp.StatusCode))
 	}
@@ -74,8 +80,28 @@ func (source *Source) fetchHTTP(g getter) error {
 	}
 	defer f.Close()
 
-	fmt.Fprintf(source.output, "Saving %s\n", source.savePath)
-	_, err = io.Copy(f, resp.Body)
+	bar := progressbar.NewOptions64(
+		resp.ContentLength,
+		progressbar.OptionSetWriter(source.output),
+		progressbar.OptionShowBytes(true),
+		progressbar.OptionSetWidth(width),
+		progressbar.OptionThrottle(throttle*time.Millisecond),
+		progressbar.OptionShowCount(),
+		progressbar.OptionOnCompletion(func() {
+			fmt.Fprint(source.output, "\n")
+		}),
+		progressbar.OptionSpinnerType(spinner),
+		progressbar.OptionFullWidth(),
+		progressbar.OptionSetTheme(progressbar.Theme{
+			Saucer:        "=",
+			SaucerHead:    ">",
+			SaucerPadding: " ",
+			BarStart:      "[",
+			BarEnd:        "]",
+		}),
+	)
+
+	_, err = io.Copy(io.MultiWriter(f, bar), resp.Body)
 	if err != nil {
 		return fmt.Errorf("%w", err)
 	}
@@ -149,7 +175,7 @@ func (source *Source) checkB3SumFromFile(filename string, b3sum string) error {
 		return err
 	}
 	if sum != b3sum {
-		return fmt.Errorf("%w: expected: %s actual: %s", errHash, b3sum, sum)
+		return fmt.Errorf("%w:\n\texpected: %s\n\tactual:   %s", errHash, b3sum, sum)
 	}
 	return nil
 }

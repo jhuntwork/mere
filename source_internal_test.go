@@ -21,6 +21,7 @@ const (
 	goodHTTPB3Sum = "3fba5250be9ac259c56e7250c526bc83bacb4be825f2799d3d59e5b4878dd74e"
 	fileB3Sum     = "b319b03ad4ff94817e3555791bb67df918cd86466fc14426d4a969d94ded5c37"
 	sourceCache   = "testdata/src"
+	goodBody      = "content"
 )
 
 var (
@@ -51,7 +52,7 @@ func (*badReader) Close() error {
 	return fmt.Errorf("%w", errClose)
 }
 
-func (s *serverErrHTTP) Get(string) (*http.Response, error) {
+func (s *serverErrHTTP) Do(*http.Request) (*http.Response, error) {
 	var resp http.Response
 	resp.StatusCode = 500
 	resp.Body = ioutil.NopCloser(bytes.NewBufferString(""))
@@ -59,21 +60,22 @@ func (s *serverErrHTTP) Get(string) (*http.Response, error) {
 	return &resp, nil
 }
 
-func (b *badHTTP) Get(string) (*http.Response, error) {
+func (b *badHTTP) Do(*http.Request) (*http.Response, error) {
 	var resp http.Response
 
 	return &resp, fmt.Errorf("%w", errTransit)
 }
 
-func (g *goodHTTP) Get(string) (*http.Response, error) {
+func (g *goodHTTP) Do(*http.Request) (*http.Response, error) {
 	var resp http.Response
 	resp.StatusCode = 200
-	resp.Body = ioutil.NopCloser(bytes.NewBufferString("content"))
+	resp.Body = ioutil.NopCloser(bytes.NewBufferString(goodBody))
+	resp.ContentLength = int64(len(goodBody))
 
 	return &resp, nil
 }
 
-func (g *goodHTTPBadBody) Get(string) (*http.Response, error) {
+func (g *goodHTTPBadBody) Do(*http.Request) (*http.Response, error) {
 	var resp http.Response
 	resp.StatusCode = 200
 	resp.Body = &badReader{}
@@ -182,7 +184,7 @@ func Test_fetchHTTP(t *testing.T) {
 	tests := []struct {
 		description string
 		filename    string
-		client      getter
+		client      doer
 		savePath    string
 		errMsg      string
 	}{
@@ -207,25 +209,36 @@ func Test_fetchHTTP(t *testing.T) {
 			savePath:    "/dev/null/test3",
 			errMsg:      "open /dev/null/test3: not a directory",
 		},
+		{
+			description: "should not fail typically",
+			filename:    "testdata/spec.yaml",
+			client:      &goodHTTP{},
+			savePath:    "/dev/null",
+		},
 	}
 	t.Parallel()
-	var buf bytes.Buffer
 	for _, tc := range tests {
 		tc := tc
+		var buf bytes.Buffer
 		t.Run(tc.description, func(t *testing.T) {
 			t.Parallel()
 			assert := assert.New(t)
 			spec, _ := NewSpec(tc.filename, &buf)
 			spec.Sources[0].savePath = tc.savePath
 			err := spec.Sources[0].fetchHTTP(tc.client)
-			if err == nil {
-				t.Error("expected an error but did not receive one")
+			if tc.errMsg != "" {
+				if err == nil {
+					t.Error("expected an error but did not receive one")
+				}
+				assert.EqualError(err, tc.errMsg)
+			} else {
+				assert.Nil(err)
 			}
-			assert.EqualError(err, tc.errMsg)
 		})
 	}
 	t.Run("should not fail when content is successfully returned", func(t *testing.T) {
 		t.Parallel()
+		var buf bytes.Buffer
 		assert := assert.New(t)
 		spec, _ := NewSpec("testdata/spec.yaml", &buf)
 		tmpfile, err := ioutil.TempFile("", "")
@@ -338,7 +351,7 @@ type sourceTest struct {
 	localName    string
 	errMsg       string
 	srcPath      string
-	client       getter
+	client       doer
 }
 
 func setupsource(t *testing.T, test sourceTest, filePath string) (func(t *testing.T), *Spec) {

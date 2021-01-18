@@ -47,7 +47,7 @@ type Spec struct {
 	Test         string    `json:"test,omitempty"`
 	Install      string    `json:"install,omitempty"`
 	Packages     []Package `json:"packages"`
-	httpclient   getter
+	httpclient   doer
 	sourceCache  string
 	buildContext string
 	workingDir   string
