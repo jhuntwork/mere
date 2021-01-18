@@ -57,7 +57,7 @@ func (c copywrapper) Copy(dst io.Writer, src io.Reader) (int64, error) {
 }
 
 func (source *Source) fetchHTTP(g getter) error {
-	fmt.Fprintf(source.output, "Downloading %s", source.URL)
+	fmt.Fprintf(source.output, "Downloading %s\n", source.URL)
 	resp, err := g.Get(source.URL)
 	if err != nil {
 		return fmt.Errorf("%w", err)
@@ -74,7 +74,7 @@ func (source *Source) fetchHTTP(g getter) error {
 	}
 	defer f.Close()
 
-	fmt.Fprintf(source.output, "Saving %s", source.savePath)
+	fmt.Fprintf(source.output, "Saving %s\n", source.savePath)
 	_, err = io.Copy(f, resp.Body)
 	if err != nil {
 		return fmt.Errorf("%w", err)
@@ -143,7 +143,7 @@ func ensureDir(md mkdirall, path string) error {
 }
 
 func (source *Source) checkB3SumFromFile(filename string, b3sum string) error {
-	fmt.Fprintf(source.output, "Validating %s", filename)
+	fmt.Fprintf(source.output, "Validating %s\n", filename)
 	sum, err := computeB3SumFromFile(filename)
 	if err != nil {
 		return err
@@ -232,7 +232,7 @@ func (source *Source) extract(dir string) error {
 		return fmt.Errorf("%w", err)
 	}
 	defer f.Close()
-	fmt.Fprintf(source.output, "Extracting %s", source.savePath)
+	fmt.Fprintf(source.output, "Extracting %s\n", source.savePath)
 	err = extract.Archive(context.Background(), f, dir, nil)
 	if err != nil {
 		return fmt.Errorf("%w", err)

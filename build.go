@@ -110,7 +110,7 @@ func (s *Spec) buildSteps(t temper, l linker) error {
 		}
 	}
 
-	fmt.Fprintf(s.output, "Context directory is %s", s.buildContext)
+	fmt.Fprintf(s.output, "Context directory is %s\n", s.buildContext)
 
 	err = s.setupSymlinks(l)
 	if err != nil {
@@ -119,7 +119,7 @@ func (s *Spec) buildSteps(t temper, l linker) error {
 
 	for _, stage := range s.buildOrder {
 		if stage["cmd"] != "" {
-			fmt.Fprintf(s.output, "Executing stage %s", stage["name"])
+			fmt.Fprintf(s.output, "Executing stage %s\n", stage["name"])
 			err = s.executeStage(stage["cmd"])
 			if err != nil {
 				return fmt.Errorf("%w", err)
