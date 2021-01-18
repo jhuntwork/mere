@@ -14,7 +14,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/codeclysm/extract/v3"
+	"github.com/jhuntwork/extract/v3"
 	"github.com/schollz/progressbar/v3"
 	"github.com/zeebo/blake3"
 )
