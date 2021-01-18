@@ -9,7 +9,7 @@ require (
 	github.com/ghodss/yaml v1.0.0
 	github.com/jhuntwork/aia-transport-go v1.2.2-0.20201206175750-f458d9e5bd9f
 	github.com/json-iterator/go v1.1.10
-	github.com/stretchr/testify v1.6.1
+	github.com/stretchr/testify v1.7.0
 	github.com/xeipuuv/gojsonschema v1.2.0
 	github.com/zeebo/blake3 v0.1.0
 )
