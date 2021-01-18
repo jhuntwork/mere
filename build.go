@@ -82,7 +82,7 @@ func (s *Spec) setupSymlinks(l linker) error {
 	return nil
 }
 
-func (s *Spec) buildSteps(t temper, l linker) error {
+func (s *Spec) setupBuildSteps(t temper, l linker) error {
 	errors := s.fetchSources()
 	if len(errors) != 0 {
 		return fmt.Errorf("%w: %v", errBuild, errors)
@@ -112,16 +112,17 @@ func (s *Spec) buildSteps(t temper, l linker) error {
 
 	fmt.Fprintf(s.output, "Context directory is %s\n", s.buildContext)
 
-	err = s.setupSymlinks(l)
-	if err != nil {
-		return fmt.Errorf("%w", err)
-	}
+	return s.setupSymlinks(l)
+}
 
+func (s *Spec) buildSteps() error {
+	if err := s.setupBuildSteps(tempd{}, slink{}); err != nil {
+		return err
+	}
 	for _, stage := range s.buildOrder {
 		if stage["cmd"] != "" {
 			fmt.Fprintf(s.output, "Executing stage %s\n", stage["name"])
-			err = s.executeStage(stage["cmd"])
-			if err != nil {
+			if err := s.executeStage(stage["cmd"]); err != nil {
 				return fmt.Errorf("%w", err)
 			}
 		}
@@ -131,7 +132,7 @@ func (s *Spec) buildSteps(t temper, l linker) error {
 
 // BuildSteps executes the build, test and install steps as defined in a package spec.
 func (s *Spec) BuildSteps() error {
-	return s.buildSteps(tempd{}, slink{})
+	return s.buildSteps()
 }
 
 // Cleanup removes the entire internal working directory.

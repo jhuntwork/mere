@@ -86,7 +86,7 @@ func TestNewSpecErrors(t *testing.T) {
 			assert := assert.New(t)
 			var buf bytes.Buffer
 			_, err := mere.NewSpec(tc.filename, &buf)
-			assert.EqualError(err, tc.errMsg)
+			assert.Contains(err.Error(), tc.errMsg)
 		})
 	}
 }
