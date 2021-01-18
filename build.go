@@ -8,8 +8,6 @@ import (
 	"os/exec"
 	"path"
 	"strings"
-
-	"github.com/jhuntwork/aia-transport-go"
 )
 
 var errBuild = errors.New("build error")
@@ -22,24 +20,44 @@ const (
 	mereSrcdir = "MERE_SRCDIR"
 )
 
-func (s *Spec) createWorkingDir() (string, error) {
+type temper interface {
+	tempdir(string, string) (string, error)
+}
+
+type tempd struct{}
+
+func (t tempd) tempdir(dir, pattern string) (string, error) {
+	return ioutil.TempDir(dir, pattern)
+}
+
+type linker interface {
+	symlink(string, string) error
+}
+
+type slink struct{}
+
+func (s slink) symlink(oldname, newname string) error {
+	return os.Symlink(oldname, newname)
+}
+
+func (s *Spec) createWorkingDir(t temper) (string, error) {
+	var empty string
 	pattern := strings.Join([]string{path.Base(s.Name), s.Version, "*"}, "-")
-	wd, err := s.tempDirFunc("", pattern)
+	wd, err := t.tempdir(empty, pattern)
 	if err != nil {
-		return "", fmt.Errorf("%w", err)
+		return empty, fmt.Errorf("%w", err)
 	}
 	for _, dir := range []string{build, pkg, src} {
 		if err = ensureDir(os.Mkdir, fmt.Sprintf("%s/%s", wd, dir)); err != nil {
-			return "", fmt.Errorf("%w", err)
+			return empty, fmt.Errorf("%w", err)
 		}
 	}
-
 	return wd, err
 }
 
 func (s *Spec) executeStage(stage string) error {
 	cmd := exec.Command("sh", "-c", "set -e\n"+stage) //#nosec
-	cmd.Stdout = os.Stdout
+	cmd.Stdout = s.output
 	cmd.Stderr = os.Stderr
 	cmd.Dir = s.buildContext
 	cmd.Env = []string{
@@ -53,13 +71,23 @@ func (s *Spec) executeStage(stage string) error {
 	return nil
 }
 
-// BuildSteps executes the build, test and install steps as defined in a package spec.
-func (s *Spec) BuildSteps() error {
-	errors := s.sourcesFunc(s.Sources, s.sourceCache, aia.NewTransport)
+func (s *Spec) setupSymlinks(l linker) error {
+	for _, source := range s.Sources {
+		base := path.Base(source.savePath)
+		err := l.symlink(source.savePath, fmt.Sprintf("%s/%s/%s", s.workingDir, src, base))
+		if err != nil {
+			return fmt.Errorf("%w", err)
+		}
+	}
+	return nil
+}
+
+func (s *Spec) buildSteps(t temper, l linker) error {
+	errors := s.fetchSources()
 	if len(errors) != 0 {
 		return fmt.Errorf("%w: %v", errBuild, errors)
 	}
-	wd, err := s.createWorkingDir()
+	wd, err := s.createWorkingDir(t)
 	if err != nil {
 		return fmt.Errorf("%w", err)
 	}
@@ -82,25 +110,31 @@ func (s *Spec) BuildSteps() error {
 		}
 	}
 
-	for _, source := range s.Sources {
-		base := path.Base(source.savePath)
-		err = s.symlinkFunc(source.savePath, fmt.Sprintf("%s/%s/%s", s.workingDir, src, base))
-		if err != nil {
-			return fmt.Errorf("%w", err)
-		}
-	}
+	fmt.Fprintf(s.output, "Context directory is %s", s.buildContext)
 
-	s.printHook(fmt.Sprintf("Context directory is %s", s.buildContext))
+	err = s.setupSymlinks(l)
+	if err != nil {
+		return fmt.Errorf("%w", err)
+	}
 
 	for _, stage := range s.buildOrder {
 		if stage["cmd"] != "" {
-			s.printHook(fmt.Sprintf("Executing stage %s", stage["name"]))
+			fmt.Fprintf(s.output, "Executing stage %s", stage["name"])
 			err = s.executeStage(stage["cmd"])
 			if err != nil {
 				return fmt.Errorf("%w", err)
 			}
 		}
 	}
-
 	return nil
+}
+
+// BuildSteps executes the build, test and install steps as defined in a package spec.
+func (s *Spec) BuildSteps() error {
+	return s.buildSteps(tempd{}, slink{})
+}
+
+// Cleanup removes the entire internal working directory.
+func (s *Spec) Cleanup() {
+	os.RemoveAll(s.workingDir)
 }

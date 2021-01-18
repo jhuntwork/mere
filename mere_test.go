@@ -1,14 +1,12 @@
-package mere
+package mere_test
 
 import (
-	"errors"
-	"fmt"
+	"bytes"
 	"testing"
 
+	"github.com/jhuntwork/mere"
 	"github.com/stretchr/testify/assert"
 )
-
-var errFetchSources = errors.New("failure running fetchSources")
 
 //nolint:funlen
 /*
@@ -75,37 +73,34 @@ func TestNewSpecErrors(t *testing.T) {
 			errMsg: "invalid spec file: testdata/bad_b3sum_spec.yaml\n\tsources.0.b3sum: " +
 				"String length must be greater than or equal to 64",
 		},
+		{
+			description: "Should fail when spec source uses an invalid url scheme",
+			filename:    "testdata/bad_url.yaml",
+			errMsg:      `parse "://fake/file": missing protocol scheme`,
+		},
 	}
-	for _, test := range newSpecTests {
-		test := test
-		t.Run(test.description, func(t *testing.T) {
+	for _, tc := range newSpecTests {
+		tc := tc
+		t.Run(tc.description, func(t *testing.T) {
 			t.Parallel()
 			assert := assert.New(t)
-			_, err := NewSpec(test.filename)
-			assert.EqualError(err, test.errMsg)
+			var buf bytes.Buffer
+			_, err := mere.NewSpec(tc.filename, &buf)
+			assert.EqualError(err, tc.errMsg)
 		})
 	}
 }
 
-type badUnmarshal struct{}
-
-var errUnmarshal = errors.New("failed to Unmarshal")
-
-func (b *badUnmarshal) Marshal(interface{}) ([]byte, error) {
-	return []byte{}, nil
-}
-
-func (b *badUnmarshal) Unmarshal([]byte, interface{}) error {
-	return fmt.Errorf("%w", errUnmarshal)
-}
-
-func Test_validateSchema(t *testing.T) {
+func TestBuildSteps(t *testing.T) {
 	t.Parallel()
-	t.Run("errors from Unmarshal should fail the validation", func(t *testing.T) {
+	t.Run("Should execute a build stage", func(t *testing.T) {
 		t.Parallel()
+		var buf bytes.Buffer
 		assert := assert.New(t)
-		spec := Spec{}
-		err := spec.validateSchema("testdata/spec.yaml", &badUnmarshal{})
-		assert.EqualError(err, "failed to Unmarshal")
+		spec, err := mere.NewSpec("testdata/spec_no_sources.yaml", &buf)
+		assert.Nil(err)
+		err = spec.BuildSteps()
+		defer spec.Cleanup()
+		assert.NoError(err)
 	})
 }

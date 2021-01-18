@@ -4,13 +4,16 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
+	"io"
 	"io/ioutil"
-	"os"
+	"net/http"
 	"os/user"
 	"text/template"
+	"time"
 
 	"github.com/alecthomas/jsonschema"
 	"github.com/ghodss/yaml"
+	"github.com/jhuntwork/aia-transport-go"
 	jsoniter "github.com/json-iterator/go"
 	"github.com/xeipuuv/gojsonschema"
 )
@@ -18,6 +21,7 @@ import (
 const (
 	configDir = "/.mere"
 	srcDir    = "/src"
+	timeout   = 30
 )
 
 var errValidate = errors.New("invalid spec file")
@@ -37,20 +41,18 @@ type Spec struct {
 	Home         string    `json:"home"`
 	Version      string    `json:"version"`
 	Release      int64     `json:"release"`
-	Sources      []Source  `json:"sources"`
+	Sources      []Source  `json:"sources,omitempty"`
 	BuildDeps    string    `json:"buildDeps,omitempty"`
 	Build        string    `json:"build,omitempty"`
 	Test         string    `json:"test,omitempty"`
 	Install      string    `json:"install,omitempty"`
 	Packages     []Package `json:"packages"`
+	httpclient   getter
 	sourceCache  string
 	buildContext string
 	workingDir   string
 	buildOrder   []map[string]string
-	printHook    func(string)
-	tempDirFunc  func(string, string) (string, error)
-	symlinkFunc  func(string, string) error
-	sourcesFunc  func([]Source, string, transportCreator) []error
+	output       io.Writer
 }
 
 func (s *Spec) render(v string) (string, error) {
@@ -72,14 +74,14 @@ func (s *Spec) renderAll() error {
 
 	// render values for possible template strings of specific fields.
 	// Currently supported: sources[].url, packages[].files[], build, test and install.
-	for i := 0; i < len(s.Sources); i++ {
+	for i := range s.Sources {
 		if s.Sources[i].URL, err = s.render(s.Sources[i].URL); err != nil {
 			return err
 		}
 	}
 
-	for i := 0; i < len(s.Packages); i++ {
-		for ii := 0; ii < len(s.Packages[i].Files); ii++ {
+	for i := range s.Packages {
+		for ii := range s.Packages[i].Files {
 			if s.Packages[i].Files[ii], err = s.render(s.Packages[i].Files[ii]); err != nil {
 				return err
 			}
@@ -145,17 +147,8 @@ func (s *Spec) validateSchema(path string, json jsonIterator) error {
 	return nil
 }
 
-// SetPrintHook sets a function to use as a callback for handling output.
-// The default hook is essentially a no-op.
-func (s *Spec) SetPrintHook(fn func(string)) {
-	s.printHook = fn
-	for idx := range s.Sources {
-		s.Sources[idx].printHook = fn
-	}
-}
-
 // NewSpec constructs and validates new Spec structs from a given file.
-func NewSpec(path string) (*Spec, error) {
+func NewSpec(path string, output io.Writer) (*Spec, error) {
 	spec := new(Spec)
 	if err := spec.validateSchema(path, jsoniter.ConfigCompatibleWithStandardLibrary); err != nil {
 		return nil, err
@@ -169,10 +162,21 @@ func NewSpec(path string) (*Spec, error) {
 		user, _ := user.Current()
 		spec.sourceCache = user.HomeDir + configDir + srcDir
 	}
-	spec.tempDirFunc = ioutil.TempDir
-	spec.symlinkFunc = os.Symlink
-	spec.SetPrintHook(func(output string) {})
-	spec.sourcesFunc = fetchSources
+
+	for i := range spec.Sources {
+		if err := spec.Sources[i].validateSource(); err != nil {
+			return nil, fmt.Errorf("%w", err)
+		}
+		spec.Sources[i].output = output
+		if spec.Sources[i].protocol == httpProto && spec.httpclient == nil {
+			transport, _ := aia.NewTransport()
+			spec.httpclient = &http.Client{
+				Timeout:   time.Second * timeout,
+				Transport: transport,
+			}
+		}
+	}
+
 	spec.buildOrder = []map[string]string{
 		{
 			"name": "build",
@@ -187,5 +191,8 @@ func NewSpec(path string) (*Spec, error) {
 			"cmd":  spec.Install,
 		},
 	}
+
+	spec.output = output
+
 	return spec, nil
 }

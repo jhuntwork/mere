@@ -4,8 +4,8 @@ version: 1.1.23
 release: 1
 home: https://www.musl-libc.org
 sources:
-  - url: "{{.Home}}/releases/musl-{{.Version}}.tar.gz"
-    b3sum: f4180967749450bb98528b77f7cb27c6ce551f6677b34c782354d77cfe4a7efb
+  - url: file://./testdata/testarchive.tar.gz
+    b3sum: b319b03ad4ff94817e3555791bb67df918cd86466fc14426d4a969d94ded5c37
 packages:
   - name: musl
     files:
