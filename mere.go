@@ -8,6 +8,7 @@ import (
 	"io/ioutil"
 	"net/http"
 	"os/user"
+	"strings"
 	"text/template"
 	"time"
 
@@ -24,7 +25,10 @@ const (
 	timeout   = 30
 )
 
-var errValidate = errors.New("invalid spec file")
+var (
+	errValidate = errors.New("invalid spec file")
+	errRender   = errors.New("rendering error")
+)
 
 // Package defines the properties needed to create an individual package.
 type Package struct {
@@ -71,33 +75,38 @@ func (s *Spec) render(v string) (string, error) {
 
 func (s *Spec) renderAll() error {
 	var err error
+	var errmsgs []string
 
 	// render values for possible template strings of specific fields.
 	// Currently supported: sources[].url, packages[].files[], build, test and install.
 	for i := range s.Sources {
 		if s.Sources[i].URL, err = s.render(s.Sources[i].URL); err != nil {
-			return err
+			errmsgs = append(errmsgs, err.Error())
 		}
 	}
 
 	for i := range s.Packages {
 		for ii := range s.Packages[i].Files {
 			if s.Packages[i].Files[ii], err = s.render(s.Packages[i].Files[ii]); err != nil {
-				return err
+				errmsgs = append(errmsgs, err.Error())
 			}
 		}
 	}
 
 	if s.Build, err = s.render(s.Build); err != nil {
-		return err
+		errmsgs = append(errmsgs, err.Error())
 	}
 
 	if s.Test, err = s.render(s.Test); err != nil {
-		return err
+		errmsgs = append(errmsgs, err.Error())
 	}
 
 	if s.Install, err = s.render(s.Install); err != nil {
-		return err
+		errmsgs = append(errmsgs, err.Error())
+	}
+
+	if len(errmsgs) > 0 {
+		return fmt.Errorf("%w: %s", errRender, strings.Join(errmsgs, "; "))
 	}
 
 	return nil
@@ -140,11 +149,7 @@ func (s *Spec) validateSchema(path string, json jsonIterator) error {
 		return fmt.Errorf("%w: %s\n\t%s", errValidate, path, msg)
 	}
 
-	if err := json.Unmarshal(jsondata, s); err != nil {
-		return fmt.Errorf("%w", err)
-	}
-
-	return nil
+	return json.Unmarshal(jsondata, s)
 }
 
 // NewSpec constructs and validates new Spec structs from a given file.

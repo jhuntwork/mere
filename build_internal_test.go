@@ -56,9 +56,9 @@ func Test_createWorkingDir(t *testing.T) {
 }
 
 //nolint:funlen
-func Test_buildSteps(t *testing.T) {
+func Test_setupBuildSteps(t *testing.T) {
 	t.Parallel()
-	buildStepsTests := []struct {
+	tests := []struct {
 		description string
 		filename    string
 		errMsg      string
@@ -99,13 +99,6 @@ func Test_buildSteps(t *testing.T) {
 			symlink:     slink{},
 		},
 		{
-			description: "Should return an error when the build command fails",
-			filename:    "testdata/spec_with_build_errors.yaml",
-			errMsg:      "exit status 1",
-			tempDir:     tempd{},
-			symlink:     slink{},
-		},
-		{
 			description: "Should return an error when unable to create symlinks to sources",
 			filename:    "testdata/spec_local_file.yaml",
 			errMsg:      "failure running Symlink",
@@ -113,7 +106,7 @@ func Test_buildSteps(t *testing.T) {
 			symlink:     badSymlink{},
 		},
 	}
-	for _, tc := range buildStepsTests {
+	for _, tc := range tests {
 		tc := tc
 		var buf bytes.Buffer
 		t.Run(tc.description, func(t *testing.T) {
@@ -127,7 +120,52 @@ func Test_buildSteps(t *testing.T) {
 			spec.sourceCache = tempdir
 			spec.httpclient = tc.client
 
-			err = spec.buildSteps(tc.tempDir, tc.symlink)
+			err = spec.setupBuildSteps(tc.tempDir, tc.symlink)
+			defer spec.Cleanup()
+			if tc.errMsg == "" {
+				assert.NoError(err)
+			} else {
+				assert.EqualError(err, tc.errMsg)
+			}
+		})
+	}
+}
+
+func Test_buildSteps(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		description string
+		filename    string
+		errMsg      string
+		extractFail bool
+	}{
+		{
+			description: "Should return an error when extracting an archive fails",
+			filename:    "testdata/spec_with_unextractable_archive.yaml",
+			errMsg:      "Not a supported archive",
+			extractFail: true,
+		},
+		{
+			description: "Should return an error when the build command fails",
+			filename:    "testdata/spec_with_build_errors.yaml",
+			errMsg:      "exit status 1",
+		},
+	}
+	for _, tc := range tests {
+		tc := tc
+		var buf bytes.Buffer
+		t.Run(tc.description, func(t *testing.T) {
+			t.Parallel()
+			assert := assert.New(t)
+			spec, err := NewSpec(tc.filename, &buf)
+			assert.Nil(err)
+			tempdir, err := ioutil.TempDir("", "")
+			assert.Nil(err)
+			defer os.RemoveAll(tempdir)
+			spec.sourceCache = tempdir
+			spec.httpclient = &goodHTTP{}
+
+			err = spec.buildSteps()
 			defer spec.Cleanup()
 			if tc.errMsg == "" {
 				assert.NoError(err)
