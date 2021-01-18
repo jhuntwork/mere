@@ -64,7 +64,7 @@ func Test_buildSteps(t *testing.T) {
 		errMsg      string
 		tempDir     temper
 		symlink     linker
-		client      getter
+		client      doer
 		extractFail bool
 	}{
 		{
