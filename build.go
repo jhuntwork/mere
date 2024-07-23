@@ -3,7 +3,6 @@ package mere
 import (
 	"errors"
 	"fmt"
-	"io/ioutil"
 	"os"
 	"os/exec"
 	"path"
@@ -21,23 +20,23 @@ const (
 )
 
 type temper interface {
-	tempdir(string, string) (string, error)
+	tempdir(dir, pattern string) (string, error)
 }
 
 type tempd struct{}
 
 func (t tempd) tempdir(dir, pattern string) (string, error) {
-	return ioutil.TempDir(dir, pattern)
+	return os.MkdirTemp(dir, pattern) //nolint:wrapcheck // We want the simplest possible wrap here
 }
 
 type linker interface {
-	symlink(string, string) error
+	symlink(source, target string) error
 }
 
 type slink struct{}
 
-func (s slink) symlink(oldname, newname string) error {
-	return os.Symlink(oldname, newname)
+func (s slink) symlink(source, target string) error {
+	return os.Symlink(source, target) //nolint:wrapcheck // We want the simplest possible wrap here
 }
 
 func (s *Spec) createWorkingDir(t temper) (string, error) {
@@ -95,12 +94,12 @@ func (s *Spec) setupBuildSteps(t temper, l linker) error {
 	s.buildContext = fmt.Sprintf("%s/%s", wd, build)
 
 	if len(s.Sources) > 0 {
-		if err := s.Sources[0].extract(s.buildContext); err != nil {
+		if err := extractArchive(s.Sources[0].savePath, s.buildContext); err != nil {
 			return err
 		}
 
 		// s.workingDir is a tempdir, most often it will contain one top level directory
-		files, _ := ioutil.ReadDir(s.buildContext)
+		files, _ := os.ReadDir(s.buildContext)
 		if len(files) == 1 {
 			checkPath := s.buildContext + "/" + files[0].Name()
 			info, _ := os.Stat(checkPath)
