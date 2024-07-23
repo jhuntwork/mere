@@ -5,6 +5,13 @@ issues:
 linters:
   enable-all: true
   disable:
-    - exhaustivestruct
-    - nlreturn
-    - wsl
+    - depguard # Unnecessary
+    - execinquery # Archived
+    - exhaustruct # too agressive - authors intended its use only for special cases
+    - gomnd # Replaced by mnd
+    - nlreturn # too aggressive, style
+    - rowserrcheck # disabled - https://github.com/golangci/golangci-lint/issues/2649
+    - sqlclosecheck # disabled - https://github.com/golangci/golangci-lint/issues/2649
+    - wastedassign # disabled - https://github.com/golangci/golangci-lint/issues/2649
+    - wsl # too aggressive, style
+    - varnamelen # too aggressive, style

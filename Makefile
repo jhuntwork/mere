@@ -1,5 +1,5 @@
 BINARIES := $(patsubst cmd/%,bin/%,$(wildcard cmd/*))
-GOLANGCI-LINT-VRS := "1.33.0"
+GOLANGCI-LINT-VRS := "1.59.1"
 
 .PHONY: all clean test lint
 
@@ -8,22 +8,19 @@ all: $(BINARIES)
 
 lint:
 	@[ "$$($$(go env GOPATH)/bin/golangci-lint --version | awk '{print $$4}')" = "${GOLANGCI-LINT-VRS}" ] || \
-	    curl -L -q https://install.goreleaser.com/github.com/golangci/golangci-lint.sh \
+	    curl -sSfL https://raw.githubusercontent.com/golangci/golangci-lint/master/install.sh \
 		| sh -s -- -b $$(go env GOPATH)/bin v${GOLANGCI-LINT-VRS}
 	@$$(go env GOPATH)/bin/golangci-lint run -c .golangci.yaml
 
 test: lint
-	@go vet ./...
-	@go test -v -coverprofile coverage.out ./...
+	@go run gotest.tools/gotestsum@latest -- -race -coverprofile coverage.out ./...
 	@go tool cover -func=coverage.out
 	@go tool cover -html=coverage.out -o coverage.html
 
-bin/%:
-	@CGO_ENABLED=0 go build -a -ldflags "-w -s"  -i -v -o bin/$* cmd/$*/main.go
-	@upx bin/*
+#@go test -v -coverprofile coverage.out ./...
 
-release:
-	@goreleaser release --rm-dist
+bin/%:
+	@CGO_ENABLED=0 go build -a -ldflags "-s -w" -o bin/$* cmd/$*/main.go
 
 clean:
 	@git clean -xdf

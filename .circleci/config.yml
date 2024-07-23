@@ -2,7 +2,7 @@ version: 2.1
 executors:
   go-build-essential:
     docker:
-      - image: golang:1.15
+      - image: golang:1.22.5
 jobs:
   lint:
     executor: go-build-essential

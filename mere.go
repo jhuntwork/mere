@@ -1,203 +1,77 @@
 package mere
 
 import (
-	"bytes"
 	"errors"
 	"fmt"
-	"io"
-	"io/ioutil"
 	"net/http"
-	"os/user"
-	"strings"
-	"text/template"
+	"net/url"
+	"os"
 	"time"
 
-	"github.com/alecthomas/jsonschema"
-	"github.com/ghodss/yaml"
-	"github.com/jhuntwork/aia-transport-go"
-	jsoniter "github.com/json-iterator/go"
-	"github.com/xeipuuv/gojsonschema"
-)
-
-const (
-	configDir = "/.mere"
-	srcDir    = "/src"
-	timeout   = 30
+	"github.com/fcjr/aia-transport-go"
 )
 
 var (
-	errValidate = errors.New("invalid spec file")
-	errRender   = errors.New("rendering error")
+	errNoProtoScheme       = errors.New("missing protocol scheme")
+	errBadProtoScheme      = errors.New("unsupported protocol scheme")
+	ErrStoreBadGroup       = errors.New("incorrect group")
+	ErrStoreBadPermissions = errors.New("incorrect permissions")
+	ErrStoreIsFile         = errors.New("store is a file")
 )
 
-// Package defines the properties needed to create an individual package.
-type Package struct {
-	Name  string   `json:"name"`
-	Deps  []string `json:"deps,omitempty"`
-	Files []string `json:"files,omitempty"`
+const (
+	defaultStorePath = "/mere"
+	fileProto        = "file"
+	httpProto        = "http"
+	httpsProto       = "https"
+	dirPerms         = 0o775
+)
+
+type Mere struct {
+	log        Logger
+	httpclient doer
+	store      string
 }
 
-// Spec contains the properties needed to build one or more packages
-// from the same source code.
-type Spec struct {
-	Name         string    `json:"name"`
-	Description  string    `json:"description"`
-	Home         string    `json:"home"`
-	Version      string    `json:"version"`
-	Release      int64     `json:"release"`
-	Sources      []Source  `json:"sources,omitempty"`
-	BuildDeps    string    `json:"buildDeps,omitempty"`
-	Build        string    `json:"build,omitempty"`
-	Test         string    `json:"test,omitempty"`
-	Install      string    `json:"install,omitempty"`
-	Packages     []Package `json:"packages"`
-	httpclient   doer
-	sourceCache  string
-	buildContext string
-	workingDir   string
-	buildOrder   []map[string]string
-	output       io.Writer
-}
-
-func (s *Spec) render(v string) (string, error) {
-	tl, err := template.New("").Parse(v)
+func validateURL(u string) (*url.URL, error) {
+	parsedURL, err := url.Parse(u)
 	if err != nil {
-		return "", fmt.Errorf("%w", err)
+		return parsedURL, fmt.Errorf("%w", err)
 	}
-
-	buf := new(bytes.Buffer)
-	if err = tl.Execute(buf, s); err != nil {
-		return "", fmt.Errorf("%w", err)
+	switch parsedURL.Scheme {
+	case fileProto, httpProto, httpsProto:
+		return parsedURL, nil
+	case "":
+		return parsedURL, fmt.Errorf("%w", errNoProtoScheme)
+	default:
+		return parsedURL, fmt.Errorf("%w: %s", errBadProtoScheme, parsedURL.Scheme)
 	}
-
-	return buf.String(), nil
 }
 
-func (s *Spec) renderAll() error {
-	var err error
-	var errmsgs []string
-
-	// render values for possible template strings of specific fields.
-	// Currently supported: sources[].url, packages[].files[], build, test and install.
-	for i := range s.Sources {
-		if s.Sources[i].URL, err = s.render(s.Sources[i].URL); err != nil {
-			errmsgs = append(errmsgs, err.Error())
-		}
+func NewMere(log Logger, store string) (Mere, error) {
+	if store == "" {
+		store = defaultStorePath
 	}
-
-	for i := range s.Packages {
-		for ii := range s.Packages[i].Files {
-			if s.Packages[i].Files[ii], err = s.render(s.Packages[i].Files[ii]); err != nil {
-				errmsgs = append(errmsgs, err.Error())
-			}
-		}
+	mere := Mere{log: log, store: store}
+	transport, _ := aia.NewTransport()
+	mere.httpclient = &http.Client{
+		Timeout:   time.Second * httpTimeout,
+		Transport: transport,
 	}
+	return mere, mere.validate()
+}
 
-	if s.Build, err = s.render(s.Build); err != nil {
-		errmsgs = append(errmsgs, err.Error())
+func (m *Mere) validate() error {
+	info, err := os.Stat(m.store)
+	if err != nil {
+		return fmt.Errorf("failure during stat: %w", err)
 	}
-
-	if s.Test, err = s.render(s.Test); err != nil {
-		errmsgs = append(errmsgs, err.Error())
+	if !info.IsDir() {
+		return fmt.Errorf("%w: %s", ErrStoreIsFile, m.store)
 	}
-
-	if s.Install, err = s.render(s.Install); err != nil {
-		errmsgs = append(errmsgs, err.Error())
+	perms := info.Mode().Perm()
+	if perms != dirPerms {
+		return fmt.Errorf("%w: %s 0%o", ErrStoreBadPermissions, m.store, perms)
 	}
-
-	if len(errmsgs) > 0 {
-		return fmt.Errorf("%w: %s", errRender, strings.Join(errmsgs, "; "))
-	}
-
 	return nil
-}
-
-type jsonIterator interface {
-	Marshal(interface{}) ([]byte, error)
-	Unmarshal([]byte, interface{}) error
-}
-
-func (s *Spec) validateSchema(path string, json jsonIterator) error {
-	// Create a reflector to build a JSON Schema from the Spec definition.
-	reflector := new(jsonschema.Reflector)
-	reflector.ExpandedStruct = true
-	schema := gojsonschema.NewGoLoader(reflector.Reflect(&Spec{}))
-
-	yamldata, err := ioutil.ReadFile(path)
-	if err != nil {
-		return fmt.Errorf("%w", err)
-	}
-
-	jsondata, err := yaml.YAMLToJSON(yamldata)
-	if err != nil {
-		return fmt.Errorf("%w", err)
-	}
-
-	data := gojsonschema.NewBytesLoader(jsondata)
-	result, _ := gojsonschema.Validate(schema, data)
-
-	if !result.Valid() {
-		var msg string
-		for idx, err := range result.Errors() {
-			if idx > 0 {
-				msg = fmt.Sprintf("%s\n\t%s", msg, err)
-			} else {
-				msg = err.String()
-			}
-		}
-
-		return fmt.Errorf("%w: %s\n\t%s", errValidate, path, msg)
-	}
-
-	return json.Unmarshal(jsondata, s)
-}
-
-// NewSpec constructs and validates new Spec structs from a given file.
-func NewSpec(path string, output io.Writer) (*Spec, error) {
-	spec := new(Spec)
-	if err := spec.validateSchema(path, jsoniter.ConfigCompatibleWithStandardLibrary); err != nil {
-		return nil, err
-	}
-
-	if err := spec.renderAll(); err != nil {
-		return nil, err
-	}
-
-	if spec.sourceCache == "" {
-		user, _ := user.Current()
-		spec.sourceCache = user.HomeDir + configDir + srcDir
-	}
-
-	for i := range spec.Sources {
-		if err := spec.Sources[i].validateSource(); err != nil {
-			return nil, fmt.Errorf("%w", err)
-		}
-		spec.Sources[i].output = output
-		if spec.Sources[i].protocol == httpProto && spec.httpclient == nil {
-			transport, _ := aia.NewTransport()
-			spec.httpclient = &http.Client{
-				Timeout:   time.Second * timeout,
-				Transport: transport,
-			}
-		}
-	}
-
-	spec.buildOrder = []map[string]string{
-		{
-			"name": "build",
-			"cmd":  spec.Build,
-		},
-		{
-			"name": "test",
-			"cmd":  spec.Test,
-		},
-		{
-			"name": "install",
-			"cmd":  spec.Install,
-		},
-	}
-
-	spec.output = output
-
-	return spec, nil
 }

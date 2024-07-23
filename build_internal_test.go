@@ -4,11 +4,11 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
-	"io/ioutil"
 	"os"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 var (
@@ -37,11 +37,11 @@ func (b badSymlink) symlink(string, string) error {
 func Test_createWorkingDir(t *testing.T) {
 	t.Parallel()
 	var buf bytes.Buffer
-	t.Run("should return an error if the system call to TempDir fails", func(t *testing.T) {
+	t.Run("should return an error if creating a tmpdir fails", func(t *testing.T) {
 		t.Parallel()
 		assert := assert.New(t)
 		spec, err := NewSpec("testdata/spec.yaml", &buf)
-		assert.Nil(err)
+		require.NoError(t, err)
 		_, err = spec.createWorkingDir(badTempDir{})
 		assert.EqualError(err, "failure running TempDir")
 	})
@@ -49,7 +49,7 @@ func Test_createWorkingDir(t *testing.T) {
 		t.Parallel()
 		assert := assert.New(t)
 		spec, err := NewSpec("testdata/spec.yaml", &buf)
-		assert.Nil(err)
+		require.NoError(t, err)
 		_, err = spec.createWorkingDir(badTempDirNoError{})
 		assert.EqualError(err, "mkdir testdata/no-such-file/build: no such file or directory")
 	})
@@ -77,7 +77,7 @@ func Test_setupBuildSteps(t *testing.T) {
 		{
 			description: "Should return an error when extracting an archive fails",
 			filename:    "testdata/spec_with_unextractable_archive.yaml",
-			errMsg:      "Not a supported archive",
+			errMsg:      "Not a supported archive: unknown",
 			tempDir:     tempd{},
 			symlink:     slink{},
 			extractFail: true,
@@ -86,7 +86,7 @@ func Test_setupBuildSteps(t *testing.T) {
 		{
 			description: "Should fail when fetchSources fails",
 			filename:    "testdata/spec.yaml",
-			errMsg:      `build error: [download error: Internal Server Error]`,
+			errMsg:      `build error: [received an HTTP error: 500 Internal Server Error]`,
 			tempDir:     tempd{},
 			symlink:     slink{},
 			client:      &serverErrHTTP{},
@@ -107,15 +107,14 @@ func Test_setupBuildSteps(t *testing.T) {
 		},
 	}
 	for _, tc := range tests {
-		tc := tc
 		var buf bytes.Buffer
 		t.Run(tc.description, func(t *testing.T) {
 			t.Parallel()
 			assert := assert.New(t)
 			spec, err := NewSpec(tc.filename, &buf)
-			assert.Nil(err)
-			tempdir, err := ioutil.TempDir("", "")
-			assert.Nil(err)
+			require.NoError(t, err)
+			tempdir, err := os.MkdirTemp("", "")
+			require.NoError(t, err)
 			defer os.RemoveAll(tempdir)
 			spec.sourceCache = tempdir
 			spec.httpclient = tc.client
@@ -142,7 +141,7 @@ func Test_buildSteps(t *testing.T) {
 		{
 			description: "Should return an error when extracting an archive fails",
 			filename:    "testdata/spec_with_unextractable_archive.yaml",
-			errMsg:      "Not a supported archive",
+			errMsg:      "Not a supported archive: unknown",
 			extractFail: true,
 		},
 		{
@@ -152,15 +151,14 @@ func Test_buildSteps(t *testing.T) {
 		},
 	}
 	for _, tc := range tests {
-		tc := tc
 		var buf bytes.Buffer
 		t.Run(tc.description, func(t *testing.T) {
 			t.Parallel()
 			assert := assert.New(t)
 			spec, err := NewSpec(tc.filename, &buf)
-			assert.Nil(err)
-			tempdir, err := ioutil.TempDir("", "")
-			assert.Nil(err)
+			require.NoError(t, err)
+			tempdir, err := os.MkdirTemp("", "")
+			require.NoError(t, err)
 			defer os.RemoveAll(tempdir)
 			spec.sourceCache = tempdir
 			spec.httpclient = &goodHTTP{}
