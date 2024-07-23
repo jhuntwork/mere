@@ -1,6 +1,6 @@
 # mere
 
-[![Go Report Card](https://goreportcard.com/badge/github.com/jhuntwork/mere)](https://goreportcard.com/report/github.com/jhuntwork/mere) [![codecov](https://codecov.io/gh/jhuntwork/mere/branch/master/graph/badge.svg?token=qqjphWHjsu)](https://codecov.io/gh/jhuntwork/mere)
+[![Go Report Card](https://goreportcard.com/badge/github.com/jhuntwork/mere)](https://goreportcard.com/report/github.com/jhuntwork/mere) [![codecov](https://codecov.io/gh/jhuntwork/mere/branch/main/graph/badge.svg?token=qqjphWHjsu)](https://codecov.io/gh/jhuntwork/mere)
 
 An experimental package manager.
 
