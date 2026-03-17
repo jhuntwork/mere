@@ -1,0 +1,105 @@
+const std = @import("std");
+const mere = @import("mere");
+const download = mere.download;
+const types = @import("../types.zig");
+const command = @import("../command.zig");
+const MereError = types.MereError;
+
+const uninstall_meta = command.CommandMeta{
+    .name = "uninstall",
+    .description = "Uninstall one or more packages from a profile",
+    .args = &[_]types.Arg{
+        .{
+            .name = "package",
+            .description = "Package name(s) to uninstall",
+            .required = true,
+        },
+    },
+    .flags = &[_]types.Flag{
+        .{
+            .name = "profile",
+            .short = 'p',
+            .description = "Profile to uninstall from (default: system)",
+            .flag_type = .string,
+        },
+        .{
+            .name = "verify-store",
+            .description = "Verify store content hashes during activation (slow)",
+            .flag_type = .bool,
+        },
+        .{
+            .name = "sync",
+            .description = "Force repository sync even if cache is fresh",
+            .flag_type = .bool,
+        },
+    },
+};
+
+fn handleUninstall(ctx: *mere.Context, args: *const types.ParsedArgs) MereError!types.CommandResult {
+    if (args.positional.len == 0) {
+        return MereError.MissingArgument;
+    }
+
+    const package_names = args.positional;
+    const profile_name = args.getString("profile") orelse "system";
+    const verify_store = args.getBool("verify-store");
+    const force_sync = args.getBool("sync");
+
+    const diagnostic_ctx = mere.errors.DiagnosticContext.init()
+        .withSubject(package_names[0]);
+    ctx.withDiagnosticContext(diagnostic_ctx);
+
+    performUninstall(ctx, package_names, profile_name, verify_store, force_sync) catch |err| {
+        const mapped_error = mere.errors.ErrorMapping.mapZigError(err);
+        const current_diag_ctx = ctx.getDiagnosticContext();
+        const user_message = mere.errors.getUserFriendlyMessage(err);
+        const error_ctx = current_diag_ctx.toErrorContext();
+        const formatted_message = error_ctx.formatWithMessage(ctx.allocator, user_message) catch user_message;
+        defer if (formatted_message.ptr != user_message.ptr) {
+            ctx.allocator.free(formatted_message);
+        };
+        const exit_code = command.exitCodeForError(mapped_error);
+        return types.CommandResult{
+            .success = false,
+            .exit_code = exit_code,
+            .message = try ctx.allocator.dupe(u8, formatted_message),
+        };
+    };
+
+    return types.CommandResult{
+        .success = true,
+        .message = "Package(s) uninstalled successfully",
+    };
+}
+
+fn performUninstall(
+    ctx: *mere.Context,
+    package_names: []const []const u8,
+    profile_name: []const u8,
+    verify_store: bool,
+    force_sync: bool,
+) !void {
+    _ = try ctx.getConfig();
+
+    var curl_client = try download.CurlTransferClient.init(ctx);
+    defer download.CurlTransferClient.cleanupFn(ctx, curl_client);
+    const client = curl_client.client();
+
+    const result = try mere.install.uninstallPackagesFromConfig(
+        ctx,
+        package_names,
+        client,
+        verify_store,
+        force_sync,
+        profile_name,
+    );
+    if (result) |msg| {
+        return ctx.fail(error.InvalidInput, "configuration", msg);
+    }
+}
+
+pub fn createCommand(allocator: std.mem.Allocator) !*command.Command {
+    const cmd = try allocator.create(command.Command);
+    cmd.* = command.Command.init(allocator, uninstall_meta, handleUninstall);
+    return cmd;
+}
