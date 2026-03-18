@@ -1,13 +1,15 @@
 // Profile builder - creates symlink tree projections from packages
 //
-// This module implements profile realization and generation construction.
+// This module implements profile realization, system generation construction,
+// and named-profile root publishing.
 // specs #15 and #19. A profile is a symlink tree projection of store contents.
 //
 // Key properties:
 // - File-level symlinks (directories are created, not symlinked)
 // - Path conflicts are hard errors (no implicit resolution)
 // - All symlinks are validated for boundary compliance
-// - Profiles use nested layout: /mere/profiles/<name>/gen-N/
+// - System profiles use nested layout: /mere/profiles/system/gen-N/
+// - Named profiles publish a single live root at /mere/profiles/<name>/root/
 
 const std = @import("std");
 const package_manifest = @import("manifest.zig");
@@ -17,6 +19,8 @@ const projection_index = @import("projection_index.zig");
 const path = @import("path.zig");
 const Context = @import("mere.zig").Context;
 const errors = @import("errors.zig");
+
+pub const ROOT_DIRNAME = "root";
 
 /// Profile builder error set
 ///
@@ -219,19 +223,19 @@ pub const ProjectionStats = struct {
     duration_ns: u64,
 };
 
-const ParentGenerationState = struct {
+const ParentRealizationState = struct {
     allocator: std.mem.Allocator,
-    generation_dir: []const u8,
+    realization_dir: []const u8,
     manifest: generation.GenerationManifest,
     realization: generation.RealizationData,
     path_lookup: std.StringHashMap(u32),
 
     fn init(
         allocator: std.mem.Allocator,
-        generation_dir: []const u8,
+        realization_dir: []const u8,
         manifest_data: generation.GenerationManifest,
         realization_data: generation.RealizationData,
-    ) !ParentGenerationState {
+    ) !ParentRealizationState {
         var lookup = std.StringHashMap(u32).init(allocator);
         errdefer lookup.deinit();
         try lookup.ensureTotalCapacity(@intCast(realization_data.entries.items.len));
@@ -241,18 +245,18 @@ const ParentGenerationState = struct {
 
         return .{
             .allocator = allocator,
-            .generation_dir = generation_dir,
+            .realization_dir = realization_dir,
             .manifest = manifest_data,
             .realization = realization_data,
             .path_lookup = lookup,
         };
     }
 
-    fn deinit(self: *ParentGenerationState) void {
+    fn deinit(self: *ParentRealizationState) void {
         self.path_lookup.deinit();
         self.realization.deinit();
         self.manifest.deinit();
-        self.allocator.free(self.generation_dir);
+        self.allocator.free(self.realization_dir);
     }
 };
 
@@ -282,6 +286,10 @@ fn readPackageProjection(
 
 fn isSystemProfile(profile_dir: []const u8) bool {
     return std.mem.eql(u8, std.fs.path.basename(profile_dir), "system");
+}
+
+pub fn getRootPath(allocator: std.mem.Allocator, profile_dir: []const u8) ProfileError![]const u8 {
+    return std.fs.path.join(allocator, &.{ profile_dir, ROOT_DIRNAME }) catch ProfileError.OutOfMemory;
 }
 
 fn assertRootOwnedPackages(ctx: *Context, packages: []const generation.PackageEntry) ProfileError!void {
@@ -340,7 +348,7 @@ fn planProfileRealization(
     profile_root: []const u8,
     store_root: []const u8,
     packages: []const generation.PackageEntry,
-    parent_state: ?*const ParentGenerationState,
+    parent_state: ?*const ParentRealizationState,
 ) ProfileError!ProjectionResult {
     var detector = PathConflictDetector.init(allocator);
     errdefer detector.deinit();
@@ -400,7 +408,7 @@ fn planProfileRealizationFromParent(
     profile_root: []const u8,
     store_root: []const u8,
     packages: []const generation.PackageEntry,
-    parent_state: *const ParentGenerationState,
+    parent_state: *const ParentRealizationState,
     detector: *PathConflictDetector,
     realization: *generation.RealizationData,
 ) ProfileError!void {
@@ -477,7 +485,7 @@ fn addDeltaPackageProjectionToRealization(
     profile_root: []const u8,
     store_root: []const u8,
     packages: []const generation.PackageEntry,
-    parent_state: *const ParentGenerationState,
+    parent_state: *const ParentRealizationState,
     retained_parent_owners: *const std.AutoHashMap(u32, u32),
     store_path: []const u8,
     pkg_name: []const u8,
@@ -517,7 +525,7 @@ fn addDeltaPackageProjectionToRealization(
 }
 
 fn lookupRetainedPathOwner(
-    parent_state: *const ParentGenerationState,
+    parent_state: *const ParentRealizationState,
     retained_parent_owners: *const std.AutoHashMap(u32, u32),
     projected_path: []const u8,
 ) ?u32 {
@@ -615,7 +623,7 @@ fn applyRealization(
     profile_root: []const u8,
     packages: []const generation.PackageEntry,
     realization: *const generation.RealizationData,
-    parent_state: ?*const ParentGenerationState,
+    parent_state: ?*const ParentRealizationState,
 ) ProfileError!ProjectionStats {
     var materialized_entries: usize = 0;
     var reused_entries: usize = 0;
@@ -641,8 +649,8 @@ fn applyRealization(
                 if (parent_owner_index < parent_gen.manifest.packages.items.len) {
                     const parent_pkg = parent_gen.manifest.packages.items[parent_owner_index];
                     if (std.mem.eql(u8, parent_pkg.store_path, pkg.store_path)) {
-                        const source_path = std.fs.path.join(allocator, &.{ parent_gen.generation_dir, entry.path }) catch {
-                            return ctx.fail(ProfileError.OutOfMemory, parent_gen.generation_dir, "failed to construct parent generation path");
+                        const source_path = std.fs.path.join(allocator, &.{ parent_gen.realization_dir, entry.path }) catch {
+                            return ctx.fail(ProfileError.OutOfMemory, parent_gen.realization_dir, "failed to construct parent realization path");
                         };
                         defer allocator.free(source_path);
 
@@ -749,41 +757,210 @@ fn replaceSymlinkAtomically(
     };
 }
 
-fn loadParentGenerationState(
+fn loadParentRealizationState(
     allocator: std.mem.Allocator,
     ctx: *Context,
-    profile_dir: []const u8,
-    parent_generation: u32,
-) ProfileError!ParentGenerationState {
-    const parent_dir = generation.getGenerationPath(allocator, profile_dir, parent_generation) catch {
-        return ctx.fail(ProfileError.OutOfMemory, profile_dir, "failed to construct parent generation path");
+    realization_dir: []const u8,
+) ProfileError!ParentRealizationState {
+    const owned_realization_dir = allocator.dupe(u8, realization_dir) catch {
+        return ctx.fail(ProfileError.OutOfMemory, realization_dir, "failed to duplicate parent realization path");
     };
-    errdefer allocator.free(parent_dir);
+    errdefer allocator.free(owned_realization_dir);
 
-    var manifest_data = generation.readManifest(allocator, parent_dir) catch |err| {
+    var manifest_data = generation.readManifest(allocator, realization_dir) catch |err| {
         return ctx.fail(switch (err) {
             generation.GenerationError.OutOfMemory => ProfileError.OutOfMemory,
             generation.GenerationError.PermissionDenied => ProfileError.PermissionDenied,
             generation.GenerationError.GenerationNotFound => ProfileError.FileSystem,
             generation.GenerationError.InvalidManifest, generation.GenerationError.ParseError => ProfileError.InvalidInput,
             else => ProfileError.FileSystem,
-        }, parent_dir, "failed to read parent generation manifest");
+        }, realization_dir, "failed to read parent realization manifest");
     };
     errdefer manifest_data.deinit();
 
-    var realization_data = generation.readRealization(allocator, parent_dir) catch |err| {
+    var realization_data = generation.readRealization(allocator, realization_dir) catch |err| {
         return ctx.fail(switch (err) {
             generation.GenerationError.OutOfMemory => ProfileError.OutOfMemory,
             generation.GenerationError.PermissionDenied => ProfileError.PermissionDenied,
             generation.GenerationError.InvalidManifest, generation.GenerationError.ParseError => ProfileError.InvalidInput,
             else => ProfileError.FileSystem,
-        }, parent_dir, "failed to read parent generation realization");
+        }, realization_dir, "failed to read parent realization");
     };
     errdefer realization_data.deinit();
 
-    return ParentGenerationState.init(allocator, parent_dir, manifest_data, realization_data) catch {
-        return ctx.fail(ProfileError.OutOfMemory, parent_dir, "failed to build parent generation lookup");
+    return ParentRealizationState.init(allocator, owned_realization_dir, manifest_data, realization_data) catch {
+        return ctx.fail(ProfileError.OutOfMemory, realization_dir, "failed to build parent realization lookup");
     };
+}
+
+fn exchangePaths(left_path: []const u8, right_path: []const u8) ProfileError!void {
+    const rename_exchange: u32 = 1 << 1;
+    const left_z = std.heap.page_allocator.dupeZ(u8, left_path) catch return ProfileError.OutOfMemory;
+    defer std.heap.page_allocator.free(left_z);
+    const right_z = std.heap.page_allocator.dupeZ(u8, right_path) catch return ProfileError.OutOfMemory;
+    defer std.heap.page_allocator.free(right_z);
+
+    switch (std.posix.errno(std.os.linux.renameat2(
+        std.os.linux.AT.FDCWD,
+        left_z,
+        std.os.linux.AT.FDCWD,
+        right_z,
+        rename_exchange,
+    ))) {
+        .SUCCESS => {},
+        .ACCES => return ProfileError.PermissionDenied,
+        .INVAL => return ProfileError.InvalidInput,
+        else => return ProfileError.FileSystem,
+    }
+}
+
+fn buildProfileManifest(
+    allocator: std.mem.Allocator,
+    packages: []const generation.PackageEntry,
+    generation_num: ?u32,
+    parent_generation: ?u32,
+    selected_profile: []const u8,
+) ProfileError!generation.GenerationManifest {
+    var manifest = if (generation_num) |gen_num|
+        generation.GenerationManifest.init(allocator, gen_num)
+    else
+        generation.GenerationManifest.initRoot(allocator);
+    errdefer manifest.deinit();
+
+    manifest.parent_generation = parent_generation;
+    manifest.selected_profile = allocator.dupe(u8, selected_profile) catch return ProfileError.OutOfMemory;
+
+    for (packages) |pkg| {
+        manifest.addPackage(
+            pkg.name,
+            pkg.version,
+            pkg.release,
+            pkg.arch,
+            pkg.store_path,
+            pkg.content_hash,
+        ) catch return ProfileError.OutOfMemory;
+    }
+
+    return manifest;
+}
+
+pub fn publishProfileRoot(
+    ctx: *Context,
+    profile_dir: []const u8,
+    store_root: []const u8,
+    packages: []const generation.PackageEntry,
+) ProfileError!ProjectionStats {
+    if (isSystemProfile(profile_dir)) {
+        return ctx.fail(ProfileError.InvalidInput, profile_dir, "system profile uses generations");
+    }
+
+    var random_bytes: [6]u8 = undefined;
+    std.crypto.random.bytes(&random_bytes);
+    const suffix = std.fmt.bytesToHex(random_bytes, .lower);
+    const stage_dir = std.fmt.allocPrint(ctx.allocator, "{s}/.root-new-{s}", .{ profile_dir, suffix }) catch {
+        return ctx.fail(ProfileError.OutOfMemory, profile_dir, "failed to allocate staged root path");
+    };
+    defer ctx.allocator.free(stage_dir);
+
+    std.fs.cwd().makePath(stage_dir) catch |err| {
+        return ctx.fail(switch (err) {
+            error.AccessDenied => ProfileError.PermissionDenied,
+            else => ProfileError.FileSystem,
+        }, stage_dir, "failed to create staged profile root");
+    };
+    errdefer std.fs.deleteTreeAbsolute(stage_dir) catch {};
+
+    const root_path = try getRootPath(ctx.allocator, profile_dir);
+    defer ctx.allocator.free(root_path);
+
+    var parent_state: ?ParentRealizationState = null;
+    defer if (parent_state) |*state| state.deinit();
+
+    const root_exists = blk: {
+        std.fs.accessAbsolute(root_path, .{}) catch |err| switch (err) {
+            error.FileNotFound => break :blk false,
+            else => return ctx.fail(switch (err) {
+                error.AccessDenied => ProfileError.PermissionDenied,
+                else => ProfileError.FileSystem,
+            }, root_path, "failed to access existing profile root"),
+        };
+        break :blk true;
+    };
+    if (root_exists) {
+        parent_state = try loadParentRealizationState(ctx.allocator, ctx, root_path);
+    }
+
+    const started_at = std.time.nanoTimestamp();
+    var result = try planProfileRealization(
+        ctx.allocator,
+        ctx,
+        stage_dir,
+        store_root,
+        packages,
+        if (parent_state) |*state| state else null,
+    );
+    defer result.deinit();
+
+    if (result.conflicts.hasConflicts()) {
+        return ProfileError.PathConflict;
+    }
+
+    const apply_stats = try applyRealization(
+        ctx.allocator,
+        ctx,
+        stage_dir,
+        packages,
+        &result.realization,
+        if (parent_state) |*state| state else null,
+    );
+    result.stats.materialized_entries = apply_stats.materialized_entries;
+    result.stats.reused_entries = apply_stats.reused_entries;
+    result.stats.duration_ns = @intCast(std.time.nanoTimestamp() - started_at);
+
+    var manifest = try buildProfileManifest(
+        ctx.allocator,
+        packages,
+        null,
+        null,
+        std.fs.path.basename(profile_dir),
+    );
+    defer manifest.deinit();
+
+    generation.writeRealization(ctx.allocator, stage_dir, &result.realization) catch |err| {
+        return ctx.fail(switch (err) {
+            generation.GenerationError.PermissionDenied => ProfileError.PermissionDenied,
+            generation.GenerationError.OutOfMemory => ProfileError.OutOfMemory,
+            generation.GenerationError.InvalidManifest => ProfileError.InvalidInput,
+            else => ProfileError.FileSystem,
+        }, stage_dir, "failed to write profile realization");
+    };
+
+    generation.writeManifest(ctx.allocator, stage_dir, &manifest) catch |err| {
+        return ctx.fail(switch (err) {
+            generation.GenerationError.PermissionDenied => ProfileError.PermissionDenied,
+            generation.GenerationError.OutOfMemory => ProfileError.OutOfMemory,
+            generation.GenerationError.InvalidManifest => ProfileError.InvalidInput,
+            else => ProfileError.FileSystem,
+        }, stage_dir, "failed to write profile manifest");
+    };
+
+    if (root_exists) {
+        exchangePaths(stage_dir, root_path) catch |err| {
+            return ctx.fail(err, root_path, "failed to atomically publish profile root");
+        };
+        std.fs.deleteTreeAbsolute(stage_dir) catch |err| {
+            ctx.debug("failed to remove previous profile root after publish: {}", .{err});
+        };
+    } else {
+        std.posix.rename(stage_dir, root_path) catch |err| {
+            return ctx.fail(switch (err) {
+                error.AccessDenied => ProfileError.PermissionDenied,
+                else => ProfileError.FileSystem,
+            }, root_path, "failed to publish profile root");
+        };
+    }
+
+    return result.stats;
 }
 
 pub fn createGeneration(
@@ -819,10 +996,13 @@ pub fn createGeneration(
         try assertRootOwnedPackages(ctx, packages);
     }
 
-    var parent_state = if (parent_generation) |parent_num|
-        try loadParentGenerationState(ctx.allocator, ctx, profile_dir, parent_num)
-    else
-        null;
+    var parent_state = if (parent_generation) |parent_num| blk: {
+        const parent_dir = generation.getGenerationPath(ctx.allocator, profile_dir, parent_num) catch {
+            return ctx.fail(ProfileError.OutOfMemory, profile_dir, "failed to construct parent generation path");
+        };
+        defer ctx.allocator.free(parent_dir);
+        break :blk try loadParentRealizationState(ctx.allocator, ctx, parent_dir);
+    } else null;
     defer if (parent_state) |*state| state.deinit();
 
     var result = try planProfileRealization(
@@ -851,23 +1031,14 @@ pub fn createGeneration(
     result.stats.reused_entries = apply_stats.reused_entries;
     result.stats.duration_ns = @intCast(std.time.nanoTimestamp() - started_at);
 
-    var manifest = generation.GenerationManifest.init(ctx.allocator, gen_num);
+    var manifest = try buildProfileManifest(
+        ctx.allocator,
+        packages,
+        gen_num,
+        parent_generation,
+        std.fs.path.basename(profile_dir),
+    );
     defer manifest.deinit();
-
-    manifest.parent_generation = parent_generation;
-
-    for (packages) |pkg| {
-        manifest.addPackage(
-            pkg.name,
-            pkg.version,
-            pkg.release,
-            pkg.arch,
-            pkg.store_path,
-            pkg.content_hash,
-        ) catch {
-            return ProfileError.OutOfMemory;
-        };
-    }
 
     generation.writeRealization(ctx.allocator, gen_path, &result.realization) catch |err| {
         return ctx.fail(switch (err) {

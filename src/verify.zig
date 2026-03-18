@@ -11,6 +11,7 @@ const generation = @import("generation.zig");
 const hash = @import("hash.zig");
 const manifest = @import("manifest.zig");
 const path_safety = @import("path_safety.zig");
+const profile = @import("profile.zig");
 const sign = @import("sign.zig");
 const store = @import("store.zig");
 const Context = @import("mere.zig").Context;
@@ -43,7 +44,7 @@ pub const VerifyResult = struct {
     issues: std.ArrayList(Issue) = .{},
     store_checked: usize = 0,
     store_issues: usize = 0,
-    profile_generations_checked: usize = 0,
+    profile_realizations_checked: usize = 0,
     profile_issues: usize = 0,
     gc_roots_checked: usize = 0,
     gc_roots_issues: usize = 0,
@@ -98,13 +99,13 @@ fn addProfileIssue(
     result: *VerifyResult,
     path: []const u8,
     profile_name: []const u8,
-    generation_name: []const u8,
+    realization_name: []const u8,
     message: []const u8,
 ) VerifyError!void {
     const full = std.fmt.allocPrint(
         ctx.allocator,
         "profile {s} {s}: {s}",
-        .{ profile_name, generation_name, message },
+        .{ profile_name, realization_name, message },
     ) catch {
         return ctx.fail(VerifyError.OutOfMemory, path, "failed to format profile issue");
     };
@@ -372,106 +373,149 @@ fn verifyProfiles(
         defer profile_dir_handle.close();
 
         const require_root_owned = std.mem.eql(u8, entry.name, "system");
+        if (require_root_owned) {
+            var piter = profile_dir_handle.iterate();
+            while (piter.next() catch |err| {
+                return ctx.fail(switch (err) {
+                    error.AccessDenied => VerifyError.PermissionDenied,
+                    else => VerifyError.FileSystem,
+                }, profile_dir, "failed to iterate profile directory");
+            }) |pentry| {
+                if (pentry.kind != .directory) continue;
+                if (generation.parseGenerationNumber(pentry.name) == null) continue;
 
-        var piter = profile_dir_handle.iterate();
-        while (piter.next() catch |err| {
-            return ctx.fail(switch (err) {
-                error.AccessDenied => VerifyError.PermissionDenied,
-                else => VerifyError.FileSystem,
-            }, profile_dir, "failed to iterate profile directory");
-        }) |pentry| {
-            if (pentry.kind != .directory) continue;
-            if (generation.parseGenerationNumber(pentry.name) == null) continue;
+                const gen_path = std.fs.path.join(ctx.allocator, &.{ profile_dir, pentry.name }) catch {
+                    return ctx.fail(VerifyError.OutOfMemory, profile_dir, "failed to build generation path");
+                };
+                defer ctx.allocator.free(gen_path);
 
-            const gen_path = std.fs.path.join(ctx.allocator, &.{ profile_dir, pentry.name }) catch {
-                return ctx.fail(VerifyError.OutOfMemory, profile_dir, "failed to build generation path");
+                result.profile_realizations_checked += 1;
+
+                var gen_manifest = generation.readManifest(ctx.allocator, gen_path) catch {
+                    result.profile_issues += 1;
+                    try addProfileIssue(ctx, result, gen_path, entry.name, pentry.name, "generation manifest missing or invalid");
+                    continue;
+                };
+                defer gen_manifest.deinit();
+
+                try verifyProfileManifestPackages(ctx, result, store_root, entry.name, pentry.name, require_root_owned, full_hash, &gen_manifest);
+            }
+        } else {
+            const root_path = profile.getRootPath(ctx.allocator, profile_dir) catch {
+                return ctx.fail(VerifyError.OutOfMemory, profile_dir, "failed to build profile root path");
             };
-            defer ctx.allocator.free(gen_path);
+            defer ctx.allocator.free(root_path);
 
-            result.profile_generations_checked += 1;
+            std.fs.accessAbsolute(root_path, .{}) catch |err| switch (err) {
+                error.FileNotFound => continue,
+                error.AccessDenied => {
+                    result.profile_issues += 1;
+                    try addIssue(ctx, result, .profile, root_path, "failed to access profile root");
+                    continue;
+                },
+                else => {
+                    result.profile_issues += 1;
+                    try addIssue(ctx, result, .profile, root_path, "failed to access profile root");
+                    continue;
+                },
+            };
 
-            var gen_manifest = generation.readManifest(ctx.allocator, gen_path) catch {
+            result.profile_realizations_checked += 1;
+            var root_manifest = generation.readManifest(ctx.allocator, root_path) catch {
                 result.profile_issues += 1;
-                try addProfileIssue(ctx, result, gen_path, entry.name, pentry.name, "generation manifest missing or invalid");
+                try addProfileIssue(ctx, result, root_path, entry.name, "root", "profile manifest missing or invalid");
                 continue;
             };
-            defer gen_manifest.deinit();
+            defer root_manifest.deinit();
 
-            for (gen_manifest.packages.items) |pkg| {
-                if (!path_safety.isWithinBoundary(pkg.store_path, store_root)) {
-                    result.profile_issues += 1;
-                    try addProfileIssue(ctx, result, pkg.store_path, entry.name, pentry.name, "store path outside store root");
-                    continue;
-                }
+            try verifyProfileManifestPackages(ctx, result, store_root, entry.name, "root", require_root_owned, full_hash, &root_manifest);
+        }
+    }
+}
 
-                std.fs.accessAbsolute(pkg.store_path, .{}) catch {
-                    result.profile_issues += 1;
-                    try addProfileIssue(ctx, result, pkg.store_path, entry.name, pentry.name, "store path does not exist");
-                    continue;
-                };
+fn verifyProfileManifestPackages(
+    ctx: *Context,
+    result: *VerifyResult,
+    store_root: []const u8,
+    profile_name: []const u8,
+    realization_name: []const u8,
+    require_root_owned: bool,
+    full_hash: bool,
+    manifest_data: *generation.GenerationManifest,
+) VerifyError!void {
+    for (manifest_data.packages.items) |pkg| {
+        if (!path_safety.isWithinBoundary(pkg.store_path, store_root)) {
+            result.profile_issues += 1;
+            try addProfileIssue(ctx, result, pkg.store_path, profile_name, realization_name, "store path outside store root");
+            continue;
+        }
 
-                const stat_buf = std.posix.fstatat(std.posix.AT.FDCWD, pkg.store_path, 0) catch {
-                    result.profile_issues += 1;
-                    try addProfileIssue(ctx, result, pkg.store_path, entry.name, pentry.name, "failed to stat store path");
-                    continue;
-                };
+        std.fs.accessAbsolute(pkg.store_path, .{}) catch {
+            result.profile_issues += 1;
+            try addProfileIssue(ctx, result, pkg.store_path, profile_name, realization_name, "store path does not exist");
+            continue;
+        };
 
-                if ((stat_buf.mode & std.posix.S.IFMT) != std.posix.S.IFDIR) {
-                    result.profile_issues += 1;
-                    try addProfileIssue(ctx, result, pkg.store_path, entry.name, pentry.name, "store path is not a directory");
-                }
+        const stat_buf = std.posix.fstatat(std.posix.AT.FDCWD, pkg.store_path, 0) catch {
+            result.profile_issues += 1;
+            try addProfileIssue(ctx, result, pkg.store_path, profile_name, realization_name, "failed to stat store path");
+            continue;
+        };
 
-                if (require_root_owned) {
-                    if (stat_buf.uid != 0 or stat_buf.gid != 0) {
-                        result.profile_issues += 1;
-                        try addProfileIssue(ctx, result, pkg.store_path, entry.name, pentry.name, "store path is not root-owned");
-                    }
-                    if ((stat_buf.mode & 0o222) != 0) {
-                        result.profile_issues += 1;
-                        try addProfileIssue(ctx, result, pkg.store_path, entry.name, pentry.name, "store path is writable");
-                    }
-                }
+        if ((stat_buf.mode & std.posix.S.IFMT) != std.posix.S.IFDIR) {
+            result.profile_issues += 1;
+            try addProfileIssue(ctx, result, pkg.store_path, profile_name, realization_name, "store path is not a directory");
+        }
 
-                if (pkg.content_hash.len != 64) {
-                    result.profile_issues += 1;
-                    try addProfileIssue(ctx, result, pkg.store_path, entry.name, pentry.name, "invalid content hash length in generation manifest");
-                }
-
-                if (full_hash) {
-                    const computed = hash.calculateStoreContentHash(ctx.allocator, pkg.store_path, null) catch {
-                        result.profile_issues += 1;
-                        try addProfileIssue(ctx, result, pkg.store_path, entry.name, pentry.name, "failed to compute store content hash");
-                        continue;
-                    };
-                    defer ctx.allocator.free(computed);
-
-                    if (!std.mem.eql(u8, computed, pkg.content_hash)) {
-                        result.profile_issues += 1;
-                        try addProfileIssue(ctx, result, pkg.store_path, entry.name, pentry.name, "computed store hash does not match generation manifest");
-                    }
-                }
-
-                const components = store.parseStorePath(pkg.store_path) catch {
-                    result.profile_issues += 1;
-                    try addProfileIssue(ctx, result, pkg.store_path, entry.name, pentry.name, "invalid store path format");
-                    continue;
-                };
-
-                if (!std.mem.eql(u8, components.content_hash, pkg.content_hash)) {
-                    result.profile_issues += 1;
-                    try addProfileIssue(ctx, result, pkg.store_path, entry.name, pentry.name, "generation manifest content hash does not match store path");
-                }
-
-                if (!std.mem.eql(u8, components.name, pkg.name)) {
-                    result.profile_issues += 1;
-                    try addProfileIssue(ctx, result, pkg.store_path, entry.name, pentry.name, "package name does not match store path");
-                }
-
-                if (!std.mem.eql(u8, components.version, pkg.version)) {
-                    result.profile_issues += 1;
-                    try addProfileIssue(ctx, result, pkg.store_path, entry.name, pentry.name, "package version does not match store path");
-                }
+        if (require_root_owned) {
+            if (stat_buf.uid != 0 or stat_buf.gid != 0) {
+                result.profile_issues += 1;
+                try addProfileIssue(ctx, result, pkg.store_path, profile_name, realization_name, "store path is not root-owned");
             }
+            if ((stat_buf.mode & 0o222) != 0) {
+                result.profile_issues += 1;
+                try addProfileIssue(ctx, result, pkg.store_path, profile_name, realization_name, "store path is writable");
+            }
+        }
+
+        if (pkg.content_hash.len != 64) {
+            result.profile_issues += 1;
+            try addProfileIssue(ctx, result, pkg.store_path, profile_name, realization_name, "invalid content hash length in profile manifest");
+        }
+
+        if (full_hash) {
+            const computed = hash.calculateStoreContentHash(ctx.allocator, pkg.store_path, null) catch {
+                result.profile_issues += 1;
+                try addProfileIssue(ctx, result, pkg.store_path, profile_name, realization_name, "failed to compute store content hash");
+                continue;
+            };
+            defer ctx.allocator.free(computed);
+
+            if (!std.mem.eql(u8, computed, pkg.content_hash)) {
+                result.profile_issues += 1;
+                try addProfileIssue(ctx, result, pkg.store_path, profile_name, realization_name, "computed store hash does not match profile manifest");
+            }
+        }
+
+        const components = store.parseStorePath(pkg.store_path) catch {
+            result.profile_issues += 1;
+            try addProfileIssue(ctx, result, pkg.store_path, profile_name, realization_name, "invalid store path format");
+            continue;
+        };
+
+        if (!std.mem.eql(u8, components.content_hash, pkg.content_hash)) {
+            result.profile_issues += 1;
+            try addProfileIssue(ctx, result, pkg.store_path, profile_name, realization_name, "profile manifest content hash does not match store path");
+        }
+
+        if (!std.mem.eql(u8, components.name, pkg.name)) {
+            result.profile_issues += 1;
+            try addProfileIssue(ctx, result, pkg.store_path, profile_name, realization_name, "package name does not match store path");
+        }
+
+        if (!std.mem.eql(u8, components.version, pkg.version)) {
+            result.profile_issues += 1;
+            try addProfileIssue(ctx, result, pkg.store_path, profile_name, realization_name, "package version does not match store path");
         }
     }
 }
@@ -730,7 +774,7 @@ test "verify gc roots rejects pin target with canonical escape" {
     try std.testing.expect(found);
 }
 
-test "verify profiles accepts valid generation manifest" {
+test "verify profiles accepts valid named profile root manifest" {
     const th = @import("test_helpers.zig");
     var test_env = try th.createTestEnv();
     defer {
@@ -752,20 +796,20 @@ test "verify profiles accepts valid generation manifest" {
     defer ctx.allocator.free(profile_root);
     try std.fs.cwd().makePath(profile_root);
 
-    const gen_dir = try std.fs.path.join(ctx.allocator, &.{ profile_root, "gen-1" });
-    defer ctx.allocator.free(gen_dir);
-    try std.fs.cwd().makePath(gen_dir);
+    const root_dir = try profile.getRootPath(ctx.allocator, profile_root);
+    defer ctx.allocator.free(root_dir);
+    try std.fs.cwd().makePath(root_dir);
 
-    var manifest_data = generation.GenerationManifest.init(ctx.allocator, 1);
+    var manifest_data = generation.GenerationManifest.initRoot(ctx.allocator);
     defer manifest_data.deinit();
     try manifest_data.addPackage("demo", "1.0.0", 1, "x86_64", store_path, content_hash);
-    try generation.writeManifest(ctx.allocator, gen_dir, &manifest_data);
+    try generation.writeManifest(ctx.allocator, root_dir, &manifest_data);
 
     var result = VerifyResult{};
     defer result.deinit(ctx.allocator);
 
     try verifyProfiles(ctx, null, false, &result);
-    try std.testing.expectEqual(@as(usize, 1), result.profile_generations_checked);
+    try std.testing.expectEqual(@as(usize, 1), result.profile_realizations_checked);
     try std.testing.expectEqual(@as(usize, 0), result.profile_issues);
 }
 
@@ -790,14 +834,14 @@ test "verify profiles reports missing store path with profile context" {
     defer ctx.allocator.free(profile_root);
     try std.fs.cwd().makePath(profile_root);
 
-    const gen_dir = try std.fs.path.join(ctx.allocator, &.{ profile_root, "gen-1" });
-    defer ctx.allocator.free(gen_dir);
-    try std.fs.cwd().makePath(gen_dir);
+    const root_dir = try profile.getRootPath(ctx.allocator, profile_root);
+    defer ctx.allocator.free(root_dir);
+    try std.fs.cwd().makePath(root_dir);
 
-    var manifest_data = generation.GenerationManifest.init(ctx.allocator, 1);
+    var manifest_data = generation.GenerationManifest.initRoot(ctx.allocator);
     defer manifest_data.deinit();
     try manifest_data.addPackage("demo", "1.0.0", 1, "x86_64", missing_store, content_hash);
-    try generation.writeManifest(ctx.allocator, gen_dir, &manifest_data);
+    try generation.writeManifest(ctx.allocator, root_dir, &manifest_data);
 
     var result = VerifyResult{};
     defer result.deinit(ctx.allocator);
@@ -805,11 +849,11 @@ test "verify profiles reports missing store path with profile context" {
     try verifyProfiles(ctx, null, false, &result);
     try std.testing.expect(result.profile_issues > 0);
     try std.testing.expect(result.issues.items.len > 0);
-    try std.testing.expect(std.mem.containsAtLeast(u8, result.issues.items[0].message, 1, "profile user gen-1"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, result.issues.items[0].message, 1, "profile user root"));
     try std.testing.expect(std.mem.containsAtLeast(u8, result.issues.items[0].message, 1, "store path does not exist"));
 }
 
-test "verify profiles reports generation manifest hash mismatch without full hash" {
+test "verify profiles reports profile manifest hash mismatch without full hash" {
     const th = @import("test_helpers.zig");
     var test_env = try th.createTestEnv();
     defer {
@@ -832,14 +876,14 @@ test "verify profiles reports generation manifest hash mismatch without full has
     defer ctx.allocator.free(profile_root);
     try std.fs.cwd().makePath(profile_root);
 
-    const gen_dir = try std.fs.path.join(ctx.allocator, &.{ profile_root, "gen-1" });
-    defer ctx.allocator.free(gen_dir);
-    try std.fs.cwd().makePath(gen_dir);
+    const root_dir = try profile.getRootPath(ctx.allocator, profile_root);
+    defer ctx.allocator.free(root_dir);
+    try std.fs.cwd().makePath(root_dir);
 
-    var manifest_data = generation.GenerationManifest.init(ctx.allocator, 1);
+    var manifest_data = generation.GenerationManifest.initRoot(ctx.allocator);
     defer manifest_data.deinit();
     try manifest_data.addPackage("demo", "1.0.0", 1, "x86_64", store_path, manifest_hash);
-    try generation.writeManifest(ctx.allocator, gen_dir, &manifest_data);
+    try generation.writeManifest(ctx.allocator, root_dir, &manifest_data);
 
     var result = VerifyResult{};
     defer result.deinit(ctx.allocator);
@@ -849,7 +893,7 @@ test "verify profiles reports generation manifest hash mismatch without full has
 
     var found = false;
     for (result.issues.items) |issue| {
-        if (std.mem.containsAtLeast(u8, issue.message, 1, "generation manifest content hash does not match store path")) {
+        if (std.mem.containsAtLeast(u8, issue.message, 1, "profile manifest content hash does not match store path")) {
             found = true;
             break;
         }

@@ -207,7 +207,7 @@ pub fn uninstallPackagesFromConfig(
         var target_step_open = true;
         errdefer if (target_step_open) emit.stepEnd(ctx, .install, "activation", false);
         const empty: [0]generation.PackageEntry = .{};
-        try createAndActivateGeneration(ctx, profile_name, &empty, verify_store);
+        try applyProfileRealization(ctx, profile_name, &empty, verify_store);
         emit.stepEnd(ctx, .install, "activation", true);
         target_step_open = false;
     }
@@ -470,9 +470,65 @@ fn buildRequestedRootsAfterRemove(ctx: *Context, profile_name: []const u8, pkg_n
     return state;
 }
 
+fn preferredSelectionsFromManifest(
+    allocator: std.mem.Allocator,
+    manifest_data: generation.GenerationManifest,
+) !PreferredSelectionsState {
+    const selections = try allocator.alloc(resolver.PreferredSelection, manifest_data.packages.items.len);
+    errdefer allocator.free(selections);
+
+    for (manifest_data.packages.items, 0..) |pkg, idx| {
+        selections[idx] = .{
+            .name = pkg.name,
+            .version = pkg.version,
+            .release = pkg.release,
+            .arch = pkg.arch,
+            .content_hash = pkg.content_hash,
+        };
+    }
+
+    return .{
+        .selections = selections,
+        .manifest = manifest_data,
+        .allocator = allocator,
+    };
+}
+
 fn loadCurrentGenerationPreferences(ctx: *Context, profile_name: []const u8) !PreferredSelectionsState {
     const profile_dir = try getProfileDir(ctx, profile_name);
     defer ctx.allocator.free(profile_dir);
+
+    if (!std.mem.eql(u8, profile_name, "system")) {
+        const root_path = profile.getRootPath(ctx.allocator, profile_dir) catch return error.OutOfMemory;
+        defer ctx.allocator.free(root_path);
+
+        std.fs.accessAbsolute(root_path, .{}) catch |err| {
+            return switch (err) {
+                error.FileNotFound => PreferredSelectionsState.initEmpty(ctx.allocator),
+                error.AccessDenied => error.PermissionDenied,
+                else => error.FileSystem,
+            };
+        };
+
+        var manifest_data = generation.readManifest(ctx.allocator, root_path) catch |err| {
+            return switch (err) {
+                generation.GenerationError.OutOfMemory => error.OutOfMemory,
+                generation.GenerationError.PermissionDenied => error.PermissionDenied,
+                generation.GenerationError.InvalidManifest,
+                generation.GenerationError.ParseError,
+                generation.GenerationError.InvalidInput,
+                generation.GenerationError.GenerationNotFound,
+                generation.GenerationError.NoCurrentGeneration,
+                generation.GenerationError.NoPreviousGeneration,
+                generation.GenerationError.ProfilesNotFound,
+                => error.InvalidInput,
+                else => error.FileSystem,
+            };
+        };
+        errdefer manifest_data.deinit();
+
+        return preferredSelectionsFromManifest(ctx.allocator, manifest_data);
+    }
 
     const current_generation = generation.getCurrentGeneration(profile_dir) catch |err| {
         return switch (err) {
@@ -510,24 +566,7 @@ fn loadCurrentGenerationPreferences(ctx: *Context, profile_name: []const u8) !Pr
     };
     errdefer manifest_data.deinit();
 
-    const selections = try ctx.allocator.alloc(resolver.PreferredSelection, manifest_data.packages.items.len);
-    errdefer ctx.allocator.free(selections);
-
-    for (manifest_data.packages.items, 0..) |pkg, idx| {
-        selections[idx] = .{
-            .name = pkg.name,
-            .version = pkg.version,
-            .release = pkg.release,
-            .arch = pkg.arch,
-            .content_hash = pkg.content_hash,
-        };
-    }
-
-    return .{
-        .selections = selections,
-        .manifest = manifest_data,
-        .allocator = ctx.allocator,
-    };
+    return preferredSelectionsFromManifest(ctx.allocator, manifest_data);
 }
 
 fn parseInstallRootRequirements(
@@ -826,13 +865,12 @@ fn applyInstallTargets(
     target_profile_path: ?[]const u8,
     verify_store: bool,
 ) !void {
-    // 3. Create new generation in the profile OR symlink to target profile
+    // 3. Create or publish the target profile realization, or symlink to a build profile
     if (target_profile_path) |profile_path| {
         // Symlink packages directly to the target profile (for build profiles)
         try symlinkPackagesToProfile(ctx, profile_path, installed_packages);
     } else if (profile_name) |prof_name| {
-        // Create a new generation in the named profile (for system profiles)
-        try createAndActivateGeneration(ctx, prof_name, installed_packages, verify_store);
+        try applyProfileRealization(ctx, prof_name, installed_packages, verify_store);
     }
 }
 
@@ -896,8 +934,9 @@ fn symlinkPackagesToProfile(ctx: *Context, profile_path: []const u8, installed_p
     emit.logSegmentsSeverity(ctx, .install, .info, &segments);
 }
 
-/// Create a new generation from installed packages and activate it
-fn createAndActivateGeneration(ctx: *Context, prof_name: []const u8, installed_packages: []const generation.PackageEntry, verify_store: bool) !void {
+/// Apply installed packages to the requested profile target.
+/// System profiles create and activate generations; named profiles publish a single root.
+fn applyProfileRealization(ctx: *Context, prof_name: []const u8, installed_packages: []const generation.PackageEntry, verify_store: bool) !void {
     const profile_dir = try std.fs.path.join(ctx.allocator, &.{ ctx.root_path, "mere", "profiles", prof_name });
     defer ctx.allocator.free(profile_dir);
 
@@ -913,34 +952,32 @@ fn createAndActivateGeneration(ctx: *Context, prof_name: []const u8, installed_p
         };
     };
 
-    // Get current generation for parent reference
-    const current_gen = generation.getCurrentGeneration(profile_dir) catch null;
-
-    // Create the generation
-    const gen_num = profile.createGeneration(
-        ctx,
-        profile_dir,
-        store_root,
-        installed_packages,
-        current_gen,
-    ) catch |err| {
-        ctx.debug("failed to create generation: {}", .{err});
-        const diag = ctx.getDiagnosticContext();
-        if (diag.details == null) {
-            ctx.setDiagnosticContextFmt(profile_dir, "failed to create generation: {s}", .{@errorName(err)});
-        }
-        return switch (err) {
-            profile.ProfileError.PathConflict => error.ConflictingProvision,
-            profile.ProfileError.PermissionDenied => error.PermissionDenied,
-            profile.ProfileError.OutOfMemory => error.OutOfMemory,
-            profile.ProfileError.InvalidStoreLayout => error.InvalidInput,
-            else => error.FileSystem,
-        };
-    };
-
-    emitInstallGenerationStatus(ctx, "created", gen_num, prof_name);
-
     if (std.mem.eql(u8, prof_name, "system")) {
+        const current_gen = generation.getCurrentGeneration(profile_dir) catch null;
+
+        const gen_num = profile.createGeneration(
+            ctx,
+            profile_dir,
+            store_root,
+            installed_packages,
+            current_gen,
+        ) catch |err| {
+            ctx.debug("failed to create generation: {}", .{err});
+            const diag = ctx.getDiagnosticContext();
+            if (diag.details == null) {
+                ctx.setDiagnosticContextFmt(profile_dir, "failed to create generation: {s}", .{@errorName(err)});
+            }
+            return switch (err) {
+                profile.ProfileError.PathConflict => error.ConflictingProvision,
+                profile.ProfileError.PermissionDenied => error.PermissionDenied,
+                profile.ProfileError.OutOfMemory => error.OutOfMemory,
+                profile.ProfileError.InvalidStoreLayout => error.InvalidInput,
+                else => error.FileSystem,
+            };
+        };
+
+        emitInstallGenerationStatus(ctx, "created", gen_num, prof_name);
+
         const result = activation.activateSystemGeneration(
             ctx,
             gen_num,
@@ -973,17 +1010,47 @@ fn createAndActivateGeneration(ctx: *Context, prof_name: []const u8, installed_p
         };
         emit.logSegmentsSeverity(ctx, .install, .info, &segments);
     } else {
-        _ = activation.switchProfileGeneration(
+        const stats = profile.publishProfileRoot(
             ctx,
-            prof_name,
-            gen_num,
-            if (verify_store) .full_store else .fast,
+            profile_dir,
+            store_root,
+            installed_packages,
         ) catch |err| {
-            ctx.debug("failed to switch profile generation: {}", .{err});
-            return ctx.fail(mapActivationError(err), profile_dir, "failed to activate generation");
+            ctx.debug("failed to publish profile root: {}", .{err});
+            const diag = ctx.getDiagnosticContext();
+            if (diag.details == null) {
+                ctx.setDiagnosticContextFmt(profile_dir, "failed to publish profile root: {s}", .{@errorName(err)});
+            }
+            return switch (err) {
+                profile.ProfileError.PathConflict => error.ConflictingProvision,
+                profile.ProfileError.PermissionDenied => error.PermissionDenied,
+                profile.ProfileError.OutOfMemory => error.OutOfMemory,
+                profile.ProfileError.InvalidStoreLayout => error.InvalidInput,
+                else => error.FileSystem,
+            };
         };
+        const details = std.fmt.allocPrint(
+            ctx.allocator,
+            "{d} packages ({d} entries, {d} materialized, {d} reused, {d} ms)",
+            .{
+                installed_packages.len,
+                stats.total_entries,
+                stats.materialized_entries,
+                stats.reused_entries,
+                @divFloor(stats.duration_ns, std.time.ns_per_ms),
+            },
+        ) catch return error.OutOfMemory;
+        defer ctx.allocator.free(details);
 
-        emitInstallGenerationStatus(ctx, "activated", gen_num, prof_name);
+        const segments = [_]mere.ui.Segment{
+            .{ .text = "profile root", .kind = .normal },
+            .{ .text = " published", .kind = .success },
+            .{ .text = " for '", .kind = .normal },
+            .{ .text = prof_name, .kind = .detail },
+            .{ .text = "': ", .kind = .normal },
+            .{ .text = details, .kind = .detail },
+        };
+        emit.logSegmentsSeverity(ctx, .install, .info, &segments);
     }
 }
 
@@ -1940,16 +2007,16 @@ test "buildProfileResolverRequirements orders explicit roots before existing req
     try std.testing.expectEqualStrings("A", requirements[1].name);
 }
 
-test "integration: full install pipeline with generation creation and activation" {
+test "integration: full install pipeline publishes named profile root" {
     // This test verifies the complete install pipeline:
     // 1. Config loading (simulated)
     // 2. RepoCache sync
     // 3. Dependency resolution across repos
     // 4. Package download and extraction
     // 5. Store placement with content-addressed paths
-    // 6. Generation creation with manifest.json
+    // 6. Named-profile root publish with manifest.json
     // 7. Profile symlink tree building
-    // 8. Generation activation (current -> gen-N)
+    // 8. No generation activation state for named profiles
 
     const th = @import("test_helpers.zig");
     var test_env = try th.createTestEnv();
@@ -2201,15 +2268,15 @@ test "integration: full install pipeline with generation creation and activation
     defer ctx.allocator.free(store_path_b);
     try std.fs.accessAbsolute(store_path_b, .{});
 
-    // 2. Verify generation directory exists
+    // 2. Verify named profile root exists
     const profile_dir = try std.fs.path.join(ctx.allocator, &.{ test_env.path, "mere", "profiles", profile_name });
     defer ctx.allocator.free(profile_dir);
-    const gen_dir = try std.fs.path.join(ctx.allocator, &.{ profile_dir, "gen-1" });
-    defer ctx.allocator.free(gen_dir);
-    try std.fs.accessAbsolute(gen_dir, .{});
+    const root_dir = try profile.getRootPath(ctx.allocator, profile_dir);
+    defer ctx.allocator.free(root_dir);
+    try std.fs.accessAbsolute(root_dir, .{});
 
-    // 3. Verify manifest.json exists in generation
-    const manifest_json_path = try std.fs.path.join(ctx.allocator, &.{ gen_dir, "manifest.json" });
+    // 3. Verify manifest.json exists in root
+    const manifest_json_path = try std.fs.path.join(ctx.allocator, &.{ root_dir, "manifest.json" });
     defer ctx.allocator.free(manifest_json_path);
     try std.fs.accessAbsolute(manifest_json_path, .{});
 
@@ -2226,11 +2293,11 @@ test "integration: full install pipeline with generation creation and activation
     try std.testing.expect(std.mem.indexOf(u8, manifest_content, "2.0.0") != null);
 
     // 5. Verify profile symlink tree exists
-    const profile_usr_bin = try std.fs.path.join(ctx.allocator, &.{ gen_dir, "usr", "bin" });
+    const profile_usr_bin = try std.fs.path.join(ctx.allocator, &.{ root_dir, "usr", "bin" });
     defer ctx.allocator.free(profile_usr_bin);
     try std.fs.accessAbsolute(profile_usr_bin, .{});
 
-    const profile_usr_lib = try std.fs.path.join(ctx.allocator, &.{ gen_dir, "usr", "lib" });
+    const profile_usr_lib = try std.fs.path.join(ctx.allocator, &.{ root_dir, "usr", "lib" });
     defer ctx.allocator.free(profile_usr_lib);
     try std.fs.accessAbsolute(profile_usr_lib, .{});
 
@@ -2243,26 +2310,19 @@ test "integration: full install pipeline with generation creation and activation
     defer ctx.allocator.free(profile_libhello);
     try std.fs.accessAbsolute(profile_libhello, .{});
 
-    // 7. Verify 'current' symlink points to gen-1
+    // 7. Verify named profiles do not expose generation activation state
     const current_link = try std.fs.path.join(ctx.allocator, &.{ profile_dir, "current" });
     defer ctx.allocator.free(current_link);
-
-    var link_target_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const link_target = try std.fs.readLinkAbsolute(current_link, &link_target_buf);
-    try std.testing.expectEqualStrings("gen-1", link_target);
-
-    // 8. Verify getCurrentGeneration returns 1
-    const current_gen = try generation.getCurrentGeneration(profile_dir);
-    try std.testing.expectEqual(@as(u32, 1), current_gen);
+    try std.testing.expectError(error.FileNotFound, std.fs.accessAbsolute(current_link, .{}));
+    try std.testing.expectEqual(@as(?u32, null), try generation.getCurrentGeneration(profile_dir));
 }
 
-test "integration: profile lifecycle with multiple generations and rollback" {
-    // This test verifies the profile lifecycle:
-    // 1. Install pkgA → gen-1 → activate
-    // 2. Install pkgC (different package) → gen-2 → activate
-    // 3. Verify gen-2 has files from both installations
-    // 4. Rollback to gen-1 → verify only pkgA files exist
-    // 5. Switch forward to gen-2 → verify pkgC files return
+test "integration: named profile lifecycle replaces root atomically and additively" {
+    // This test verifies the named-profile lifecycle:
+    // 1. Install pkgA → publish root
+    // 2. Install pkgC → republish root with additive package set
+    // 3. Verify root contains both installations
+    // 4. Verify no generation activation state exists for the named profile
 
     const th = @import("test_helpers.zig");
     var test_env = try th.createTestEnv();
@@ -2313,7 +2373,7 @@ test "integration: profile lifecycle with multiple generations and rollback" {
     defer std.testing.allocator.free(packages_dir);
     try std.fs.cwd().makePath(packages_dir);
 
-    // Create package A (will be in gen-1)
+    // Create package A (will be in the initial root)
     var pkg_a = package.Package.init(ctx);
     pkg_a.name = try ctx.allocator.dupe(u8, "pkgA");
     pkg_a.version = try ctx.allocator.dupe(u8, "1.0.0");
@@ -2377,7 +2437,7 @@ test "integration: profile lifecycle with multiple generations and rollback" {
     _ = try repo.db.insertPackageTransaction(&pkg_a);
     pkg_a.deinit();
 
-    // Create package C (will be added in gen-2)
+    // Create package C (will be added when the root is republished)
     var pkg_c = package.Package.init(ctx);
     pkg_c.name = try ctx.allocator.dupe(u8, "pkgC");
     pkg_c.version = try ctx.allocator.dupe(u8, "3.0.0");
@@ -2488,79 +2548,50 @@ test "integration: profile lifecycle with multiple generations and rollback" {
     const profile_dir = try std.fs.path.join(ctx.allocator, &.{ test_env.path, "mere", "profiles", profile_name });
     defer ctx.allocator.free(profile_dir);
 
-    // Step 1: Install pkgA → gen-1
+    const root_dir = try profile.getRootPath(ctx.allocator, profile_dir);
+    defer ctx.allocator.free(root_dir);
+
+    // Step 1: Install pkgA → publish root
     const pkg_a_names = [_][]const u8{"pkgA"};
     try installPackagesToProfile(ctx, &repocaches, pkg_a_names[0..], client, false, false, false, profile_name, null);
 
-    // Verify gen-1 created and activated
-    var current_gen = try generation.getCurrentGeneration(profile_dir);
-    try std.testing.expectEqual(@as(u32, 1), current_gen);
+    try std.fs.accessAbsolute(root_dir, .{});
+    try std.testing.expectEqual(@as(?u32, null), try generation.getCurrentGeneration(profile_dir));
 
-    // Verify tool-a exists in gen-1
-    const gen1_tool_a = try std.fs.path.join(ctx.allocator, &.{ profile_dir, "gen-1", "usr", "bin", "tool-a" });
-    defer ctx.allocator.free(gen1_tool_a);
-    try std.fs.accessAbsolute(gen1_tool_a, .{});
+    // Verify tool-a exists in the published root
+    const root_tool_a = try std.fs.path.join(ctx.allocator, &.{ root_dir, "usr", "bin", "tool-a" });
+    defer ctx.allocator.free(root_tool_a);
+    try std.fs.accessAbsolute(root_tool_a, .{});
 
-    // Verify tool-c does NOT exist in gen-1
-    const gen1_tool_c = try std.fs.path.join(ctx.allocator, &.{ profile_dir, "gen-1", "usr", "bin", "tool-c" });
-    defer ctx.allocator.free(gen1_tool_c);
-    std.fs.accessAbsolute(gen1_tool_c, .{}) catch |err| {
-        try std.testing.expectEqual(error.FileNotFound, err);
-    };
+    // Verify tool-c does NOT exist before the second publish
+    const root_tool_c = try std.fs.path.join(ctx.allocator, &.{ root_dir, "usr", "bin", "tool-c" });
+    defer ctx.allocator.free(root_tool_c);
+    try std.testing.expectError(error.FileNotFound, std.fs.accessAbsolute(root_tool_c, .{}));
 
-    // Step 2: Install pkgC → gen-2
+    // Step 2: Install pkgC → republish root
     const pkg_c_names = [_][]const u8{"pkgC"};
     try installPackagesToProfile(ctx, &repocaches, pkg_c_names[0..], client, false, false, false, profile_name, null);
 
-    // Verify gen-2 created and activated
-    current_gen = try generation.getCurrentGeneration(profile_dir);
-    try std.testing.expectEqual(@as(u32, 2), current_gen);
+    // Additive install: both tools are present in the replacement root
+    try std.fs.accessAbsolute(root_tool_a, .{});
+    try std.fs.accessAbsolute(root_tool_c, .{});
 
-    // Verify tool-c exists in gen-2
-    const gen2_tool_c = try std.fs.path.join(ctx.allocator, &.{ profile_dir, "gen-2", "usr", "bin", "tool-c" });
-    defer ctx.allocator.free(gen2_tool_c);
-    try std.fs.accessAbsolute(gen2_tool_c, .{});
+    const root_manifest_path = try std.fs.path.join(ctx.allocator, &.{ root_dir, "manifest.json" });
+    defer ctx.allocator.free(root_manifest_path);
+    const root_manifest_data = try std.fs.cwd().readFileAlloc(ctx.allocator, root_manifest_path, 1024 * 1024);
+    defer ctx.allocator.free(root_manifest_data);
+    try std.testing.expect(std.mem.indexOf(u8, root_manifest_data, "\"generation\"") == null);
+    try std.testing.expect(std.mem.indexOf(u8, root_manifest_data, "pkgA") != null);
+    try std.testing.expect(std.mem.indexOf(u8, root_manifest_data, "pkgC") != null);
 
-    // Additive install: tool-a from gen-1 remains present in gen-2
-    const gen2_tool_a = try std.fs.path.join(ctx.allocator, &.{ profile_dir, "gen-2", "usr", "bin", "tool-a" });
-    defer ctx.allocator.free(gen2_tool_a);
-    try std.fs.accessAbsolute(gen2_tool_a, .{});
-
-    // Verify current symlink points to gen-2
+    // Named profiles do not expose activation symlinks or rollback helpers
     const current_link = try std.fs.path.join(ctx.allocator, &.{ profile_dir, "current" });
     defer ctx.allocator.free(current_link);
-    var link_buf: [std.fs.max_path_bytes]u8 = undefined;
-    var link_target = try std.fs.readLinkAbsolute(current_link, &link_buf);
-    try std.testing.expectEqualStrings("gen-2", link_target);
-
-    // Step 3: Rollback to gen-1
-    const rolled_back_gen = try generation.findPreviousGeneration(ctx.allocator, profile_dir);
-    _ = try activation.switchProfileGeneration(ctx, profile_name, rolled_back_gen, .fast);
-    try std.testing.expectEqual(@as(u32, 1), rolled_back_gen);
-
-    // Verify current now points to gen-1
-    current_gen = try generation.getCurrentGeneration(profile_dir);
-    try std.testing.expectEqual(@as(u32, 1), current_gen);
-
-    link_target = try std.fs.readLinkAbsolute(current_link, &link_buf);
-    try std.testing.expectEqualStrings("gen-1", link_target);
-
-    // Step 4: Switch forward to gen-2
-    _ = try activation.switchProfileGeneration(ctx, profile_name, 2, .fast);
-
-    // Verify current now points to gen-2 again
-    current_gen = try generation.getCurrentGeneration(profile_dir);
-    try std.testing.expectEqual(@as(u32, 2), current_gen);
-
-    link_target = try std.fs.readLinkAbsolute(current_link, &link_buf);
-    try std.testing.expectEqualStrings("gen-2", link_target);
-
-    // Step 5: Verify listGenerations returns both
+    try std.testing.expectError(error.FileNotFound, std.fs.accessAbsolute(current_link, .{}));
+    try std.testing.expectEqual(@as(?u32, null), try generation.getCurrentGeneration(profile_dir));
     const all_gens = try generation.listGenerations(ctx.allocator, profile_dir);
     defer ctx.allocator.free(all_gens);
-    try std.testing.expectEqual(@as(usize, 2), all_gens.len);
-    try std.testing.expectEqual(@as(u32, 1), all_gens[0]);
-    try std.testing.expectEqual(@as(u32, 2), all_gens[1]);
+    try std.testing.expectEqual(@as(usize, 0), all_gens.len);
 }
 
 test "integration: symlink tree conflict detection" {
@@ -3116,22 +3147,18 @@ test "integration: multi-repository priority selection" {
     // Verify the installed version is 2.0.0 by checking the store path contains the high-priority content hash
     const profile_dir = try std.fs.path.join(ctx.allocator, &.{ ctx.root_path, "mere", "profiles", profile_name });
     defer ctx.allocator.free(profile_dir);
-    const current_link = try std.fs.path.join(ctx.allocator, &.{ profile_dir, "current" });
-    defer ctx.allocator.free(current_link);
+    const root_dir = try profile.getRootPath(ctx.allocator, profile_dir);
+    defer ctx.allocator.free(root_dir);
+    const root_manifest_path = try std.fs.path.join(ctx.allocator, &.{ root_dir, "manifest.json" });
+    defer ctx.allocator.free(root_manifest_path);
 
-    // Read the generation manifest to verify which version was installed
-    var current_target_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const current_target = try std.fs.readLinkAbsolute(current_link, &current_target_buf);
-    const gen_manifest_path = try std.fs.path.join(ctx.allocator, &.{ profile_dir, current_target, "manifest.json" });
-    defer ctx.allocator.free(gen_manifest_path);
-
-    const gen_manifest_data = try std.fs.cwd().readFileAlloc(ctx.allocator, gen_manifest_path, 1024 * 1024);
-    defer ctx.allocator.free(gen_manifest_data);
+    const root_manifest_data = try std.fs.cwd().readFileAlloc(ctx.allocator, root_manifest_path, 1024 * 1024);
+    defer ctx.allocator.free(root_manifest_data);
 
     // Verify version 2.0.0 is in the manifest (from high-priority repo)
-    try std.testing.expect(std.mem.indexOf(u8, gen_manifest_data, "2.0.0") != null);
+    try std.testing.expect(std.mem.indexOf(u8, root_manifest_data, "2.0.0") != null);
     // Verify version 1.0.0 is NOT in the manifest
-    try std.testing.expect(std.mem.indexOf(u8, gen_manifest_data, "1.0.0") == null);
+    try std.testing.expect(std.mem.indexOf(u8, root_manifest_data, "1.0.0") == null);
 }
 
 test "integration: garbage collection removes unreferenced store paths" {

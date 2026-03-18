@@ -293,16 +293,15 @@ signature = ed25519_sign(secret_key, manifest_bytes)
 
 ## Profile and Generation System
 
-### 6. Generation Manifest Schema
+### 6. Profile Manifest Schema
 
-`/mere/profiles/<profile-name>/gen-<N>/manifest.json` holds generation metadata.
+`/mere/profiles/system/gen-<N>/manifest.json` and `/mere/profiles/<name>/root/manifest.json` share the same manifest schema.
 
 **Required fields (v1)**:
 
 | Field            | Type    | Description                 |
 | ---------------- | ------- | --------------------------- |
 | `schema_version` | integer | Schema version, starts at 1 |
-| `generation`     | integer | Generation number N         |
 | `created_at`     | u64     | Unix epoch seconds          |
 | `packages`       | array   | List of package entries     |
 
@@ -321,6 +320,7 @@ signature = ed25519_sign(secret_key, manifest_bytes)
 
 | Field               | Type    | Description                              |
 | ------------------- | ------- | ---------------------------------------- |
+| `generation`        | integer | System generation number N               |
 | `parent_generation` | integer | Previous generation this was built from  |
 | `notes`             | string  | Human comment                            |
 | `selected_profile`  | string  | Profile name (for multi-profile support) |
@@ -349,36 +349,37 @@ signature = ed25519_sign(secret_key, manifest_bytes)
 
 **Signing**: Optional in v1.
 
-**Rationale (JSON vs KDL)**: The generation manifest is a strict completion marker and source of truth for activation/GC.
+**Rationale (JSON vs KDL)**: The profile manifest is a strict completion marker and source of truth for activation/GC.
 JSON is used here to keep the format intentionally rigid and canonical, reducing ambiguity in parsing and validation.
 
-#### 6.1 Generation Directory Validity
+#### 6.1 Realization Validity
 
-A generation directory (`gen-N/`) is considered **valid** if and only if:
+A profile realization directory (`gen-N/` for system, `root/` for named profiles) is considered **valid** if and only if:
 - `manifest.json` exists
 - `manifest.json` parses successfully
 - `schema_version` is supported
 
-**Incomplete Generations**: Any generation directory lacking a valid manifest **MUST** be treated as:
+**Incomplete Realizations**: Any realization directory lacking a valid manifest **MUST** be treated as:
 - Non-existent for all purposes
-- Ignored by activation, GC, listing, and rollback commands
+- Ignored by publishing, activation, GC, listing, and rollback commands
 
-**Failure Semantics**: If generation construction fails:
+**Failure Semantics**: If realization construction fails:
 - Partial directories MAY remain on disk
 - Tools MUST NOT attempt recovery
 - The absence of a valid manifest is the sole indicator of failure
 
 **Normative invariant**: The filesystem is the source of truth; the manifest is the authority. No additional state or marker files are permitted.
 
-#### 6.2 Trust Boundary for Generation Metadata
+#### 6.2 Trust Boundary for Profile Metadata
 
-Generation manifests are **unsigned** in v1. The system assumes:
-- `/mere/profiles/` is host-owned and trusted
+Profile manifests are **unsigned** in v1. The system assumes:
+- `/mere/profiles/system/` is host-owned and trusted for system activation
+- Named profile manifests are user-owned and authoritative only for that named profile
 - Local filesystem integrity is a prerequisite for correct operation
 
-**GC Implications**: GC correctness depends on generation manifests being truthful.
+**GC Implications**: GC correctness depends on system generation manifests and named profile manifests being truthful within their respective trust domains.
 
-**Normative invariant**: If `/mere/profiles/` is compromised, GC behavior is undefined and system integrity is already lost.
+**Normative invariant**: If `/mere/profiles/system/` is compromised, system integrity is already lost. If a named profile is compromised, that profile's realization and retention behavior are undefined, but this MUST NOT expand to privileged system activation decisions.
 
 ---
 
@@ -388,7 +389,7 @@ Generation manifests are **unsigned** in v1. The system assumes:
 For profile activation symlinks, the only allowed targets are **inside `/mere/store/`** (specifically: inside a store root like `/mere/store/<hash>-<name>-<version>/...`). Nothing in `/etc`, `/run`, `/tmp`, `/home`, etc. If it's not in the store, it's not a valid activation target.
 
 **b) Allowed symlink destinations**:
-Activation may create symlinks **only inside the profile directory being built**, e.g. `/mere/profiles/system-<N>/...` (or a staging dir). Never write outside that tree during build. The only exception: the **one control symlink** `/mere/profiles/system -> system-<N>` (via atomic rename) during switching.
+Activation may create symlinks **only inside the profile realization directory being built**, e.g. `/mere/profiles/system/gen-<N>/...` or `/mere/profiles/<name>/.root-new-<nonce>/...`. Never write outside that tree during build. The only exception is the control pointer used to publish the finished realization (`/mere/profiles/system/current` for the system profile, or the final `root/` exchange for a named profile).
 
 **c) Relative symlinks inside packages**:
 Yes, relative symlinks in store payloads are allowed **if they resolve safely**. Absolute symlinks are allowed only if they resolve within the same store root (rare; usually reject them as escape hatches).
@@ -425,7 +426,7 @@ Allowed and expected. Treated as normal store payload. Requirement: when resolve
    - Ensure each symlink's resolved target stays within that same root
    - Reject links that escape, loop, or exceed depth
 
-2. **Profile activation validator** (during generation build):
+2. **Profile realization validator** (during realization build):
    - Every symlink created in profile must:
      - Have destination path within the profile root
      - Target a path within `/mere/store/` (ideally within store roots listed in generation manifest)
@@ -478,11 +479,14 @@ Mere uses a single system-wide root at `/mere/` (or `${root}/mere/` for alternat
 │       ├── manifest.v1     # Package manifest (excluded from content hash)
 │       ├── manifest.v1.sig # Manifest signature (excluded from content hash)
 │       └── ...             # Package payload
-├── profiles/               # Generation-based profiles
+├── profiles/               # System generations + named profile roots
 │   ├── system/             # System profile (root-owned)
 │   │   ├── current -> gen-N
 │   │   └── gen-N/
 │   └── <user>/             # User profiles
+│       ├── root/           # Live realized tree for the named profile
+│       │   └── manifest.json
+│       └── requested.kdl
 ├── dev/                    # Local development state (mode 1777 subdirs)
 │   ├── repo/
 │   │   └── <name>/
@@ -517,8 +521,6 @@ Mere uses a single system-wide root at `/mere/` (or `${root}/mere/` for alternat
 │   │   │   ├── current -> /mere/profiles/system/current
 │   │   │   └── kept/
 │   │   │       └── gen-N -> /mere/profiles/system/gen-N
-│   │   └── <user>/
-│   │       └── ...
 │   └── pins/
 │       └── <pin-name> -> /mere/store/<hash>-<name>-<version>/
 └── keys/                   # System-wide public keys (optional)
@@ -905,7 +907,9 @@ When dependency resolution fails, implementations MUST provide diagnostics that 
 
 ### 12. GC Root Storage
 
-GC roots are **directory-namespaced symlinks under `/mere/gc-roots/`**.
+GC roots are a combination of:
+- **Directory-namespaced symlinks under `/mere/gc-roots/`** for the system profile and explicit pins
+- **Direct named-profile manifests** under `/mere/profiles/<name>/root/manifest.json`
 
 **Structure**:
 ```
@@ -916,67 +920,70 @@ GC roots are **directory-namespaced symlinks under `/mere/gc-roots/`**.
 │   │   └── kept/
 │   │       ├── gen-41 -> /mere/profiles/system/gen-41
 │   │       └── gen-42 -> /mere/profiles/system/gen-42
-│   └── dev/
-│       ├── current -> /mere/profiles/dev/current
-│       └── kept/
-│           ├── gen-7 -> /mere/profiles/dev/gen-7
-│           └── gen-8 -> /mere/profiles/dev/gen-8
 └── pins/
     ├── my-pin -> /mere/store/<hash>-foo-1.0/
     ├── my-pin.note
     └── ...
 ```
 
-**Note**: The system profile is treated as a regular profile. All profile roots (including system) live under `/mere/gc-roots/profiles/<profile-name>/`. There is no special directory for system vs named profiles.
+Named profiles are **not** mirrored into `/mere/gc-roots/`. Their live realized trees are rooted directly by the existence of `/mere/profiles/<name>/root/manifest.json`.
 
 **Pins**: Named symlinks under `gc-roots/pins/` pointing to store paths. Optionally accompanied by a `.note` file (plain text) explaining why the pin exists.
 
 **What creates/removes roots**:
-- **Generation switching**: Creates/maintains roots for active and kept generations
+- **System generation switching**: Creates/maintains roots for active and kept system generations
+- **Named profile install/uninstall**: Replaces the live `root/` realization in-place
 - **Admin commands**: `mere pin` / `mere unpin` create/remove explicit pins (requires root)
 - **GC**: Never mutates roots - only deletes store paths unreachable from any root
 
-**Generation retention policy** (per-profile):
+**System generation retention policy**:
 
 A generation is "kept" (has a GC root) if:
-1. It is the **active generation** (always rooted as `current`), OR
-2. It is among the **last K generations** for that profile (default K=2, configurable), OR
-3. It has an **explicit keep marker** (`/mere/profiles/<name>/gen-N/.keep` exists)
+1. It is the **active system generation** (always rooted as `current`), OR
+2. It is among the **last K system generations** (default K=2, configurable), OR
+3. It has an **explicit keep marker** (`/mere/profiles/system/gen-N/.keep` exists)
 
 **Keep marker files**:
-- `/mere/profiles/<name>/gen-N/.keep` - empty file or small text marking generation as explicitly kept
-- `/mere/profiles/<name>/gen-N/.keep.note` - optional human explanation (like pin notes)
+- `/mere/profiles/system/gen-N/.keep` - empty file or small text marking a system generation as explicitly kept
+- `/mere/profiles/system/gen-N/.keep.note` - optional human explanation (like pin notes)
 
-**Root management during activation**:
-1. Update `gc-roots/profiles/<profile-name>/current` to point to active generation
-2. For each generation satisfying "kept" criteria: ensure root exists under `gc-roots/profiles/<profile-name>/kept/`
-3. For generations NOT satisfying "kept" criteria: remove root from `kept/`
+**Root management during system activation**:
+1. Update `gc-roots/profiles/system/current` to point to the active generation
+2. For each kept system generation: ensure a root exists under `gc-roots/profiles/system/kept/`
+3. For system generations not satisfying kept criteria: remove the root from `kept/`
 
-**Important boundary**: Activation/switching updates GC roots only. It MUST NOT delete generation directories. Pruning old, unkept generations is performed only by `mere gc`.
+**Named profile liveness**:
+- A named profile is live if `/mere/profiles/<name>/root/manifest.json` exists and parses
+- No additional GC-root symlink is created for named profiles
+- Deleting the profile directory removes that root
 
-**Generation deletion** (`mere generation delete <N> [--profile <name>]`):
-- Removes the generation directory (`/mere/profiles/<name>/gen-N/`)
+**Generation deletion** (`mere generation delete <N>`):
+- Removes the generation directory (`/mere/profiles/system/gen-N/`)
 - Removes the corresponding root if it exists
 - Fails if trying to delete the active generation
 
 **Explicit keep/unkeep commands**:
-- `mere generation keep <N> [--profile <name>]` - creates `.keep` marker
-- `mere generation unkeep <N> [--profile <name>]` - removes `.keep` marker (generation may still be rooted by retention window)
+- `mere generation keep <N>` - creates `.keep` marker on a system generation
+- `mere generation unkeep <N>` - removes `.keep` marker (the generation may still be rooted by the retention window)
 
 **GC algorithm (MVP)**:
 
-GC is filesystem-driven and does not perform transitive dependency closure at GC time. A generation is already the realized closure of what's needed—all store paths referenced by the profile. GC keeps exactly what generations/pins reference.
+GC is filesystem-driven and does not perform transitive dependency closure at GC time. A system generation or named profile realization is already the realized closure of what's needed. GC keeps exactly what those realized manifests and explicit pins reference.
 
 Algorithm:
 1. **Collect reachable set**:
    - Walk all symlinks in `/mere/gc-roots/` recursively
-   - For generation roots (under `profiles/<profile-name>/`):
+   - For system generation roots (under `profiles/system/`):
      - Follow symlink to generation directory
      - Read generation manifest
      - Extract `store_path` from each package entry
      - Add each to reachable set
    - For pin roots (under `pins/`):
      - Add store path to reachable set directly
+   - For each named profile under `/mere/profiles/`:
+     - If `root/manifest.json` exists, read it
+     - Extract `store_path` from each package entry
+     - Add each to reachable set
 
 2. **Enumerate candidates**:
    - Scan `/mere/store/` directory
@@ -989,13 +996,12 @@ Algorithm:
      - Verify path is a directory (not symlink or file)
      - Delete recursively
 
-4. **Prune unkept generations**:
-   - For each profile under `/mere/profiles/`:
-     - Enumerate `gen-N/` directories
-     - Determine "kept" set using retention policy (current, last K, `.keep`)
-     - Delete any generation directory not in kept set
+4. **Prune unkept system generations**:
+   - Enumerate `gen-N/` directories under `/mere/profiles/system/`
+   - Determine the kept set using system retention policy (`current`, last K, `.keep`)
+   - Delete any system generation directory not in the kept set
 
-Generation pruning is therefore decoupled from activation: switches update the keep-set, and `mere gc` is the operation that reclaims unkept generations on disk.
+System generation pruning is therefore decoupled from activation: switches update the keep-set, and `mere gc` is the operation that reclaims unkept system generations on disk.
 
 **Safety measures**:
 - Refuse to run GC if `/mere/gc-roots/` has no roots
@@ -1004,7 +1010,7 @@ Generation pruning is therefore decoupled from activation: switches update the k
 - Take exclusive lock (same as switching) to prevent races with installs/activation
 
 **CLI**:
-- `mere gc` - run garbage collection (store objects + unkept generations)
+- `mere gc` - run garbage collection (store objects + unkept system generations)
 - `mere gc --dry-run` - show what would be deleted (paths + count) without deleting
 
 **Dry-run output**:
@@ -1309,18 +1315,18 @@ A **profile** is a named collection of realized package content presented as a `
 
 #### 15.1 Profile Model
 
-Profiles live under `/mere/profiles/<profile-name>/`. There are three kinds:
+Profiles live under `/mere/profiles/<profile-name>/`. There are two kinds:
 
 1. **System profile** (`system`) - managed by `mere install` + activation
 2. **Named user profiles** (e.g., `dev`, `go`, `audio`) - explicitly created and managed
 
-#### 15.2 Profile Generations
+#### 15.2 System Profile Generations
 
-All profiles, including `system`, use the same nested generational layout.
+The system profile uses the nested generational layout.
 
 **On-disk structure**:
 ```
-/mere/profiles/<name>/
+/mere/profiles/system/
 ├── current -> gen-42
 ├── gen-41/
 │   ├── bin/
@@ -1339,20 +1345,35 @@ All profiles, including `system`, use the same nested generational layout.
 **Rules**:
 - `current` is a symlink to the active generation
 - Generation directories are immutable once created
-- Generation numbering is per-profile, starting at 1
+- Generation numbering is system-only and starts at 1
 - Next generation = max existing `gen-N` + 1 (filesystem scan)
-
-**System profile**:
-```
-/mere/profiles/system/
-├── current -> gen-42
-├── gen-41/
-└── gen-42/
-```
 
 The `/usr` symlink points to `/mere/profiles/system/current`.
 
-#### 15.3 Requested Set (User Intent)
+#### 15.3 Named Profile Realized State
+
+Named profiles are **not generational**. Each named profile has at most one live realized tree.
+
+**On-disk structure**:
+```
+/mere/profiles/<name>/
+├── root/
+│   ├── manifest.json
+│   ├── bin/
+│   ├── lib/
+│   ├── share/
+│   └── ...
+├── requested.kdl
+└── config.kdl        (optional, profile-local config)
+```
+
+**Rules**:
+- `root/` is the live realized tree for that named profile
+- `root/` may be absent for a newly created empty profile
+- Named profiles do **not** have `current`, `gen-N`, retention windows, or rollback semantics
+- Updating a named profile replaces `root/` atomically as a unit
+
+#### 15.4 Requested Set (User Intent)
 
 Each profile may have a **requested set** describing user intent.
 
@@ -1373,15 +1394,15 @@ package "zig" version="0.12"
 **Install/uninstall semantics**:
 - `mere install <pkg...>` is **additive**: each package is added to the requested set (deduplicated by name).
 - `mere uninstall <pkg...>` removes package names from the requested set.
-- Realized generations are built from the **entire** requested set after each update, not only the command's explicit package list.
+- The realized system generation or named profile root is built from the **entire** requested set after each update, not only the command's explicit package list.
 
-#### 15.4 Realized Manifests
+#### 15.5 Realized Manifests
 
-Every realized generation directory contains a `manifest.json` using the same schema as spec #6. No separate "profile manifest" schema exists.
+Every realized system generation directory and every named profile `root/` contains a `manifest.json` using the same schema as spec #6. No separate "profile manifest" schema exists.
 
-#### 15.5 GC Roots Layout
+#### 15.6 GC Roots Layout
 
-GC roots are directory-namespaced to prevent collisions.
+GC roots are directory-namespaced to prevent collisions for system generations and pins. Named profiles are rooted directly by their live `root/` realization.
 
 **Structure**:
 ```
@@ -1392,17 +1413,14 @@ GC roots are directory-namespaced to prevent collisions.
 │   │   └── kept/
 │   │       ├── gen-41 -> /mere/profiles/system/gen-41
 │   │       └── gen-42 -> /mere/profiles/system/gen-42
-│   └── dev/
-│       ├── current -> /mere/profiles/dev/current
-│       └── kept/
-│           ├── gen-7 -> /mere/profiles/dev/gen-7
-│           └── gen-8 -> /mere/profiles/dev/gen-8
 └── pins/
     ├── keep-vim -> /mere/store/<hash>-vim-9.0
     └── keep-vim.note  (optional explanation)
 ```
 
-**Note**: The system profile is treated as a regular profile under `gc-roots/profiles/system/`. There is no special-casing for system vs named profiles.
+**Direct named profile roots**:
+- `/mere/profiles/<name>/root/manifest.json` is itself a live GC root
+- There is no `/mere/gc-roots/profiles/<name>/` subtree for named profiles
 
 **Root types**:
 
@@ -1410,47 +1428,46 @@ GC roots are directory-namespaced to prevent collisions.
 | ------------------------------------- | ------------------------------------------------- |
 | `gc-roots/profiles/system/current`    | Active system generation                          |
 | `gc-roots/profiles/system/kept/gen-N` | Retained system generations                       |
-| `gc-roots/profiles/<name>/current`    | Active generation for named profile               |
-| `gc-roots/profiles/<name>/kept/gen-N` | Retained generations for named profile            |
+| `/mere/profiles/<name>/root/manifest.json` | Live named-profile realization (direct root) |
 | `gc-roots/pins/<pin-name>`            | Admin pins (store path references, requires root) |
 
-#### 15.6 Retention Policy
+#### 15.7 System Retention Policy
 
-Retention is **per-profile**, not global.
+Retention applies to the **system profile generation history**.
 
-**Rules** (for each profile independently):
+**Rules**:
 - Always keep `current`
-- Keep last **K** generations (default K=2, configurable per-profile)
+- Keep last **K** system generations (default K=2, configurable)
 - Keep any generation with a `.keep` marker file inside
 
 **Keep markers**:
 ```
-/mere/profiles/<name>/gen-N/.keep
-/mere/profiles/<name>/gen-N/.keep.note  (optional explanation)
+/mere/profiles/system/gen-N/.keep
+/mere/profiles/system/gen-N/.keep.note  (optional explanation)
 ```
 
 **GC behavior**:
 - Walks all roots under `/mere/gc-roots/`
+- Walks all named profile roots under `/mere/profiles/<name>/root/`
 - Collects reachable store paths from manifests and pins
 - Deletes unreachable store paths
-- Prunes generation directories not in the kept set (current, last K, `.keep`)
+- Prunes system generation directories not in the kept set (`current`, last K, `.keep`)
 - Never mutates roots
 
-#### 15.7 Profile Lifecycle Commands
+#### 15.8 Profile Lifecycle Commands
 
-**`mere profile list`**: Lists all profiles with current generation and status (kind, generation number, kept count).
+**`mere profile list`**: Lists all profiles. The system profile reports current generation state; named profiles report whether a live `root/` exists.
 
 **`mere profile create <name> [--from <base>]`**:
-- Without `--from`: Creates empty profile (directory + empty `requested.kdl`, no generations)
-- With `--from <base>`: Clones base's current generation as `gen-1`, sets `current -> gen-1`
-- Errors: profile exists, base doesn't exist, base has no current, name is `system`
+- Without `--from`: Creates empty profile (directory + empty `requested.kdl`, no `root/`)
+- With `--from <base>`: Clones the base profile's active realized state into `<name>/root/`
+- Errors: profile exists, base doesn't exist, base has no realized state, name is `system`
 
 **`mere profile delete <name>`**:
 - Removes `/mere/profiles/<name>/` recursively
-- Removes `/mere/gc-roots/profiles/<name>/` recursively
 - Errors: doesn't exist, name is `system`
 
-#### 15.8 `mere install` Integration
+#### 15.9 `mere install` Integration
 
 **Default behavior** (`mere install <pkg...>`):
 - Targets system profile
@@ -1462,31 +1479,32 @@ Retention is **per-profile**, not global.
 
 **Profile-targeted install** (`mere install --profile <name> <pkg...>`):
 - Targets `/mere/profiles/<name>/`
-- Creates new generation, updates that profile's `current`
-- Updates `/mere/gc-roots/profiles/<name>/current`
+- Realizes a new named-profile tree and atomically replaces `/mere/profiles/<name>/root/`
 - Does NOT affect system or host `/usr`
 - Adds package name(s) to `/mere/profiles/<name>/requested.kdl` (deduplicated)
-- Resolves from the full requested set and realizes that closure in the new generation
+- Resolves from the full requested set and realizes that closure in the new `root/`
 
 **Auto-create**: If target profile doesn't exist, auto-creates it (empty, like `mere profile create <name>`).
 
 **`mere uninstall` integration** (`mere uninstall [--profile <name>] <pkg...>`):
 - Removes package name(s) from target profile's `requested.kdl`
-- Creates and activates a new generation for that profile from the remaining requested set
-- If the requested set becomes empty, realizes an empty generation for that profile
-- Updates profile GC roots in the same way as install
+- For the system profile: creates and activates a new generation from the remaining requested set
+- For a named profile: atomically replaces `root/` with the remaining realized closure
+- If the requested set becomes empty, realizes an empty system generation or an empty named `root/`
 
-#### 15.9 Generation Management Commands
+#### 15.10 Generation Management Commands
 
-**`mere generation list [--profile <name>]`**: Lists generations (default: system). Shows number, timestamp, kept status, active status.
+Generation commands apply to the **system profile only**.
 
-**`mere generation keep <N> [--profile <name>]`**: Creates `.keep` marker and GC root under `kept/`.
+**`mere generation list`**: Lists system generations. Shows number, timestamp, kept status, active status.
 
-**`mere generation unkeep <N> [--profile <name>]`**: Removes `.keep` marker and GC root from `kept/`.
+**`mere generation keep <N>`**: Creates `.keep` marker and GC root under `kept/`.
 
-**`mere generation delete <N> [--profile <name>]`**: Removes generation directory and GC root. Error if generation is `current`.
+**`mere generation unkeep <N>`**: Removes `.keep` marker and GC root from `kept/`.
 
-#### 15.10 Atomic Switching
+**`mere generation delete <N>`**: Removes the system generation directory and GC root. Error if generation is `current`.
+
+#### 15.11 Atomic Publishing
 
 System activation uses atomic symlink replacement:
 
@@ -1499,7 +1517,15 @@ This switching step does not prune old generation directories. It only updates t
 
 The `/usr` symlink always points to `/mere/profiles/system/current` and never changes after bootstrap.
 
-**Activation / rollback** (`mere generation activate <N> [--profile <name>]`): Same atomic procedure, different target. For the system profile, activation also applies system-specific host integration such as `/etc` template processing. For named profiles, activation switches only that profile's `current` generation and updates its GC roots.
+**System activation / rollback** (`mere generation activate <N>`): Same atomic procedure, different target. System activation also applies system-specific host integration such as `/etc` template processing.
+
+**Named profile publishing**:
+1. Build a staged realization directory at `/mere/profiles/<name>/.root-new-<nonce>/`
+2. Validate the staged `manifest.json`
+3. Publish it atomically as `/mere/profiles/<name>/root/`
+4. Remove the previously live tree after the publish succeeds
+
+Named profiles do not retain historical realized trees and do not support rollback by generation number.
 
 ---
 
@@ -1744,7 +1770,7 @@ Clock skew between builders does not invalidate signatures but may affect instal
 
 ### 19. Profile Build Algorithm
 
-A profile is a **symlink tree projection** of store contents. Generation directories contain symlinks into `/mere/store/`, not copied files.
+A profile realization is a **symlink tree projection** of store contents. System generation directories and named profile `root/` directories contain symlinks into `/mere/store/`, not copied files.
 
 **Structure** (note: content under `usr/` subtree, metadata outside):
 ```
@@ -1823,20 +1849,20 @@ Optional: `/bin`, `/sbin`, `/lib` may exist as compatibility symlinks:
 - `/usr/local` MUST be a real directory reserved for admin use
 - Packages can use any path structure: `bin/`, `sbin/`, `lib/`, `usr/bin/`, etc.
 - No path canonicalization is performed during profile realization
-- Profile generations contain whatever directory structure the packages provide
+- Profile realizations contain whatever directory structure the packages provide
 
 **What this means for packages**:
-- Packages shipping `bin/foo` will have `bin/foo` in the generation
-- Packages shipping `usr/bin/foo` will have `usr/bin/foo` in the generation
+- Packages shipping `bin/foo` will have `bin/foo` in the realization
+- Packages shipping `usr/bin/foo` will have `usr/bin/foo` in the realization
 - Both are valid and will be accessible via the external scaffolding symlinks
 - Packages MUST NOT ship any content under `usr/local/` - such packages MUST be rejected
 
 #### 19.2 /etc Path Handling
 
-Package-provided configuration MUST NOT be projected directly into the profile generation.
+Package-provided configuration MUST NOT be projected directly into the profile realization.
 
 **Rules**:
-- `etc/*` paths encountered in payloads during profile realization MUST be **ignored** (not symlinked into generation)
+- `etc/*` paths encountered in payloads during profile realization MUST be **ignored** (not symlinked into the realization)
 - Configuration defaults are supplied under `${store_root}/etc-defaults/**` and applied at activation time using the drift-reporting rules in spec #13
 - This maintains the separation between immutable package content and host-owned `/etc`
 
@@ -1847,20 +1873,20 @@ Package-provided configuration MUST NOT be projected directly into the profile g
 - Symlinks in store are re-created as symlinks in profile (pointing to store location)
 - Directories are created (not symlinked) to allow merging from multiple packages
 
-**Validation** (after build, before activation):
-- Run profile activation validator (spec #7) on all created symlinks
+**Validation** (after build, before publish or activation):
+- Run profile realization validator (spec #7) on all created symlinks
 - Verify manifest.json is valid and matches built content
 - Ensure no symlinks escape boundaries
 
 ---
 
-### 20. Generation Numbering
+### 20. System Generation Numbering
 
-**Rule**: Next generation number = 1 + max existing `gen-N` directory under the profile directory.
+**Rule**: Next system generation number = 1 + max existing `gen-N` directory under `/mere/profiles/system/`.
 
 **Algorithm**:
 ```
-scan /mere/profiles/<profile-name>/ for directories matching "gen-<N>" pattern
+scan /mere/profiles/system/ for directories matching "gen-<N>" pattern
 extract N from each match
 next_generation = max(all N values) + 1
 if no matches exist: next_generation = 1
@@ -1871,10 +1897,10 @@ if no matches exist: next_generation = 1
 - Survives manual deletion of generations
 - Deterministic and inspectable
 - Gaps in sequence are allowed (e.g., after GC deletes old generations)
-- Per-profile numbering (system and named profiles each have independent sequences)
+- Numbering exists only for the system profile
 
 **Edge cases**:
-- Empty profile (no generations): first generation is `gen-1`
+- Empty system profile (no generations): first generation is `gen-1`
 - Only non-matching directories: first generation is `gen-1`
 - Concurrent builds: use atomic directory creation with unique staging name, then rename
 

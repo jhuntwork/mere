@@ -5,6 +5,7 @@ const command = @import("../command.zig");
 const MereError = mere.errors.MereError;
 const namespace = mere.namespace;
 const emit = mere.ui.emit;
+const profile = mere.profile;
 
 const shell_meta = command.CommandMeta{
     .name = "shell",
@@ -179,7 +180,11 @@ fn resolveProfileRoot(allocator: std.mem.Allocator, root_path: []const u8, profi
     const profile_dir = try std.fs.path.join(allocator, &.{ profiles_base, profile_name });
     defer allocator.free(profile_dir);
 
-    return try std.fs.path.join(allocator, &.{ profile_dir, "current" });
+    if (std.mem.eql(u8, profile_name, "system")) {
+        return try std.fs.path.join(allocator, &.{ profile_dir, "current" });
+    }
+
+    return try profile.getRootPath(allocator, profile_dir);
 }
 
 pub fn createCommand(allocator: std.mem.Allocator) !*command.Command {

@@ -144,6 +144,8 @@ fn collectGarbageAtPathsWithPackagePool(
         reachable.deinit();
     }
 
+    try collectNamedProfileReachable(ctx, profiles_dir, &reachable);
+
     // Safety check: refuse to run if no roots exist
     if (reachable.count() == 0) {
         return ctx.fail(GCError.NoRoots, gc_roots_dir, "no GC roots found");
@@ -430,6 +432,59 @@ fn pruneGenerations(
     result: *GCResult,
 ) GCError!void {
     const allocator = ctx.allocator;
+    const system_profile_dir = std.fs.path.join(allocator, &.{ profiles_dir, "system" }) catch {
+        return ctx.fail(GCError.OutOfMemory, profiles_dir, "out of memory building system profile path");
+    };
+    defer allocator.free(system_profile_dir);
+
+    const all_gens = generation.listGenerations(allocator, system_profile_dir) catch |err| switch (err) {
+        generation.GenerationError.ProfilesNotFound => return,
+        generation.GenerationError.OutOfMemory => return ctx.fail(GCError.OutOfMemory, system_profile_dir, "out of memory listing generations"),
+        generation.GenerationError.PermissionDenied => return ctx.fail(GCError.PermissionDenied, system_profile_dir, "permission denied listing generations"),
+        else => return ctx.fail(GCError.FileSystem, system_profile_dir, "failed to list generations"),
+    };
+    defer allocator.free(all_gens);
+
+    if (all_gens.len == 0) return;
+
+    const kept_gens = gcroots.getKeptGenerations(allocator, system_profile_dir, retention_count) catch |err| switch (err) {
+        gcroots.GCRootsError.OutOfMemory => return ctx.fail(GCError.OutOfMemory, system_profile_dir, "out of memory determining kept generations"),
+        gcroots.GCRootsError.PermissionDenied => return ctx.fail(GCError.PermissionDenied, system_profile_dir, "permission denied reading keep markers"),
+        else => return ctx.fail(GCError.FileSystem, system_profile_dir, "failed to determine kept generations"),
+    };
+    defer allocator.free(kept_gens);
+
+    const current_gen = try readCurrentGeneration(ctx, system_profile_dir);
+
+    for (all_gens) |gen| {
+        if (isKeptGeneration(gen, current_gen, kept_gens)) continue;
+
+        const gen_path = generation.getGenerationPath(allocator, system_profile_dir, gen) catch {
+            return ctx.fail(GCError.OutOfMemory, system_profile_dir, "out of memory building generation path");
+        };
+        defer allocator.free(gen_path);
+
+        result.addDeleted(gen_path) catch {
+            return ctx.fail(GCError.OutOfMemory, gen_path, "out of memory recording deleted path");
+        };
+
+        if (!options.dry_run) {
+            std.fs.deleteTreeAbsolute(gen_path) catch |err| {
+                return switch (err) {
+                    error.AccessDenied => ctx.fail(GCError.PermissionDenied, gen_path, "permission denied deleting generation"),
+                    else => ctx.fail(GCError.FileSystem, gen_path, "failed to delete generation"),
+                };
+            };
+        }
+    }
+}
+
+fn collectNamedProfileReachable(
+    ctx: *mere.Context,
+    profiles_dir: []const u8,
+    reachable: *std.StringHashMap(void),
+) GCError!void {
+    const allocator = ctx.allocator;
     var profiles_handle = std.fs.openDirAbsolute(profiles_dir, .{ .iterate = true }) catch |err| {
         return switch (err) {
             error.FileNotFound => return, // No profiles directory = nothing to prune
@@ -448,51 +503,25 @@ fn pruneGenerations(
         const e = entry.?;
 
         if (e.kind != .directory) continue;
+        if (std.mem.eql(u8, e.name, "system")) continue;
 
         const profile_dir = std.fs.path.join(allocator, &.{ profiles_dir, e.name }) catch {
             return ctx.fail(GCError.OutOfMemory, profiles_dir, "out of memory building profile path");
         };
         defer allocator.free(profile_dir);
 
-        const all_gens = generation.listGenerations(allocator, profile_dir) catch |err| switch (err) {
-            generation.GenerationError.OutOfMemory => return ctx.fail(GCError.OutOfMemory, profile_dir, "out of memory listing generations"),
-            generation.GenerationError.PermissionDenied => return ctx.fail(GCError.PermissionDenied, profile_dir, "permission denied listing generations"),
-            else => return ctx.fail(GCError.FileSystem, profile_dir, "failed to list generations"),
+        const root_dir = std.fs.path.join(allocator, &.{ profile_dir, "root" }) catch {
+            return ctx.fail(GCError.OutOfMemory, profile_dir, "out of memory building profile root path");
         };
-        defer allocator.free(all_gens);
+        defer allocator.free(root_dir);
 
-        if (all_gens.len == 0) continue;
-
-        const kept_gens = gcroots.getKeptGenerations(allocator, profile_dir, retention_count) catch |err| switch (err) {
-            gcroots.GCRootsError.OutOfMemory => return ctx.fail(GCError.OutOfMemory, profile_dir, "out of memory determining kept generations"),
-            gcroots.GCRootsError.PermissionDenied => return ctx.fail(GCError.PermissionDenied, profile_dir, "permission denied reading keep markers"),
-            else => return ctx.fail(GCError.FileSystem, profile_dir, "failed to determine kept generations"),
+        std.fs.accessAbsolute(root_dir, .{}) catch |err| switch (err) {
+            error.FileNotFound => continue,
+            error.AccessDenied => return ctx.fail(GCError.PermissionDenied, root_dir, "permission denied accessing profile root"),
+            else => return ctx.fail(GCError.FileSystem, root_dir, "failed to access profile root"),
         };
-        defer allocator.free(kept_gens);
 
-        const current_gen = try readCurrentGeneration(ctx, profile_dir);
-
-        for (all_gens) |gen| {
-            if (isKeptGeneration(gen, current_gen, kept_gens)) continue;
-
-            const gen_path = generation.getGenerationPath(allocator, profile_dir, gen) catch {
-                return ctx.fail(GCError.OutOfMemory, profile_dir, "out of memory building generation path");
-            };
-            defer allocator.free(gen_path);
-
-            result.addDeleted(gen_path) catch {
-                return ctx.fail(GCError.OutOfMemory, gen_path, "out of memory recording deleted path");
-            };
-
-            if (!options.dry_run) {
-                std.fs.deleteTreeAbsolute(gen_path) catch |err| {
-                    return switch (err) {
-                        error.AccessDenied => ctx.fail(GCError.PermissionDenied, gen_path, "permission denied deleting generation"),
-                        else => ctx.fail(GCError.FileSystem, gen_path, "failed to delete generation"),
-                    };
-                };
-            }
-        }
+        try collectFromRoot(ctx, root_dir, reachable);
     }
 }
 

@@ -13,7 +13,6 @@ const generation_mod = @import("mere").generation;
 fn emitGenerationActivationStatus(
     ctx: *mere.Context,
     gen_num: u32,
-    profile_name: ?[]const u8,
     etc_copied: ?usize,
     etc_unchanged: ?usize,
     etc_differing: ?usize,
@@ -45,20 +44,6 @@ fn emitGenerationActivationStatus(
         return;
     }
 
-    if (profile_name) |profile| {
-        const segments = [_]mere.ui.Segment{
-            .{ .text = "generation ", .kind = .normal },
-            .{ .text = "activated", .kind = .success },
-            .{ .text = ": ", .kind = .normal },
-            .{ .text = gen_text, .kind = .detail },
-            .{ .text = " for profile '", .kind = .normal },
-            .{ .text = profile, .kind = .detail },
-            .{ .text = "'", .kind = .normal },
-        };
-        emit.logSegmentsSeverity(ctx, .generation, .info, &segments);
-        return;
-    }
-
     const segments = [_]mere.ui.Segment{
         .{ .text = "generation ", .kind = .normal },
         .{ .text = "activated", .kind = .success },
@@ -74,19 +59,10 @@ const generation_meta = command.CommandMeta{
     .description = "Manage generations",
 };
 
-/// Common --profile flag for all generation subcommands
-const profile_flag = types.Flag{
-    .name = "profile",
-    .short = 'p',
-    .description = "Profile name (default: system)",
-    .flag_type = .string,
-};
-
 /// List subcommand metadata
 const list_meta = command.CommandMeta{
     .name = "list",
     .description = "List all generations",
-    .flags = &[_]types.Flag{profile_flag},
 };
 
 /// Keep subcommand metadata
@@ -100,14 +76,11 @@ const keep_meta = command.CommandMeta{
             .required = true,
         },
     },
-    .flags = &[_]types.Flag{
-        profile_flag,
-        .{
-            .name = "note",
-            .description = "Human-readable note explaining why this generation is kept",
-            .flag_type = .string,
-        },
-    },
+    .flags = &[_]types.Flag{.{
+        .name = "note",
+        .description = "Human-readable note explaining why this generation is kept",
+        .flag_type = .string,
+    }},
 };
 
 /// Unkeep subcommand metadata
@@ -121,7 +94,6 @@ const unkeep_meta = command.CommandMeta{
             .required = true,
         },
     },
-    .flags = &[_]types.Flag{profile_flag},
 };
 
 /// Delete subcommand metadata
@@ -135,7 +107,6 @@ const delete_meta = command.CommandMeta{
             .required = true,
         },
     },
-    .flags = &[_]types.Flag{profile_flag},
 };
 
 /// Activate subcommand metadata
@@ -150,7 +121,6 @@ const activate_meta = command.CommandMeta{
         },
     },
     .flags = &[_]types.Flag{
-        profile_flag,
         .{
             .name = "verify-store",
             .description = "Verify store content hashes during activation (slow)",
@@ -166,16 +136,11 @@ fn handleGeneration(ctx: *mere.Context, args: *const types.ParsedArgs) MereError
     return types.CommandResult{ .success = true };
 }
 
-/// Get profile name from args, defaulting to "system"
-fn getProfileName(args: *const types.ParsedArgs) []const u8 {
-    return args.getString("profile") orelse "system";
-}
-
 /// List generations handler
 pub fn handleList(ctx: *mere.Context, args: *const types.ParsedArgs) MereError!types.CommandResult {
-    const profile_name = getProfileName(args);
+    _ = args;
 
-    const profile_dir = std.fs.path.join(ctx.allocator, &.{ ctx.root_path, "mere", "profiles", profile_name }) catch {
+    const profile_dir = std.fs.path.join(ctx.allocator, &.{ ctx.root_path, "mere", "profiles", "system" }) catch {
         return MereError.OutOfMemory;
     };
     defer ctx.allocator.free(profile_dir);
@@ -210,7 +175,7 @@ pub fn handleList(ctx: *mere.Context, args: *const types.ParsedArgs) MereError!t
     }
 
     // Get rooted generations from the profile-specific gc roots directory
-    const profile_gc_dir = std.fs.path.join(ctx.allocator, &.{ gc_roots_dir, "profiles", profile_name }) catch {
+    const profile_gc_dir = std.fs.path.join(ctx.allocator, &.{ gc_roots_dir, "profiles", "system" }) catch {
         return MereError.OutOfMemory;
     };
     defer ctx.allocator.free(profile_gc_dir);
@@ -223,7 +188,7 @@ pub fn handleList(ctx: *mere.Context, args: *const types.ParsedArgs) MereError!t
     defer output.deinit(ctx.allocator);
 
     const writer = output.writer(ctx.allocator);
-    try writer.print("Generations for profile '{s}':\n", .{profile_name});
+    try writer.writeAll("Generations for profile 'system':\n");
 
     for (all_gens) |gen| {
         const is_current = current != null and current.? == gen;
@@ -284,9 +249,8 @@ pub fn handleKeep(ctx: *mere.Context, args: *const types.ParsedArgs) MereError!t
     };
 
     const note = args.getString("note");
-    const profile_name = getProfileName(args);
 
-    const profile_dir = std.fs.path.join(ctx.allocator, &.{ ctx.root_path, "mere", "profiles", profile_name }) catch {
+    const profile_dir = std.fs.path.join(ctx.allocator, &.{ ctx.root_path, "mere", "profiles", "system" }) catch {
         return MereError.OutOfMemory;
     };
     defer ctx.allocator.free(profile_dir);
@@ -330,9 +294,7 @@ pub fn handleUnkeep(ctx: *mere.Context, args: *const types.ParsedArgs) MereError
         };
     };
 
-    const profile_name = getProfileName(args);
-
-    const profile_dir = std.fs.path.join(ctx.allocator, &.{ ctx.root_path, "mere", "profiles", profile_name }) catch {
+    const profile_dir = std.fs.path.join(ctx.allocator, &.{ ctx.root_path, "mere", "profiles", "system" }) catch {
         return MereError.OutOfMemory;
     };
     defer ctx.allocator.free(profile_dir);
@@ -375,9 +337,7 @@ pub fn handleDelete(ctx: *mere.Context, args: *const types.ParsedArgs) MereError
         };
     };
 
-    const profile_name = getProfileName(args);
-
-    const profile_dir = std.fs.path.join(ctx.allocator, &.{ ctx.root_path, "mere", "profiles", profile_name }) catch {
+    const profile_dir = std.fs.path.join(ctx.allocator, &.{ ctx.root_path, "mere", "profiles", "system" }) catch {
         return MereError.OutOfMemory;
     };
     defer ctx.allocator.free(profile_dir);
@@ -427,10 +387,9 @@ pub fn handleActivate(ctx: *mere.Context, args: *const types.ParsedArgs) MereErr
         };
     };
 
-    const profile_name = getProfileName(args);
     const verify_store = args.getBool("verify-store");
 
-    const profile_dir = std.fs.path.join(ctx.allocator, &.{ ctx.root_path, "mere", "profiles", profile_name }) catch {
+    const profile_dir = std.fs.path.join(ctx.allocator, &.{ ctx.root_path, "mere", "profiles", "system" }) catch {
         return MereError.OutOfMemory;
     };
     defer ctx.allocator.free(profile_dir);
@@ -454,31 +413,8 @@ pub fn handleActivate(ctx: *mere.Context, args: *const types.ParsedArgs) MereErr
         };
     };
 
-    if (std.mem.eql(u8, profile_name, "system")) {
-        const result = activation.activateSystemGeneration(
-            ctx,
-            gen_num,
-            if (verify_store) .full_store else .fast,
-        ) catch |err| {
-            const msg = switch (err) {
-                activation.ActivationError.GenerationNotFound => "generation not found",
-                activation.ActivationError.FileSystem => "file system error",
-                else => "failed to activate generation",
-            };
-            return types.CommandResult{
-                .success = false,
-                .exit_code = 1,
-                .message = try ctx.allocator.dupe(u8, msg),
-            };
-        };
-
-        emitGenerationActivationStatus(ctx, gen_num, null, result.etc_copied, result.etc_skipped, result.etc_differing);
-        return types.CommandResult{ .success = true };
-    }
-
-    _ = activation.switchProfileGeneration(
+    const result = activation.activateSystemGeneration(
         ctx,
-        profile_name,
         gen_num,
         if (verify_store) .full_store else .fast,
     ) catch |err| {
@@ -494,7 +430,7 @@ pub fn handleActivate(ctx: *mere.Context, args: *const types.ParsedArgs) MereErr
         };
     };
 
-    emitGenerationActivationStatus(ctx, gen_num, profile_name, null, null, null);
+    emitGenerationActivationStatus(ctx, gen_num, result.etc_copied, result.etc_skipped, result.etc_differing);
     return types.CommandResult{ .success = true };
 }
 

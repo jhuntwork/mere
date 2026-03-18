@@ -124,7 +124,7 @@ pub fn handleVerify(ctx: *mere.Context, args: *const types.ParsedArgs) MereError
         emitVerifySummaryRow(ctx, "store", result.store_checked, "", result.store_issues);
     }
     if (opts.verify_profiles) {
-        emitVerifySummaryRow(ctx, "profiles", result.profile_generations_checked, " generations", result.profile_issues);
+        emitVerifySummaryRow(ctx, "profiles", result.profile_realizations_checked, " realizations", result.profile_issues);
     }
     if (opts.verify_gc_roots) {
         emitVerifySummaryRow(ctx, "gc-roots", result.gc_roots_checked, "", result.gc_roots_issues);

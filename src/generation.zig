@@ -181,7 +181,7 @@ pub const RealizationData = struct {
 
 pub const GenerationManifest = struct {
     schema_version: u32,
-    generation: u32,
+    generation: ?u32,
     created_at: u64, // Unix epoch seconds
     packages: std.ArrayList(PackageEntry),
 
@@ -197,6 +197,20 @@ pub const GenerationManifest = struct {
         return GenerationManifest{
             .schema_version = MANIFEST_SCHEMA_VERSION,
             .generation = generation_num,
+            .created_at = @intCast(std.time.timestamp()),
+            .packages = .{},
+            .parent_generation = null,
+            .notes = null,
+            .selected_profile = null,
+            .tool_version = null,
+            .allocator = allocator,
+        };
+    }
+
+    pub fn initRoot(allocator: std.mem.Allocator) GenerationManifest {
+        return GenerationManifest{
+            .schema_version = MANIFEST_SCHEMA_VERSION,
+            .generation = null,
             .created_at = @intCast(std.time.timestamp()),
             .packages = .{},
             .parent_generation = null,
@@ -249,9 +263,11 @@ pub const GenerationManifest = struct {
         defer allocator.free(schema_line);
         buffer.appendSlice(allocator, schema_line) catch return GenerationError.OutOfMemory;
 
-        const gen_line = std.fmt.allocPrint(allocator, "  \"generation\": {d},\n", .{self.generation}) catch return GenerationError.OutOfMemory;
-        defer allocator.free(gen_line);
-        buffer.appendSlice(allocator, gen_line) catch return GenerationError.OutOfMemory;
+        if (self.generation) |generation_num| {
+            const gen_line = std.fmt.allocPrint(allocator, "  \"generation\": {d},\n", .{generation_num}) catch return GenerationError.OutOfMemory;
+            defer allocator.free(gen_line);
+            buffer.appendSlice(allocator, gen_line) catch return GenerationError.OutOfMemory;
+        }
 
         const created_line = std.fmt.allocPrint(allocator, "  \"created_at\": {d},\n", .{self.created_at}) catch return GenerationError.OutOfMemory;
         defer allocator.free(created_line);
@@ -350,12 +366,12 @@ pub const GenerationManifest = struct {
         }
 
         const generation = blk: {
-            const v = obj.get("generation") orelse return GenerationError.InvalidManifest;
+            const v = obj.get("generation") orelse break :blk null;
             if (v != .integer) return GenerationError.InvalidManifest;
             if (v.integer < 0 or v.integer > std.math.maxInt(u32)) {
                 return GenerationError.InvalidManifest;
             }
-            break :blk @as(u32, @intCast(v.integer));
+            break :blk @as(?u32, @intCast(v.integer));
         };
 
         const created_at = blk: {
@@ -975,7 +991,6 @@ pub fn writeRealization(
 
 // Tests
 
-// Spec #6: Generation manifest encode/decode round-trip
 test "GenerationManifest encode and parse roundtrip" {
     const allocator = std.testing.allocator;
 
@@ -1011,7 +1026,7 @@ test "GenerationManifest encode and parse roundtrip" {
     defer parsed.deinit();
 
     try std.testing.expectEqual(@as(u32, 1), parsed.schema_version);
-    try std.testing.expectEqual(@as(u32, 42), parsed.generation);
+    try std.testing.expectEqual(@as(?u32, 42), parsed.generation);
     try std.testing.expectEqual(@as(?u32, 41), parsed.parent_generation);
     try std.testing.expectEqualStrings("test generation", parsed.notes.?);
     try std.testing.expectEqualStrings("test-version", parsed.tool_version.?);
@@ -1045,7 +1060,6 @@ test "RealizationData encode and decode roundtrip" {
     try std.testing.expectEqual(@as(u32, 1), decoded.entries.items[1].owner_package_index);
 }
 
-// Spec #6: Wrong schema_version rejected
 test "GenerationManifest parse rejects wrong schema version" {
     const allocator = std.testing.allocator;
 
@@ -1062,29 +1076,33 @@ test "GenerationManifest parse rejects wrong schema version" {
     try std.testing.expectError(GenerationError.InvalidManifest, result);
 }
 
-// Spec #6: Generation manifest required fields
-test "GenerationManifest parse rejects missing required fields" {
+test "GenerationManifest parse accepts named profile root manifest without generation" {
     const allocator = std.testing.allocator;
 
-    // Missing generation
-    const json1 =
+    const json =
         \\{
         \\  "schema_version": 1,
         \\  "created_at": 1234567890,
         \\  "packages": []
         \\}
     ;
-    try std.testing.expectError(GenerationError.InvalidManifest, GenerationManifest.parse(allocator, json1));
+    var parsed = try GenerationManifest.parse(allocator, json);
+    defer parsed.deinit();
+    try std.testing.expectEqual(@as(?u32, null), parsed.generation);
+}
+
+test "GenerationManifest parse rejects missing required fields" {
+    const allocator = std.testing.allocator;
 
     // Missing packages
-    const json2 =
+    const json =
         \\{
         \\  "schema_version": 1,
         \\  "generation": 1,
         \\  "created_at": 1234567890
         \\}
     ;
-    try std.testing.expectError(GenerationError.InvalidManifest, GenerationManifest.parse(allocator, json2));
+    try std.testing.expectError(GenerationError.InvalidManifest, GenerationManifest.parse(allocator, json));
 }
 
 test "GenerationManifest parse rejects negative integers" {
@@ -1103,7 +1121,6 @@ test "GenerationManifest parse rejects negative integers" {
     try std.testing.expectError(GenerationError.InvalidManifest, result);
 }
 
-// Spec #20: Generation numbering - next gen = max(existing gen-N) + 1
 test "getNextGenerationNumber with existing generations" {
     const th = @import("test_helpers.zig");
     var test_env = try th.createTestEnv();
@@ -1141,7 +1158,6 @@ test "getNextGenerationNumber with existing generations" {
     try std.testing.expectEqual(@as(u32, 6), next);
 }
 
-// Spec #20: Empty profile (no generations) → first generation is gen-1
 test "getNextGenerationNumber with no generations" {
     const th = @import("test_helpers.zig");
     var test_env = try th.createTestEnv();
@@ -1161,7 +1177,6 @@ test "getNextGenerationNumber with no generations" {
     try std.testing.expectEqual(@as(u32, 1), next);
 }
 
-// Spec #20: Nonexistent profile directory → error
 test "getNextGenerationNumber with nonexistent profile dir" {
     const result = getNextGenerationNumber("/nonexistent/profiles/system");
     try std.testing.expectError(GenerationError.ProfilesNotFound, result);
@@ -1201,7 +1216,7 @@ test "writeManifest and readManifest" {
     var read_manifest = try readManifest(allocator, gen_dir);
     defer read_manifest.deinit();
 
-    try std.testing.expectEqual(@as(u32, 1), read_manifest.generation);
+    try std.testing.expectEqual(@as(?u32, 1), read_manifest.generation);
     try std.testing.expectEqual(@as(usize, 1), read_manifest.packages.items.len);
     try std.testing.expectEqualStrings("test-pkg", read_manifest.packages.items[0].name);
 }
@@ -1283,7 +1298,6 @@ test "formatGenerationName" {
     try std.testing.expectEqualStrings("gen-42", name42);
 }
 
-// Spec #20: Gaps in generation sequence are handled correctly
 // gen-1, gen-5 exist → next generation is gen-6 (max + 1, not gap-filling)
 test "getNextGenerationNumber handles gaps in sequence" {
     const th = @import("test_helpers.zig");
