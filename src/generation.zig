@@ -984,7 +984,7 @@ test "GenerationManifest encode and parse roundtrip" {
 
     manifest.parent_generation = 41;
     manifest.notes = try allocator.dupe(u8, "test generation");
-    manifest.tool_version = try allocator.dupe(u8, "0.1.0");
+    manifest.tool_version = try allocator.dupe(u8, "test-version");
 
     try manifest.addPackage(
         "nginx",
@@ -1014,7 +1014,7 @@ test "GenerationManifest encode and parse roundtrip" {
     try std.testing.expectEqual(@as(u32, 42), parsed.generation);
     try std.testing.expectEqual(@as(?u32, 41), parsed.parent_generation);
     try std.testing.expectEqualStrings("test generation", parsed.notes.?);
-    try std.testing.expectEqualStrings("0.1.0", parsed.tool_version.?);
+    try std.testing.expectEqualStrings("test-version", parsed.tool_version.?);
     try std.testing.expectEqual(@as(usize, 2), parsed.packages.items.len);
 
     try std.testing.expectEqualStrings("nginx", parsed.packages.items[0].name);
