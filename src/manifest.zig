@@ -368,6 +368,8 @@ test "PackageManifestV1 encoded size matches formula" {
 }
 
 test "writeManifest maps makePath AccessDenied to PermissionDenied" {
+    if (std.posix.geteuid() == 0) return error.SkipZigTest;
+
     const th = @import("test_helpers.zig");
     var test_env = try th.createTestEnv();
     defer {

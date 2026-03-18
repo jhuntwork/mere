@@ -1747,6 +1747,8 @@ test "scanKeyDirectory returns empty for nonexistent directory" {
 }
 
 test "scanKeyDirectory returns PermissionDenied for unreadable directory" {
+    if (std.posix.geteuid() == 0) return error.SkipZigTest;
+
     const testing = std.testing;
     const th = @import("test_helpers.zig");
 
@@ -1765,7 +1767,17 @@ test "scanKeyDirectory returns PermissionDenied for unreadable directory" {
     try restricted.chmod(0o000);
     defer restricted.chmod(0o755) catch {};
 
-    try testing.expectError(SignError.PermissionDenied, scanKeyDirectory(testing.allocator, keys_dir));
+    const result = scanKeyDirectory(testing.allocator, keys_dir);
+    if (result) |loaded_keys| {
+        var success = loaded_keys;
+        defer {
+            for (success.items) |*k| k.deinit(testing.allocator);
+            success.deinit(testing.allocator);
+        }
+        return error.TestExpectedError;
+    } else |err| {
+        try testing.expectEqual(SignError.PermissionDenied, err);
+    }
 }
 
 // Spec #5: Signature verification with trusted fingerprints

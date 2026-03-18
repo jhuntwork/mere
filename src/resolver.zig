@@ -2188,6 +2188,8 @@ test "resolve handles larger dependency chain deterministically" {
 }
 
 test "resolve fails when pin directory is unreadable" {
+    if (std.posix.geteuid() == 0) return error.SkipZigTest;
+
     const th = @import("test_helpers.zig");
     var test_env = try th.createTestEnv();
     defer {
@@ -2213,10 +2215,14 @@ test "resolve fails when pin directory is unreadable" {
     defer std.posix.fchmodat(std.posix.AT.FDCWD, gc_roots, 0o755, 0) catch {};
 
     var repocaches = [_]*RepoCache{&repocache};
-    try std.testing.expectError(
-        ResolverError.PermissionDenied,
-        resolve(ctx, &.{"A"}, repocaches[0..], allocator),
-    );
+    const result = resolve(ctx, &.{"A"}, repocaches[0..], allocator);
+    if (result) |success| {
+        var owned = success;
+        defer owned.deinit();
+        return error.TestExpectedError;
+    } else |err| {
+        try std.testing.expectEqual(ResolverError.PermissionDenied, err);
+    }
 }
 
 test "resolve handles larger SCC cycle" {

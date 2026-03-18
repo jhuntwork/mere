@@ -1579,6 +1579,8 @@ test "buildProfile rejects packages missing projection.v1" {
 }
 
 test "buildProfile preserves existing symlink when atomic replacement cannot start" {
+    if (std.posix.geteuid() == 0) return error.SkipZigTest;
+
     const th = @import("test_helpers.zig");
     var test_env = try th.createTestEnv();
     defer {
@@ -1623,7 +1625,13 @@ test "buildProfile preserves existing symlink when atomic replacement cannot sta
     defer profile_bin_dir.chmod(0o755) catch {};
 
     const result = buildProfile(allocator, &test_env.ctx, profile_root, store_root, &.{testPackageEntry("test", pkg_path)});
-    try std.testing.expectError(ProfileError.PermissionDenied, result);
+    if (result) |success| {
+        var owned = success;
+        defer owned.deinit();
+        return error.TestExpectedError;
+    } else |err| {
+        try std.testing.expectEqual(ProfileError.PermissionDenied, err);
+    }
 
     var buf: [std.fs.max_path_bytes]u8 = undefined;
     const target = try std.fs.readLinkAbsolute(link_path, &buf);

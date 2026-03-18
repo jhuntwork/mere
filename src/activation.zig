@@ -559,6 +559,8 @@ test "switchProfileGeneration rejects store path that shares prefix but escapes 
 }
 
 test "applyEtcTemplatesForManifest preserves PermissionDenied from etc template processing" {
+    if (std.posix.geteuid() == 0) return error.SkipZigTest;
+
     const th = @import("test_helpers.zig");
     var test_env = try th.createTestEnv();
     defer {
@@ -609,10 +611,14 @@ test "applyEtcTemplatesForManifest preserves PermissionDenied from etc template 
     var loaded_manifest = try loadValidatedTargetManifest(&test_env.ctx, profile_dir, 1, false);
     defer loaded_manifest.deinit();
 
-    try std.testing.expectError(
-        ActivationError.PermissionDenied,
-        applyEtcTemplatesForManifest(&test_env.ctx, &loaded_manifest, etc_dir),
-    );
+    const result = applyEtcTemplatesForManifest(&test_env.ctx, &loaded_manifest, etc_dir);
+    if (result) |success| {
+        var owned = success;
+        defer owned.deinit();
+        return error.TestExpectedError;
+    } else |err| {
+        try std.testing.expectEqual(ActivationError.PermissionDenied, err);
+    }
 }
 
 test "activateSystemGeneration rolls back created /etc files and does not switch on failure" {

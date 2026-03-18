@@ -744,6 +744,8 @@ test "archive mapHashError preserves actionable classes" {
 }
 
 test "deduplicate reports traversal permission failures" {
+    if (std.posix.geteuid() == 0) return error.SkipZigTest;
+
     const th = @import("test_helpers.zig");
     var test_env = try th.createTestEnv();
     defer {
@@ -788,6 +790,8 @@ test "deduplicate does not create missing source directory" {
 }
 
 test "deduplicate failure preserves original duplicate file" {
+    if (std.posix.geteuid() == 0) return error.SkipZigTest;
+
     const th = @import("test_helpers.zig");
     var test_env = try th.createTestEnv();
     defer {
