@@ -161,6 +161,13 @@ pub fn getUserFriendlyMessage(err: anyerror) []const u8 {
         error.CorruptData => "corrupt or incompatible data",
         error.SignatureInvalid => "signature verification failed",
         error.Internal => "internal error",
+        error.SessionSetupError => "failed to set up namespace session",
+        error.SyntheticRootSetupError => "failed to build synthetic root",
+        error.DeviceSetupError => "failed to set up namespace devices",
+        error.EtcSetupError => "failed to generate namespace etc files",
+        error.MountRestricted => "mount operation not permitted in this environment",
+        error.MountSourceMissing => "bind mount source path not found",
+        error.MountBindError => "bind mount failed",
 
         // Convert module errors
         error.PkginfoNotFound => ".PKGINFO file not found in package",

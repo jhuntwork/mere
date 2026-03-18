@@ -70,6 +70,7 @@ pub const FlagValue = union(FlagType) {
 pub const ParsedArgs = struct {
     command_path: [][]const u8, // Full path like ["dev", "import"]
     positional: [][]const u8,
+    passthrough: [][]const u8,
     flags: std.StringHashMap(FlagValue),
     global_flags: std.StringHashMap(FlagValue),
     allocator: std.mem.Allocator,
@@ -78,6 +79,7 @@ pub const ParsedArgs = struct {
         return ParsedArgs{
             .command_path = &[_][]const u8{},
             .positional = &[_][]const u8{},
+            .passthrough = &[_][]const u8{},
             .flags = std.StringHashMap(FlagValue).init(allocator),
             .global_flags = std.StringHashMap(FlagValue).init(allocator),
             .allocator = allocator,
@@ -92,6 +94,9 @@ pub const ParsedArgs = struct {
         }
         if (self.positional.len > 0) {
             self.allocator.free(self.positional);
+        }
+        if (self.passthrough.len > 0) {
+            self.allocator.free(self.passthrough);
         }
     }
 

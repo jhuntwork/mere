@@ -165,7 +165,7 @@ pub const CLI = struct {
 
             // Handle -- sentinel: stop processing flags, keep rest as-is
             if (std.mem.eql(u8, arg, "--")) {
-                // Add all remaining args after -- as positional (excluding the -- itself)
+                try filtered.append(allocator, arg);
                 i += 1;
                 while (i < args.len) : (i += 1) {
                     try filtered.append(allocator, args[i]);
@@ -235,12 +235,17 @@ pub const CLI = struct {
         // Parse arguments, but skip the command parts that were already identified
         const start_index = 1 + command_path.items.len;
         const remaining_args = if (start_index < args.len) args[start_index..] else &[_][]const u8{};
+        const passthrough_index = for (remaining_args, 0..) |arg, idx| {
+            if (std.mem.eql(u8, arg, "--")) break idx;
+        } else null;
+        const parser_args = if (passthrough_index) |idx| remaining_args[0..idx] else remaining_args;
+        const passthrough_args = if (passthrough_index) |idx| remaining_args[idx + 1 ..] else &[_][]const u8{};
 
         // Create a new args array with program name + remaining args for the parser
         var parse_args = std.ArrayList([]const u8).empty;
         defer parse_args.deinit(self.allocator);
         try parse_args.append(self.allocator, args[0]); // Keep program name
-        for (remaining_args) |arg| {
+        for (parser_args) |arg| {
             try parse_args.append(self.allocator, arg);
         }
 
@@ -249,6 +254,9 @@ pub const CLI = struct {
         // Set the command path on the parsed args
         if (command_path.items.len > 0) {
             parsed.command_path = try self.allocator.dupe([]const u8, command_path.items);
+        }
+        if (passthrough_args.len > 0) {
+            parsed.passthrough = try self.allocator.dupe([]const u8, passthrough_args);
         }
 
         return parsed;

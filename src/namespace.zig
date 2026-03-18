@@ -44,10 +44,6 @@ fn buildEnvBasePath(allocator: std.mem.Allocator, xdg_runtime: ?[]const u8) ![]c
     return allocator.dupe(u8, "/tmp/mere/env");
 }
 
-fn getEnvBasePath(allocator: std.mem.Allocator) ![]const u8 {
-    return buildEnvBasePath(allocator, std.posix.getenv("XDG_RUNTIME_DIR"));
-}
-
 pub const EnvMode = enum {
     shell,
     build,
@@ -104,8 +100,14 @@ pub const EnvError = Std.OutOfMemory || Std.FileSystem || Std.PermissionDenied |
     OverlayFsUnavailable,
     ProfileNotFound,
     WorkspaceNotFound,
+    SessionSetupError,
+    SyntheticRootSetupError,
+    DeviceSetupError,
+    EtcSetupError,
     UnshareError,
     MountPrivateError, // mount(MS_PRIVATE) failed
+    MountRestricted, // mount syscall was denied by kernel/sandbox policy
+    MountSourceMissing, // bind mount source path does not exist
     MountBindError, // bind mount failed
     MountTmpfsError, // tmpfs mount failed
     MountProcError, // proc mount failed
@@ -348,13 +350,8 @@ fn generateSessionId() [32]u8 {
     return hex;
 }
 
-fn createSession(allocator: std.mem.Allocator, mode: EnvMode) EnvError!SessionInfo {
+fn createSessionAtBase(allocator: std.mem.Allocator, mode: EnvMode, env_base: []const u8) EnvError!SessionInfo {
     const id = generateSessionId();
-
-    const env_base = getEnvBasePath(allocator) catch {
-        return EnvError.OutOfMemory;
-    };
-    defer allocator.free(env_base);
 
     const base_path = std.fmt.allocPrint(allocator, "{s}/{s}/", .{ env_base, id }) catch {
         return EnvError.OutOfMemory;
@@ -375,7 +372,7 @@ fn createSession(allocator: std.mem.Allocator, mode: EnvMode) EnvError!SessionIn
             dir;
 
         std.fs.cwd().makePath(clean_dir) catch {
-            return EnvError.FileSystem;
+            return EnvError.SessionSetupError;
         };
     }
 
@@ -390,15 +387,15 @@ fn createSession(allocator: std.mem.Allocator, mode: EnvMode) EnvError!SessionIn
         };
         defer allocator.free(etc_work);
 
-        std.fs.cwd().makePath(etc_upper) catch return EnvError.FileSystem;
-        std.fs.cwd().makePath(etc_work) catch return EnvError.FileSystem;
+        std.fs.cwd().makePath(etc_upper) catch return EnvError.SessionSetupError;
+        std.fs.cwd().makePath(etc_work) catch return EnvError.SessionSetupError;
     } else {
         const etc_gen = std.fmt.allocPrint(allocator, "{s}etc-gen", .{base_path}) catch {
             return EnvError.OutOfMemory;
         };
         defer allocator.free(etc_gen);
 
-        std.fs.cwd().makePath(etc_gen) catch return EnvError.FileSystem;
+        std.fs.cwd().makePath(etc_gen) catch return EnvError.SessionSetupError;
     }
 
     return SessionInfo{
@@ -408,6 +405,29 @@ fn createSession(allocator: std.mem.Allocator, mode: EnvMode) EnvError!SessionIn
         .mode = mode,
         .allocator = allocator,
     };
+}
+
+fn createSession(allocator: std.mem.Allocator, mode: EnvMode) EnvError!SessionInfo {
+    if (std.posix.getenv("XDG_RUNTIME_DIR")) |xdg_runtime| {
+        const xdg_base = buildEnvBasePath(allocator, xdg_runtime) catch {
+            return EnvError.OutOfMemory;
+        };
+        defer allocator.free(xdg_base);
+
+        if (createSessionAtBase(allocator, mode, xdg_base)) |session| {
+            return session;
+        } else |err| switch (err) {
+            EnvError.SessionSetupError => {},
+            else => return err,
+        }
+    }
+
+    const tmp_base = buildEnvBasePath(allocator, null) catch {
+        return EnvError.OutOfMemory;
+    };
+    defer allocator.free(tmp_base);
+
+    return createSessionAtBase(allocator, mode, tmp_base);
 }
 
 fn buildSyntheticRoot(allocator: std.mem.Allocator, session: *const SessionInfo, profile_root: []const u8) EnvError!void {
@@ -425,7 +445,7 @@ fn buildSyntheticRoot(allocator: std.mem.Allocator, session: *const SessionInfo,
         };
         defer allocator.free(full_path);
 
-        std.fs.cwd().makePath(full_path) catch return EnvError.FileSystem;
+        std.fs.cwd().makePath(full_path) catch return EnvError.SyntheticRootSetupError;
     }
 
     if (session.mode == .build) {
@@ -434,7 +454,7 @@ fn buildSyntheticRoot(allocator: std.mem.Allocator, session: *const SessionInfo,
         };
         defer allocator.free(work_path);
 
-        std.fs.cwd().makePath(work_path) catch return EnvError.FileSystem;
+        std.fs.cwd().makePath(work_path) catch return EnvError.SyntheticRootSetupError;
     }
 
     // Bind-mount profile directories (bin, sbin, lib, usr) if they exist in the profile
@@ -460,7 +480,7 @@ fn buildSyntheticRoot(allocator: std.mem.Allocator, session: *const SessionInfo,
         defer allocator.free(target_path);
 
         // Create the mount point directory
-        std.fs.cwd().makePath(target_path) catch return EnvError.FileSystem;
+        std.fs.cwd().makePath(target_path) catch return EnvError.SyntheticRootSetupError;
 
         // Bind-mount the profile directory (read-only for safety)
         try mountBind(source_path, target_path, true);
@@ -577,6 +597,14 @@ fn applyBuildMounts(allocator: std.mem.Allocator, session: *const SessionInfo, o
 }
 
 fn mountBind(source: []const u8, target: []const u8, read_only: bool) EnvError!void {
+    std.fs.accessAbsolute(source, .{}) catch |err| {
+        return switch (err) {
+            error.FileNotFound => EnvError.MountSourceMissing,
+            error.AccessDenied => EnvError.PermissionDenied,
+            else => EnvError.FileSystem,
+        };
+    };
+
     const src_c = toCString(source) catch return EnvError.OutOfMemory;
     defer std.heap.page_allocator.free(src_c);
 
@@ -585,12 +613,21 @@ fn mountBind(source: []const u8, target: []const u8, read_only: bool) EnvError!v
 
     var rc = c.mount(src_c.ptr, tgt_c.ptr, null, MS_BIND | MS_REC, null);
     if (rc != 0) {
+        switch (std.c._errno().*) {
+            c.EPERM, c.EACCES => return EnvError.MountRestricted,
+            c.ENOENT => return EnvError.MountSourceMissing,
+            else => {},
+        }
         return EnvError.MountBindError;
     }
 
     if (read_only) {
         rc = c.mount(null, tgt_c.ptr, null, MS_BIND | MS_REMOUNT | MS_RDONLY | MS_REC, null);
         if (rc != 0) {
+            switch (std.c._errno().*) {
+                c.EPERM, c.EACCES => return EnvError.MountRestricted,
+                else => {},
+            }
             return EnvError.MountBindError;
         }
     }
@@ -698,13 +735,13 @@ fn setupMinimalDev(allocator: std.mem.Allocator, dev_path: []const u8) EnvError!
     }
 
     var dev_dir = std.fs.openDirAbsolute(dev_path, .{}) catch {
-        return EnvError.FileSystem;
+        return EnvError.DeviceSetupError;
     };
     defer dev_dir.close();
 
     dev_dir.symLink("/proc/self/fd", "fd", .{}) catch |err| {
         if (err != error.PathAlreadyExists) {
-            return EnvError.FileSystem;
+            return EnvError.DeviceSetupError;
         }
     };
 
@@ -715,7 +752,7 @@ fn setupMinimalDev(allocator: std.mem.Allocator, dev_path: []const u8) EnvError!
 
 fn bindDeviceNode(target: []const u8, name: []const u8) EnvError!void {
     var file = std.fs.createFileAbsolute(target, .{}) catch {
-        return EnvError.FileSystem;
+        return EnvError.DeviceSetupError;
     };
     file.close();
 
@@ -728,7 +765,7 @@ fn bindDeviceNode(target: []const u8, name: []const u8) EnvError!void {
 }
 
 fn generateMinimalEtc(allocator: std.mem.Allocator, etc_path: []const u8) EnvError!void {
-    std.fs.cwd().makePath(etc_path) catch return EnvError.FileSystem;
+    std.fs.cwd().makePath(etc_path) catch return EnvError.EtcSetupError;
 
     const passwd_content = "root:x:0:0:root:/root:/bin/sh\nnobody:x:65534:65534:nobody:/nonexistent:/usr/sbin/nologin\n";
     try writeFile(allocator, etc_path, "passwd", passwd_content);
@@ -749,7 +786,7 @@ fn generateMinimalEtc(allocator: std.mem.Allocator, etc_path: []const u8) EnvErr
     };
     defer allocator.free(ssl_certs_path);
 
-    std.fs.cwd().makePath(ssl_certs_path) catch return EnvError.FileSystem;
+    std.fs.cwd().makePath(ssl_certs_path) catch return EnvError.EtcSetupError;
 
     if (readHostFile("/etc/ssl/certs/ca-certificates.crt", 1024 * 1024)) |content| {
         defer std.heap.page_allocator.free(content);
@@ -764,12 +801,12 @@ fn writeFile(allocator: std.mem.Allocator, dir_path: []const u8, name: []const u
     defer allocator.free(path);
 
     var file = std.fs.createFileAbsolute(path, .{}) catch {
-        return EnvError.FileSystem;
+        return EnvError.EtcSetupError;
     };
     defer file.close();
 
     file.writeAll(content) catch {
-        return EnvError.FileSystem;
+        return EnvError.EtcSetupError;
     };
 }
 
@@ -1073,7 +1110,7 @@ test "bindDeviceNode fails when bind mount fails" {
     defer std.testing.allocator.free(target);
 
     // Use a guaranteed-nonexistent host device path segment to force bind failure.
-    try std.testing.expectError(EnvError.MountBindError, bindDeviceNode(target, "__definitely_missing_device__"));
+    try std.testing.expectError(EnvError.MountSourceMissing, bindDeviceNode(target, "__definitely_missing_device__"));
 }
 
 test "EnvError covers all error cases" {
@@ -1086,9 +1123,15 @@ test "EnvError covers all error cases" {
         EnvError.OverlayFsUnavailable,
         EnvError.ProfileNotFound,
         EnvError.WorkspaceNotFound,
+        EnvError.SessionSetupError,
+        EnvError.SyntheticRootSetupError,
+        EnvError.DeviceSetupError,
+        EnvError.EtcSetupError,
         EnvError.InvalidInput,
         EnvError.UnshareError,
         EnvError.MountPrivateError,
+        EnvError.MountRestricted,
+        EnvError.MountSourceMissing,
         EnvError.MountBindError,
         EnvError.MountTmpfsError,
         EnvError.MountProcError,
@@ -1103,7 +1146,7 @@ test "EnvError covers all error cases" {
     };
 
     // Just verify we can iterate through all error types
-    try std.testing.expectEqual(@as(usize, 21), all_errors.len);
+    try std.testing.expectEqual(@as(usize, 27), all_errors.len);
 }
 
 test "buildEnvBasePath uses explicit XDG runtime dir when provided" {
@@ -1122,4 +1165,20 @@ test "buildEnvBasePath falls back to /tmp when XDG runtime dir is missing" {
     defer allocator.free(path);
 
     try std.testing.expectEqualStrings("/tmp/mere/env", path);
+}
+
+test "createSessionAtBase creates a session under the requested base" {
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const tmp_path = try tmp_dir.dir.realpath(".", &path_buf);
+    const base = try std.fs.path.join(std.testing.allocator, &.{ tmp_path, "mere", "env" });
+    defer std.testing.allocator.free(base);
+
+    var session = try createSessionAtBase(std.testing.allocator, .shell, base);
+    defer session.deinit();
+
+    try std.testing.expect(std.mem.startsWith(u8, session.base_path, base));
+    try std.testing.expect(std.fs.path.isAbsolute(session.root_path));
 }

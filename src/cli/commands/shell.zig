@@ -9,7 +9,7 @@ const profile = mere.profile;
 
 const shell_meta = command.CommandMeta{
     .name = "shell",
-    .description = "Enter an interactive shell with a selected profile",
+    .description = "Enter an interactive shell or run a command with a selected profile",
     .args = &[_]types.Arg{},
     .flags = &[_]types.Flag{
         .{
@@ -29,6 +29,16 @@ const shell_meta = command.CommandMeta{
 
 fn handleShell(ctx: *mere.Context, args: *const types.ParsedArgs) MereError!types.CommandResult {
     const no_etc_overlay = args.getBool("no-etc-overlay");
+    if (args.positional.len > 0 and args.passthrough.len == 0) {
+        return types.CommandResult{
+            .success = false,
+            .exit_code = 2,
+            .message = try ctx.allocator.dupe(
+                u8,
+                "unexpected positional arguments; use `mere shell -- <command> [args...]` to run a command",
+            ),
+        };
+    }
 
     // Profile resolution order:
     // 1. --profile/-p
@@ -92,7 +102,7 @@ fn handleShell(ctx: *mere.Context, args: *const types.ParsedArgs) MereError!type
 
     const opts = namespace.EnvOptions{
         .profile_root = profile_root,
-        .command = null,
+        .command = if (args.passthrough.len > 0) args.passthrough else null,
         .workspace = null,
         .no_etc_overlay = no_etc_overlay,
         .env = null,
@@ -104,7 +114,13 @@ fn handleShell(ctx: *mere.Context, args: *const types.ParsedArgs) MereError!type
         const details: []const u8 = switch (err) {
             namespace.EnvError.UserNamespacesDisabled => "enable with: sysctl -w kernel.unprivileged_userns_clone=1",
             namespace.EnvError.OverlayFsUnavailable => "try --no-etc-overlay flag",
-            namespace.EnvError.MountBindError => "bind mount failed - check profile has bin/, sbin/, lib/ directories",
+            namespace.EnvError.SessionSetupError => "failed to create namespace session directories under XDG_RUNTIME_DIR or /tmp",
+            namespace.EnvError.SyntheticRootSetupError => "failed to build synthetic root for the selected profile",
+            namespace.EnvError.DeviceSetupError => "failed to set up /dev inside the namespace",
+            namespace.EnvError.EtcSetupError => "failed to generate the namespace /etc overlay",
+            namespace.EnvError.MountRestricted => "bind mounts are restricted in this environment; sandbox or kernel policy is blocking mount(2)",
+            namespace.EnvError.MountSourceMissing => "bind mount source path is missing",
+            namespace.EnvError.MountBindError => "bind mount syscall failed after validating the source path",
             namespace.EnvError.MountTmpfsError => "tmpfs mount failed",
             namespace.EnvError.MountOverlayError => "overlay mount failed - try --no-etc-overlay flag",
             namespace.EnvError.MountProcError => "proc mount failed",
