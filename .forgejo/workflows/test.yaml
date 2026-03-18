@@ -5,5 +5,4 @@ jobs:
     container:
       image: mere/zig
     steps:
-      - uses: actions/checkout@v4
       - run: zig build test --summary all
