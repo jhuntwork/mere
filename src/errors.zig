@@ -165,6 +165,7 @@ pub fn getUserFriendlyMessage(err: anyerror) []const u8 {
         error.SyntheticRootSetupError => "failed to build synthetic root",
         error.DeviceSetupError => "failed to set up namespace devices",
         error.EtcSetupError => "failed to generate namespace etc files",
+        error.WorkingDirectoryUnavailable => "requested working directory is not available inside the namespace",
         error.MountRestricted => "mount operation not permitted in this environment",
         error.MountSourceMissing => "bind mount source path not found",
         error.MountBindError => "bind mount failed",

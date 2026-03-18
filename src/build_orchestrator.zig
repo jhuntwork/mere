@@ -1757,6 +1757,7 @@ fn runOneNamespacePhase(
     const opts = namespace.EnvOptions{
         .profile_root = exec_ctx.profile_root,
         .command = &cmd_args,
+        .cwd = "/work",
         .workspace = workspace.recipe_root,
         .needs_root = parsed_recipe.needs_root,
         .no_etc_overlay = false,

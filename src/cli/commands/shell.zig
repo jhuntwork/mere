@@ -83,6 +83,24 @@ fn handleShell(ctx: *mere.Context, args: *const types.ParsedArgs) MereError!type
     };
     defer ctx.allocator.free(profile_root);
 
+    const invocation_cwd = std.fs.realpathAlloc(ctx.allocator, ".") catch {
+        return types.CommandResult{
+            .success = false,
+            .exit_code = 1,
+            .message = try ctx.allocator.dupe(u8, "Failed to resolve current working directory"),
+        };
+    };
+    defer ctx.allocator.free(invocation_cwd);
+
+    const shell_env = namespace.cloneHostEnvWithVar(ctx.allocator, "MERE_SHELL_PROFILE", profile_name) catch {
+        return types.CommandResult{
+            .success = false,
+            .exit_code = 1,
+            .message = try ctx.allocator.dupe(u8, "Failed to prepare shell environment"),
+        };
+    };
+    defer namespace.freeOwnedEnv(ctx.allocator, shell_env);
+
     // Set diagnostic context - the subject is the profile being entered
     const diag_ctx = mere.errors.DiagnosticContext.init()
         .withSubject(profile_root);
@@ -103,13 +121,17 @@ fn handleShell(ctx: *mere.Context, args: *const types.ParsedArgs) MereError!type
     const opts = namespace.EnvOptions{
         .profile_root = profile_root,
         .command = if (args.passthrough.len > 0) args.passthrough else null,
+        .cwd = invocation_cwd,
         .workspace = null,
         .no_etc_overlay = no_etc_overlay,
-        .env = null,
+        .env = shell_env,
     };
 
     // Error boundary: catch all errors and map them to user-friendly messages at CLI boundary
     namespace.enterEnv(ctx.allocator, .shell, opts) catch |err| {
+        var owned_details: ?[]u8 = null;
+        defer if (owned_details) |details| ctx.allocator.free(details);
+
         // Get specific error details for namespace errors
         const details: []const u8 = switch (err) {
             namespace.EnvError.UserNamespacesDisabled => "enable with: sysctl -w kernel.unprivileged_userns_clone=1",
@@ -118,6 +140,14 @@ fn handleShell(ctx: *mere.Context, args: *const types.ParsedArgs) MereError!type
             namespace.EnvError.SyntheticRootSetupError => "failed to build synthetic root for the selected profile",
             namespace.EnvError.DeviceSetupError => "failed to set up /dev inside the namespace",
             namespace.EnvError.EtcSetupError => "failed to generate the namespace /etc overlay",
+            namespace.EnvError.WorkingDirectoryUnavailable => blk: {
+                owned_details = std.fmt.allocPrint(
+                    ctx.allocator,
+                    "requested working directory is not available inside the namespace: {s}",
+                    .{invocation_cwd},
+                ) catch null;
+                break :blk owned_details orelse "requested working directory is not available inside the namespace";
+            },
             namespace.EnvError.MountRestricted => "bind mounts are restricted in this environment; sandbox or kernel policy is blocking mount(2)",
             namespace.EnvError.MountSourceMissing => "bind mount source path is missing",
             namespace.EnvError.MountBindError => "bind mount syscall failed after validating the source path",

@@ -52,6 +52,7 @@ pub const EnvMode = enum {
 pub const EnvOptions = struct {
     profile_root: []const u8,
     command: ?[]const []const u8 = null,
+    cwd: ?[]const u8 = null,
     workspace: ?[]const u8 = null,
     // Build namespaces run as real user by default; set true for recipes that require root-inside-namespace.
     needs_root: bool = false,
@@ -68,6 +69,49 @@ pub const OutputHandler = struct {
         self.handleFn(self.ctx, bytes, is_stderr);
     }
 };
+
+pub fn cloneHostEnvWithVar(
+    allocator: std.mem.Allocator,
+    key: []const u8,
+    value: []const u8,
+) ![]const [*:0]const u8 {
+    var env_map = try std.process.getEnvMap(allocator);
+    defer env_map.deinit();
+
+    try env_map.put(key, value);
+
+    const count = env_map.count();
+    var result = try allocator.alloc([*:0]const u8, count);
+    errdefer allocator.free(result);
+
+    var i: usize = 0;
+    errdefer {
+        var j: usize = 0;
+        while (j < i) : (j += 1) {
+            const slice = std.mem.span(result[j]);
+            allocator.free(result[j][0 .. slice.len + 1]);
+        }
+    }
+
+    var it = env_map.iterator();
+    while (it.next()) |entry| {
+        const kv = try std.fmt.allocPrint(allocator, "{s}={s}", .{ entry.key_ptr.*, entry.value_ptr.* });
+        defer allocator.free(kv);
+        const kv_z = try allocator.dupeZ(u8, kv);
+        result[i] = kv_z.ptr;
+        i += 1;
+    }
+
+    return result;
+}
+
+pub fn freeOwnedEnv(allocator: std.mem.Allocator, envp: []const [*:0]const u8) void {
+    for (envp) |ptr| {
+        const slice = std.mem.span(ptr);
+        allocator.free(ptr[0 .. slice.len + 1]);
+    }
+    allocator.free(envp);
+}
 
 const SessionInfo = struct {
     id: [32]u8,
@@ -104,6 +148,7 @@ pub const EnvError = Std.OutOfMemory || Std.FileSystem || Std.PermissionDenied |
     SyntheticRootSetupError,
     DeviceSetupError,
     EtcSetupError,
+    WorkingDirectoryUnavailable,
     UnshareError,
     MountPrivateError, // mount(MS_PRIVATE) failed
     MountRestricted, // mount syscall was denied by kernel/sandbox policy
@@ -146,7 +191,7 @@ pub fn enterEnv(allocator: std.mem.Allocator, mode: EnvMode, opts: EnvOptions) E
 
     try mountProc(allocator, session.root_path);
     try mountTmpfsInRoot(allocator, session.root_path, "tmp");
-    try chrootAndChdir(session.root_path);
+    try chrootAndChdir(session.root_path, opts.cwd);
     try dropPrivileges(identity.uid, identity.gid);
     try execCommand(allocator, opts.command, opts.env);
 }
@@ -239,6 +284,12 @@ fn validateInputs(opts: EnvOptions, mode: EnvMode) EnvError!void {
             else => EnvError.FileSystem,
         };
     };
+
+    if (opts.cwd) |cwd| {
+        if (cwd.len == 0 or cwd[0] != '/') {
+            return EnvError.InvalidInput;
+        }
+    }
 
     if (mode == .build) {
         if (opts.workspace) |ws| {
@@ -816,7 +867,7 @@ fn readHostFile(path: []const u8, max_size: usize) ?[]u8 {
     return file.readToEndAlloc(std.heap.page_allocator, max_size) catch null;
 }
 
-fn chrootAndChdir(root_path: []const u8) EnvError!void {
+fn chrootAndChdir(root_path: []const u8, cwd: ?[]const u8) EnvError!void {
     const root = if (root_path.len > 0 and root_path[root_path.len - 1] == '/')
         root_path[0 .. root_path.len - 1]
     else
@@ -830,9 +881,16 @@ fn chrootAndChdir(root_path: []const u8) EnvError!void {
         return EnvError.ChrootError;
     }
 
-    const rc_chdir = c.chdir("/");
+    const target_cwd = cwd orelse "/";
+    const cwd_c = toCString(target_cwd) catch return EnvError.OutOfMemory;
+    defer std.heap.page_allocator.free(cwd_c);
+
+    const rc_chdir = c.chdir(cwd_c.ptr);
     if (rc_chdir != 0) {
-        return EnvError.ChrootError;
+        return if (cwd != null)
+            EnvError.WorkingDirectoryUnavailable
+        else
+            EnvError.ChrootError;
     }
 }
 
@@ -942,9 +1000,28 @@ test "EnvOptions defaults" {
     };
 
     try std.testing.expect(opts.command == null);
+    try std.testing.expect(opts.cwd == null);
     try std.testing.expect(opts.workspace == null);
     try std.testing.expect(opts.no_etc_overlay == false);
     try std.testing.expect(opts.env == null);
+}
+
+test "cloneHostEnvWithVar injects requested variable" {
+    const allocator = std.testing.allocator;
+
+    const envp = try cloneHostEnvWithVar(allocator, "MERE_SHELL_PROFILE", "zig");
+    defer freeOwnedEnv(allocator, envp);
+
+    var found = false;
+    for (envp) |entry| {
+        const kv = std.mem.span(entry);
+        if (std.mem.eql(u8, kv, "MERE_SHELL_PROFILE=zig")) {
+            found = true;
+            break;
+        }
+    }
+
+    try std.testing.expect(found);
 }
 
 test "SessionInfo deinit frees memory" {
@@ -1051,6 +1128,22 @@ test "validateInputs succeeds for valid build mode options with workspace" {
     try validateInputs(opts, .build);
 }
 
+test "validateInputs rejects relative cwd" {
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const tmp_path = tmp_dir.dir.realpath(".", &path_buf) catch unreachable;
+
+    const opts = EnvOptions{
+        .profile_root = tmp_path,
+        .cwd = "relative/path",
+    };
+
+    const result = validateInputs(opts, .shell);
+    try std.testing.expectError(EnvError.InvalidInput, result);
+}
+
 test "validateInputs allows null workspace in build mode" {
     // Create a temporary directory for profile_root
     var tmp_dir = std.testing.tmpDir(.{});
@@ -1127,6 +1220,7 @@ test "EnvError covers all error cases" {
         EnvError.SyntheticRootSetupError,
         EnvError.DeviceSetupError,
         EnvError.EtcSetupError,
+        EnvError.WorkingDirectoryUnavailable,
         EnvError.InvalidInput,
         EnvError.UnshareError,
         EnvError.MountPrivateError,
@@ -1146,7 +1240,7 @@ test "EnvError covers all error cases" {
     };
 
     // Just verify we can iterate through all error types
-    try std.testing.expectEqual(@as(usize, 27), all_errors.len);
+    try std.testing.expectEqual(@as(usize, 28), all_errors.len);
 }
 
 test "buildEnvBasePath uses explicit XDG runtime dir when provided" {

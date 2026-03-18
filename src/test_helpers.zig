@@ -608,6 +608,7 @@ pub fn hostNamespaceRunner(
 ) anyerror!u8 {
     const argv = opts.command orelse return namespace.EnvError.InvalidInput;
     const workspace_root = opts.workspace orelse return namespace.EnvError.WorkspaceNotFound;
+    const requested_cwd = opts.cwd orelse "/work";
 
     var host_argv = try allocator.alloc([]const u8, argv.len);
     defer {
@@ -630,10 +631,13 @@ pub fn hostNamespaceRunner(
         }
     }
 
+    const host_cwd = try rewriteNamespaceWorkPath(allocator, requested_cwd, workspace_root);
+    defer allocator.free(host_cwd);
+
     const result = try std.process.Child.run(.{
         .allocator = allocator,
         .argv = host_argv,
-        .cwd = workspace_root,
+        .cwd = host_cwd,
         .env_map = &env_map,
         .max_output_bytes = 1024 * 1024,
     });
