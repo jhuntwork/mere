@@ -29,6 +29,7 @@ pub fn code(token: Token) []const u8 {
 pub fn segmentCode(kind: events.SegmentKind) ?[]const u8 {
     return switch (kind) {
         .normal => null,
+        .err => code(.err),
         .success => code(.success),
         .warn => code(.warn),
         .label => code(.meta_label),

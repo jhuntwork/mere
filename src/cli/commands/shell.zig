@@ -73,7 +73,7 @@ fn handleShell(ctx: *mere.Context, args: *const types.ParsedArgs) MereError!type
         ctx.withDiagnosticContext(diag_ctx);
 
         const user_message = mere.errors.getUserFriendlyMessage(err);
-        const error_ctx = diag_ctx.toErrorContext();
+        const error_ctx = ctx.getDiagnosticContext().toErrorContext();
         const formatted = error_ctx.formatWithMessage(ctx.allocator, user_message) catch user_message;
 
         return types.CommandResult{
@@ -108,7 +108,7 @@ fn handleShell(ctx: *mere.Context, args: *const types.ParsedArgs) MereError!type
     ctx.withDiagnosticContext(diag_ctx);
 
     std.Io.Dir.accessAbsolute(path.currentIo(), profile_root, .{}) catch {
-        const error_ctx = diag_ctx.toErrorContext();
+        const error_ctx = ctx.getDiagnosticContext().toErrorContext();
         const formatted = error_ctx.formatWithMessage(ctx.allocator, "profile not found") catch
             try ctx.allocator.dupe(u8, "profile not found");
 

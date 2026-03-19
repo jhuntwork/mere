@@ -301,7 +301,7 @@ pub const CLI = struct {
                 mere.ui.emit.logLineSeverity(ctx, commandPhase(args.command_path), .info, msg);
             } else {
                 const error_segments = [_]mere.ui.Segment{
-                    .{ .text = "error", .kind = .warn },
+                    .{ .text = "error", .kind = .err },
                     .{ .text = ": ", .kind = .normal },
                     .{ .text = msg, .kind = .normal },
                 };

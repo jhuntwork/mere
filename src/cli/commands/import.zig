@@ -106,7 +106,7 @@ fn handleImport(ctx: *mere.Context, args: *const types.ParsedArgs) MereError!typ
 
         // Get user-friendly error message and format with context
         const user_message = mere.errors.getUserFriendlyMessage(err);
-        const error_ctx = diagnostic_ctx.toErrorContext();
+        const error_ctx = ctx.getDiagnosticContext().toErrorContext();
         const formatted_message = error_ctx.formatWithMessage(ctx.allocator, user_message) catch user_message;
         defer if (formatted_message.ptr != user_message.ptr) ctx.allocator.free(formatted_message);
 

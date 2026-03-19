@@ -352,8 +352,13 @@ pub fn stageEmpty(
     };
     errdefer ctx.allocator.free(staged_db_path);
 
-    const db = RepoDB.init(ctx, staged_db_path, false) catch {
-        return ctx.fail(PublishError.FileSystem, staged_db_path, "failed to open staged published db");
+    const db = RepoDB.init(ctx, staged_db_path, false) catch |err| {
+        return switch (err) {
+            error.OutOfMemory => PublishError.OutOfMemory,
+            error.PermissionDenied => PublishError.PermissionDenied,
+            error.InvalidInput => PublishError.InvalidInput,
+            else => ctx.fail(PublishError.FileSystem, staged_db_path, "failed to open staged published db"),
+        };
     };
 
     return StagedUpdate{
@@ -390,8 +395,14 @@ pub fn stageFromPublishedBaseline(
         };
     }
 
-    const db = RepoDB.init(ctx, staged_db_path, false) catch {
-        return ctx.fail(PublishError.FileSystem, staged_db_path, "failed to open staged published baseline db");
+    const db = RepoDB.init(ctx, staged_db_path, false) catch |err| {
+        return switch (err) {
+            error.OutOfMemory => PublishError.OutOfMemory,
+            error.PermissionDenied => PublishError.PermissionDenied,
+            error.InvalidInput => ctx.fail(PublishError.InvalidInput, baseline_db_path, "published baseline repository database schema is outdated or invalid"),
+            error.CorruptData => ctx.fail(PublishError.InvalidInput, baseline_db_path, "published baseline repository database schema is outdated or invalid"),
+            else => ctx.fail(PublishError.FileSystem, staged_db_path, "failed to open staged published baseline db"),
+        };
     };
     errdefer {
         db.deinit();

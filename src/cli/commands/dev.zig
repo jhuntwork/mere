@@ -359,7 +359,7 @@ fn handleRepoSign(ctx: *mere.Context, args: *const types.ParsedArgs) MereError!t
         const mapped_error = ErrorMapping.mapModuleError(@TypeOf(err), err);
 
         const user_message = getUserFriendlyMessage(err);
-        const error_ctx = diagnostic_ctx.toErrorContext();
+        const error_ctx = ctx.getDiagnosticContext().toErrorContext();
         const formatted_message = error_ctx.formatWithMessage(ctx.allocator, user_message) catch user_message;
         defer if (formatted_message.ptr != user_message.ptr) ctx.allocator.free(formatted_message);
 
@@ -410,7 +410,7 @@ fn handleRepoUndo(ctx: *mere.Context, args: *const types.ParsedArgs) MereError!t
     performRepoUndo(ctx, repo_name) catch |err| {
         const mapped_error = ErrorMapping.mapModuleError(@TypeOf(err), err);
         const user_message = getUserFriendlyMessage(err);
-        const error_ctx = diagnostic_ctx.toErrorContext();
+        const error_ctx = ctx.getDiagnosticContext().toErrorContext();
         const formatted_message = error_ctx.formatWithMessage(ctx.allocator, user_message) catch user_message;
         defer if (formatted_message.ptr != user_message.ptr) ctx.allocator.free(formatted_message);
 
@@ -491,7 +491,7 @@ fn handleRepoRemove(ctx: *mere.Context, args: *const types.ParsedArgs) MereError
         const mapped_error = ErrorMapping.mapModuleError(@TypeOf(err), err);
 
         const user_message = getUserFriendlyMessage(err);
-        const error_ctx = diagnostic_ctx.toErrorContext();
+        const error_ctx = ctx.getDiagnosticContext().toErrorContext();
         const formatted_message = error_ctx.formatWithMessage(ctx.allocator, user_message) catch user_message;
         defer if (formatted_message.ptr != user_message.ptr) ctx.allocator.free(formatted_message);
 
@@ -589,7 +589,7 @@ fn handlePublish(ctx: *mere.Context, args: *const types.ParsedArgs) MereError!ty
     const stats = dev_publish.publish(ctx, repo_name, out_dir, selectors, keep_count) catch |err| {
         const mapped_error = ErrorMapping.mapModuleError(@TypeOf(err), err);
         const user_message = getUserFriendlyMessage(err);
-        const error_ctx = diagnostic_ctx.toErrorContext();
+        const error_ctx = ctx.getDiagnosticContext().toErrorContext();
         const formatted_message = error_ctx.formatWithMessage(ctx.allocator, user_message) catch user_message;
         defer if (formatted_message.ptr != user_message.ptr) ctx.allocator.free(formatted_message);
         const exit_code = command.exitCodeForError(mapped_error);

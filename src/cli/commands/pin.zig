@@ -116,7 +116,7 @@ pub fn handleAdd(ctx: *mere.Context, args: *const types.ParsedArgs) MereError!ty
             else => "operation failed",
         };
 
-        const error_ctx = diagnostic_ctx.toErrorContext();
+        const error_ctx = ctx.getDiagnosticContext().toErrorContext();
         const formatted_message = error_ctx.formatWithMessage(ctx.allocator, user_message) catch user_message;
         defer if (formatted_message.ptr != user_message.ptr) ctx.allocator.free(formatted_message);
 
@@ -164,7 +164,7 @@ pub fn handleRemove(ctx: *mere.Context, args: *const types.ParsedArgs) MereError
             else => "operation failed",
         };
 
-        const error_ctx = diagnostic_ctx.toErrorContext();
+        const error_ctx = ctx.getDiagnosticContext().toErrorContext();
         const formatted_message = error_ctx.formatWithMessage(ctx.allocator, user_message) catch user_message;
         defer if (formatted_message.ptr != user_message.ptr) ctx.allocator.free(formatted_message);
 

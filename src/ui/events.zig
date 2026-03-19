@@ -8,6 +8,7 @@ pub const Severity = enum {
 
 pub const SegmentKind = enum {
     normal,
+    err,
     success,
     warn,
     label,

@@ -167,8 +167,15 @@ pub const Repository = struct {
         errdefer ctx.allocator.free(active_paths.sig_path);
 
         // Open RepoDB
-        const db = RepoDB.init(ctx, active_paths.db_path, read_only) catch {
-            return ctx.fail(Error.FileSystem, active_paths.db_path, "failed to open repository database");
+        const db = RepoDB.init(ctx, active_paths.db_path, read_only) catch |err| {
+            return switch (err) {
+                error.OutOfMemory => Error.OutOfMemory,
+                error.PermissionDenied => Error.PermissionDenied,
+                error.InvalidInput => Error.InvalidInput,
+                error.CorruptData => Error.CorruptData,
+                error.SignatureInvalid => Error.SignatureInvalid,
+                else => ctx.fail(Error.FileSystem, active_paths.db_path, "failed to open repository database"),
+            };
         };
         return Repository{
             .ctx = ctx,
