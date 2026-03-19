@@ -13,6 +13,11 @@ const c = @cImport({
 const default_timeout: u32 = 30;
 const max_parallel_downloads: usize = 3;
 
+fn monotonicMillis() i64 {
+    const now = std.Io.Clock.awake.now(path.currentIo());
+    return @intCast(@divFloor(now.nanoseconds, std.time.ns_per_ms));
+}
+
 /// Download operations error set
 ///
 /// Standard Errors:
@@ -119,7 +124,7 @@ pub const CurlTransferClient = struct {
         defer ctx.allocator.free(temp_path);
 
         const dest_exists = blk: {
-            std.fs.accessAbsolute(dest_abs, .{}) catch |err| {
+            std.Io.Dir.accessAbsolute(path.currentIo(), dest_abs, .{}) catch |err| {
                 ctx.debug("destination file does not exist: {s}", .{@errorName(err)});
                 break :blk false;
             };
@@ -127,7 +132,7 @@ pub const CurlTransferClient = struct {
         };
 
         const temp_exists = blk: {
-            std.fs.accessAbsolute(temp_path, .{}) catch |err| {
+            std.Io.Dir.accessAbsolute(path.currentIo(), temp_path, .{}) catch |err| {
                 ctx.debug("temp file does not exist: {s}", .{@errorName(err)});
                 break :blk false;
             };
@@ -159,11 +164,11 @@ pub const CurlTransferClient = struct {
 
             if (std.mem.eql(u8, &hash_result, &expected_bytes)) {
                 const final_bytes_total = blk: {
-                    const temp_file = std.fs.openFileAbsolute(temp_path, .{}) catch {
+                    const temp_file = std.Io.Dir.openFileAbsolute(path.currentIo(), temp_path, .{}) catch {
                         break :blk 0;
                     };
-                    defer temp_file.close();
-                    break :blk temp_file.getEndPos() catch 0;
+                    defer temp_file.close(path.currentIo());
+                    break :blk (temp_file.stat(path.currentIo()) catch break :blk 0).size;
                 };
 
                 ctx.debug("partial download already matches expected hash; skipping network transfer", .{});
@@ -177,14 +182,15 @@ pub const CurlTransferClient = struct {
 
         if (options.allow_resume and temp_exists) {
             ctx.debug("checking if download can be resumed", .{});
-            const temp_file = std.fs.openFileAbsolute(temp_path, .{ .mode = .read_write }) catch {
+            const temp_file = std.Io.Dir.openFileAbsolute(path.currentIo(), temp_path, .{ .mode = .read_write }) catch {
                 return ctx.fail(error.FileSystem, temp_path, "failed to open partial download file");
             };
-            initial_size = temp_file.getEndPos() catch {
-                temp_file.close();
+            const temp_stat = temp_file.stat(path.currentIo()) catch {
+                temp_file.close(path.currentIo());
                 return ctx.fail(error.FileSystem, temp_path, "failed to get partial download size");
             };
-            temp_file.close();
+            initial_size = temp_stat.size;
+            temp_file.close(path.currentIo());
             can_resume = initial_size > 0;
 
             if (can_resume) {
@@ -193,20 +199,21 @@ pub const CurlTransferClient = struct {
         }
 
         const file = if (can_resume)
-            std.fs.openFileAbsolute(temp_path, .{ .mode = .read_write }) catch {
+            std.Io.Dir.openFileAbsolute(path.currentIo(), temp_path, .{ .mode = .read_write }) catch {
                 return ctx.fail(error.FileSystem, temp_path, "failed to open download file");
             }
         else
-            std.fs.createFileAbsolute(temp_path, .{
+            std.Io.Dir.createFileAbsolute(path.currentIo(), temp_path, .{
                 .read = true,
                 .truncate = true,
             }) catch {
                 return ctx.fail(error.FileSystem, temp_path, "failed to create download file");
             };
-        defer file.close();
+        defer file.close(path.currentIo());
 
         if (can_resume) {
-            file.seekTo(initial_size) catch {
+            var file_writer = std.Io.File.Writer.initStreaming(file, path.currentIo(), &.{});
+            file_writer.seekTo(initial_size) catch {
                 return ctx.fail(error.FileSystem, temp_path, "failed to seek partial download file");
             };
         }
@@ -221,9 +228,10 @@ pub const CurlTransferClient = struct {
             download_id,
             subject,
         );
-        const final_bytes_total = file.getEndPos() catch {
+        const final_stat = file.stat(path.currentIo()) catch {
             return ctx.fail(error.FileSystem, temp_path, "failed to determine downloaded size");
         };
+        const final_bytes_total = final_stat.size;
 
         if (options.expected_hash != null) {
             const actual_hex_alloc = hash_mod.calculateFileHash(ctx.allocator, temp_path) catch |err| {
@@ -282,7 +290,7 @@ pub const BatchDownloadRequest = struct {
 };
 
 const CurlDownloadSession = struct {
-    file: std.fs.File,
+    file: std.Io.File,
     ctx: *Context,
     download_id: u64,
     subject: ui.Subject,
@@ -295,7 +303,7 @@ const CurlDownloadSession = struct {
 fn curlWriteToFileCallback(ptr: [*]u8, size: usize, nmemb: usize, userdata: *anyopaque) callconv(.c) usize {
     const real_size = size * nmemb;
     const session: *CurlDownloadSession = @ptrCast(@alignCast(userdata));
-    session.file.writeAll(ptr[0..real_size]) catch return 0;
+    session.file.writeStreamingAll(path.currentIo(), ptr[0..real_size]) catch return 0;
     return real_size;
 }
 
@@ -309,7 +317,7 @@ fn curlXferInfoCallback(
     const session: *CurlDownloadSession = @ptrCast(@alignCast(userdata));
     const total_now: ?u64 = if (dltotal > 0) session.initial_size + @as(u64, @intCast(dltotal)) else null;
     const current_now: u64 = session.initial_size + (if (dlnow > 0) @as(u64, @intCast(dlnow)) else 0);
-    const now_ms = std.time.milliTimestamp();
+    const now_ms = monotonicMillis();
 
     // Emit at most ~20fps unless this is a meaningful byte advance.
     if (now_ms - session.last_emit_ms < 50 and current_now <= session.last_emit_current + 64 * 1024) {
@@ -327,7 +335,7 @@ fn curlXferInfoCallback(
 fn downloadFileWithCurl(
     client: *CurlTransferClient,
     ctx: *Context,
-    file: std.fs.File,
+    file: std.Io.File,
     url: [:0]const u8,
     timeout: u32,
     initial_size: u64,
@@ -395,7 +403,7 @@ const MultiDownloadSession = struct {
     ctx: *Context,
     download_id: u64,
     subject: ui.Subject,
-    file: std.fs.File,
+    file: std.Io.File,
     temp_path: []u8,
     dest_abs: []u8,
     dest_exists: bool,
@@ -413,14 +421,14 @@ const MultiDownloadSession = struct {
 
 fn finalizeTempIntoDestination(ctx: *Context, temp_path: []const u8, dest_abs: []const u8, dest_exists: bool, force: bool) !void {
     if (!dest_exists) {
-        std.fs.renameAbsolute(temp_path, dest_abs) catch {
+        std.Io.Dir.renameAbsolute(temp_path, dest_abs, path.currentIo()) catch {
             return ctx.fail(error.FileSystem, dest_abs, "failed to move download into destination");
         };
     } else if (force) {
-        std.fs.deleteFileAbsolute(dest_abs) catch {
+        std.Io.Dir.deleteFileAbsolute(path.currentIo(), dest_abs) catch {
             return ctx.fail(error.FileSystem, dest_abs, "failed to remove existing destination file");
         };
-        std.fs.renameAbsolute(temp_path, dest_abs) catch {
+        std.Io.Dir.renameAbsolute(temp_path, dest_abs, path.currentIo()) catch {
             return ctx.fail(error.FileSystem, dest_abs, "failed to replace destination file");
         };
     }
@@ -429,7 +437,7 @@ fn finalizeTempIntoDestination(ctx: *Context, temp_path: []const u8, dest_abs: [
 fn multiWriteToFileCallback(ptr: [*]u8, size: usize, nmemb: usize, userdata: *anyopaque) callconv(.c) usize {
     const real_size = size * nmemb;
     const session: *MultiDownloadSession = @ptrCast(@alignCast(userdata));
-    session.file.writeAll(ptr[0..real_size]) catch return 0;
+    session.file.writeStreamingAll(path.currentIo(), ptr[0..real_size]) catch return 0;
     return real_size;
 }
 
@@ -443,7 +451,7 @@ fn multiXferInfoCallback(
     const session: *MultiDownloadSession = @ptrCast(@alignCast(userdata));
     const total_now: ?u64 = if (dltotal > 0) session.initial_size + @as(u64, @intCast(dltotal)) else null;
     const current_now: u64 = session.initial_size + (if (dlnow > 0) @as(u64, @intCast(dlnow)) else 0);
-    const now_ms = std.time.milliTimestamp();
+    const now_ms = monotonicMillis();
 
     if (now_ms - session.last_emit_ms < 50 and current_now <= session.last_emit_current + 64 * 1024) {
         return 0;
@@ -492,7 +500,7 @@ pub fn downloadBatch(
                 session.easy = null;
             }
             if (session.file_open) {
-                session.file.close();
+                session.file.close(path.currentIo());
                 session.file_open = false;
             }
             ctx.allocator.free(session.temp_path);
@@ -524,11 +532,11 @@ pub fn downloadBatch(
         errdefer emit.downloadError(ctx, download_id, subject);
 
         const dest_exists = blk: {
-            std.fs.accessAbsolute(dest_abs, .{}) catch break :blk false;
+            std.Io.Dir.accessAbsolute(path.currentIo(), dest_abs, .{}) catch break :blk false;
             break :blk true;
         };
         const temp_exists = blk: {
-            std.fs.accessAbsolute(temp_path, .{}) catch break :blk false;
+            std.Io.Dir.accessAbsolute(path.currentIo(), temp_path, .{}) catch break :blk false;
             break :blk true;
         };
 
@@ -557,9 +565,9 @@ pub fn downloadBatch(
 
             if (std.mem.eql(u8, &hash_result, &expected_bytes)) {
                 const final_bytes_total = blk: {
-                    const temp_file = std.fs.openFileAbsolute(temp_path, .{}) catch break :blk 0;
-                    defer temp_file.close();
-                    break :blk temp_file.getEndPos() catch 0;
+                    const temp_file = std.Io.Dir.openFileAbsolute(path.currentIo(), temp_path, .{}) catch break :blk 0;
+                    defer temp_file.close(path.currentIo());
+                    break :blk (temp_file.stat(path.currentIo()) catch break :blk 0).size;
                 };
                 try finalizeTempIntoDestination(ctx, temp_path, dest_abs, dest_exists, req.options.force);
                 emit.downloadComplete(ctx, download_id, subject, final_bytes_total);
@@ -572,28 +580,30 @@ pub fn downloadBatch(
         var can_resume = false;
         var initial_size: u64 = 0;
         if (req.options.allow_resume and temp_exists) {
-            const temp_file = std.fs.openFileAbsolute(temp_path, .{ .mode = .read_write }) catch {
+            const temp_file = std.Io.Dir.openFileAbsolute(path.currentIo(), temp_path, .{ .mode = .read_write }) catch {
                 return ctx.fail(error.FileSystem, temp_path, "failed to open partial download file");
             };
-            initial_size = temp_file.getEndPos() catch {
-                temp_file.close();
+            const temp_stat = temp_file.stat(path.currentIo()) catch {
+                temp_file.close(path.currentIo());
                 return ctx.fail(error.FileSystem, temp_path, "failed to get partial download size");
             };
-            temp_file.close();
+            initial_size = temp_stat.size;
+            temp_file.close(path.currentIo());
             can_resume = initial_size > 0;
         }
 
         const file = if (can_resume)
-            std.fs.openFileAbsolute(temp_path, .{ .mode = .read_write }) catch {
+            std.Io.Dir.openFileAbsolute(path.currentIo(), temp_path, .{ .mode = .read_write }) catch {
                 return ctx.fail(error.FileSystem, temp_path, "failed to open download file");
             }
         else
-            std.fs.createFileAbsolute(temp_path, .{ .read = true, .truncate = true }) catch {
+            std.Io.Dir.createFileAbsolute(path.currentIo(), temp_path, .{ .read = true, .truncate = true }) catch {
                 return ctx.fail(error.FileSystem, temp_path, "failed to create download file");
             };
-        errdefer file.close();
+        errdefer file.close(path.currentIo());
         if (can_resume) {
-            file.seekTo(initial_size) catch {
+            var file_writer = std.Io.File.Writer.initStreaming(file, path.currentIo(), &.{});
+            file_writer.seekTo(initial_size) catch {
                 return ctx.fail(error.FileSystem, temp_path, "failed to seek partial download file");
             };
         }
@@ -661,8 +671,8 @@ pub fn downloadBatch(
     _ = c.curl_multi_perform(curl_multi, &running);
     var finished: usize = 0;
     var first_error: ?anyerror = null;
-    var failed_labels = std.ArrayList([]u8){};
-    var failed_details = std.ArrayList([]u8){};
+    var failed_labels: std.ArrayList([]u8) = .empty;
+    var failed_details: std.ArrayList([]u8) = .empty;
     defer {
         for (failed_labels.items) |label| ctx.allocator.free(label);
         failed_labels.deinit(ctx.allocator);
@@ -692,7 +702,7 @@ pub fn downloadBatch(
             var mismatch_actual_set = false;
 
             if (session.file_open) {
-                session.file.close();
+                session.file.close(path.currentIo());
                 session.file_open = false;
             }
 
@@ -739,9 +749,9 @@ pub fn downloadBatch(
 
             if (!session_failed) {
                 session.final_bytes_total = blk: {
-                    const temp_file = std.fs.openFileAbsolute(session.temp_path, .{}) catch break :blk 0;
-                    defer temp_file.close();
-                    break :blk temp_file.getEndPos() catch 0;
+                    const temp_file = std.Io.Dir.openFileAbsolute(path.currentIo(), session.temp_path, .{}) catch break :blk 0;
+                    defer temp_file.close(path.currentIo());
+                    break :blk (temp_file.stat(path.currentIo()) catch break :blk 0).size;
                 };
 
                 if (session.expected_hash != null) {
@@ -837,7 +847,7 @@ pub fn downloadBatch(
     }
 
     if (failed_details.items.len > 0) {
-        var diag = std.ArrayList(u8){};
+        var diag: std.ArrayList(u8) = .empty;
         defer diag.deinit(ctx.allocator);
         for (failed_details.items, 0..) |line, i| {
             if (i > 0) try diag.appendSlice(ctx.allocator, "; ");
@@ -849,19 +859,22 @@ pub fn downloadBatch(
     }
 
     if (failed_labels.items.len > 0) {
-        var summary = std.ArrayList(u8){};
+        var summary: std.ArrayList(u8) = .empty;
         defer summary.deinit(ctx.allocator);
+        var out_buf: std.Io.Writer.Allocating = .fromArrayList(ctx.allocator, &summary);
+        const out = &out_buf.writer;
 
         const shown = @min(failed_labels.items.len, 5);
-        try std.fmt.format(summary.writer(ctx.allocator), "download failures ({d}): ", .{failed_labels.items.len});
+        out.print("download failures ({d}): ", .{failed_labels.items.len}) catch return error.OutOfMemory;
         var i: usize = 0;
         while (i < shown) : (i += 1) {
-            if (i > 0) try summary.appendSlice(ctx.allocator, ", ");
-            try summary.appendSlice(ctx.allocator, failed_labels.items[i]);
+            if (i > 0) out.writeAll(", ") catch return error.OutOfMemory;
+            out.writeAll(failed_labels.items[i]) catch return error.OutOfMemory;
         }
         if (failed_labels.items.len > shown) {
-            try std.fmt.format(summary.writer(ctx.allocator), ", +{d} more", .{failed_labels.items.len - shown});
+            out.print(", +{d} more", .{failed_labels.items.len - shown}) catch return error.OutOfMemory;
         }
+        summary = out_buf.toArrayList();
         ctx.debug("{s}", .{summary.items});
     }
 
@@ -1035,15 +1048,13 @@ test "downloadFile does not append duplicate bytes when partial file exists for 
 
     {
         const f = try path.makePathAndOpenFile(part_path);
-        defer f.close();
-        try f.writeAll("abc");
+        defer f.close(path.currentIo());
+        try f.writeStreamingAll(path.currentIo(), "abc");
     }
 
     try downloadFile(transfer, ctx, "http://example.com/file", dest_path, DownloadOptions{ .allow_resume = true });
 
-    const f = try std.fs.openFileAbsolute(dest_path, .{});
-    defer f.close();
-    const content = try f.readToEndAlloc(ctx.allocator, 1024);
+    const content = try std.Io.Dir.readFileAlloc(std.Io.Dir.cwd(), path.currentIo(), dest_path, ctx.allocator, .limited(1024));
     defer ctx.allocator.free(content);
     try std.testing.expectEqualStrings("abcdef", content);
 }
@@ -1078,7 +1089,10 @@ test "downloadFile hash verification success and failure" {
     const rel_name = "test_download_hash.txt";
     // Touch the file in the temp dir to ensure the parent directory exists and permissions are correct
     // Touch the file and close it immediately to avoid unused value error
-    (try test_env.tmp.dir.createFile(rel_name, .{})).close();
+    {
+        const file = try test_env.tmp.dir.createFile(path.currentIo(), rel_name, .{});
+        file.close(path.currentIo());
+    }
     const dest_path = try std.fs.path.join(std.testing.allocator, &.{ test_env.path, rel_name });
     defer std.testing.allocator.free(dest_path);
 
@@ -1086,7 +1100,7 @@ test "downloadFile hash verification success and failure" {
     const pathmod = @import("path.zig");
     const parent_dir = std.fs.path.dirname(dest_path) orelse ".";
     var dir = try pathmod.makePathAndOpenDir(parent_dir);
-    defer dir.close();
+    defer dir.close(path.currentIo());
 
     // Success case: correct hash
     const opts = DownloadOptions{
@@ -1105,7 +1119,7 @@ test "downloadFile hash verification success and failure" {
     try testing.expectError(error.SignatureVerificationFailed, downloadFile(client, ctx, "http://example.com/file", dest_path, opts_bad));
 
     // Clean up the file if it exists
-    std.fs.deleteFileAbsolute(dest_path) catch {};
+    std.Io.Dir.deleteFileAbsolute(path.currentIo(), dest_path) catch {};
 }
 
 test "downloadFile works with file:// scheme using CurlTransferClient" {
@@ -1124,8 +1138,8 @@ test "downloadFile works with file:// scheme using CurlTransferClient" {
     defer ctx.allocator.free(src_file_path);
     {
         const f = try path.makePathAndOpenFile(src_file_path);
-        try f.writeAll(src_content);
-        f.close();
+        try f.writeStreamingAll(path.currentIo(), src_content);
+        f.close(path.currentIo());
     }
 
     // Prepare destination path
@@ -1143,11 +1157,9 @@ test "downloadFile works with file:// scheme using CurlTransferClient" {
     try downloadFile(client, ctx, url_buf[0.. :0], dest_file_path, DownloadOptions{});
 
     // Verify destination file contents
-    const f2 = try std.fs.openFileAbsolute(dest_file_path, .{});
-    defer f2.close();
-    var buf: [64]u8 = undefined;
-    const n = try f2.readAll(&buf);
-    try std.testing.expectEqualStrings(src_content, buf[0..n]);
+    const downloaded = try std.Io.Dir.readFileAlloc(std.Io.Dir.cwd(), path.currentIo(), dest_file_path, ctx.allocator, .limited(1024));
+    defer ctx.allocator.free(downloaded);
+    try std.testing.expectEqualStrings(src_content, downloaded);
 
     // Cleanup CurlTransferClient to avoid memory leak
     CurlTransferClient.cleanupFn(ctx, curl_client);
@@ -1203,11 +1215,9 @@ test "ensurePackageArchiveCached downloads and caches, then hits cache" {
     defer ctx.allocator.free(cache_path);
 
     // File should exist and contain the expected bytes
-    const file = try std.fs.openFileAbsolute(cache_path, .{});
-    defer file.close();
-    var buf: [32]u8 = undefined;
-    const n = try file.readAll(&buf);
-    try std.testing.expectEqualStrings("archive-cached", buf[0..n]);
+    const cached = try std.Io.Dir.readFileAlloc(std.Io.Dir.cwd(), path.currentIo(), cache_path, ctx.allocator, .limited(1024));
+    defer ctx.allocator.free(cached);
+    try std.testing.expectEqualStrings("archive-cached", cached);
     // Second call: should hit cache and keep the original cached bytes.
     try dummy.set("https://repo.example.com/packages/mypkg-1.2.3-1-x86_64-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.pkg.tar.zst", "should-not-be-used");
     const cache_path2 = try th.ensurePackageArchiveCached(
@@ -1218,11 +1228,9 @@ test "ensurePackageArchiveCached downloads and caches, then hits cache" {
     defer ctx.allocator.free(cache_path2);
 
     // File should still contain the original cached bytes
-    const file2 = try std.fs.openFileAbsolute(cache_path2, .{});
-    defer file2.close();
-    var buf2: [32]u8 = undefined;
-    const n2 = try file2.readAll(&buf2);
-    try std.testing.expectEqualStrings("archive-cached", buf2[0..n2]);
+    const cached2 = try std.Io.Dir.readFileAlloc(std.Io.Dir.cwd(), path.currentIo(), cache_path2, ctx.allocator, .limited(1024));
+    defer ctx.allocator.free(cached2);
+    try std.testing.expectEqualStrings("archive-cached", cached2);
     // test_repocache cleanup handled by defer test_repocache.deinit() above
 }
 

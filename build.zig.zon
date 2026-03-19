@@ -2,7 +2,7 @@
     .name = .mere,
     .version = "0.4.1",
     .fingerprint = 0x86c577aae39c0548,
-    .minimum_zig_version = "0.15.1",
+    .minimum_zig_version = "0.16.0",
     .paths = .{
         "build.zig",
         "build.zig.zon",

@@ -5,6 +5,7 @@ const config = @import("../config.zig");
 const hash = @import("../hash.zig");
 const mere = @import("../mere.zig");
 const packaging = @import("../packaging.zig");
+const path_mod = @import("../path.zig");
 const recipe = @import("../recipe.zig");
 const split_staging = @import("split_staging.zig");
 
@@ -84,7 +85,7 @@ pub const SourceUnpackSpec = struct {
 
 pub const ExecutionTrace = struct {
     allocator: ?std.mem.Allocator = null,
-    nodes: std.ArrayList(artifact_model.BuildNode) = .{},
+    nodes: std.ArrayList(artifact_model.BuildNode) = .empty,
     fetched_sources: ?artifact_model.ArtifactRef = null,
     unpacked_source_tree: ?artifact_model.ArtifactRef = null,
     profile_tree: ?artifact_model.ArtifactRef = null,
@@ -114,7 +115,7 @@ pub const ExecutionTrace = struct {
     }
 
     pub fn formatSummaryAlloc(self: *const ExecutionTrace, allocator: std.mem.Allocator) ![]const u8 {
-        var parts: std.ArrayList(u8) = .{};
+        var parts: std.ArrayList(u8) = .empty;
         defer parts.deinit(allocator);
 
         for (self.nodes.items, 0..) |node, i| {
@@ -1141,13 +1142,14 @@ test "restoreUnpackedSources does not depend on fetch key record" {
 
     const recipe_dir = try std.fs.path.join(allocator, &.{ test_env.path, "recipe" });
     defer allocator.free(recipe_dir);
-    try std.fs.cwd().makePath(recipe_dir);
+    var recipe_dir_handle = try path_mod.makePathAndOpenDir(recipe_dir);
+    recipe_dir_handle.close(path_mod.currentIo());
 
     const source_file = try std.fs.path.join(allocator, &.{ recipe_dir, "source.txt" });
     defer allocator.free(source_file);
-    var source_handle = try std.fs.createFileAbsolute(source_file, .{});
-    defer source_handle.close();
-    try source_handle.writeAll("source");
+    var source_handle = try std.Io.Dir.createFileAbsolute(path_mod.currentIo(), source_file, .{});
+    defer source_handle.close(path_mod.currentIo());
+    try source_handle.writeStreamingAll(path_mod.currentIo(), "source");
 
     const recipe_buf =
         \\recipe {
@@ -1165,13 +1167,14 @@ test "restoreUnpackedSources does not depend on fetch key record" {
 
     const fetched_dir = try std.fs.path.join(allocator, &.{ test_env.path, "fetched" });
     defer allocator.free(fetched_dir);
-    try std.fs.cwd().makePath(fetched_dir);
+    var fetched_dir_handle = try path_mod.makePathAndOpenDir(fetched_dir);
+    fetched_dir_handle.close(path_mod.currentIo());
 
     const fetched_file = try std.fs.path.join(allocator, &.{ fetched_dir, "source.txt" });
     defer allocator.free(fetched_file);
-    var fetched_handle = try std.fs.createFileAbsolute(fetched_file, .{});
-    defer fetched_handle.close();
-    try fetched_handle.writeAll("fetched");
+    var fetched_handle = try std.Io.Dir.createFileAbsolute(path_mod.currentIo(), fetched_file, .{});
+    defer fetched_handle.close(path_mod.currentIo());
+    try fetched_handle.writeStreamingAll(path_mod.currentIo(), "fetched");
 
     const fetch_key = try build_cache.computeSourceFetchKey(allocator, &test_env.ctx, recipe_dir, &parsed_recipe);
     defer allocator.free(fetch_key);
@@ -1183,13 +1186,14 @@ test "restoreUnpackedSources does not depend on fetch key record" {
     defer allocator.free(unpacked_dir);
     const actual_dir = try std.fs.path.join(allocator, &.{ unpacked_dir, "demo-1.0.0" });
     defer allocator.free(actual_dir);
-    try std.fs.cwd().makePath(actual_dir);
+    var actual_dir_handle = try path_mod.makePathAndOpenDir(actual_dir);
+    actual_dir_handle.close(path_mod.currentIo());
 
     const unpacked_file = try std.fs.path.join(allocator, &.{ actual_dir, "hello.txt" });
     defer allocator.free(unpacked_file);
-    var unpacked_handle = try std.fs.createFileAbsolute(unpacked_file, .{});
-    defer unpacked_handle.close();
-    try unpacked_handle.writeAll("unpacked");
+    var unpacked_handle = try std.Io.Dir.createFileAbsolute(path_mod.currentIo(), unpacked_file, .{});
+    defer unpacked_handle.close(path_mod.currentIo());
+    try unpacked_handle.writeStreamingAll(path_mod.currentIo(), "unpacked");
 
     const unpack_key = try build_cache.computeSourceUnpackKey(allocator, fetch_key);
     defer allocator.free(unpack_key);
@@ -1200,7 +1204,7 @@ test "restoreUnpackedSources does not depend on fetch key record" {
     defer allocator.free(cache_root);
     const fetch_key_path = try std.fs.path.join(allocator, &.{ cache_root, "keys", build_cache.ArtifactKind.source_fetch.asString(), fetch_key });
     defer allocator.free(fetch_key_path);
-    try std.fs.deleteFileAbsolute(fetch_key_path);
+    try std.Io.Dir.deleteFileAbsolute(path_mod.currentIo(), fetch_key_path);
 
     const restore_dir = try std.fs.path.join(allocator, &.{ test_env.path, "restore-unpacked" });
     defer allocator.free(restore_dir);
@@ -1218,7 +1222,7 @@ test "restoreUnpackedSources does not depend on fetch key record" {
     try std.testing.expect(restored.actual_path != null);
     const restored_file = try std.fs.path.join(allocator, &.{ restore_dir, "demo-1.0.0", "hello.txt" });
     defer allocator.free(restored_file);
-    const content = try std.fs.cwd().readFileAlloc(allocator, restored_file, 64);
+    const content = try std.Io.Dir.readFileAlloc(std.Io.Dir.cwd(), path_mod.currentIo(), restored_file, allocator, .limited(64));
     defer allocator.free(content);
     try std.testing.expectEqualStrings("unpacked", content);
 }

@@ -1,5 +1,6 @@
 const std = @import("std");
 const errors = @import("errors.zig");
+const path_mod = @import("path.zig");
 
 const Std = errors.StandardErrors;
 pub const GenerationError = Std.OutOfMemory || Std.FileSystem || Std.PermissionDenied || Std.InvalidInput || error{
@@ -53,7 +54,7 @@ pub const RealizationData = struct {
 
     pub fn init(allocator: std.mem.Allocator) RealizationData {
         return .{
-            .entries = .{},
+            .entries = .empty,
             .allocator = allocator,
         };
     }
@@ -197,8 +198,8 @@ pub const GenerationManifest = struct {
         return GenerationManifest{
             .schema_version = MANIFEST_SCHEMA_VERSION,
             .generation = generation_num,
-            .created_at = @intCast(std.time.timestamp()),
-            .packages = .{},
+            .created_at = @intCast(std.Io.Clock.real.now(path_mod.currentIo()).toSeconds()),
+            .packages = .empty,
             .parent_generation = null,
             .notes = null,
             .selected_profile = null,
@@ -211,8 +212,8 @@ pub const GenerationManifest = struct {
         return GenerationManifest{
             .schema_version = MANIFEST_SCHEMA_VERSION,
             .generation = null,
-            .created_at = @intCast(std.time.timestamp()),
-            .packages = .{},
+            .created_at = @intCast(std.Io.Clock.real.now(path_mod.currentIo()).toSeconds()),
+            .packages = .empty,
             .parent_generation = null,
             .notes = null,
             .selected_profile = null,
@@ -254,7 +255,7 @@ pub const GenerationManifest = struct {
     }
 
     pub fn encode(self: *const GenerationManifest, allocator: std.mem.Allocator) GenerationError![]u8 {
-        var buffer: std.ArrayList(u8) = .{};
+        var buffer: std.ArrayList(u8) = .empty;
         errdefer buffer.deinit(allocator);
 
         buffer.appendSlice(allocator, "{\n") catch return GenerationError.OutOfMemory;
@@ -387,7 +388,7 @@ pub const GenerationManifest = struct {
             .schema_version = schema_version,
             .generation = generation,
             .created_at = created_at,
-            .packages = .{},
+            .packages = .empty,
             .parent_generation = null,
             .notes = null,
             .selected_profile = null,
@@ -520,20 +521,20 @@ fn validateRealizationPath(path: []const u8) GenerationError!void {
 }
 
 pub fn getNextGenerationNumber(profile_dir: []const u8) GenerationError!u32 {
-    var dir = std.fs.openDirAbsolute(profile_dir, .{ .iterate = true }) catch |err| {
+    var dir = std.Io.Dir.openDirAbsolute(path_mod.currentIo(), profile_dir, .{ .iterate = true }) catch |err| {
         return switch (err) {
             error.FileNotFound => GenerationError.ProfilesNotFound,
             error.AccessDenied => GenerationError.PermissionDenied,
             else => GenerationError.FileSystem,
         };
     };
-    defer dir.close();
+    defer dir.close(path_mod.currentIo());
 
     var max_gen: u32 = 0;
 
     var iter = dir.iterate();
     while (true) {
-        const entry = iter.next() catch |err| {
+        const entry = iter.next(path_mod.currentIo()) catch |err| {
             return switch (err) {
                 error.AccessDenied => GenerationError.PermissionDenied,
                 else => GenerationError.FileSystem,
@@ -582,7 +583,7 @@ pub fn getCurrentGeneration(profile_dir: []const u8) GenerationError!?u32 {
     };
 
     var target_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const target = std.fs.readLinkAbsolute(current_path, &target_buf) catch |err| {
+    const target_len = std.Io.Dir.readLinkAbsolute(path_mod.currentIo(), current_path, &target_buf) catch |err| {
         return switch (err) {
             error.FileNotFound => null,
             error.AccessDenied => GenerationError.PermissionDenied,
@@ -590,28 +591,28 @@ pub fn getCurrentGeneration(profile_dir: []const u8) GenerationError!?u32 {
         };
     };
 
-    return parseGenerationNumber(target);
+    return parseGenerationNumber(target_buf[0..target_len]);
 }
 
 pub fn listGenerations(
     allocator: std.mem.Allocator,
     profile_dir: []const u8,
 ) GenerationError![]u32 {
-    var dir = std.fs.openDirAbsolute(profile_dir, .{ .iterate = true }) catch |err| {
+    var dir = std.Io.Dir.openDirAbsolute(path_mod.currentIo(), profile_dir, .{ .iterate = true }) catch |err| {
         return switch (err) {
             error.FileNotFound => GenerationError.ProfilesNotFound,
             error.AccessDenied => GenerationError.PermissionDenied,
             else => GenerationError.FileSystem,
         };
     };
-    defer dir.close();
+    defer dir.close(path_mod.currentIo());
 
-    var generations: std.ArrayList(u32) = .{};
+    var generations: std.ArrayList(u32) = .empty;
     errdefer generations.deinit(allocator);
 
     var iter = dir.iterate();
     while (true) {
-        const entry = iter.next() catch |err| {
+        const entry = iter.next(path_mod.currentIo()) catch |err| {
             return switch (err) {
                 error.AccessDenied => GenerationError.PermissionDenied,
                 else => GenerationError.FileSystem,
@@ -687,22 +688,26 @@ test "listGenerations ignores generation without manifest.json" {
     const allocator = test_env.ctx.allocator;
     const profile_dir = try std.fs.path.join(allocator, &.{ test_env.path, "mere", "profiles", "system" });
     defer allocator.free(profile_dir);
-    try std.fs.cwd().makePath(profile_dir);
+    var profile_dir_handle = try path_mod.makePathAndOpenDir(profile_dir);
+    profile_dir_handle.close(path_mod.currentIo());
 
     const gen1_path = try std.fs.path.join(allocator, &.{ profile_dir, "gen-1" });
     defer allocator.free(gen1_path);
-    try std.fs.cwd().makePath(gen1_path);
+    var gen1_dir = try path_mod.makePathAndOpenDir(gen1_path);
+    gen1_dir.close(path_mod.currentIo());
     var manifest1 = GenerationManifest.init(allocator, 1);
     defer manifest1.deinit();
     try writeManifest(allocator, gen1_path, &manifest1);
 
     const gen2_path = try std.fs.path.join(allocator, &.{ profile_dir, "gen-2" });
     defer allocator.free(gen2_path);
-    try std.fs.cwd().makePath(gen2_path);
+    var gen2_dir = try path_mod.makePathAndOpenDir(gen2_path);
+    gen2_dir.close(path_mod.currentIo());
 
     const gen3_path = try std.fs.path.join(allocator, &.{ profile_dir, "gen-3" });
     defer allocator.free(gen3_path);
-    try std.fs.cwd().makePath(gen3_path);
+    var gen3_dir = try path_mod.makePathAndOpenDir(gen3_path);
+    gen3_dir.close(path_mod.currentIo());
     var manifest3 = GenerationManifest.init(allocator, 3);
     defer manifest3.deinit();
     try writeManifest(allocator, gen3_path, &manifest3);
@@ -726,12 +731,14 @@ test "listGenerations returns sorted list" {
     const allocator = test_env.ctx.allocator;
     const profile_dir = try std.fs.path.join(allocator, &.{ test_env.path, "mere", "profiles", "system" });
     defer allocator.free(profile_dir);
-    try std.fs.cwd().makePath(profile_dir);
+    var profile_dir_handle = try path_mod.makePathAndOpenDir(profile_dir);
+    profile_dir_handle.close(path_mod.currentIo());
 
     for ([_]u32{ 3, 1, 5, 2 }) |n| {
         const gen_path = try std.fmt.allocPrint(allocator, "{s}/gen-{d}", .{ profile_dir, n });
         defer allocator.free(gen_path);
-        try std.fs.cwd().makePath(gen_path);
+        var gen_dir = try path_mod.makePathAndOpenDir(gen_path);
+        gen_dir.close(path_mod.currentIo());
 
         var manifest = GenerationManifest.init(allocator, n);
         defer manifest.deinit();
@@ -759,7 +766,8 @@ test "getCurrentGeneration returns null when no active generation" {
     const allocator = test_env.ctx.allocator;
     const profile_dir = try std.fs.path.join(allocator, &.{ test_env.path, "mere", "profiles", "system" });
     defer allocator.free(profile_dir);
-    try std.fs.cwd().makePath(profile_dir);
+    var profile_dir_handle = try path_mod.makePathAndOpenDir(profile_dir);
+    profile_dir_handle.close(path_mod.currentIo());
 
     const current = try getCurrentGeneration(profile_dir);
     try std.testing.expectEqual(@as(?u32, null), current);
@@ -776,22 +784,24 @@ test "findPreviousGeneration returns previous generation" {
     const allocator = test_env.ctx.allocator;
     const profile_dir = try std.fs.path.join(allocator, &.{ test_env.path, "mere", "profiles", "system" });
     defer allocator.free(profile_dir);
-    try std.fs.cwd().makePath(profile_dir);
+    var profile_dir_handle = try path_mod.makePathAndOpenDir(profile_dir);
+    profile_dir_handle.close(path_mod.currentIo());
 
     for ([_]u32{ 1, 2, 3 }) |n| {
         const gen_path = try std.fmt.allocPrint(allocator, "{s}/gen-{d}", .{ profile_dir, n });
         defer allocator.free(gen_path);
-        try std.fs.cwd().makePath(gen_path);
+        var gen_dir = try path_mod.makePathAndOpenDir(gen_path);
+        gen_dir.close(path_mod.currentIo());
 
         var manifest = GenerationManifest.init(allocator, n);
         defer manifest.deinit();
         try writeManifest(allocator, gen_path, &manifest);
     }
 
-    var profile_dir_handle = try std.fs.openDirAbsolute(profile_dir, .{});
-    defer profile_dir_handle.close();
-    profile_dir_handle.deleteFile(CURRENT_SYMLINK) catch {};
-    try profile_dir_handle.symLink("gen-3", CURRENT_SYMLINK, .{});
+    var current_handle = try std.Io.Dir.openDirAbsolute(path_mod.currentIo(), profile_dir, .{});
+    defer current_handle.close(path_mod.currentIo());
+    current_handle.deleteFile(path_mod.currentIo(), CURRENT_SYMLINK) catch {};
+    try current_handle.symLink(path_mod.currentIo(), "gen-3", CURRENT_SYMLINK, .{});
 
     const previous = try findPreviousGeneration(allocator, profile_dir);
     try std.testing.expectEqual(@as(u32, 2), previous);
@@ -808,20 +818,22 @@ test "findPreviousGeneration fails when no previous generation" {
     const allocator = test_env.ctx.allocator;
     const profile_dir = try std.fs.path.join(allocator, &.{ test_env.path, "mere", "profiles", "system" });
     defer allocator.free(profile_dir);
-    try std.fs.cwd().makePath(profile_dir);
+    var profile_dir_handle = try path_mod.makePathAndOpenDir(profile_dir);
+    profile_dir_handle.close(path_mod.currentIo());
 
     const gen_path = try std.fs.path.join(allocator, &.{ profile_dir, "gen-1" });
     defer allocator.free(gen_path);
-    try std.fs.cwd().makePath(gen_path);
+    var gen_dir = try path_mod.makePathAndOpenDir(gen_path);
+    gen_dir.close(path_mod.currentIo());
 
     var manifest = GenerationManifest.init(allocator, 1);
     defer manifest.deinit();
     try writeManifest(allocator, gen_path, &manifest);
 
-    var profile_dir_handle = try std.fs.openDirAbsolute(profile_dir, .{});
-    defer profile_dir_handle.close();
-    profile_dir_handle.deleteFile(CURRENT_SYMLINK) catch {};
-    try profile_dir_handle.symLink("gen-1", CURRENT_SYMLINK, .{});
+    var current_handle = try std.Io.Dir.openDirAbsolute(path_mod.currentIo(), profile_dir, .{});
+    defer current_handle.close(path_mod.currentIo());
+    current_handle.deleteFile(path_mod.currentIo(), CURRENT_SYMLINK) catch {};
+    try current_handle.symLink(path_mod.currentIo(), "gen-1", CURRENT_SYMLINK, .{});
 
     const result = findPreviousGeneration(allocator, profile_dir);
     try std.testing.expectError(GenerationError.NoPreviousGeneration, result);
@@ -838,7 +850,8 @@ test "findPreviousGeneration fails when no current generation" {
     const allocator = test_env.ctx.allocator;
     const profile_dir = try std.fs.path.join(allocator, &.{ test_env.path, "mere", "profiles", "system" });
     defer allocator.free(profile_dir);
-    try std.fs.cwd().makePath(profile_dir);
+    var profile_dir_handle = try path_mod.makePathAndOpenDir(profile_dir);
+    profile_dir_handle.close(path_mod.currentIo());
 
     const result = findPreviousGeneration(allocator, profile_dir);
     try std.testing.expectError(GenerationError.NoCurrentGeneration, result);
@@ -856,16 +869,17 @@ pub fn readManifest(allocator: std.mem.Allocator, generation_dir: []const u8) Ge
     };
     defer allocator.free(manifest_path);
 
-    const file = std.fs.openFileAbsolute(manifest_path, .{}) catch |err| {
+    const io = path_mod.currentIo();
+    var file = path_mod.openExistingFile(manifest_path) catch |err| {
         return switch (err) {
             error.FileNotFound => GenerationError.GenerationNotFound,
             error.AccessDenied => GenerationError.PermissionDenied,
             else => GenerationError.FileSystem,
         };
     };
-    defer file.close();
+    defer file.close(io);
 
-    const stat = file.stat() catch |err| {
+    const stat = file.stat(io) catch |err| {
         return switch (err) {
             error.AccessDenied => GenerationError.PermissionDenied,
             else => GenerationError.FileSystem,
@@ -881,7 +895,7 @@ pub fn readManifest(allocator: std.mem.Allocator, generation_dir: []const u8) Ge
     };
     defer allocator.free(buffer);
 
-    const bytes_read = file.readAll(buffer) catch |err| {
+    const bytes_read = file.readPositionalAll(io, buffer, 0) catch |err| {
         return switch (err) {
             error.AccessDenied => GenerationError.PermissionDenied,
             else => GenerationError.FileSystem,
@@ -904,15 +918,16 @@ pub fn writeManifest(allocator: std.mem.Allocator, generation_dir: []const u8, m
     const content = try manifest.encode(allocator);
     defer allocator.free(content);
 
-    const file = std.fs.createFileAbsolute(manifest_path, .{}) catch |err| {
+    const io = path_mod.currentIo();
+    var file = std.Io.Dir.createFileAbsolute(io, manifest_path, .{}) catch |err| {
         return switch (err) {
             error.AccessDenied => GenerationError.PermissionDenied,
             else => GenerationError.FileSystem,
         };
     };
-    defer file.close();
+    defer file.close(io);
 
-    file.writeAll(content) catch |err| {
+    file.writeStreamingAll(io, content) catch |err| {
         return switch (err) {
             error.AccessDenied => GenerationError.PermissionDenied,
             else => GenerationError.FileSystem,
@@ -926,16 +941,17 @@ pub fn readRealization(allocator: std.mem.Allocator, generation_dir: []const u8)
     };
     defer allocator.free(realization_path);
 
-    const file = std.fs.openFileAbsolute(realization_path, .{}) catch |err| {
+    const io = path_mod.currentIo();
+    var file = path_mod.openExistingFile(realization_path) catch |err| {
         return switch (err) {
             error.FileNotFound => GenerationError.GenerationNotFound,
             error.AccessDenied => GenerationError.PermissionDenied,
             else => GenerationError.FileSystem,
         };
     };
-    defer file.close();
+    defer file.close(io);
 
-    const stat = file.stat() catch |err| {
+    const stat = file.stat(io) catch |err| {
         return switch (err) {
             error.AccessDenied => GenerationError.PermissionDenied,
             else => GenerationError.FileSystem,
@@ -949,7 +965,7 @@ pub fn readRealization(allocator: std.mem.Allocator, generation_dir: []const u8)
     };
     defer allocator.free(buffer);
 
-    const bytes_read = file.readAll(buffer) catch |err| {
+    const bytes_read = file.readPositionalAll(io, buffer, 0) catch |err| {
         return switch (err) {
             error.AccessDenied => GenerationError.PermissionDenied,
             else => GenerationError.FileSystem,
@@ -973,15 +989,16 @@ pub fn writeRealization(
     const content = try realization.encode(allocator);
     defer allocator.free(content);
 
-    const file = std.fs.createFileAbsolute(realization_path, .{}) catch |err| {
+    const io = path_mod.currentIo();
+    var file = std.Io.Dir.createFileAbsolute(io, realization_path, .{}) catch |err| {
         return switch (err) {
             error.AccessDenied => GenerationError.PermissionDenied,
             else => GenerationError.FileSystem,
         };
     };
-    defer file.close();
+    defer file.close(io);
 
-    file.writeAll(content) catch |err| {
+    file.writeStreamingAll(io, content) catch |err| {
         return switch (err) {
             error.AccessDenied => GenerationError.PermissionDenied,
             else => GenerationError.FileSystem,
@@ -1134,25 +1151,30 @@ test "getNextGenerationNumber with existing generations" {
     // Create profile directory (simulating /mere/profiles/system/)
     const profile_dir = try std.fs.path.join(allocator, &.{ test_env.path, "profiles", "system" });
     defer allocator.free(profile_dir);
-    try std.fs.cwd().makePath(profile_dir);
+    var profile_dir_handle = try path_mod.makePathAndOpenDir(profile_dir);
+    profile_dir_handle.close(path_mod.currentIo());
 
     // Create some generation directories using new gen-N naming
     const gen1 = try std.fs.path.join(allocator, &.{ profile_dir, "gen-1" });
     defer allocator.free(gen1);
-    try std.fs.cwd().makePath(gen1);
+    var gen1_dir = try path_mod.makePathAndOpenDir(gen1);
+    gen1_dir.close(path_mod.currentIo());
 
     const gen5 = try std.fs.path.join(allocator, &.{ profile_dir, "gen-5" });
     defer allocator.free(gen5);
-    try std.fs.cwd().makePath(gen5);
+    var gen5_dir = try path_mod.makePathAndOpenDir(gen5);
+    gen5_dir.close(path_mod.currentIo());
 
     const gen3 = try std.fs.path.join(allocator, &.{ profile_dir, "gen-3" });
     defer allocator.free(gen3);
-    try std.fs.cwd().makePath(gen3);
+    var gen3_dir = try path_mod.makePathAndOpenDir(gen3);
+    gen3_dir.close(path_mod.currentIo());
 
     // Also create a non-matching directory (should be ignored)
     const other = try std.fs.path.join(allocator, &.{ profile_dir, "other-dir" });
     defer allocator.free(other);
-    try std.fs.cwd().makePath(other);
+    var other_dir = try path_mod.makePathAndOpenDir(other);
+    other_dir.close(path_mod.currentIo());
 
     const next = try getNextGenerationNumber(profile_dir);
     try std.testing.expectEqual(@as(u32, 6), next);
@@ -1171,7 +1193,8 @@ test "getNextGenerationNumber with no generations" {
     // Create empty profile directory
     const profile_dir = try std.fs.path.join(allocator, &.{ test_env.path, "profiles", "system" });
     defer allocator.free(profile_dir);
-    try std.fs.cwd().makePath(profile_dir);
+    var profile_dir_handle = try path_mod.makePathAndOpenDir(profile_dir);
+    profile_dir_handle.close(path_mod.currentIo());
 
     const next = try getNextGenerationNumber(profile_dir);
     try std.testing.expectEqual(@as(u32, 1), next);
@@ -1195,7 +1218,8 @@ test "writeManifest and readManifest" {
     // Create generation directory (new nested layout: profile/gen-N)
     const gen_dir = try std.fs.path.join(allocator, &.{ test_env.path, "profiles", "system", "gen-1" });
     defer allocator.free(gen_dir);
-    try std.fs.cwd().makePath(gen_dir);
+    var gen_dir_handle = try path_mod.makePathAndOpenDir(gen_dir);
+    gen_dir_handle.close(path_mod.currentIo());
 
     // Create and write manifest
     var manifest = GenerationManifest.init(allocator, 1);
@@ -1232,7 +1256,8 @@ test "writeRealization and readRealization" {
     const allocator = test_env.ctx.allocator;
     const gen_dir = try std.fs.path.join(allocator, &.{ test_env.path, "profiles", "system", "gen-1" });
     defer allocator.free(gen_dir);
-    try std.fs.cwd().makePath(gen_dir);
+    var gen_dir_handle = try path_mod.makePathAndOpenDir(gen_dir);
+    gen_dir_handle.close(path_mod.currentIo());
 
     var realization = RealizationData.init(allocator);
     defer realization.deinit();
@@ -1312,16 +1337,19 @@ test "getNextGenerationNumber handles gaps in sequence" {
     // Create profile directory
     const profile_dir = try std.fs.path.join(allocator, &.{ test_env.path, "profiles", "system" });
     defer allocator.free(profile_dir);
-    try std.fs.cwd().makePath(profile_dir);
+    var profile_dir_handle = try path_mod.makePathAndOpenDir(profile_dir);
+    profile_dir_handle.close(path_mod.currentIo());
 
     // Create gen-1 and gen-5 (gap: 2, 3, 4 missing)
     const gen1 = try std.fs.path.join(allocator, &.{ profile_dir, "gen-1" });
     defer allocator.free(gen1);
-    try std.fs.cwd().makePath(gen1);
+    var gen1_dir = try path_mod.makePathAndOpenDir(gen1);
+    gen1_dir.close(path_mod.currentIo());
 
     const gen5 = try std.fs.path.join(allocator, &.{ profile_dir, "gen-5" });
     defer allocator.free(gen5);
-    try std.fs.cwd().makePath(gen5);
+    var gen5_dir = try path_mod.makePathAndOpenDir(gen5);
+    gen5_dir.close(path_mod.currentIo());
 
     // Next should be 6 (max(1,5) + 1), not 2 (gap-filling)
     const next = try getNextGenerationNumber(profile_dir);

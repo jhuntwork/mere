@@ -177,7 +177,7 @@ pub fn uninstallPackagesFromConfig(
     try persistRequestedRoots(ctx, &requested_state);
 
     if (requested_state.packages.items.len > 0) {
-        var requested_tokens = std.ArrayList([]const u8){};
+        var requested_tokens: std.ArrayList([]const u8) = .empty;
         defer {
             for (requested_tokens.items) |token| ctx.allocator.free(token);
             requested_tokens.deinit(ctx.allocator);
@@ -360,7 +360,7 @@ fn loadRequestedRootsState(ctx: *Context, profile_name: []const u8) !RequestedRo
     const profile_dir = try getProfileDir(ctx, profile_name);
     defer ctx.allocator.free(profile_dir);
 
-    std.fs.cwd().makePath(profile_dir) catch |err| {
+    path.ensureDirExists(profile_dir) catch |err| {
         ctx.setDiagnosticContext(profile_dir, "failed to create profile directory");
         return switch (err) {
             error.AccessDenied => error.PermissionDenied,
@@ -502,7 +502,7 @@ fn loadCurrentGenerationPreferences(ctx: *Context, profile_name: []const u8) !Pr
         const root_path = profile.getRootPath(ctx.allocator, profile_dir) catch return error.OutOfMemory;
         defer ctx.allocator.free(root_path);
 
-        std.fs.accessAbsolute(root_path, .{}) catch |err| {
+        std.Io.Dir.accessAbsolute(path.currentIo(), root_path, .{}) catch |err| {
             return switch (err) {
                 error.FileNotFound => PreferredSelectionsState.initEmpty(ctx.allocator),
                 error.AccessDenied => error.PermissionDenied,
@@ -573,7 +573,7 @@ fn parseInstallRootRequirements(
     allocator: std.mem.Allocator,
     pkg_tokens: []const []const u8,
 ) !std.ArrayList(InstallRootRequirement) {
-    var requirements: std.ArrayList(InstallRootRequirement) = .{};
+    var requirements: std.ArrayList(InstallRootRequirement) = .empty;
     errdefer deinitInstallRootRequirements(allocator, &requirements);
 
     var requirement_index = std.StringHashMap(usize).init(allocator);
@@ -779,7 +779,7 @@ fn installResolvedPackages(
 
     // 2. Install each package to store in topological order
     // Collect installed package info for generation creation
-    var installed_packages: std.ArrayList(generation.PackageEntry) = .{};
+    var installed_packages: std.ArrayList(generation.PackageEntry) = .empty;
     errdefer {
         for (installed_packages.items) |*pkg_info| {
             pkg_info.deinit(ctx.allocator);
@@ -812,16 +812,16 @@ fn prefetchMissingPackageArchives(
     sorted_packages: []resolver.ResolvedPackage,
     client: download.TransferClient,
 ) !std.ArrayList([]const u8) {
-    var requests = std.ArrayList(download.BatchDownloadRequest){};
+    var requests: std.ArrayList(download.BatchDownloadRequest) = .empty;
     defer requests.deinit(ctx.allocator);
 
-    var owned_urls = std.ArrayList([:0]const u8){};
+    var owned_urls: std.ArrayList([:0]const u8) = .empty;
     defer {
         for (owned_urls.items) |url| ctx.allocator.free(url);
         owned_urls.deinit(ctx.allocator);
     }
 
-    var cache_paths = std.ArrayList([]const u8){};
+    var cache_paths: std.ArrayList([]const u8) = .empty;
     errdefer {
         for (cache_paths.items) |path_buf| ctx.allocator.free(path_buf);
         cache_paths.deinit(ctx.allocator);
@@ -830,14 +830,14 @@ fn prefetchMissingPackageArchives(
     for (sorted_packages) |*resolved| {
         const cache_dir = try resolved.repocache.archiveCacheDir();
         defer ctx.allocator.free(cache_dir);
-        std.fs.cwd().makePath(cache_dir) catch |err| {
+        path.ensureDirExists(cache_dir) catch |err| {
             return ctx.fail(err, cache_dir, "failed to create package cache directory");
         };
 
         const cache_path = try resolved.repocache.archiveCachePath(&resolved.pkg);
         errdefer ctx.allocator.free(cache_path);
 
-        std.fs.accessAbsolute(cache_path, .{}) catch {
+        std.Io.Dir.accessAbsolute(path.currentIo(), cache_path, .{}) catch {
             const archive_url = try resolved.repocache.archiveUrl(&resolved.pkg);
             errdefer ctx.allocator.free(archive_url);
 
@@ -944,7 +944,7 @@ fn applyProfileRealization(ctx: *Context, prof_name: []const u8, installed_packa
     defer ctx.allocator.free(store_root);
 
     // Ensure profile directory exists
-    std.fs.cwd().makePath(profile_dir) catch |err| {
+    path.ensureDirExists(profile_dir) catch |err| {
         ctx.setDiagnosticContext(profile_dir, "failed to create profile directory");
         return switch (err) {
             error.AccessDenied => error.PermissionDenied,
@@ -1105,7 +1105,7 @@ fn installSinglePackageToStore(
     defer if (!keep_preverify_install_dir) ctx.allocator.free(preverify_install_dir);
 
     var preverify_exists = true;
-    std.fs.accessAbsolute(preverify_install_dir, .{}) catch {
+    std.Io.Dir.accessAbsolute(path.currentIo(), preverify_install_dir, .{}) catch {
         preverify_exists = false;
     };
 
@@ -1131,12 +1131,12 @@ fn installSinglePackageToStore(
     }
 
     const staging = try stageAndValidatePayload(ctx, pkg, cache_path, preverify.manifest_content_hash);
-    errdefer std.fs.deleteTreeAbsolute(staging.staging_dir) catch {};
+    errdefer path.deleteTreeAbsolute(staging.staging_dir) catch {};
     defer ctx.allocator.free(staging.staging_dir);
 
     if (staging.content_exists and !reinstall) {
         ctx.debug("content already exists in store: {s}", .{staging.install_dir});
-        std.fs.deleteTreeAbsolute(staging.staging_dir) catch {};
+        path.deleteTreeAbsolute(staging.staging_dir) catch {};
 
         try finalizeAdmittedStoreObject(ctx, repo_cache, staging.install_dir, &preverify, true);
 
@@ -1154,7 +1154,7 @@ fn installSinglePackageToStore(
 
     if (reinstall and staging.content_exists) {
         ctx.debug("reinstall requested, removing existing store dir: {s}", .{staging.install_dir});
-        std.fs.deleteTreeAbsolute(staging.install_dir) catch {};
+        path.deleteTreeAbsolute(staging.install_dir) catch {};
     }
 
     const store_parent = std.fs.path.dirname(staging.install_dir) orelse {
@@ -1164,7 +1164,7 @@ fn installSinglePackageToStore(
         ctx.setDiagnosticContext(staging.install_dir, "failed to create store parent directory");
         return mapInstallFsError(err);
     };
-    parent_dir.close();
+    parent_dir.close(path.currentIo());
 
     // === Step 4: Atomic rename to final path ===
     const staging_z = try ctx.allocator.dupeZ(u8, staging.staging_dir);
@@ -1178,10 +1178,10 @@ fn installSinglePackageToStore(
         if (errno == .EXIST or errno == .NOTEMPTY) {
             // Target already exists - another process beat us, treat as success
             ctx.debug("target already exists (race), cleaning up staging dir", .{});
-            std.fs.deleteTreeAbsolute(staging.staging_dir) catch {};
+            path.deleteTreeAbsolute(staging.staging_dir) catch {};
         } else {
             ctx.debug("atomic rename failed with errno {d}", .{rename_result});
-            std.fs.deleteTreeAbsolute(staging.staging_dir) catch {};
+            path.deleteTreeAbsolute(staging.staging_dir) catch {};
             return ctx.fail(error.FileSystem, staging.install_dir, "atomic rename to final path failed");
         }
     }
@@ -1205,39 +1205,40 @@ fn installSinglePackageToStore(
 /// Set a directory and its contents to read-only (best-effort)
 /// Removes write permissions while preserving read and execute bits
 fn setDirectoryReadOnly(dir_path: []const u8) !void {
-    var dir = try std.fs.openDirAbsolute(dir_path, .{ .iterate = true });
-    defer dir.close();
+    const io = path.currentIo();
+    var dir = try std.Io.Dir.openDirAbsolute(io, dir_path, .{ .iterate = true });
+    defer dir.close(io);
 
     var walker = try dir.walk(std.heap.page_allocator);
     defer walker.deinit();
 
     while (true) {
-        const entry = try walker.next();
+        const entry = try walker.next(io);
         if (entry == null) break;
         const e = entry.?;
         // Get metadata and change permissions
         if (e.kind == .directory) {
-            var subdir = dir.openDir(e.path, .{}) catch continue;
-            defer subdir.close();
-            const stat = subdir.stat() catch continue;
+            var subdir = dir.openDir(io, e.path, .{}) catch continue;
+            defer subdir.close(io);
+            const stat = subdir.stat(io) catch continue;
             // Remove write bits (0o222) but preserve read (0o444) and execute (0o111)
-            const new_mode = stat.mode & ~@as(std.fs.File.Mode, 0o222);
-            subdir.chmod(new_mode) catch {};
+            const new_mode = stat.permissions.toMode() & ~@as(std.posix.mode_t, 0o222);
+            subdir.setPermissions(io, .fromMode(new_mode)) catch {};
         } else {
             // Open file in read-only mode just to get handle for chmod
-            var file = dir.openFile(e.path, .{ .mode = .read_only }) catch continue;
-            defer file.close();
-            const stat = file.stat() catch continue;
+            var file = dir.openFile(io, e.path, .{ .mode = .read_only }) catch continue;
+            defer file.close(io);
+            const stat = file.stat(io) catch continue;
             // Remove write bits (0o222) but preserve read (0o444) and execute (0o111)
-            const new_mode = stat.mode & ~@as(std.fs.File.Mode, 0o222);
-            file.chmod(new_mode) catch {};
+            const new_mode = stat.permissions.toMode() & ~@as(std.posix.mode_t, 0o222);
+            file.setPermissions(io, .fromMode(new_mode)) catch {};
         }
     }
 
     // Also chmod the directory itself
-    const stat = try dir.stat();
-    const new_mode = stat.mode & ~@as(std.fs.File.Mode, 0o222);
-    dir.chmod(new_mode) catch {};
+    const stat = try dir.stat(io);
+    const new_mode = stat.permissions.toMode() & ~@as(std.posix.mode_t, 0o222);
+    dir.setPermissions(io, .fromMode(new_mode)) catch {};
 }
 
 const ParsedManifest = struct {
@@ -1331,7 +1332,8 @@ fn preVerifyManifest(
     defer verify_temp_dir.cleanup();
 
     var verify_path_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const verify_dir = try verify_temp_dir.dir.realpath(".", &verify_path_buf);
+    const verify_dir_len = try verify_temp_dir.dir.realPath(path.currentIo(), &verify_path_buf);
+    const verify_dir = verify_path_buf[0..verify_dir_len];
 
     ctx.debug("partial-extracting manifest for pre-verification", .{});
     try extract.fileInto(ctx, cache_path, verify_dir, manifest.MANIFEST_FILENAME);
@@ -1430,24 +1432,24 @@ fn stageAndValidatePayload(
     defer ctx.allocator.free(incoming_dir);
 
     // Ensure .incoming directory exists
-    std.fs.cwd().makePath(incoming_dir) catch |err| {
+    path.ensureDirExists(incoming_dir) catch |err| {
         ctx.debug("failed to create .incoming dir: {}", .{err});
         return ctx.fail(mapInstallFsError(err), incoming_dir, "failed to create staging directory");
     };
 
     // Create unique staging directory
     var rand_buf: [16]u8 = undefined;
-    std.crypto.random.bytes(&rand_buf);
+    path.currentIo().random(&rand_buf);
     const rand_hex = std.fmt.bytesToHex(rand_buf, .lower);
     const staging_dir = try std.fs.path.join(ctx.allocator, &.{ incoming_dir, &rand_hex });
     errdefer ctx.allocator.free(staging_dir);
 
     ctx.debug("staging package in: {s}", .{staging_dir});
-    std.fs.cwd().makePath(staging_dir) catch |err| {
+    path.ensureDirExists(staging_dir) catch |err| {
         ctx.debug("failed to create staging dir: {}", .{err});
         return ctx.fail(mapInstallFsError(err), staging_dir, "failed to create staging directory");
     };
-    errdefer std.fs.deleteTreeAbsolute(staging_dir) catch {};
+    errdefer path.deleteTreeAbsolute(staging_dir) catch {};
 
     // === Step 3: Extract payload and validate ===
     extract.intoPreservingSpecialBits(ctx, cache_path, staging_dir) catch |err| {
@@ -1508,7 +1510,7 @@ fn stageAndValidatePayload(
     ctx.debug("content-addressed store path: {s}", .{install_dir});
 
     var content_exists = true;
-    std.fs.accessAbsolute(install_dir, .{}) catch {
+    std.Io.Dir.accessAbsolute(path.currentIo(), install_dir, .{}) catch {
         content_exists = false;
     };
 
@@ -1586,9 +1588,9 @@ test "multi-repository install uses priority and resolves dependencies across re
     defer std.testing.allocator.free(repo2_dir);
     {
         var d1 = try path.makePathAndOpenDir(repo1_dir);
-        d1.close();
+        d1.close(path.currentIo());
         var d2 = try path.makePathAndOpenDir(repo2_dir);
-        d2.close();
+        d2.close(path.currentIo());
     }
 
     // Place DB files as repo1/repo1.db and repo2/repo2.db using path helpers
@@ -1599,9 +1601,9 @@ test "multi-repository install uses priority and resolves dependencies across re
     const db_path2 = try std.fs.path.join(std.testing.allocator, &.{ repo2_dir, db_file2 });
     defer std.testing.allocator.free(db_path2);
     var f1 = try path.makePathAndOpenFile(db_path1);
-    f1.close();
+    f1.close(path.currentIo());
     var f2 = try path.makePathAndOpenFile(db_path2);
-    f2.close();
+    f2.close(path.currentIo());
 
     // Generate and save valid keypairs for each repo
     // Generate and save valid keypairs for each repo (declare at outer scope)
@@ -1636,7 +1638,7 @@ test "multi-repository install uses priority and resolves dependencies across re
     // Create dummy package file for A
     const packages_dir1 = try std.fs.path.join(std.testing.allocator, &.{ repo1_dir, "packages" });
     defer std.testing.allocator.free(packages_dir1);
-    try std.fs.cwd().makePath(packages_dir1);
+    try path.ensureDirExists(packages_dir1);
     var pkg_a = package.Package.init(ctx);
     pkg_a.name = try ctx.allocator.dupe(u8, "A");
     pkg_a.version = try ctx.allocator.dupe(u8, "1.0.0");
@@ -1651,24 +1653,24 @@ test "multi-repository install uses priority and resolves dependencies across re
 
     {
         // Ensure packages_dir1 exists
-        try std.fs.cwd().makePath(packages_dir1);
+        try path.ensureDirExists(packages_dir1);
 
         // Create a temp directory structure for archive.createTar
         const pkg_a_staging = try std.fs.path.join(ctx.allocator, &.{ test_env.path, "pkg_a_staging" });
         defer ctx.allocator.free(pkg_a_staging);
-        try std.fs.cwd().makePath(pkg_a_staging);
+        try path.ensureDirExists(pkg_a_staging);
 
         // Write file.txt
         const file_txt_path = try std.fs.path.join(ctx.allocator, &.{ pkg_a_staging, "file.txt" });
         defer ctx.allocator.free(file_txt_path);
         var file_txt = try path.makePathAndOpenFile(file_txt_path);
-        try file_txt.writeAll("hello");
-        file_txt.close();
+        try file_txt.writeStreamingAll(path.currentIo(), "hello");
+        file_txt.close(path.currentIo());
 
         // Create .mere directory and manifest.v1 binary data
         const mere_dir_path = try std.fs.path.join(ctx.allocator, &.{ pkg_a_staging, manifest.META_DIR });
         defer ctx.allocator.free(mere_dir_path);
-        try std.fs.cwd().makePath(mere_dir_path);
+        try path.ensureDirExists(mere_dir_path);
 
         pkg_a_content_hash = try hash.calculateStoreContentHash(ctx.allocator, pkg_a_staging, null);
         var content_hash_bytes: [32]u8 = undefined;
@@ -1710,7 +1712,7 @@ test "multi-repository install uses priority and resolves dependencies across re
     // Create dummy package file for B
     const packages_dir2 = try std.fs.path.join(std.testing.allocator, &.{ repo2_dir, "packages" });
     defer std.testing.allocator.free(packages_dir2);
-    try std.fs.cwd().makePath(packages_dir2);
+    try path.ensureDirExists(packages_dir2);
     var pkg_b = package.Package.init(ctx);
     pkg_b.name = try ctx.allocator.dupe(u8, "B");
     pkg_b.version = try ctx.allocator.dupe(u8, "1.0.0");
@@ -1725,24 +1727,24 @@ test "multi-repository install uses priority and resolves dependencies across re
 
     {
         // Ensure packages_dir2 exists
-        try std.fs.cwd().makePath(packages_dir2);
+        try path.ensureDirExists(packages_dir2);
 
         // Create a temp directory structure for archive.createTar
         const pkg_b_staging = try std.fs.path.join(ctx.allocator, &.{ test_env.path, "pkg_b_staging" });
         defer ctx.allocator.free(pkg_b_staging);
-        try std.fs.cwd().makePath(pkg_b_staging);
+        try path.ensureDirExists(pkg_b_staging);
 
         // Write file.txt
         const file_txt_path = try std.fs.path.join(ctx.allocator, &.{ pkg_b_staging, "file.txt" });
         defer ctx.allocator.free(file_txt_path);
         var file_txt = try path.makePathAndOpenFile(file_txt_path);
-        try file_txt.writeAll("hello");
-        file_txt.close();
+        try file_txt.writeStreamingAll(path.currentIo(), "hello");
+        file_txt.close(path.currentIo());
 
         // Create .mere directory and manifest.v1 binary data
         const mere_dir_path = try std.fs.path.join(ctx.allocator, &.{ pkg_b_staging, manifest.META_DIR });
         defer ctx.allocator.free(mere_dir_path);
-        try std.fs.cwd().makePath(mere_dir_path);
+        try path.ensureDirExists(mere_dir_path);
 
         pkg_b_content_hash = try hash.calculateStoreContentHash(ctx.allocator, pkg_b_staging, null);
         var content_hash_bytes: [32]u8 = undefined;
@@ -1804,7 +1806,7 @@ test "multi-repository install uses priority and resolves dependencies across re
     // Copy the public keys to the user keys directory so verifyWithTrustedFingerprints can find them
     const user_keys_dir = try std.fs.path.join(std.testing.allocator, &.{ test_env.path, ".mere", "keys" });
     defer std.testing.allocator.free(user_keys_dir);
-    try std.fs.cwd().makePath(user_keys_dir);
+    try path.ensureDirExists(user_keys_dir);
 
     const user_pub1 = try std.fs.path.join(std.testing.allocator, &.{ user_keys_dir, "repo1.pub" });
     defer std.testing.allocator.free(user_pub1);
@@ -1821,10 +1823,10 @@ test "multi-repository install uses priority and resolves dependencies across re
     defer std.testing.allocator.free(repo_url2);
 
     // Build trusted_fingerprints lists for each repo
-    var fps1 = std.ArrayList([]const u8){};
+    var fps1: std.ArrayList([]const u8) = .empty;
     try fps1.append(ctx.allocator, try ctx.allocator.dupe(u8, fingerprint1));
 
-    var fps2 = std.ArrayList([]const u8){};
+    var fps2: std.ArrayList([]const u8) = .empty;
     try fps2.append(ctx.allocator, try ctx.allocator.dupe(u8, fingerprint2));
 
     // Repo1: higher priority, contains package A (depends on B)
@@ -1974,14 +1976,14 @@ test "resolveInstallPlan batches multiple roots and deduplicates shared dependen
 test "buildProfileResolverRequirements orders explicit roots before existing requested roots" {
     const allocator = std.testing.allocator;
 
-    var install_requirements = std.ArrayList(InstallRootRequirement){};
+    var install_requirements: std.ArrayList(InstallRootRequirement) = .empty;
     defer deinitInstallRootRequirements(allocator, &install_requirements);
     try install_requirements.append(allocator, .{
         .name = try allocator.dupe(u8, "X"),
         .constraint_expr = null,
     });
 
-    var requested_packages = std.ArrayList(requested.RequestedPackage){};
+    var requested_packages: std.ArrayList(requested.RequestedPackage) = .empty;
     defer {
         for (requested_packages.items) |*pkg| pkg.deinit(allocator);
         requested_packages.deinit(allocator);
@@ -2040,7 +2042,7 @@ test "integration: full install pipeline publishes named profile root" {
     defer std.testing.allocator.free(repo_dir);
     {
         var d = try path.makePathAndOpenDir(repo_dir);
-        d.close();
+        d.close(path.currentIo());
     }
 
     // Create DB file
@@ -2048,7 +2050,7 @@ test "integration: full install pipeline publishes named profile root" {
     const db_path = try std.fs.path.join(std.testing.allocator, &.{ repo_dir, db_file });
     defer std.testing.allocator.free(db_path);
     var f = try path.makePathAndOpenFile(db_path);
-    f.close();
+    f.close(path.currentIo());
 
     // Generate keypair
     const keypair = try sign.generateKeyPair();
@@ -2066,7 +2068,7 @@ test "integration: full install pipeline publishes named profile root" {
     // Create packages directory
     const packages_dir = try std.fs.path.join(std.testing.allocator, &.{ repo_dir, "packages" });
     defer std.testing.allocator.free(packages_dir);
-    try std.fs.cwd().makePath(packages_dir);
+    try path.ensureDirExists(packages_dir);
 
     // Create package A (depends on B)
     var pkg_a = package.Package.init(ctx);
@@ -2081,19 +2083,19 @@ test "integration: full install pipeline publishes named profile root" {
     // Create staging dir for package A with actual content
     const pkg_a_staging = try std.fs.path.join(ctx.allocator, &.{ test_env.path, "pkg_a_staging" });
     defer ctx.allocator.free(pkg_a_staging);
-    try std.fs.cwd().makePath(pkg_a_staging);
+    try path.ensureDirExists(pkg_a_staging);
 
     // Create usr/bin directory structure
     const usr_bin_path = try std.fs.path.join(ctx.allocator, &.{ pkg_a_staging, "usr", "bin" });
     defer ctx.allocator.free(usr_bin_path);
-    try std.fs.cwd().makePath(usr_bin_path);
+    try path.ensureDirExists(usr_bin_path);
 
     // Create a binary file
     const bin_file_path = try std.fs.path.join(ctx.allocator, &.{ usr_bin_path, "hello-a" });
     defer ctx.allocator.free(bin_file_path);
     var bin_file = try path.makePathAndOpenFile(bin_file_path);
-    try bin_file.writeAll("#!/bin/sh\necho Hello from A\n");
-    bin_file.close();
+    try bin_file.writeStreamingAll(path.currentIo(), "#!/bin/sh\necho Hello from A\n");
+    bin_file.close(path.currentIo());
 
     // Compute actual content hash for A
     const content_hash_a = try hash.calculateStoreContentHash(ctx.allocator, pkg_a_staging, null);
@@ -2102,7 +2104,7 @@ test "integration: full install pipeline publishes named profile root" {
     // Create manifest.v1 for A
     const mere_dir_a = try std.fs.path.join(ctx.allocator, &.{ pkg_a_staging, manifest.META_DIR });
     defer ctx.allocator.free(mere_dir_a);
-    try std.fs.cwd().makePath(mere_dir_a);
+    try path.ensureDirExists(mere_dir_a);
 
     var content_hash_bytes_a: [32]u8 = undefined;
     _ = std.fmt.hexToBytes(&content_hash_bytes_a, content_hash_a) catch unreachable;
@@ -2148,19 +2150,19 @@ test "integration: full install pipeline publishes named profile root" {
     // Create staging dir for package B
     const pkg_b_staging = try std.fs.path.join(ctx.allocator, &.{ test_env.path, "pkg_b_staging" });
     defer ctx.allocator.free(pkg_b_staging);
-    try std.fs.cwd().makePath(pkg_b_staging);
+    try path.ensureDirExists(pkg_b_staging);
 
     // Create usr/lib directory structure
     const usr_lib_path = try std.fs.path.join(ctx.allocator, &.{ pkg_b_staging, "usr", "lib" });
     defer ctx.allocator.free(usr_lib_path);
-    try std.fs.cwd().makePath(usr_lib_path);
+    try path.ensureDirExists(usr_lib_path);
 
     // Create a library file
     const lib_file_path = try std.fs.path.join(ctx.allocator, &.{ usr_lib_path, "libhello.so" });
     defer ctx.allocator.free(lib_file_path);
     var lib_file = try path.makePathAndOpenFile(lib_file_path);
-    try lib_file.writeAll("fake shared library content");
-    lib_file.close();
+    try lib_file.writeStreamingAll(path.currentIo(), "fake shared library content");
+    lib_file.close(path.currentIo());
 
     // Compute actual content hash for B
     const content_hash_b = try hash.calculateStoreContentHash(ctx.allocator, pkg_b_staging, null);
@@ -2169,7 +2171,7 @@ test "integration: full install pipeline publishes named profile root" {
     // Create manifest.v1 for B
     const mere_dir_b = try std.fs.path.join(ctx.allocator, &.{ pkg_b_staging, manifest.META_DIR });
     defer ctx.allocator.free(mere_dir_b);
-    try std.fs.cwd().makePath(mere_dir_b);
+    try path.ensureDirExists(mere_dir_b);
 
     var content_hash_bytes_b: [32]u8 = undefined;
     _ = std.fmt.hexToBytes(&content_hash_bytes_b, content_hash_b) catch unreachable;
@@ -2211,7 +2213,7 @@ test "integration: full install pipeline publishes named profile root" {
     // Copy public key to user keys directory
     const user_keys_dir = try std.fs.path.join(std.testing.allocator, &.{ test_env.path, ".mere", "keys" });
     defer std.testing.allocator.free(user_keys_dir);
-    try std.fs.cwd().makePath(user_keys_dir);
+    try path.ensureDirExists(user_keys_dir);
     const user_pub = try std.fs.path.join(std.testing.allocator, &.{ user_keys_dir, "repo.pub" });
     defer std.testing.allocator.free(user_pub);
     try keypair.public_key.saveToFile(user_pub);
@@ -2221,7 +2223,7 @@ test "integration: full install pipeline publishes named profile root" {
     defer std.testing.allocator.free(repo_url);
 
     // Build trusted fingerprints list
-    var fps = std.ArrayList([]const u8){};
+    var fps: std.ArrayList([]const u8) = .empty;
     try fps.append(ctx.allocator, try ctx.allocator.dupe(u8, fingerprint));
 
     // Add repo to config
@@ -2262,28 +2264,26 @@ test "integration: full install pipeline publishes named profile root" {
     // 1. Verify store paths exist for both packages
     const store_path_a = try store.constructStorePath(ctx, content_hash_a, "pkgA", "1.0.0");
     defer ctx.allocator.free(store_path_a);
-    try std.fs.accessAbsolute(store_path_a, .{});
+    try std.Io.Dir.accessAbsolute(path.currentIo(), store_path_a, .{});
 
     const store_path_b = try store.constructStorePath(ctx, content_hash_b, "pkgB", "2.0.0");
     defer ctx.allocator.free(store_path_b);
-    try std.fs.accessAbsolute(store_path_b, .{});
+    try std.Io.Dir.accessAbsolute(path.currentIo(), store_path_b, .{});
 
     // 2. Verify named profile root exists
     const profile_dir = try std.fs.path.join(ctx.allocator, &.{ test_env.path, "mere", "profiles", profile_name });
     defer ctx.allocator.free(profile_dir);
     const root_dir = try profile.getRootPath(ctx.allocator, profile_dir);
     defer ctx.allocator.free(root_dir);
-    try std.fs.accessAbsolute(root_dir, .{});
+    try std.Io.Dir.accessAbsolute(path.currentIo(), root_dir, .{});
 
     // 3. Verify manifest.json exists in root
     const manifest_json_path = try std.fs.path.join(ctx.allocator, &.{ root_dir, "manifest.json" });
     defer ctx.allocator.free(manifest_json_path);
-    try std.fs.accessAbsolute(manifest_json_path, .{});
+    try std.Io.Dir.accessAbsolute(path.currentIo(), manifest_json_path, .{});
 
     // 4. Verify manifest.json contains correct packages
-    const manifest_file = try std.fs.openFileAbsolute(manifest_json_path, .{});
-    defer manifest_file.close();
-    const manifest_content = try manifest_file.readToEndAlloc(ctx.allocator, 1024 * 1024);
+    const manifest_content = try std.Io.Dir.readFileAlloc(std.Io.Dir.cwd(), path.currentIo(), manifest_json_path, ctx.allocator, .limited(1024 * 1024));
     defer ctx.allocator.free(manifest_content);
 
     // Check that both packages are mentioned in manifest
@@ -2295,25 +2295,25 @@ test "integration: full install pipeline publishes named profile root" {
     // 5. Verify profile symlink tree exists
     const profile_usr_bin = try std.fs.path.join(ctx.allocator, &.{ root_dir, "usr", "bin" });
     defer ctx.allocator.free(profile_usr_bin);
-    try std.fs.accessAbsolute(profile_usr_bin, .{});
+    try std.Io.Dir.accessAbsolute(path.currentIo(), profile_usr_bin, .{});
 
     const profile_usr_lib = try std.fs.path.join(ctx.allocator, &.{ root_dir, "usr", "lib" });
     defer ctx.allocator.free(profile_usr_lib);
-    try std.fs.accessAbsolute(profile_usr_lib, .{});
+    try std.Io.Dir.accessAbsolute(path.currentIo(), profile_usr_lib, .{});
 
     // 6. Verify specific files are symlinked in profile
     const profile_hello_a = try std.fs.path.join(ctx.allocator, &.{ profile_usr_bin, "hello-a" });
     defer ctx.allocator.free(profile_hello_a);
-    try std.fs.accessAbsolute(profile_hello_a, .{});
+    try std.Io.Dir.accessAbsolute(path.currentIo(), profile_hello_a, .{});
 
     const profile_libhello = try std.fs.path.join(ctx.allocator, &.{ profile_usr_lib, "libhello.so" });
     defer ctx.allocator.free(profile_libhello);
-    try std.fs.accessAbsolute(profile_libhello, .{});
+    try std.Io.Dir.accessAbsolute(path.currentIo(), profile_libhello, .{});
 
     // 7. Verify named profiles do not expose generation activation state
     const current_link = try std.fs.path.join(ctx.allocator, &.{ profile_dir, "current" });
     defer ctx.allocator.free(current_link);
-    try std.testing.expectError(error.FileNotFound, std.fs.accessAbsolute(current_link, .{}));
+    try std.testing.expectError(error.FileNotFound, std.Io.Dir.accessAbsolute(path.currentIo(), current_link, .{}));
     try std.testing.expectEqual(@as(?u32, null), try generation.getCurrentGeneration(profile_dir));
 }
 
@@ -2346,14 +2346,14 @@ test "integration: named profile lifecycle replaces root atomically and additive
     defer std.testing.allocator.free(repo_dir);
     {
         var d = try path.makePathAndOpenDir(repo_dir);
-        d.close();
+        d.close(path.currentIo());
     }
 
     // Create DB file
     const db_path = try std.fs.path.join(std.testing.allocator, &.{ repo_dir, "repo.db" });
     defer std.testing.allocator.free(db_path);
     var f = try path.makePathAndOpenFile(db_path);
-    f.close();
+    f.close(path.currentIo());
 
     // Generate keypair
     const keypair = try sign.generateKeyPair();
@@ -2371,7 +2371,7 @@ test "integration: named profile lifecycle replaces root atomically and additive
     // Create packages directory
     const packages_dir = try std.fs.path.join(std.testing.allocator, &.{ repo_dir, "packages" });
     defer std.testing.allocator.free(packages_dir);
-    try std.fs.cwd().makePath(packages_dir);
+    try path.ensureDirExists(packages_dir);
 
     // Create package A (will be in the initial root)
     var pkg_a = package.Package.init(ctx);
@@ -2386,17 +2386,17 @@ test "integration: named profile lifecycle replaces root atomically and additive
     // Create staging dir for package A
     const pkg_a_staging = try std.fs.path.join(ctx.allocator, &.{ test_env.path, "pkg_a_staging" });
     defer ctx.allocator.free(pkg_a_staging);
-    try std.fs.cwd().makePath(pkg_a_staging);
+    try path.ensureDirExists(pkg_a_staging);
 
     // Create usr/bin/tool-a
     const usr_bin_a = try std.fs.path.join(ctx.allocator, &.{ pkg_a_staging, "usr", "bin" });
     defer ctx.allocator.free(usr_bin_a);
-    try std.fs.cwd().makePath(usr_bin_a);
+    try path.ensureDirExists(usr_bin_a);
     const tool_a_path = try std.fs.path.join(ctx.allocator, &.{ usr_bin_a, "tool-a" });
     defer ctx.allocator.free(tool_a_path);
     var tool_a = try path.makePathAndOpenFile(tool_a_path);
-    try tool_a.writeAll("#!/bin/sh\necho tool-a\n");
-    tool_a.close();
+    try tool_a.writeStreamingAll(path.currentIo(), "#!/bin/sh\necho tool-a\n");
+    tool_a.close(path.currentIo());
 
     // Compute content hash for A
     const content_hash_a = try hash.calculateStoreContentHash(ctx.allocator, pkg_a_staging, null);
@@ -2405,7 +2405,7 @@ test "integration: named profile lifecycle replaces root atomically and additive
     // Create manifest.v1 for A
     const mere_dir_a = try std.fs.path.join(ctx.allocator, &.{ pkg_a_staging, manifest.META_DIR });
     defer ctx.allocator.free(mere_dir_a);
-    try std.fs.cwd().makePath(mere_dir_a);
+    try path.ensureDirExists(mere_dir_a);
 
     var content_hash_bytes_a: [32]u8 = undefined;
     _ = std.fmt.hexToBytes(&content_hash_bytes_a, content_hash_a) catch unreachable;
@@ -2450,17 +2450,17 @@ test "integration: named profile lifecycle replaces root atomically and additive
     // Create staging dir for package C
     const pkg_c_staging = try std.fs.path.join(ctx.allocator, &.{ test_env.path, "pkg_c_staging" });
     defer ctx.allocator.free(pkg_c_staging);
-    try std.fs.cwd().makePath(pkg_c_staging);
+    try path.ensureDirExists(pkg_c_staging);
 
     // Create usr/bin/tool-c
     const usr_bin_c = try std.fs.path.join(ctx.allocator, &.{ pkg_c_staging, "usr", "bin" });
     defer ctx.allocator.free(usr_bin_c);
-    try std.fs.cwd().makePath(usr_bin_c);
+    try path.ensureDirExists(usr_bin_c);
     const tool_c_path = try std.fs.path.join(ctx.allocator, &.{ usr_bin_c, "tool-c" });
     defer ctx.allocator.free(tool_c_path);
     var tool_c = try path.makePathAndOpenFile(tool_c_path);
-    try tool_c.writeAll("#!/bin/sh\necho tool-c\n");
-    tool_c.close();
+    try tool_c.writeStreamingAll(path.currentIo(), "#!/bin/sh\necho tool-c\n");
+    tool_c.close(path.currentIo());
 
     // Compute content hash for C
     const content_hash_c = try hash.calculateStoreContentHash(ctx.allocator, pkg_c_staging, null);
@@ -2469,7 +2469,7 @@ test "integration: named profile lifecycle replaces root atomically and additive
     // Create manifest.v1 for C
     const mere_dir_c = try std.fs.path.join(ctx.allocator, &.{ pkg_c_staging, manifest.META_DIR });
     defer ctx.allocator.free(mere_dir_c);
-    try std.fs.cwd().makePath(mere_dir_c);
+    try path.ensureDirExists(mere_dir_c);
 
     var content_hash_bytes_c: [32]u8 = undefined;
     _ = std.fmt.hexToBytes(&content_hash_bytes_c, content_hash_c) catch unreachable;
@@ -2510,7 +2510,7 @@ test "integration: named profile lifecycle replaces root atomically and additive
 
     const user_keys_dir = try std.fs.path.join(std.testing.allocator, &.{ test_env.path, ".mere", "keys" });
     defer std.testing.allocator.free(user_keys_dir);
-    try std.fs.cwd().makePath(user_keys_dir);
+    try path.ensureDirExists(user_keys_dir);
     const user_pub = try std.fs.path.join(std.testing.allocator, &.{ user_keys_dir, "repo.pub" });
     defer std.testing.allocator.free(user_pub);
     try keypair.public_key.saveToFile(user_pub);
@@ -2518,7 +2518,7 @@ test "integration: named profile lifecycle replaces root atomically and additive
     const repo_url = try std.fmt.allocPrint(std.testing.allocator, "file://{s}", .{repo_dir});
     defer std.testing.allocator.free(repo_url);
 
-    var fps = std.ArrayList([]const u8){};
+    var fps: std.ArrayList([]const u8) = .empty;
     try fps.append(ctx.allocator, try ctx.allocator.dupe(u8, fingerprint));
 
     try ctx.configuration.?.repos.append(ctx.allocator, config_mod.RepoConfig{
@@ -2555,30 +2555,38 @@ test "integration: named profile lifecycle replaces root atomically and additive
     const pkg_a_names = [_][]const u8{"pkgA"};
     try installPackagesToProfile(ctx, &repocaches, pkg_a_names[0..], client, false, false, false, profile_name, null);
 
-    try std.fs.accessAbsolute(root_dir, .{});
+    try std.Io.Dir.accessAbsolute(path.currentIo(), root_dir, .{});
     try std.testing.expectEqual(@as(?u32, null), try generation.getCurrentGeneration(profile_dir));
 
     // Verify tool-a exists in the published root
     const root_tool_a = try std.fs.path.join(ctx.allocator, &.{ root_dir, "usr", "bin", "tool-a" });
     defer ctx.allocator.free(root_tool_a);
-    try std.fs.accessAbsolute(root_tool_a, .{});
+    try std.Io.Dir.accessAbsolute(path.currentIo(), root_tool_a, .{});
 
     // Verify tool-c does NOT exist before the second publish
     const root_tool_c = try std.fs.path.join(ctx.allocator, &.{ root_dir, "usr", "bin", "tool-c" });
     defer ctx.allocator.free(root_tool_c);
-    try std.testing.expectError(error.FileNotFound, std.fs.accessAbsolute(root_tool_c, .{}));
+    try std.testing.expectError(error.FileNotFound, std.Io.Dir.accessAbsolute(path.currentIo(), root_tool_c, .{}));
 
     // Step 2: Install pkgC → republish root
     const pkg_c_names = [_][]const u8{"pkgC"};
     try installPackagesToProfile(ctx, &repocaches, pkg_c_names[0..], client, false, false, false, profile_name, null);
 
     // Additive install: both tools are present in the replacement root
-    try std.fs.accessAbsolute(root_tool_a, .{});
-    try std.fs.accessAbsolute(root_tool_c, .{});
+    try std.Io.Dir.accessAbsolute(path.currentIo(), root_tool_a, .{});
+    try std.Io.Dir.accessAbsolute(path.currentIo(), root_tool_c, .{});
 
     const root_manifest_path = try std.fs.path.join(ctx.allocator, &.{ root_dir, "manifest.json" });
     defer ctx.allocator.free(root_manifest_path);
-    const root_manifest_data = try std.fs.cwd().readFileAlloc(ctx.allocator, root_manifest_path, 1024 * 1024);
+    const root_manifest_data = blk: {
+        const file = try path.openExistingFile(root_manifest_path);
+        defer file.close(path.currentIo());
+        const stat = try file.stat(path.currentIo());
+        const data = try ctx.allocator.alloc(u8, @intCast(stat.size));
+        errdefer ctx.allocator.free(data);
+        const len = try file.readPositionalAll(path.currentIo(), data, 0);
+        break :blk data[0..len];
+    };
     defer ctx.allocator.free(root_manifest_data);
     try std.testing.expect(std.mem.indexOf(u8, root_manifest_data, "\"generation\"") == null);
     try std.testing.expect(std.mem.indexOf(u8, root_manifest_data, "pkgA") != null);
@@ -2587,7 +2595,7 @@ test "integration: named profile lifecycle replaces root atomically and additive
     // Named profiles do not expose activation symlinks or rollback helpers
     const current_link = try std.fs.path.join(ctx.allocator, &.{ profile_dir, "current" });
     defer ctx.allocator.free(current_link);
-    try std.testing.expectError(error.FileNotFound, std.fs.accessAbsolute(current_link, .{}));
+    try std.testing.expectError(error.FileNotFound, std.Io.Dir.accessAbsolute(path.currentIo(), current_link, .{}));
     try std.testing.expectEqual(@as(?u32, null), try generation.getCurrentGeneration(profile_dir));
     const all_gens = try generation.listGenerations(ctx.allocator, profile_dir);
     defer ctx.allocator.free(all_gens);
@@ -2620,13 +2628,13 @@ test "integration: symlink tree conflict detection" {
     defer std.testing.allocator.free(repo_dir);
     {
         var d = try path.makePathAndOpenDir(repo_dir);
-        d.close();
+        d.close(path.currentIo());
     }
 
     const db_path = try std.fs.path.join(std.testing.allocator, &.{ repo_dir, "repo.db" });
     defer std.testing.allocator.free(db_path);
     var f = try path.makePathAndOpenFile(db_path);
-    f.close();
+    f.close(path.currentIo());
 
     const keypair = try sign.generateKeyPair();
     const pub_path = try std.fs.path.join(std.testing.allocator, &.{ repo_dir, "repo.db.pub" });
@@ -2641,7 +2649,7 @@ test "integration: symlink tree conflict detection" {
 
     const packages_dir = try std.fs.path.join(std.testing.allocator, &.{ repo_dir, "packages" });
     defer std.testing.allocator.free(packages_dir);
-    try std.fs.cwd().makePath(packages_dir);
+    try path.ensureDirExists(packages_dir);
 
     // Create package X with /usr/bin/conflict-tool
     var pkg_x = package.Package.init(ctx);
@@ -2655,23 +2663,23 @@ test "integration: symlink tree conflict detection" {
 
     const pkg_x_staging = try std.fs.path.join(ctx.allocator, &.{ test_env.path, "pkg_x_staging" });
     defer ctx.allocator.free(pkg_x_staging);
-    try std.fs.cwd().makePath(pkg_x_staging);
+    try path.ensureDirExists(pkg_x_staging);
 
     const usr_bin_x = try std.fs.path.join(ctx.allocator, &.{ pkg_x_staging, "usr", "bin" });
     defer ctx.allocator.free(usr_bin_x);
-    try std.fs.cwd().makePath(usr_bin_x);
+    try path.ensureDirExists(usr_bin_x);
     const conflict_tool_x = try std.fs.path.join(ctx.allocator, &.{ usr_bin_x, "conflict-tool" });
     defer ctx.allocator.free(conflict_tool_x);
     var tool_x = try path.makePathAndOpenFile(conflict_tool_x);
-    try tool_x.writeAll("#!/bin/sh\necho from X\n");
-    tool_x.close();
+    try tool_x.writeStreamingAll(path.currentIo(), "#!/bin/sh\necho from X\n");
+    tool_x.close(path.currentIo());
 
     const content_hash_x = try hash.calculateStoreContentHash(ctx.allocator, pkg_x_staging, null);
     defer ctx.allocator.free(content_hash_x);
 
     const mere_dir_x = try std.fs.path.join(ctx.allocator, &.{ pkg_x_staging, manifest.META_DIR });
     defer ctx.allocator.free(mere_dir_x);
-    try std.fs.cwd().makePath(mere_dir_x);
+    try path.ensureDirExists(mere_dir_x);
 
     var content_hash_bytes_x: [32]u8 = undefined;
     _ = std.fmt.hexToBytes(&content_hash_bytes_x, content_hash_x) catch unreachable;
@@ -2714,23 +2722,23 @@ test "integration: symlink tree conflict detection" {
 
     const pkg_y_staging = try std.fs.path.join(ctx.allocator, &.{ test_env.path, "pkg_y_staging" });
     defer ctx.allocator.free(pkg_y_staging);
-    try std.fs.cwd().makePath(pkg_y_staging);
+    try path.ensureDirExists(pkg_y_staging);
 
     const usr_bin_y = try std.fs.path.join(ctx.allocator, &.{ pkg_y_staging, "usr", "bin" });
     defer ctx.allocator.free(usr_bin_y);
-    try std.fs.cwd().makePath(usr_bin_y);
+    try path.ensureDirExists(usr_bin_y);
     const conflict_tool_y = try std.fs.path.join(ctx.allocator, &.{ usr_bin_y, "conflict-tool" });
     defer ctx.allocator.free(conflict_tool_y);
     var tool_y = try path.makePathAndOpenFile(conflict_tool_y);
-    try tool_y.writeAll("#!/bin/sh\necho from Y\n"); // Different content!
-    tool_y.close();
+    try tool_y.writeStreamingAll(path.currentIo(), "#!/bin/sh\necho from Y\n"); // Different content!
+    tool_y.close(path.currentIo());
 
     const content_hash_y = try hash.calculateStoreContentHash(ctx.allocator, pkg_y_staging, null);
     defer ctx.allocator.free(content_hash_y);
 
     const mere_dir_y = try std.fs.path.join(ctx.allocator, &.{ pkg_y_staging, manifest.META_DIR });
     defer ctx.allocator.free(mere_dir_y);
-    try std.fs.cwd().makePath(mere_dir_y);
+    try path.ensureDirExists(mere_dir_y);
 
     var content_hash_bytes_y: [32]u8 = undefined;
     _ = std.fmt.hexToBytes(&content_hash_bytes_y, content_hash_y) catch unreachable;
@@ -2771,12 +2779,12 @@ test "integration: symlink tree conflict detection" {
 
     const pkg_main_staging = try std.fs.path.join(ctx.allocator, &.{ test_env.path, "pkg_main_staging" });
     defer ctx.allocator.free(pkg_main_staging);
-    try std.fs.cwd().makePath(pkg_main_staging);
+    try path.ensureDirExists(pkg_main_staging);
 
     // Create empty content for main package
     const mere_dir_main = try std.fs.path.join(ctx.allocator, &.{ pkg_main_staging, manifest.META_DIR });
     defer ctx.allocator.free(mere_dir_main);
-    try std.fs.cwd().makePath(mere_dir_main);
+    try path.ensureDirExists(mere_dir_main);
 
     const content_hash_main = try hash.calculateStoreContentHash(ctx.allocator, pkg_main_staging, null);
     defer ctx.allocator.free(content_hash_main);
@@ -2821,7 +2829,7 @@ test "integration: symlink tree conflict detection" {
 
     const user_keys_dir = try std.fs.path.join(std.testing.allocator, &.{ test_env.path, ".mere", "keys" });
     defer std.testing.allocator.free(user_keys_dir);
-    try std.fs.cwd().makePath(user_keys_dir);
+    try path.ensureDirExists(user_keys_dir);
     const user_pub = try std.fs.path.join(std.testing.allocator, &.{ user_keys_dir, "repo.pub" });
     defer std.testing.allocator.free(user_pub);
     try keypair.public_key.saveToFile(user_pub);
@@ -2829,7 +2837,7 @@ test "integration: symlink tree conflict detection" {
     const repo_url = try std.fmt.allocPrint(std.testing.allocator, "file://{s}", .{repo_dir});
     defer std.testing.allocator.free(repo_url);
 
-    var fps = std.ArrayList([]const u8){};
+    var fps: std.ArrayList([]const u8) = .empty;
     try fps.append(ctx.allocator, try ctx.allocator.dupe(u8, fingerprint));
 
     try ctx.configuration.?.repos.append(ctx.allocator, config_mod.RepoConfig{
@@ -2894,9 +2902,9 @@ test "integration: multi-repository priority selection" {
 
     {
         var d1 = try path.makePathAndOpenDir(high_repo_dir);
-        d1.close();
+        d1.close(path.currentIo());
         var d2 = try path.makePathAndOpenDir(low_repo_dir);
-        d2.close();
+        d2.close(path.currentIo());
     }
 
     // Create DB files
@@ -2906,9 +2914,9 @@ test "integration: multi-repository priority selection" {
     defer std.testing.allocator.free(db_path_low);
     {
         var f1 = try path.makePathAndOpenFile(db_path_high);
-        f1.close();
+        f1.close(path.currentIo());
         var f2 = try path.makePathAndOpenFile(db_path_low);
-        f2.close();
+        f2.close(path.currentIo());
     }
 
     // Generate keypairs
@@ -2933,11 +2941,11 @@ test "integration: multi-repository priority selection" {
     // Create packages directories
     const packages_dir_high = try std.fs.path.join(std.testing.allocator, &.{ high_repo_dir, "packages" });
     defer std.testing.allocator.free(packages_dir_high);
-    try std.fs.cwd().makePath(packages_dir_high);
+    try path.ensureDirExists(packages_dir_high);
 
     const packages_dir_low = try std.fs.path.join(std.testing.allocator, &.{ low_repo_dir, "packages" });
     defer std.testing.allocator.free(packages_dir_low);
-    try std.fs.cwd().makePath(packages_dir_low);
+    try path.ensureDirExists(packages_dir_low);
 
     // Create sharedPkg 2.0.0 in high-priority repo
     var pkg_high = package.Package.init(ctx);
@@ -2951,24 +2959,24 @@ test "integration: multi-repository priority selection" {
 
     const pkg_high_staging = try std.fs.path.join(ctx.allocator, &.{ test_env.path, "pkg_high_staging" });
     defer ctx.allocator.free(pkg_high_staging);
-    try std.fs.cwd().makePath(pkg_high_staging);
+    try path.ensureDirExists(pkg_high_staging);
 
     // Create unique content for high-priority version
     const usr_bin_high = try std.fs.path.join(ctx.allocator, &.{ pkg_high_staging, "usr", "bin" });
     defer ctx.allocator.free(usr_bin_high);
-    try std.fs.cwd().makePath(usr_bin_high);
+    try path.ensureDirExists(usr_bin_high);
     const tool_high = try std.fs.path.join(ctx.allocator, &.{ usr_bin_high, "shared-tool" });
     defer ctx.allocator.free(tool_high);
     var tool_high_f = try path.makePathAndOpenFile(tool_high);
-    try tool_high_f.writeAll("#!/bin/sh\necho version 2.0.0 from high priority\n");
-    tool_high_f.close();
+    try tool_high_f.writeStreamingAll(path.currentIo(), "#!/bin/sh\necho version 2.0.0 from high priority\n");
+    tool_high_f.close(path.currentIo());
 
     const content_hash_high = try hash.calculateStoreContentHash(ctx.allocator, pkg_high_staging, null);
     defer ctx.allocator.free(content_hash_high);
 
     const mere_dir_high = try std.fs.path.join(ctx.allocator, &.{ pkg_high_staging, manifest.META_DIR });
     defer ctx.allocator.free(mere_dir_high);
-    try std.fs.cwd().makePath(mere_dir_high);
+    try path.ensureDirExists(mere_dir_high);
 
     var content_hash_bytes_high: [32]u8 = undefined;
     _ = std.fmt.hexToBytes(&content_hash_bytes_high, content_hash_high) catch unreachable;
@@ -3010,24 +3018,24 @@ test "integration: multi-repository priority selection" {
 
     const pkg_low_staging = try std.fs.path.join(ctx.allocator, &.{ test_env.path, "pkg_low_staging" });
     defer ctx.allocator.free(pkg_low_staging);
-    try std.fs.cwd().makePath(pkg_low_staging);
+    try path.ensureDirExists(pkg_low_staging);
 
     // Create unique content for low-priority version
     const usr_bin_low = try std.fs.path.join(ctx.allocator, &.{ pkg_low_staging, "usr", "bin" });
     defer ctx.allocator.free(usr_bin_low);
-    try std.fs.cwd().makePath(usr_bin_low);
+    try path.ensureDirExists(usr_bin_low);
     const tool_low = try std.fs.path.join(ctx.allocator, &.{ usr_bin_low, "shared-tool" });
     defer ctx.allocator.free(tool_low);
     var tool_low_f = try path.makePathAndOpenFile(tool_low);
-    try tool_low_f.writeAll("#!/bin/sh\necho version 1.0.0 from low priority\n");
-    tool_low_f.close();
+    try tool_low_f.writeStreamingAll(path.currentIo(), "#!/bin/sh\necho version 1.0.0 from low priority\n");
+    tool_low_f.close(path.currentIo());
 
     const content_hash_low = try hash.calculateStoreContentHash(ctx.allocator, pkg_low_staging, null);
     defer ctx.allocator.free(content_hash_low);
 
     const mere_dir_low = try std.fs.path.join(ctx.allocator, &.{ pkg_low_staging, manifest.META_DIR });
     defer ctx.allocator.free(mere_dir_low);
-    try std.fs.cwd().makePath(mere_dir_low);
+    try path.ensureDirExists(mere_dir_low);
 
     var content_hash_bytes_low: [32]u8 = undefined;
     _ = std.fmt.hexToBytes(&content_hash_bytes_low, content_hash_low) catch unreachable;
@@ -3077,7 +3085,7 @@ test "integration: multi-repository priority selection" {
     // Copy public keys to user keys directory
     const user_keys_dir = try std.fs.path.join(std.testing.allocator, &.{ test_env.path, ".mere", "keys" });
     defer std.testing.allocator.free(user_keys_dir);
-    try std.fs.cwd().makePath(user_keys_dir);
+    try path.ensureDirExists(user_keys_dir);
 
     const user_pub_high = try std.fs.path.join(std.testing.allocator, &.{ user_keys_dir, "high_repo.pub" });
     defer std.testing.allocator.free(user_pub_high);
@@ -3093,10 +3101,10 @@ test "integration: multi-repository priority selection" {
     const repo_url_low = try std.fmt.allocPrint(std.testing.allocator, "file://{s}", .{low_repo_dir});
     defer std.testing.allocator.free(repo_url_low);
 
-    var fps_high = std.ArrayList([]const u8){};
+    var fps_high: std.ArrayList([]const u8) = .empty;
     try fps_high.append(ctx.allocator, try ctx.allocator.dupe(u8, fingerprint_high));
 
-    var fps_low = std.ArrayList([]const u8){};
+    var fps_low: std.ArrayList([]const u8) = .empty;
     try fps_low.append(ctx.allocator, try ctx.allocator.dupe(u8, fingerprint_low));
 
     // Add high priority repo first (priority 10)
@@ -3152,7 +3160,15 @@ test "integration: multi-repository priority selection" {
     const root_manifest_path = try std.fs.path.join(ctx.allocator, &.{ root_dir, "manifest.json" });
     defer ctx.allocator.free(root_manifest_path);
 
-    const root_manifest_data = try std.fs.cwd().readFileAlloc(ctx.allocator, root_manifest_path, 1024 * 1024);
+    const root_manifest_data = blk: {
+        const file = try path.openExistingFile(root_manifest_path);
+        defer file.close(path.currentIo());
+        const stat = try file.stat(path.currentIo());
+        const data = try ctx.allocator.alloc(u8, @intCast(stat.size));
+        errdefer ctx.allocator.free(data);
+        const len = try file.readPositionalAll(path.currentIo(), data, 0);
+        break :blk data[0..len];
+    };
     defer ctx.allocator.free(root_manifest_data);
 
     // Verify version 2.0.0 is in the manifest (from high-priority repo)
@@ -3195,14 +3211,14 @@ test "integration: garbage collection removes unreferenced store paths" {
     defer std.testing.allocator.free(repo_dir);
     {
         var d = try path.makePathAndOpenDir(repo_dir);
-        d.close();
+        d.close(path.currentIo());
     }
 
     const db_path = try std.fs.path.join(std.testing.allocator, &.{ repo_dir, "repo.db" });
     defer std.testing.allocator.free(db_path);
     {
         var f = try path.makePathAndOpenFile(db_path);
-        f.close();
+        f.close(path.currentIo());
     }
 
     const keypair = try sign.generateKeyPair();
@@ -3216,7 +3232,7 @@ test "integration: garbage collection removes unreferenced store paths" {
     const sig_len = sign.c.crypto_sign_BYTES;
     const packages_dir = try std.fs.path.join(std.testing.allocator, &.{ repo_dir, "packages" });
     defer std.testing.allocator.free(packages_dir);
-    try std.fs.cwd().makePath(packages_dir);
+    try path.ensureDirExists(packages_dir);
 
     // Helper to create a package
     const createPackage = struct {
@@ -3242,12 +3258,12 @@ test "integration: garbage collection removes unreferenced store paths" {
             defer context.allocator.free(staging_name);
             const pkg_staging = try std.fs.path.join(context.allocator, &.{ env_path, staging_name });
             defer context.allocator.free(pkg_staging);
-            try std.fs.cwd().makePath(pkg_staging);
+            try path.ensureDirExists(pkg_staging);
 
             // Create unique content
             const usr_bin = try std.fs.path.join(context.allocator, &.{ pkg_staging, "usr", "bin" });
             defer context.allocator.free(usr_bin);
-            try std.fs.cwd().makePath(usr_bin);
+            try path.ensureDirExists(usr_bin);
             const tool_name = try std.fmt.allocPrint(context.allocator, "{s}-tool", .{pkg_name});
             defer context.allocator.free(tool_name);
             const tool_path = try std.fs.path.join(context.allocator, &.{ usr_bin, tool_name });
@@ -3255,15 +3271,15 @@ test "integration: garbage collection removes unreferenced store paths" {
             var tool_f = try path.makePathAndOpenFile(tool_path);
             const content = try std.fmt.allocPrint(context.allocator, "#!/bin/sh\necho {s} {s}\n", .{ pkg_name, pkg_version });
             defer context.allocator.free(content);
-            try tool_f.writeAll(content);
-            tool_f.close();
+            try tool_f.writeStreamingAll(path.currentIo(), content);
+            tool_f.close(path.currentIo());
 
             const content_hash_str = try hash.calculateStoreContentHash(context.allocator, pkg_staging, null);
             defer context.allocator.free(content_hash_str);
 
             const mere_dir = try std.fs.path.join(context.allocator, &.{ pkg_staging, manifest.META_DIR });
             defer context.allocator.free(mere_dir);
-            try std.fs.cwd().makePath(mere_dir);
+            try path.ensureDirExists(mere_dir);
 
             var content_hash_bytes: [32]u8 = undefined;
             _ = std.fmt.hexToBytes(&content_hash_bytes, content_hash_str) catch unreachable;
@@ -3318,7 +3334,7 @@ test "integration: garbage collection removes unreferenced store paths" {
 
     const user_keys_dir = try std.fs.path.join(std.testing.allocator, &.{ test_env.path, ".mere", "keys" });
     defer std.testing.allocator.free(user_keys_dir);
-    try std.fs.cwd().makePath(user_keys_dir);
+    try path.ensureDirExists(user_keys_dir);
     const user_pub = try std.fs.path.join(std.testing.allocator, &.{ user_keys_dir, "repo.pub" });
     defer std.testing.allocator.free(user_pub);
     try keypair.public_key.saveToFile(user_pub);
@@ -3326,7 +3342,7 @@ test "integration: garbage collection removes unreferenced store paths" {
     const repo_url = try std.fmt.allocPrint(std.testing.allocator, "file://{s}", .{repo_dir});
     defer std.testing.allocator.free(repo_url);
 
-    var fps = std.ArrayList([]const u8){};
+    var fps: std.ArrayList([]const u8) = .empty;
     try fps.append(ctx.allocator, try ctx.allocator.dupe(u8, fingerprint));
 
     try ctx.configuration.?.repos.append(ctx.allocator, config_mod.RepoConfig{
@@ -3370,7 +3386,7 @@ test "integration: garbage collection removes unreferenced store paths" {
     defer ctx.allocator.free(store_path_a);
 
     // Verify A exists in store
-    try std.fs.accessAbsolute(store_path_a, .{});
+    try std.Io.Dir.accessAbsolute(path.currentIo(), store_path_a, .{});
 
     // Step 2: Install pkgB (additive: creates gen-2 with A + B)
     const pkg_b_names = [_][]const u8{"pkgB"};
@@ -3381,7 +3397,7 @@ test "integration: garbage collection removes unreferenced store paths" {
     defer ctx.allocator.free(store_path_b);
 
     // Verify B exists
-    try std.fs.accessAbsolute(store_path_b, .{});
+    try std.Io.Dir.accessAbsolute(path.currentIo(), store_path_b, .{});
 
     // Both generations exist, both store paths should be rooted
     {
@@ -3414,8 +3430,8 @@ test "integration: garbage collection removes unreferenced store paths" {
     }
 
     // Verify both A and B remain reachable
-    try std.fs.accessAbsolute(store_path_a, .{});
-    try std.fs.accessAbsolute(store_path_b, .{});
+    try std.Io.Dir.accessAbsolute(path.currentIo(), store_path_a, .{});
+    try std.Io.Dir.accessAbsolute(path.currentIo(), store_path_b, .{});
 }
 
 test "installPackageToProfile symlinks to target profile" {
@@ -3441,27 +3457,27 @@ test "installPackageToProfile symlinks to target profile" {
     // Create package content in store
     const usr_bin = try std.fs.path.join(ctx.allocator, &.{ pkg_store_path, "usr", "bin" });
     defer ctx.allocator.free(usr_bin);
-    try std.fs.cwd().makePath(usr_bin);
+    try path.ensureDirExists(usr_bin);
 
     const tool_path = try std.fs.path.join(ctx.allocator, &.{ usr_bin, "test-tool" });
     defer ctx.allocator.free(tool_path);
     var tool_f = try path.makePathAndOpenFile(tool_path);
-    try tool_f.writeAll("#!/bin/sh\necho test\n");
-    tool_f.close();
+    try tool_f.writeStreamingAll(path.currentIo(), "#!/bin/sh\necho test\n");
+    tool_f.close(path.currentIo());
 
     try writeProjectionForPackageDir(ctx.allocator, pkg_store_path);
 
     // Create a target profile directory
     const target_profile = try std.fs.path.join(ctx.allocator, &.{ test_env.path, "build-profile" });
     defer ctx.allocator.free(target_profile);
-    try std.fs.cwd().makePath(target_profile);
+    try path.ensureDirExists(target_profile);
 
     // Create standard subdirectories
     const subdirs = [_][]const u8{ "bin", "sbin", "lib", "usr", "usr/bin", "usr/lib", "usr/share" };
     for (subdirs) |subdir| {
         const subdir_path = try std.fs.path.join(ctx.allocator, &.{ target_profile, subdir });
         defer ctx.allocator.free(subdir_path);
-        try std.fs.cwd().makePath(subdir_path);
+        try path.ensureDirExists(subdir_path);
     }
 
     // Create mock installed package info
@@ -3485,10 +3501,11 @@ test "installPackageToProfile symlinks to target profile" {
 
     // Check that the symlink exists
     var link_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const link_target = std.fs.readLinkAbsolute(profile_tool, &link_buf) catch |err| {
+    const link_len = std.Io.Dir.readLinkAbsolute(path.currentIo(), profile_tool, &link_buf) catch |err| {
         std.debug.print("failed to read symlink at {s}: {}\n", .{ profile_tool, err });
         return ctx.fail(err, profile_tool, "failed to read symlink");
     };
+    const link_target = link_buf[0..link_len];
 
     // Verify the symlink points to the store
     try std.testing.expect(std.mem.startsWith(u8, link_target, store_root));
@@ -3516,34 +3533,34 @@ test "store admission uses atomic rename from staging directory to final store p
     defer ctx.allocator.free(store_root);
     const incoming_dir = try std.fs.path.join(ctx.allocator, &.{ store_root, ".incoming" });
     defer ctx.allocator.free(incoming_dir);
-    try std.fs.cwd().makePath(incoming_dir);
+    try path.ensureDirExists(incoming_dir);
 
     // Create staging directory under .incoming/ (same filesystem for atomic rename)
     const staging_dir = try std.fs.path.join(ctx.allocator, &.{ incoming_dir, "test-rand-staging" });
     defer ctx.allocator.free(staging_dir);
-    try std.fs.cwd().makePath(staging_dir);
+    try path.ensureDirExists(staging_dir);
 
     // Populate staging directory with package content
     const staging_file = try std.fs.path.join(ctx.allocator, &.{ staging_dir, "usr", "bin", "hello" });
     defer ctx.allocator.free(staging_file);
     {
         const parent = std.fs.path.dirname(staging_file).?;
-        try std.fs.cwd().makePath(parent);
-        var f = try std.fs.createFileAbsolute(staging_file, .{});
-        try f.writeAll("#!/bin/sh\necho hello\n");
-        f.close();
+        try path.ensureDirExists(parent);
+        var f = try std.Io.Dir.createFileAbsolute(path.currentIo(), staging_file, .{});
+        try f.writeStreamingAll(path.currentIo(), "#!/bin/sh\necho hello\n");
+        f.close(path.currentIo());
     }
 
     // Create .mere/manifest.v1 marker in staging (excluded from hash but present in store)
     const mere_dir = try std.fs.path.join(ctx.allocator, &.{ staging_dir, ".mere" });
     defer ctx.allocator.free(mere_dir);
-    try std.fs.cwd().makePath(mere_dir);
+    try path.ensureDirExists(mere_dir);
     const manifest_file = try std.fs.path.join(ctx.allocator, &.{ mere_dir, "manifest.v1" });
     defer ctx.allocator.free(manifest_file);
     {
-        var f = try std.fs.createFileAbsolute(manifest_file, .{});
-        try f.writeAll("MEREMFST");
-        f.close();
+        var f = try std.Io.Dir.createFileAbsolute(path.currentIo(), manifest_file, .{});
+        try f.writeStreamingAll(path.currentIo(), "MEREMFST");
+        f.close(path.currentIo());
     }
 
     // Define the final content-addressed store path
@@ -3557,13 +3574,8 @@ test "store admission uses atomic rename from staging directory to final store p
 
     // === Atomic rename: the single syscall that admits the package ===
     // This mirrors installSinglePackageToStore Step 4
-    const staging_z = try ctx.allocator.dupeZ(u8, staging_dir);
-    defer ctx.allocator.free(staging_z);
-    const final_z = try ctx.allocator.dupeZ(u8, final_store_path);
-    defer ctx.allocator.free(final_z);
-
-    // Use std.posix.renameZ which wraps the rename(2) syscall
-    try std.posix.renameZ(staging_z, final_z);
+    // Rename the staged directory into its final content-addressed path.
+    try std.Io.Dir.renameAbsolute(staging_dir, final_store_path, path.currentIo());
 
     // Verify postconditions:
     // 1. Staging directory no longer exists (it was moved, not copied)
@@ -3575,19 +3587,19 @@ test "store admission uses atomic rename from staging directory to final store p
     // 3. Content is intact at the final path (rename preserves directory tree)
     const final_file = try std.fs.path.join(ctx.allocator, &.{ final_store_path, "usr", "bin", "hello" });
     defer ctx.allocator.free(final_file);
-    var verify = try std.fs.openFileAbsolute(final_file, .{});
-    defer verify.close();
+    var verify = try path.openExistingFile(final_file);
+    defer verify.close(path.currentIo());
     var buf: [100]u8 = undefined;
-    const n = try verify.readAll(&buf);
+    const n = try verify.readPositionalAll(path.currentIo(), &buf, 0);
     try std.testing.expectEqualStrings("#!/bin/sh\necho hello\n", buf[0..n]);
 
     // 4. Manifest marker is also present (whole tree moved atomically)
     const final_manifest = try std.fs.path.join(ctx.allocator, &.{ final_store_path, ".mere", "manifest.v1" });
     defer ctx.allocator.free(final_manifest);
-    var mf = try std.fs.openFileAbsolute(final_manifest, .{});
-    defer mf.close();
+    var mf = try path.openExistingFile(final_manifest);
+    defer mf.close(path.currentIo());
     var mbuf: [20]u8 = undefined;
-    const mn = try mf.readAll(&mbuf);
+    const mn = try mf.readPositionalAll(path.currentIo(), &mbuf, 0);
     try std.testing.expectEqualStrings("MEREMFST", mbuf[0..mn]);
 }
 
@@ -3782,7 +3794,7 @@ fn finalizeTestPackageArchive(
     const archive_final = try std.fs.path.join(ctx.allocator, &.{ packages_dir, archive_name });
     errdefer ctx.allocator.free(archive_final);
 
-    try std.fs.renameAbsolute(archive_temp, archive_final);
+    try std.Io.Dir.renameAbsolute(archive_temp, archive_final, path.currentIo());
     return archive_final;
 }
 
@@ -3802,34 +3814,35 @@ test "determineInstallTargetBehavior preserves explicit store-only and profile t
 }
 
 test "setDirectoryReadOnly reports traversal permission failures" {
-    if (std.posix.geteuid() == 0) return error.SkipZigTest;
+    if (std.os.linux.geteuid() == 0) return error.SkipZigTest;
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    try tmp.dir.makePath("restricted");
+    try tmp.dir.createDirPath(path.currentIo(), "restricted");
     {
-        var restricted = try tmp.dir.openDir("restricted", .{});
-        defer restricted.close();
-        try restricted.chmod(0o000);
+        var restricted = try tmp.dir.openDir(path.currentIo(), "restricted", .{});
+        defer restricted.close(path.currentIo());
+        try restricted.setPermissions(path.currentIo(), .fromMode(0o000));
     }
     defer {
-        if (tmp.dir.openDir("restricted", .{})) |restricted| {
+        if (tmp.dir.openDir(path.currentIo(), "restricted", .{})) |restricted| {
             var dir_handle = restricted;
-            defer dir_handle.close();
-            dir_handle.chmod(0o755) catch {};
+            defer dir_handle.close(path.currentIo());
+            dir_handle.setPermissions(path.currentIo(), .fromMode(0o755)) catch {};
         } else |_| {}
     }
 
     var buf: [std.fs.max_path_bytes]u8 = undefined;
-    const root_path = try tmp.dir.realpath(".", &buf);
+    const root_path_len = try tmp.dir.realPath(path.currentIo(), &buf);
+    const root_path = buf[0..root_path_len];
 
     const result = setDirectoryReadOnly(root_path);
     try std.testing.expectError(error.AccessDenied, result);
 }
 
 test "finalizeAdmittedStoreObject fails hard on rollback-state update after admission" {
-    if (std.posix.geteuid() == 0) return error.SkipZigTest;
+    if (std.os.linux.geteuid() == 0) return error.SkipZigTest;
 
     const th = @import("test_helpers.zig");
     var test_env = try th.createTestEnv();
@@ -3841,18 +3854,18 @@ test "finalizeAdmittedStoreObject fails hard on rollback-state update after admi
 
     const install_dir = try std.fs.path.join(ctx.allocator, &.{ test_env.path, "mere", "store", ("d" ** 64) ++ "-pkg-1.0.0" });
     defer ctx.allocator.free(install_dir);
-    try std.fs.cwd().makePath(install_dir);
+    try path.ensureDirExists(install_dir);
 
     // Non-local repo cache so rollback-state update path is exercised.
     var repo_cache = try RepoCache.init(ctx, "remote-finalize-test", "https://example.invalid/repo", &[_][]const u8{}, 100);
     defer repo_cache.deinit();
-    try std.fs.cwd().makePath(repo_cache.cache_dir);
+    try path.ensureDirExists(repo_cache.cache_dir);
 
     // Force rollback-state write failure while leaving admitted store object intact.
-    var cache_dir_handle = try std.fs.openDirAbsolute(repo_cache.cache_dir, .{});
-    defer cache_dir_handle.close();
-    try cache_dir_handle.chmod(0o555);
-    defer cache_dir_handle.chmod(0o755) catch {};
+    var cache_dir_handle = try path.openExistingDir(repo_cache.cache_dir);
+    defer cache_dir_handle.close(path.currentIo());
+    try cache_dir_handle.setPermissions(path.currentIo(), .fromMode(0o555));
+    defer cache_dir_handle.setPermissions(path.currentIo(), .fromMode(0o755)) catch {};
 
     var content_hash_bytes: [32]u8 = undefined;
     _ = try std.fmt.hexToBytes(&content_hash_bytes, "d" ** 64);
@@ -3884,5 +3897,5 @@ test "finalizeAdmittedStoreObject fails hard on rollback-state update after admi
 
     // Store object remains admitted; post-admission finalization failure does not
     // remove the object.
-    try std.fs.accessAbsolute(install_dir, .{});
+    try std.Io.Dir.accessAbsolute(path.currentIo(), install_dir, .{});
 }

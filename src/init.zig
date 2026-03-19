@@ -58,7 +58,7 @@ pub const InitResult = struct {
     pub fn init(allocator: std.mem.Allocator) InitResult {
         return InitResult{
             .allocator = allocator,
-            .checks = .{},
+            .checks = .empty,
             .changes_applied = 0,
             .issues_found = 0,
         };
@@ -78,7 +78,7 @@ pub const InitResult = struct {
 
 /// Required directory layout with specifications
 fn getRequiredDirectories(allocator: std.mem.Allocator, root: []const u8) ![]DirSpec {
-    var list: std.ArrayList(DirSpec) = .{};
+    var list: std.ArrayList(DirSpec) = .empty;
     errdefer list.deinit(allocator);
 
     const dirs = [_]struct { rel: []const u8, mode: u32, desc: []const u8 }{
@@ -117,7 +117,7 @@ fn getRequiredDirectories(allocator: std.mem.Allocator, root: []const u8) ![]Dir
 /// Check if running as root
 fn isRoot() bool {
     if (@hasDecl(std.posix, "getuid")) {
-        return std.posix.getuid() == 0;
+        return std.os.linux.getuid() == 0;
     }
     return false;
 }

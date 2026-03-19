@@ -57,24 +57,25 @@ pub fn deduplicate(ctx: *Context, dir_path: []const u8) ArchiveError!Deduplicati
     var arena = std.heap.ArenaAllocator.init(ctx.allocator);
     defer arena.deinit();
     const alloc = arena.allocator();
+    const io = path.currentIo();
     var stats = DeduplicationStats{};
 
     var dir = path.openExistingDir(dir_path) catch |err| {
         return ctx.fail(mapArchiveFsError(err), dir_path, "failed to open source directory");
     };
-    defer dir.close();
+    defer dir.close(io);
 
     var walker = dir.walk(alloc) catch |err| {
         return ctx.fail(mapArchiveFsError(err), dir_path, "failed to initialize directory walk");
     };
     defer walker.deinit();
 
-    const FileEntry = struct { path: []const u8, kind: std.fs.File.Kind };
+    const FileEntry = struct { path: []const u8, kind: std.Io.File.Kind };
     var file_entries = std.array_list.Managed(FileEntry).init(alloc);
     defer file_entries.deinit();
 
     while (true) {
-        const entry = walker.next() catch |err| {
+        const entry = walker.next(io) catch |err| {
             return ctx.fail(mapArchiveFsError(err), dir_path, "failed to iterate source directory");
         };
         if (entry == null) break;
@@ -87,7 +88,7 @@ pub fn deduplicate(ctx: *Context, dir_path: []const u8) ArchiveError!Deduplicati
     }
 
     const FileInfo = struct { path: []const u8, inode: u64, hash: []const u8 };
-    var files: std.ArrayList(FileInfo) = .{};
+    var files: std.ArrayList(FileInfo) = .empty;
     defer files.deinit(alloc);
 
     var hash_groups = std.StringHashMap(std.ArrayList(usize)).init(alloc);
@@ -122,10 +123,14 @@ pub fn deduplicate(ctx: *Context, dir_path: []const u8) ArchiveError!Deduplicati
             hash_key = gop.key_ptr.*;
         } else {
             hash_key = h_dup;
-            gop.value_ptr.* = .{};
+            gop.value_ptr.* = .empty;
         }
 
-        const st = std.fs.cwd().statFile(abs_for_hash) catch |err| {
+        var file_for_stat = path.openExistingFile(abs_for_hash) catch |err| {
+            return ctx.fail(mapArchiveFsError(err), abs_for_hash, "failed to stat file");
+        };
+        defer file_for_stat.close(io);
+        const st = file_for_stat.stat(io) catch |err| {
             return ctx.fail(mapArchiveFsError(err), abs_for_hash, "failed to stat file");
         };
         try files.append(alloc, .{ .path = fe.path, .inode = st.inode, .hash = hash_key });
@@ -191,7 +196,11 @@ pub fn deduplicate(ctx: *Context, dir_path: []const u8) ArchiveError!Deduplicati
             }
 
             const target_abs = try std.fs.path.join(alloc, &.{ dir_path, fi.path });
-            const target_stat = std.fs.cwd().statFile(target_abs) catch |err| {
+            var target_file = path.openExistingFile(target_abs) catch |err| {
+                return ctx.fail(mapArchiveFsError(err), target_abs, "failed to stat duplicate file");
+            };
+            defer target_file.close(io);
+            const target_stat = target_file.stat(io) catch |err| {
                 return ctx.fail(mapArchiveFsError(err), target_abs, "failed to stat duplicate file");
             };
             const target_temp_abs = try std.fmt.allocPrint(alloc, "{s}.mere-dedup-tmp", .{target_abs});
@@ -202,17 +211,20 @@ pub fn deduplicate(ctx: *Context, dir_path: []const u8) ArchiveError!Deduplicati
 
             const target_temp_abs_z = try alloc.dupeZ(u8, target_temp_abs);
             defer alloc.free(target_temp_abs_z);
-            std.posix.unlink(target_temp_abs_z) catch |err| switch (err) {
-                error.FileNotFound => {},
-                else => return ctx.fail(mapArchiveFsError(err), target_temp_abs, "failed to remove stale dedup temp file"),
-            };
+            switch (std.posix.errno(std.c.unlink(target_temp_abs_z))) {
+                .SUCCESS, .NOENT => {},
+                .ACCES => return ctx.fail(ArchiveError.PermissionDenied, target_temp_abs, "failed to remove stale dedup temp file"),
+                else => return ctx.fail(ArchiveError.FileSystem, target_temp_abs, "failed to remove stale dedup temp file"),
+            }
 
-            std.posix.link(canonical_abs_z, target_temp_abs_z) catch |err| {
-                return ctx.fail(mapArchiveFsError(err), target_temp_abs, "failed to create replacement hard link");
-            };
-            errdefer std.posix.unlink(target_temp_abs_z) catch {};
+            switch (std.posix.errno(std.c.link(canonical_abs_z, target_temp_abs_z))) {
+                .SUCCESS => {},
+                .ACCES => return ctx.fail(ArchiveError.PermissionDenied, target_temp_abs, "failed to create replacement hard link"),
+                else => return ctx.fail(ArchiveError.FileSystem, target_temp_abs, "failed to create replacement hard link"),
+            }
+            errdefer _ = std.c.unlink(target_temp_abs_z);
 
-            if (std.fs.renameAbsolute(target_temp_abs, target_abs)) |_| {
+            if (std.Io.Dir.renameAbsolute(target_temp_abs, target_abs, io)) |_| {
                 if (!group_deduplicated) {
                     stats.groups_deduplicated += 1;
                     group_deduplicated = true;
@@ -234,6 +246,7 @@ pub fn deduplicate(ctx: *Context, dir_path: []const u8) ArchiveError!Deduplicati
 pub fn createPackageArchive(ctx: *Context, source_dir: []const u8, output_path: []const u8) !void {
     const resolved_source_dir = try resolveSourceDir(ctx, source_dir);
     defer ctx.allocator.free(resolved_source_dir);
+    const io = path.currentIo();
 
     if (output_path.len == 0) {
         return archiveFail(ctx, "output_path", "empty output path");
@@ -248,17 +261,17 @@ pub fn createPackageArchive(ctx: *Context, source_dir: []const u8, output_path: 
     const out_file = path.makePathAndOpenFile(temp_output_path) catch {
         return archiveFail(ctx, temp_output_path, "failed to open temporary output file");
     };
-    defer out_file.close();
+    defer out_file.close(io);
     errdefer {
         if (std.fs.path.isAbsolute(temp_output_path)) {
-            std.fs.deleteFileAbsolute(temp_output_path) catch {};
+            std.Io.Dir.deleteFileAbsolute(io, temp_output_path) catch {};
         } else {
-            std.fs.cwd().deleteFile(temp_output_path) catch {};
+            std.Io.Dir.cwd().deleteFile(io, temp_output_path) catch {};
         }
     }
 
     var file_buf: [8192]u8 = undefined;
-    var out_writer = std.fs.File.writer(out_file, file_buf[0..]);
+    var out_writer = out_file.writer(io, &file_buf);
     var compressor = zstd_c.StreamCompressor.init(ctx.allocator, &out_writer.interface) catch {
         return archiveFail(ctx, output_path, "failed to initialize streaming compressor");
     };
@@ -271,16 +284,16 @@ pub fn createPackageArchive(ctx: *Context, source_dir: []const u8, output_path: 
     compressor.finish() catch {
         return archiveFail(ctx, output_path, "failed to finalize compressed archive");
     };
-    out_writer.interface.flush() catch {
+    out_writer.flush() catch {
         return archiveFail(ctx, output_path, "failed to write compressed archive");
     };
 
     if (std.fs.path.isAbsolute(temp_output_path) and std.fs.path.isAbsolute(output_path)) {
-        std.fs.renameAbsolute(temp_output_path, output_path) catch {
+        std.Io.Dir.renameAbsolute(temp_output_path, output_path, io) catch {
             return archiveFail(ctx, output_path, "failed to atomically publish archive");
         };
     } else {
-        std.fs.cwd().rename(temp_output_path, output_path) catch {
+        std.Io.Dir.rename(std.Io.Dir.cwd(), temp_output_path, std.Io.Dir.cwd(), output_path, io) catch {
             return archiveFail(ctx, output_path, "failed to atomically publish archive");
         };
     }
@@ -307,21 +320,18 @@ fn createTarToCompressor(ctx: *Context, source_dir: []const u8, compressor: *zst
 }
 
 fn resolveSourceDir(ctx: *Context, source_dir: []const u8) ![]const u8 {
-    var src_dir: std.fs.Dir = undefined;
-    if (std.fs.path.isAbsolute(source_dir)) {
-        src_dir = std.fs.openDirAbsolute(source_dir, .{}) catch {
-            return archiveFail(ctx, source_dir, "failed to open source directory");
-        };
-    } else {
-        src_dir = std.fs.cwd().openDir(source_dir, .{}) catch {
-            return archiveFail(ctx, source_dir, "failed to open source directory");
-        };
-    }
-    defer src_dir.close();
+    var src_dir = path.openExistingDir(source_dir) catch {
+        return archiveFail(ctx, source_dir, "failed to open source directory");
+    };
+    defer src_dir.close(path.currentIo());
 
     // Use a canonical absolute path so later path checks stay stable.
-    return std.fs.realpathAlloc(ctx.allocator, source_dir) catch {
+    var real_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const real_len = src_dir.realPath(path.currentIo(), &real_buf) catch {
         return archiveFail(ctx, source_dir, "failed to resolve source directory");
+    };
+    return ctx.allocator.dupe(u8, real_buf[0..real_len]) catch {
+        return archiveFail(ctx, source_dir, "failed to copy resolved source directory");
     };
 }
 
@@ -476,6 +486,7 @@ fn stripPrefix(full: []const u8, prefix: []const u8) ?[]const u8 {
 }
 
 fn writeArchiveEntry(ctx: *Context, archive: *c.struct_archive, entry: *c.struct_archive_entry, source_dir: []const u8) !void {
+    const io = path.currentIo();
     if (c.archive_write_header(archive, entry) != c.ARCHIVE_OK) {
         return archiveFail(ctx, source_dir, "failed to write archive header");
     }
@@ -485,17 +496,19 @@ fn writeArchiveEntry(ctx: *Context, archive: *c.struct_archive, entry: *c.struct
         c.archive_entry_hardlink(entry) != null or size <= 0) return;
 
     const sp = c.archive_entry_sourcepath(entry) orelse return;
-    const file = std.fs.openFileAbsoluteZ(sp, .{}) catch {
+    const file = std.Io.Dir.openFileAbsolute(io, std.mem.span(sp), .{}) catch {
         return archiveFail(ctx, source_dir, "failed to open file for archive data");
     };
-    defer file.close();
+    defer file.close(io);
 
     var buf: [8192]u8 = undefined;
+    var offset: u64 = 0;
     while (true) {
-        const n = file.read(&buf) catch {
+        const n = file.readPositionalAll(io, &buf, offset) catch {
             return archiveFail(ctx, source_dir, "failed to read file data");
         };
         if (n == 0) break;
+        offset += n;
         if (c.archive_write_data(archive, &buf, n) != @as(c.la_ssize_t, @intCast(n))) {
             return archiveFail(ctx, source_dir, "failed to write file data");
         }
@@ -539,14 +552,16 @@ test "createPackageArchive empty source directory" {
     const empty_dir = try std.fs.path.join(std.testing.allocator, &.{ test_env.path, "empty" });
     defer std.testing.allocator.free(empty_dir);
     var empty_dir_handle = try path.makePathAndOpenDir(empty_dir);
-    defer empty_dir_handle.close();
+    defer empty_dir_handle.close(path.currentIo());
 
     const archive_path = try std.fs.path.join(std.testing.allocator, &.{ test_env.path, "empty_archive.tar.zst" });
     defer std.testing.allocator.free(archive_path);
 
     try createPackageArchive(&test_env.ctx, empty_dir, archive_path);
 
-    const stat = try std.fs.cwd().statFile(archive_path);
+    const archive_file = try path.openExistingFile(archive_path);
+    defer archive_file.close(path.currentIo());
+    const stat = try archive_file.stat(path.currentIo());
     try std.testing.expect(stat.size > 0);
 
     const archive_path_z = try std.testing.allocator.dupeZ(u8, archive_path);
@@ -565,6 +580,7 @@ test "createPackageArchive empty source directory" {
 
 test "deduplicate replaces duplicate files with hard links pointing to canonical path" {
     const th = @import("test_helpers.zig");
+    const io = path.currentIo();
     var test_env = try th.createTestEnv();
     defer {
         test_env.cleanup();
@@ -573,11 +589,13 @@ test "deduplicate replaces duplicate files with hard links pointing to canonical
 
     const files_dir = try std.fs.path.join(std.testing.allocator, &.{ test_env.path, "files" });
     defer std.testing.allocator.free(files_dir);
-    try std.fs.cwd().makePath(files_dir);
+    var files_dir_handle = try path.makePathAndOpenDir(files_dir);
+    files_dir_handle.close(io);
 
     const sub_dir = try std.fs.path.join(std.testing.allocator, &.{ files_dir, "sub" });
     defer std.testing.allocator.free(sub_dir);
-    try std.fs.cwd().makePath(sub_dir);
+    var sub_dir_handle = try path.makePathAndOpenDir(sub_dir);
+    sub_dir_handle.close(io);
 
     const content = "duplicate content";
 
@@ -588,23 +606,23 @@ test "deduplicate replaces duplicate files with hard links pointing to canonical
     // Create canonical file a.txt
     const a_abs_create = try std.fs.path.join(std.testing.allocator, &.{ files_dir, a_rel });
     defer std.testing.allocator.free(a_abs_create);
-    var a_file = try std.fs.createFileAbsolute(a_abs_create, .{});
-    try a_file.writeAll(content);
-    a_file.close();
+    var a_file = try std.Io.Dir.createFileAbsolute(io, a_abs_create, .{});
+    try a_file.writeStreamingAll(io, content);
+    a_file.close(io);
 
     // Create duplicate b.txt
     const b_abs_create = try std.fs.path.join(std.testing.allocator, &.{ files_dir, b_rel });
     defer std.testing.allocator.free(b_abs_create);
-    var b_file = try std.fs.createFileAbsolute(b_abs_create, .{});
-    try b_file.writeAll(content);
-    b_file.close();
+    var b_file = try std.Io.Dir.createFileAbsolute(io, b_abs_create, .{});
+    try b_file.writeStreamingAll(io, content);
+    b_file.close(io);
 
     // Create duplicate sub/c.txt
     const c_abs_create = try std.fs.path.join(std.testing.allocator, &.{ files_dir, c_rel });
     defer std.testing.allocator.free(c_abs_create);
-    var c_file = try std.fs.createFileAbsolute(c_abs_create, .{});
-    try c_file.writeAll(content);
-    c_file.close();
+    var c_file = try std.Io.Dir.createFileAbsolute(io, c_abs_create, .{});
+    try c_file.writeStreamingAll(io, content);
+    c_file.close(io);
 
     // Run deduplicate
     const stats = try deduplicate(&test_env.ctx, files_dir);
@@ -621,26 +639,36 @@ test "deduplicate replaces duplicate files with hard links pointing to canonical
     const c_abs = try std.fs.path.join(std.testing.allocator, &.{ files_dir, c_rel });
     defer std.testing.allocator.free(c_abs);
 
-    const a_stat = try std.fs.cwd().statFile(a_abs);
-    const b_stat = try std.fs.cwd().statFile(b_abs);
-    const c_stat = try std.fs.cwd().statFile(c_abs);
+    var a_stat_file = try path.openExistingFile(a_abs);
+    defer a_stat_file.close(io);
+    const a_stat = try a_stat_file.stat(io);
+    var b_stat_file = try path.openExistingFile(b_abs);
+    defer b_stat_file.close(io);
+    const b_stat = try b_stat_file.stat(io);
+    var c_stat_file = try path.openExistingFile(c_abs);
+    defer c_stat_file.close(io);
+    const c_stat = try c_stat_file.stat(io);
 
     // All files should have the same inode (hard linked)
     try std.testing.expect(a_stat.inode == b_stat.inode);
     try std.testing.expect(a_stat.inode == c_stat.inode);
 
     // All files should still contain the same content
-    const a_file_check = try std.fs.cwd().openFile(a_abs, .{});
-    defer a_file_check.close();
+    const a_file_check = try path.openExistingFile(a_abs);
+    defer a_file_check.close(io);
     var a_content_buf: [100]u8 = undefined;
-    const a_content_len = try a_file_check.readAll(&a_content_buf);
-    const a_content = a_content_buf[0..a_content_len];
+    var a_reader_buf: [256]u8 = undefined;
+    var a_reader = a_file_check.reader(io, &a_reader_buf);
+    try a_reader.interface.readSliceAll(a_content_buf[0..content.len]);
+    const a_content = a_content_buf[0..content.len];
 
-    const b_file_check = try std.fs.cwd().openFile(b_abs, .{});
-    defer b_file_check.close();
+    const b_file_check = try path.openExistingFile(b_abs);
+    defer b_file_check.close(io);
     var b_content_buf: [100]u8 = undefined;
-    const b_content_len = try b_file_check.readAll(&b_content_buf);
-    const b_content = b_content_buf[0..b_content_len];
+    var b_reader_buf: [256]u8 = undefined;
+    var b_reader = b_file_check.reader(io, &b_reader_buf);
+    try b_reader.interface.readSliceAll(b_content_buf[0..content.len]);
+    const b_content = b_content_buf[0..content.len];
 
     try std.testing.expect(std.mem.eql(u8, a_content, b_content));
     try std.testing.expect(std.mem.eql(u8, a_content, content));
@@ -648,6 +676,7 @@ test "deduplicate replaces duplicate files with hard links pointing to canonical
 
 test "deduplicate preserves existing hard links without unnecessary operations" {
     const th = @import("test_helpers.zig");
+    const io = path.currentIo();
     var test_env = try th.createTestEnv();
     defer {
         test_env.cleanup();
@@ -656,7 +685,8 @@ test "deduplicate preserves existing hard links without unnecessary operations" 
 
     const files_dir = try std.fs.path.join(std.testing.allocator, &.{ test_env.path, "hardlink_test" });
     defer std.testing.allocator.free(files_dir);
-    try std.fs.cwd().makePath(files_dir);
+    var files_dir_handle = try path.makePathAndOpenDir(files_dir);
+    files_dir_handle.close(io);
 
     const content = "shared content for hard links";
 
@@ -667,9 +697,9 @@ test "deduplicate preserves existing hard links without unnecessary operations" 
     // Create original file
     const original_abs = try std.fs.path.join(std.testing.allocator, &.{ files_dir, original_rel });
     defer std.testing.allocator.free(original_abs);
-    var original_file = try std.fs.createFileAbsolute(original_abs, .{});
-    try original_file.writeAll(content);
-    original_file.close();
+    var original_file = try std.Io.Dir.createFileAbsolute(io, original_abs, .{});
+    try original_file.writeStreamingAll(io, content);
+    original_file.close(io);
 
     // Create existing hard link to original file
     const existing_hardlink_abs = try std.fs.path.join(std.testing.allocator, &.{ files_dir, existing_hardlink_rel });
@@ -684,14 +714,20 @@ test "deduplicate preserves existing hard links without unnecessary operations" 
     // Create a separate duplicate file (not hard-linked)
     const duplicate_abs = try std.fs.path.join(std.testing.allocator, &.{ files_dir, duplicate_file_rel });
     defer std.testing.allocator.free(duplicate_abs);
-    var duplicate_file = try std.fs.createFileAbsolute(duplicate_abs, .{});
-    try duplicate_file.writeAll(content);
-    duplicate_file.close();
+    var duplicate_file = try std.Io.Dir.createFileAbsolute(io, duplicate_abs, .{});
+    try duplicate_file.writeStreamingAll(io, content);
+    duplicate_file.close(io);
 
     // Get inodes before deduplication
-    const original_stat_before = try std.fs.cwd().statFile(original_abs);
-    const existing_hardlink_stat_before = try std.fs.cwd().statFile(existing_hardlink_abs);
-    const duplicate_stat_before = try std.fs.cwd().statFile(duplicate_abs);
+    var original_stat_before_file = try path.openExistingFile(original_abs);
+    defer original_stat_before_file.close(io);
+    const original_stat_before = try original_stat_before_file.stat(io);
+    var existing_hardlink_stat_before_file = try path.openExistingFile(existing_hardlink_abs);
+    defer existing_hardlink_stat_before_file.close(io);
+    const existing_hardlink_stat_before = try existing_hardlink_stat_before_file.stat(io);
+    var duplicate_stat_before_file = try path.openExistingFile(duplicate_abs);
+    defer duplicate_stat_before_file.close(io);
+    const duplicate_stat_before = try duplicate_stat_before_file.stat(io);
 
     // Verify existing hard link relationship
     try std.testing.expect(original_stat_before.inode == existing_hardlink_stat_before.inode);
@@ -704,9 +740,15 @@ test "deduplicate preserves existing hard links without unnecessary operations" 
     try std.testing.expectEqual(@as(u64, content.len), stats.bytes_saved);
 
     // Get inodes after deduplication
-    const original_stat_after = try std.fs.cwd().statFile(original_abs);
-    const existing_hardlink_stat_after = try std.fs.cwd().statFile(existing_hardlink_abs);
-    const duplicate_stat_after = try std.fs.cwd().statFile(duplicate_abs);
+    var original_stat_after_file = try path.openExistingFile(original_abs);
+    defer original_stat_after_file.close(io);
+    const original_stat_after = try original_stat_after_file.stat(io);
+    var existing_hardlink_stat_after_file = try path.openExistingFile(existing_hardlink_abs);
+    defer existing_hardlink_stat_after_file.close(io);
+    const existing_hardlink_stat_after = try existing_hardlink_stat_after_file.stat(io);
+    var duplicate_stat_after_file = try path.openExistingFile(duplicate_abs);
+    defer duplicate_stat_after_file.close(io);
+    const duplicate_stat_after = try duplicate_stat_after_file.stat(io);
 
     // Verify that existing hard links are preserved (same inodes as before)
     try std.testing.expect(original_stat_before.inode == original_stat_after.inode);
@@ -721,11 +763,13 @@ test "deduplicate preserves existing hard links without unnecessary operations" 
     try std.testing.expect(original_stat_after.inode == duplicate_stat_after.inode);
 
     // Verify all files still contain the correct content
-    const original_file_check = try std.fs.cwd().openFile(original_abs, .{});
-    defer original_file_check.close();
+    const original_file_check = try path.openExistingFile(original_abs);
+    defer original_file_check.close(io);
     var content_buf: [100]u8 = undefined;
-    const content_len = try original_file_check.readAll(&content_buf);
-    const read_content = content_buf[0..content_len];
+    var content_reader_buf: [256]u8 = undefined;
+    var content_reader = original_file_check.reader(io, &content_reader_buf);
+    try content_reader.interface.readSliceAll(content_buf[0..content.len]);
+    const read_content = content_buf[0..content.len];
     try std.testing.expect(std.mem.eql(u8, read_content, content));
 }
 
@@ -744,9 +788,10 @@ test "archive mapHashError preserves actionable classes" {
 }
 
 test "deduplicate reports traversal permission failures" {
-    if (std.posix.geteuid() == 0) return error.SkipZigTest;
+    if (std.os.linux.geteuid() == 0) return error.SkipZigTest;
 
     const th = @import("test_helpers.zig");
+    const io = path.currentIo();
     var test_env = try th.createTestEnv();
     defer {
         test_env.cleanup();
@@ -755,20 +800,27 @@ test "deduplicate reports traversal permission failures" {
 
     const files_dir = try std.fs.path.join(std.testing.allocator, &.{ test_env.path, "perm_test" });
     defer std.testing.allocator.free(files_dir);
-    try std.fs.cwd().makePath(files_dir);
+    var files_dir_handle = try path.makePathAndOpenDir(files_dir);
+    files_dir_handle.close(io);
 
     const blocked_dir = try std.fs.path.join(std.testing.allocator, &.{ files_dir, "blocked" });
     defer std.testing.allocator.free(blocked_dir);
-    try std.fs.cwd().makePath(blocked_dir);
+    var blocked_dir_handle = try path.makePathAndOpenDir(blocked_dir);
+    blocked_dir_handle.close(io);
 
     const blocked_file = try std.fs.path.join(std.testing.allocator, &.{ blocked_dir, "x.txt" });
     defer std.testing.allocator.free(blocked_file);
-    var f = try std.fs.createFileAbsolute(blocked_file, .{});
-    try f.writeAll("hidden");
-    f.close();
+    var f = try std.Io.Dir.createFileAbsolute(io, blocked_file, .{});
+    try f.writeStreamingAll(io, "hidden");
+    f.close(io);
 
-    try std.posix.fchmodat(std.posix.AT.FDCWD, blocked_dir, 0, 0);
-    defer std.posix.fchmodat(std.posix.AT.FDCWD, blocked_dir, 0o755, 0) catch {};
+    const blocked_dir_z = try std.testing.allocator.dupeZ(u8, blocked_dir);
+    defer std.testing.allocator.free(blocked_dir_z);
+    switch (std.posix.errno(std.c.chmod(blocked_dir_z, 0))) {
+        .SUCCESS => {},
+        else => return error.FileSystem,
+    }
+    defer _ = std.c.chmod(blocked_dir_z, 0o755);
 
     const result = deduplicate(&test_env.ctx, files_dir);
     try std.testing.expectError(ArchiveError.PermissionDenied, result);
@@ -776,6 +828,7 @@ test "deduplicate reports traversal permission failures" {
 
 test "deduplicate does not create missing source directory" {
     const th = @import("test_helpers.zig");
+    const io = path.currentIo();
     var test_env = try th.createTestEnv();
     defer {
         test_env.cleanup();
@@ -786,13 +839,14 @@ test "deduplicate does not create missing source directory" {
     defer std.testing.allocator.free(missing_dir);
 
     try std.testing.expectError(ArchiveError.FileSystem, deduplicate(&test_env.ctx, missing_dir));
-    try std.testing.expectError(error.FileNotFound, std.fs.openDirAbsolute(missing_dir, .{}));
+    try std.testing.expectError(error.FileNotFound, std.Io.Dir.openDirAbsolute(io, missing_dir, .{}));
 }
 
 test "deduplicate failure preserves original duplicate file" {
-    if (std.posix.geteuid() == 0) return error.SkipZigTest;
+    if (std.os.linux.geteuid() == 0) return error.SkipZigTest;
 
     const th = @import("test_helpers.zig");
+    const io = path.currentIo();
     var test_env = try th.createTestEnv();
     defer {
         test_env.cleanup();
@@ -801,28 +855,36 @@ test "deduplicate failure preserves original duplicate file" {
 
     const files_dir = try std.fs.path.join(std.testing.allocator, &.{ test_env.path, "replace_safety" });
     defer std.testing.allocator.free(files_dir);
-    try std.fs.cwd().makePath(files_dir);
+    var files_dir_handle = try path.makePathAndOpenDir(files_dir);
+    files_dir_handle.close(io);
 
     const canonical_abs = try std.fs.path.join(std.testing.allocator, &.{ files_dir, "a.txt" });
     defer std.testing.allocator.free(canonical_abs);
-    var canonical_file = try std.fs.createFileAbsolute(canonical_abs, .{});
-    try canonical_file.writeAll("same");
-    canonical_file.close();
+    var canonical_file = try std.Io.Dir.createFileAbsolute(io, canonical_abs, .{});
+    try canonical_file.writeStreamingAll(io, "same");
+    canonical_file.close(io);
 
     const duplicate_abs = try std.fs.path.join(std.testing.allocator, &.{ files_dir, "b.txt" });
     defer std.testing.allocator.free(duplicate_abs);
-    var duplicate_file = try std.fs.createFileAbsolute(duplicate_abs, .{});
-    try duplicate_file.writeAll("same");
-    duplicate_file.close();
+    var duplicate_file = try std.Io.Dir.createFileAbsolute(io, duplicate_abs, .{});
+    try duplicate_file.writeStreamingAll(io, "same");
+    duplicate_file.close(io);
 
-    try std.posix.fchmodat(std.posix.AT.FDCWD, files_dir, 0o555, 0);
-    defer std.posix.fchmodat(std.posix.AT.FDCWD, files_dir, 0o755, 0) catch {};
+    const files_dir_z = try std.testing.allocator.dupeZ(u8, files_dir);
+    defer std.testing.allocator.free(files_dir_z);
+    switch (std.posix.errno(std.c.chmod(files_dir_z, 0o555))) {
+        .SUCCESS => {},
+        else => return error.FileSystem,
+    }
+    defer _ = std.c.chmod(files_dir_z, 0o755);
 
     try std.testing.expectError(ArchiveError.PermissionDenied, deduplicate(&test_env.ctx, files_dir));
 
-    var duplicate_check = try std.fs.openFileAbsolute(duplicate_abs, .{});
-    defer duplicate_check.close();
+    var duplicate_check = try path.openExistingFile(duplicate_abs);
+    defer duplicate_check.close(io);
     var buf: [8]u8 = undefined;
-    const len = try duplicate_check.readAll(&buf);
-    try std.testing.expectEqualStrings("same", buf[0..len]);
+    var duplicate_reader_buf: [64]u8 = undefined;
+    var duplicate_reader = duplicate_check.reader(io, &duplicate_reader_buf);
+    try duplicate_reader.interface.readSliceAll(buf[0.."same".len]);
+    try std.testing.expectEqualStrings("same", buf[0.."same".len]);
 }

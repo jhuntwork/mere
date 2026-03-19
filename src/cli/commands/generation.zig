@@ -184,7 +184,7 @@ pub fn handleList(ctx: *mere.Context, args: *const types.ParsedArgs) MereError!t
     defer if (rooted_gens.len > 0) ctx.allocator.free(rooted_gens);
 
     // Build output
-    var output: std.ArrayList(u8) = .{};
+    var output: std.ArrayList(u8) = .empty;
     defer output.deinit(ctx.allocator);
 
     const writer = output.writer(ctx.allocator);

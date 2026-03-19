@@ -67,7 +67,7 @@ pub const WorkspaceManager = struct {
 
         // Create a unique workspace name using uuid to ensure uniqueness
         var uuid_bytes: [16]u8 = undefined;
-        std.crypto.random.bytes(&uuid_bytes);
+        path.currentIo().random(&uuid_bytes);
         const uuid_hex = std.fmt.bytesToHex(uuid_bytes[0..8], .lower);
 
         // Use recipe name with fallback, matching original BuildWorkspace logic
@@ -82,7 +82,13 @@ pub const WorkspaceManager = struct {
         // Create workspace root path: {build_root}/{recipe_name}-{version}-{release}-{uuid}
         const recipe_root = try std.fmt.allocPrint(allocator, "{s}/{s}-{s}-{d}-{s}", .{ build_root, pkg_name, pkg_version, pkg_release, uuid_hex });
         errdefer allocator.free(recipe_root);
-        errdefer std.fs.deleteTreeAbsolute(recipe_root) catch {};
+        errdefer if (std.fs.path.dirname(recipe_root)) |parent_path| {
+            if (path.openExistingDir(parent_path) catch null) |parent_dir| {
+                var dir = parent_dir;
+                defer dir.close(path.currentIo());
+                dir.deleteTree(path.currentIo(), std.fs.path.basename(recipe_root)) catch {};
+            }
+        };
 
         // Create derived directories
         const sources_dir = try std.fs.path.join(allocator, &.{ recipe_root, "sources" });
@@ -102,7 +108,7 @@ pub const WorkspaceManager = struct {
             profile_dir,
         };
         for (root_dirs) |dir_path| {
-            std.fs.cwd().makePath(dir_path) catch {
+            path.ensureDirExists(dir_path) catch {
                 return WorkspaceError.DirectoryCreationFailed;
             };
         }
@@ -110,7 +116,7 @@ pub const WorkspaceManager = struct {
         // Create package directories (matching BuildWorkspace functionality)
         const pkg_root = try std.fs.path.join(allocator, &.{ recipe_root, "pkg" });
         defer allocator.free(pkg_root);
-        std.fs.cwd().makePath(pkg_root) catch {
+        path.ensureDirExists(pkg_root) catch {
             return WorkspaceError.DirectoryCreationFailed;
         };
 
@@ -121,7 +127,7 @@ pub const WorkspaceManager = struct {
             }
             const pkg_dir = try std.fs.path.join(allocator, &.{ pkg_root, pkg_entry.name });
             defer allocator.free(pkg_dir);
-            std.fs.cwd().makePath(pkg_dir) catch {
+            path.ensureDirExists(pkg_dir) catch {
                 return WorkspaceError.DirectoryCreationFailed;
             };
         }
@@ -149,20 +155,20 @@ pub const WorkspaceManager = struct {
         defer allocator.free(build_root);
 
         // Open the build root directory
-        var dir = std.fs.openDirAbsolute(build_root, .{ .iterate = true }) catch |err| {
+        var dir = std.Io.Dir.openDirAbsolute(path.currentIo(), build_root, .{ .iterate = true }) catch |err| {
             return switch (err) {
                 error.FileNotFound => 0, // No build directory = nothing to clean
                 error.AccessDenied => WorkspaceError.FileSystem,
                 else => WorkspaceError.FileSystem,
             };
         };
-        defer dir.close();
+        defer dir.close(path.currentIo());
 
         // Iterate through workspaces and delete them
         var iter = dir.iterate();
         var deleted_count: usize = 0;
 
-        while (iter.next() catch return WorkspaceError.FileSystem) |entry| {
+        while (iter.next(path.currentIo()) catch return WorkspaceError.FileSystem) |entry| {
             // Only process directories (skip files like .gitkeep)
             if (entry.kind != .directory) continue;
             if (!isManagedWorkspaceName(entry.name)) continue;
@@ -177,7 +183,7 @@ pub const WorkspaceManager = struct {
 
             self.ctx.debug("removing build workspace: {s}", .{entry.name});
 
-            std.fs.deleteTreeAbsolute(workspace_path) catch |err| {
+            path.deleteTreeAbsolute(workspace_path) catch |err| {
                 self.ctx.debug("failed to delete build workspace {s}: {}", .{ entry.name, err });
                 continue; // Continue with other workspaces even if one fails
             };
@@ -221,7 +227,7 @@ fn isManagedWorkspaceName(name: []const u8) bool {
 
 // Test helper to check if directory exists
 fn expectDirExists(dir_path: []const u8) !void {
-    std.fs.cwd().access(dir_path, .{}) catch |err| switch (err) {
+    std.Io.Dir.accessAbsolute(path.currentIo(), dir_path, .{}) catch |err| switch (err) {
         error.FileNotFound => return std.testing.expect(false), // Directory doesn't exist
         else => return err,
     };
@@ -369,10 +375,10 @@ test "WorkspaceManager cleanup only removes managed workspace directories" {
 
     const foreign_dir = try std.fs.path.join(test_env.ctx.allocator, &.{ build_root, "manual-scratch" });
     defer test_env.ctx.allocator.free(foreign_dir);
-    try std.fs.cwd().makePath(foreign_dir);
+    try path.ensureDirExists(foreign_dir);
 
     const removed = try manager.cleanAllWorkspaces();
     try std.testing.expectEqual(@as(usize, 1), removed);
-    try std.testing.expectError(error.FileNotFound, std.fs.accessAbsolute(workspace.recipe_root, .{}));
-    try std.fs.accessAbsolute(foreign_dir, .{});
+    try std.testing.expectError(error.FileNotFound, std.Io.Dir.accessAbsolute(path.currentIo(), workspace.recipe_root, .{}));
+    try std.Io.Dir.accessAbsolute(path.currentIo(), foreign_dir, .{});
 }

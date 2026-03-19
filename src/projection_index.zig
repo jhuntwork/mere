@@ -1,6 +1,7 @@
 const std = @import("std");
 const manifest = @import("manifest.zig");
 const errors = @import("errors.zig");
+const path_mod = @import("path.zig");
 
 const Std = errors.StandardErrors;
 pub const ProjectionError = Std.OutOfMemory || Std.FileSystem || Std.PermissionDenied || Std.InvalidInput;
@@ -16,7 +17,7 @@ pub const Data = struct {
 
     pub fn init(allocator: std.mem.Allocator) Data {
         return .{
-            .paths = .{},
+            .paths = .empty,
             .allocator = allocator,
         };
     }
@@ -132,10 +133,11 @@ pub const Data = struct {
 };
 
 pub fn deriveFromPayload(allocator: std.mem.Allocator, dir_path: []const u8) ProjectionError!Data {
-    var dir = std.fs.openDirAbsolute(dir_path, .{ .iterate = true }) catch |err| {
+    const io = path_mod.currentIo();
+    var dir = std.Io.Dir.openDirAbsolute(io, dir_path, .{ .iterate = true }) catch |err| {
         return mapFsError(err);
     };
-    defer dir.close();
+    defer dir.close(io);
 
     var walker = dir.walk(allocator) catch |err| {
         return mapFsError(err);
@@ -146,7 +148,7 @@ pub fn deriveFromPayload(allocator: std.mem.Allocator, dir_path: []const u8) Pro
     errdefer data.deinit();
 
     while (true) {
-        const maybe_entry = walker.next() catch |err| {
+        const maybe_entry = walker.next(io) catch |err| {
             return mapFsError(err);
         };
         if (maybe_entry == null) break;
@@ -173,20 +175,21 @@ pub fn validateAgainstPayload(
 }
 
 pub fn readFile(allocator: std.mem.Allocator, dir_path: []const u8) ProjectionError!Data {
+    const io = path_mod.currentIo();
     const projection_path = std.fs.path.join(allocator, &.{ dir_path, manifest.PROJECTION_FILENAME }) catch {
         return ProjectionError.OutOfMemory;
     };
     defer allocator.free(projection_path);
 
-    var file = std.fs.openFileAbsolute(projection_path, .{}) catch |err| {
+    var file = std.Io.Dir.openFileAbsolute(io, projection_path, .{}) catch |err| {
         return switch (err) {
             error.FileNotFound => ProjectionError.InvalidInput,
             else => mapFsError(err),
         };
     };
-    defer file.close();
+    defer file.close(io);
 
-    const stat = file.stat() catch |err| {
+    const stat = file.stat(io) catch |err| {
         return mapFsError(err);
     };
     if (stat.size > MAX_FILE_SIZE) return ProjectionError.InvalidInput;
@@ -194,7 +197,7 @@ pub fn readFile(allocator: std.mem.Allocator, dir_path: []const u8) ProjectionEr
     const content = allocator.alloc(u8, @intCast(stat.size)) catch return ProjectionError.OutOfMemory;
     defer allocator.free(content);
 
-    const bytes_read = file.readAll(content) catch |err| {
+    const bytes_read = file.readPositionalAll(io, content, 0) catch |err| {
         return mapFsError(err);
     };
     if (bytes_read != @as(usize, @intCast(stat.size))) return ProjectionError.FileSystem;
@@ -207,7 +210,7 @@ pub fn writeFile(allocator: std.mem.Allocator, dir_path: []const u8, data: *cons
         return ProjectionError.OutOfMemory;
     };
     defer allocator.free(meta_dir_path);
-    std.fs.cwd().makePath(meta_dir_path) catch |err| {
+    path_mod.ensureDirExists(meta_dir_path) catch |err| {
         return mapFsError(err);
     };
 
@@ -219,11 +222,11 @@ pub fn writeFile(allocator: std.mem.Allocator, dir_path: []const u8, data: *cons
     const encoded = try data.encode(allocator);
     defer allocator.free(encoded);
 
-    var file = std.fs.createFileAbsolute(projection_path, .{ .truncate = true }) catch |err| {
+    var file = std.Io.Dir.createFileAbsolute(path_mod.currentIo(), projection_path, .{ .truncate = true }) catch |err| {
         return mapFsError(err);
     };
-    defer file.close();
-    file.writeAll(encoded) catch |err| {
+    defer file.close(path_mod.currentIo());
+    file.writeStreamingAll(path_mod.currentIo(), encoded) catch |err| {
         return mapFsError(err);
     };
 }
@@ -278,35 +281,35 @@ test "deriveFromPayload collects canonical leaf paths and excludes profile-speci
 
     const root = try std.fs.path.join(test_env.ctx.allocator, &.{ test_env.path, "projection-root" });
     defer test_env.ctx.allocator.free(root);
-    try std.fs.cwd().makePath(root);
+    try path_mod.ensureDirExists(root);
 
     const bin_path = try std.fs.path.join(test_env.ctx.allocator, &.{ root, "usr", "bin", "tool" });
     defer test_env.ctx.allocator.free(bin_path);
-    try std.fs.cwd().makePath(std.fs.path.dirname(bin_path).?);
-    var bin_file = try std.fs.createFileAbsolute(bin_path, .{});
-    defer bin_file.close();
-    try bin_file.writeAll("tool");
+    try path_mod.ensureDirExists(std.fs.path.dirname(bin_path).?);
+    var bin_file = try std.Io.Dir.createFileAbsolute(path_mod.currentIo(), bin_path, .{});
+    defer bin_file.close(path_mod.currentIo());
+    try bin_file.writeStreamingAll(path_mod.currentIo(), "tool");
 
     const etc_path = try std.fs.path.join(test_env.ctx.allocator, &.{ root, "etc", "config.conf" });
     defer test_env.ctx.allocator.free(etc_path);
-    try std.fs.cwd().makePath(std.fs.path.dirname(etc_path).?);
-    var etc_file = try std.fs.createFileAbsolute(etc_path, .{});
-    defer etc_file.close();
-    try etc_file.writeAll("config");
+    try path_mod.ensureDirExists(std.fs.path.dirname(etc_path).?);
+    var etc_file = try std.Io.Dir.createFileAbsolute(path_mod.currentIo(), etc_path, .{});
+    defer etc_file.close(path_mod.currentIo());
+    try etc_file.writeStreamingAll(path_mod.currentIo(), "config");
 
     const defaults_path = try std.fs.path.join(test_env.ctx.allocator, &.{ root, "etc-defaults", "myapp", "config.conf" });
     defer test_env.ctx.allocator.free(defaults_path);
-    try std.fs.cwd().makePath(std.fs.path.dirname(defaults_path).?);
-    var defaults_file = try std.fs.createFileAbsolute(defaults_path, .{});
-    defer defaults_file.close();
-    try defaults_file.writeAll("template");
+    try path_mod.ensureDirExists(std.fs.path.dirname(defaults_path).?);
+    var defaults_file = try std.Io.Dir.createFileAbsolute(path_mod.currentIo(), defaults_path, .{});
+    defer defaults_file.close(path_mod.currentIo());
+    try defaults_file.writeStreamingAll(path_mod.currentIo(), "template");
 
     const meta_path = try std.fs.path.join(test_env.ctx.allocator, &.{ root, manifest.META_KDL_FILENAME });
     defer test_env.ctx.allocator.free(meta_path);
-    try std.fs.cwd().makePath(std.fs.path.dirname(meta_path).?);
-    var meta_file = try std.fs.createFileAbsolute(meta_path, .{});
-    defer meta_file.close();
-    try meta_file.writeAll("ignored");
+    try path_mod.ensureDirExists(std.fs.path.dirname(meta_path).?);
+    var meta_file = try std.Io.Dir.createFileAbsolute(path_mod.currentIo(), meta_path, .{});
+    defer meta_file.close(path_mod.currentIo());
+    try meta_file.writeStreamingAll(path_mod.currentIo(), "ignored");
 
     var data = try deriveFromPayload(test_env.ctx.allocator, root);
     defer data.deinit();
@@ -326,14 +329,14 @@ test "deriveFromPayload rejects usr/local paths" {
 
     const root = try std.fs.path.join(test_env.ctx.allocator, &.{ test_env.path, "projection-root-usr-local" });
     defer test_env.ctx.allocator.free(root);
-    try std.fs.cwd().makePath(root);
+    try path_mod.ensureDirExists(root);
     const local_path = try std.fs.path.join(test_env.ctx.allocator, &.{ root, "usr", "local", "bin", "tool" });
     defer test_env.ctx.allocator.free(local_path);
 
-    try std.fs.cwd().makePath(std.fs.path.dirname(local_path).?);
-    var local_file = try std.fs.createFileAbsolute(local_path, .{});
-    defer local_file.close();
-    try local_file.writeAll("tool");
+    try path_mod.ensureDirExists(std.fs.path.dirname(local_path).?);
+    var local_file = try std.Io.Dir.createFileAbsolute(path_mod.currentIo(), local_path, .{});
+    defer local_file.close(path_mod.currentIo());
+    try local_file.writeStreamingAll(path_mod.currentIo(), "tool");
 
     try std.testing.expectError(ProjectionError.InvalidInput, deriveFromPayload(test_env.ctx.allocator, root));
 }
@@ -354,7 +357,7 @@ test "projection.v1 round-trips canonical path tables" {
 
     const root = try std.fs.path.join(test_env.ctx.allocator, &.{ test_env.path, "projection-roundtrip" });
     defer test_env.ctx.allocator.free(root);
-    try std.fs.cwd().makePath(root);
+    try path_mod.ensureDirExists(root);
     try writeFile(test_env.ctx.allocator, root, &data);
 
     var decoded = try readFile(test_env.ctx.allocator, root);

@@ -23,13 +23,9 @@ pub const Repository = struct {
     };
 
     fn resolvePathForBoundaryCheck(allocator: std.mem.Allocator, input_path: []const u8) ![]const u8 {
-        if (std.fs.path.isAbsolute(input_path)) {
-            return std.fs.path.resolve(allocator, &[_][]const u8{input_path});
-        }
-
-        var cwd_buf: [std.fs.max_path_bytes]u8 = undefined;
-        const cwd = try std.fs.cwd().realpath(".", &cwd_buf);
-        return std.fs.path.resolve(allocator, &[_][]const u8{ cwd, input_path });
+        var resolved_buf: [std.fs.max_path_bytes]u8 = undefined;
+        const resolved = try path.resolveToAbsolutePath(input_path, &resolved_buf);
+        return try allocator.dupe(u8, resolved);
     }
 
     fn isPathWithinBoundary(allocator: std.mem.Allocator, candidate_path: []const u8, boundary_path: []const u8) !bool {
@@ -68,7 +64,7 @@ pub const Repository = struct {
         // <repo>/current and <repo>/previous.
         // Other repository paths (e.g. /mere/cache/<repo-hash>) continue using flat layout.
         const has_current_state = blk: {
-            std.fs.accessAbsolute(current_state_path, .{}) catch |err| switch (err) {
+            std.Io.Dir.accessAbsolute(path.currentIo(), current_state_path, .{}) catch |err| switch (err) {
                 error.FileNotFound => break :blk false,
                 else => return ctx.fail(Error.FileSystem, current_state_path, "failed checking current state path"),
             };
@@ -164,7 +160,7 @@ pub const Repository = struct {
                     else => Error.FileSystem,
                 };
             };
-            dir.close();
+            dir.close(path.currentIo());
         }
         const active_paths = try resolveActiveRepoStatePaths(ctx, dir_path);
         errdefer ctx.allocator.free(active_paths.db_path);
@@ -192,15 +188,15 @@ pub const Repository = struct {
 };
 
 pub fn setupStateLayout(allocator: std.mem.Allocator, repo_dir: []const u8) !void {
-    try std.fs.cwd().makePath(repo_dir);
+    try path.ensureDirExists(repo_dir);
     const current_dir = try std.fs.path.join(allocator, &.{ repo_dir, repo_history.CURRENT_STATE_DIR });
     defer allocator.free(current_dir);
-    try std.fs.cwd().makePath(current_dir);
+    try path.ensureDirExists(current_dir);
 
-    var dir = try std.fs.openDirAbsolute(repo_dir, .{});
-    defer dir.close();
-    dir.deleteFile("current") catch {};
-    dir.deleteFile("previous") catch {};
+    var dir = try path.openExistingDir(repo_dir);
+    defer dir.close(path.currentIo());
+    dir.deleteFile(path.currentIo(), "current") catch {};
+    dir.deleteFile(path.currentIo(), "previous") catch {};
 }
 
 test "Repository.dbPath and sigPath" {
@@ -263,9 +259,9 @@ test "Repository.signDb creates signature file" {
     // Create a dummy db file
     const db_path = repo.dbPath();
     {
-        const f = try std.fs.createFileAbsolute(db_path, .{});
-        try f.writeAll("dummy db");
-        f.close();
+        const f = try std.Io.Dir.createFileAbsolute(path.currentIo(), db_path, .{});
+        try f.writeStreamingAll(path.currentIo(), "dummy db");
+        f.close(path.currentIo());
     }
 
     // Generate a keypair for signing
@@ -282,10 +278,10 @@ test "Repository.signDb creates signature file" {
 
     // Check that the signature file exists
     const sig_path = repo.sigPath();
-    const sig_file = try std.fs.openFileAbsolute(sig_path, .{});
-    defer sig_file.close();
+    const sig_file = try std.Io.Dir.openFileAbsolute(path.currentIo(), sig_path, .{});
+    defer sig_file.close(path.currentIo());
     var sig_buf: [128]u8 = undefined;
-    const sig_n = try sig_file.readAll(&sig_buf);
+    const sig_n = try sig_file.readPositionalAll(path.currentIo(), &sig_buf, 0);
     try std.testing.expect(sig_n > 0);
 }
 
@@ -307,9 +303,9 @@ test "Repository error handling - SignatureInvalid errors" {
     // Create a dummy db file for signing
     const db_path = repo.dbPath();
     {
-        const f = try std.fs.createFileAbsolute(db_path, .{});
-        try f.writeAll("dummy db");
-        f.close();
+        const f = try std.Io.Dir.createFileAbsolute(path.currentIo(), db_path, .{});
+        try f.writeStreamingAll(path.currentIo(), "dummy db");
+        f.close(path.currentIo());
     }
 
     // Test SignatureInvalid error when signing fails (non-existent signing key)
@@ -351,5 +347,5 @@ test "Repository.init read-only does not create missing directory" {
     defer ctx.allocator.free(missing_repo_dir);
 
     try std.testing.expectError(Error.FileSystem, Repository.init(ctx, missing_repo_dir, true));
-    try std.testing.expectError(error.FileNotFound, std.fs.openDirAbsolute(missing_repo_dir, .{}));
+    try std.testing.expectError(error.FileNotFound, path.openExistingDir(missing_repo_dir));
 }

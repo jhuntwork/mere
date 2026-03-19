@@ -21,6 +21,7 @@ const etc = @import("etc.zig");
 const mere = @import("mere.zig");
 const errors = @import("errors.zig");
 const hash = @import("hash.zig");
+const path_mod = @import("path.zig");
 const path_safety = @import("path_safety.zig");
 
 /// Activation error set
@@ -117,13 +118,13 @@ fn switchProfileGenerationAtPath(
     gen_num: u32,
 ) ActivationError!void {
     // Open profile directory for symlink operations
-    var profile_dir_handle = std.fs.openDirAbsolute(profile_dir, .{}) catch {
+    var profile_dir_handle = std.Io.Dir.openDirAbsolute(path_mod.currentIo(), profile_dir, .{}) catch {
         return ctx.fail(ActivationError.FileSystem, profile_dir, "failed to open profile directory for activation");
     };
-    defer profile_dir_handle.close();
+    defer profile_dir_handle.close(path_mod.currentIo());
 
     // Remove stale temp symlink if it exists (idempotent)
-    profile_dir_handle.deleteFile(CURRENT_SYMLINK_TEMP) catch |err| {
+    profile_dir_handle.deleteFile(path_mod.currentIo(), CURRENT_SYMLINK_TEMP) catch |err| {
         switch (err) {
             error.FileNotFound => {}, // OK, doesn't exist
             else => {
@@ -139,21 +140,25 @@ fn switchProfileGenerationAtPath(
     defer ctx.allocator.free(target);
 
     // Create temp symlink: .current-new -> gen-<N>
-    profile_dir_handle.symLink(target, CURRENT_SYMLINK_TEMP, .{}) catch {
+    profile_dir_handle.symLink(path_mod.currentIo(), target, CURRENT_SYMLINK_TEMP, .{}) catch {
         return ctx.fail(ActivationError.FileSystem, profile_dir, "failed to create temporary symlink .current-new");
     };
 
+    const current_temp_path = std.fs.path.join(ctx.allocator, &.{ profile_dir, CURRENT_SYMLINK_TEMP }) catch {
+        return ctx.fail(ActivationError.OutOfMemory, profile_dir, "failed to construct temporary symlink path");
+    };
+    defer ctx.allocator.free(current_temp_path);
+    const current_path = std.fs.path.join(ctx.allocator, &.{ profile_dir, CURRENT_SYMLINK }) catch {
+        return ctx.fail(ActivationError.OutOfMemory, profile_dir, "failed to construct current symlink path");
+    };
+    defer ctx.allocator.free(current_path);
+
     // Atomic rename: .current-new -> current
     // This is the atomic operation that makes the switch visible
-    std.posix.renameat(
-        profile_dir_handle.fd,
-        CURRENT_SYMLINK_TEMP,
-        profile_dir_handle.fd,
-        CURRENT_SYMLINK,
-    ) catch {
+    std.Io.Dir.renameAbsolute(current_temp_path, current_path, path_mod.currentIo()) catch {
         // Record diagnostic context and clean up temp symlink on failure
         const err = ctx.fail(ActivationError.FileSystem, profile_dir, "failed to atomically rename .current-new -> current");
-        profile_dir_handle.deleteFile(CURRENT_SYMLINK_TEMP) catch {};
+        profile_dir_handle.deleteFile(path_mod.currentIo(), CURRENT_SYMLINK_TEMP) catch {};
         return err;
     };
 }
@@ -171,7 +176,7 @@ fn loadValidatedTargetManifest(
     defer ctx.allocator.free(gen_path);
 
     // Check generation directory exists
-    std.fs.accessAbsolute(gen_path, .{}) catch {
+    std.Io.Dir.accessAbsolute(path_mod.currentIo(), gen_path, .{}) catch {
         return ctx.fail(ActivationError.GenerationNotFound, gen_path, "generation not found");
     };
 
@@ -300,23 +305,42 @@ fn validateGenerationStorePaths(
             return ctx.fail(ActivationError.InvalidInput, pkg.store_path, "store path outside store root");
         }
 
-        const stat_buf = std.posix.fstatat(std.posix.AT.FDCWD, pkg.store_path, 0) catch |err| {
+        var store_dir = path_mod.openExistingDir(pkg.store_path) catch |err| {
             return ctx.fail(switch (err) {
                 error.FileNotFound => ActivationError.FileSystem,
                 error.AccessDenied => ActivationError.PermissionDenied,
                 else => ActivationError.FileSystem,
             }, pkg.store_path, "failed to stat store path");
         };
+        defer store_dir.close(path_mod.currentIo());
+        const stat_buf = store_dir.stat(path_mod.currentIo()) catch |err| {
+            return ctx.fail(switch (err) {
+                error.AccessDenied => ActivationError.PermissionDenied,
+                else => ActivationError.FileSystem,
+            }, pkg.store_path, "failed to stat store path");
+        };
 
-        if ((stat_buf.mode & std.posix.S.IFMT) != std.posix.S.IFDIR) {
+        if (stat_buf.kind != .directory) {
             return ctx.fail(ActivationError.InvalidInput, pkg.store_path, "store path is not a directory");
         }
 
         if (require_root_owned) {
-            if (stat_buf.uid != 0 or stat_buf.gid != 0) {
+            const store_path_z = try ctx.allocator.dupeZ(u8, pkg.store_path);
+            defer ctx.allocator.free(store_path_z);
+            var statx = std.mem.zeroes(std.os.linux.Statx);
+            switch (std.os.linux.errno(std.os.linux.statx(std.posix.AT.FDCWD, store_path_z, 0, .{
+                .UID = true,
+                .GID = true,
+            }, &statx))) {
+                .SUCCESS => {},
+                .ACCES => return ctx.fail(ActivationError.PermissionDenied, pkg.store_path, "failed to stat store ownership"),
+                .NOENT => return ctx.fail(ActivationError.FileSystem, pkg.store_path, "failed to stat store ownership"),
+                else => return ctx.fail(ActivationError.FileSystem, pkg.store_path, "failed to stat store ownership"),
+            }
+            if (statx.uid != 0 or statx.gid != 0) {
                 return ctx.fail(ActivationError.PermissionDenied, pkg.store_path, "store path is not root-owned");
             }
-            if ((stat_buf.mode & 0o222) != 0) {
+            if ((stat_buf.permissions.toMode() & 0o222) != 0) {
                 return ctx.fail(ActivationError.PermissionDenied, pkg.store_path, "store path is writable");
             }
         }
@@ -352,16 +376,23 @@ test "switchProfileGeneration creates atomic symlink" {
     }
 
     const allocator = test_env.ctx.allocator;
+    const io = path_mod.currentIo();
 
     // Create profile directory
     const profile_dir = try std.fs.path.join(allocator, &.{ test_env.path, "mere", "profiles", "system" });
     defer allocator.free(profile_dir);
-    try std.fs.cwd().makePath(profile_dir);
+    {
+        var dir = try path_mod.makePathAndOpenDir(profile_dir);
+        dir.close(io);
+    }
 
     // Create a generation with manifest
     const gen_path = try std.fs.path.join(allocator, &.{ profile_dir, "gen-1" });
     defer allocator.free(gen_path);
-    try std.fs.cwd().makePath(gen_path);
+    {
+        var dir = try path_mod.makePathAndOpenDir(gen_path);
+        dir.close(io);
+    }
 
     // Create a minimal manifest
     var manifest = generation.GenerationManifest.init(allocator, 1);
@@ -384,10 +415,15 @@ test "switchProfileGeneration fails for non-existent generation" {
         std.testing.allocator.destroy(test_env);
     }
 
+    const io = path_mod.currentIo();
+
     // Create profile directory
     const profile_dir = try std.fs.path.join(test_env.ctx.allocator, &.{ test_env.path, "mere", "profiles", "system" });
     defer test_env.ctx.allocator.free(profile_dir);
-    try std.fs.cwd().makePath(profile_dir);
+    {
+        var dir = try path_mod.makePathAndOpenDir(profile_dir);
+        dir.close(io);
+    }
 
     // Try to activate non-existent generation
     const result = switchProfileGeneration(&test_env.ctx, "system", 999, .fast);
@@ -403,21 +439,28 @@ test "switchProfileGeneration cleans up stale temp symlink" {
     }
 
     const allocator = test_env.ctx.allocator;
+    const io = path_mod.currentIo();
 
     // Create profile directory
     const profile_dir = try std.fs.path.join(allocator, &.{ test_env.path, "mere", "profiles", "system" });
     defer allocator.free(profile_dir);
-    try std.fs.cwd().makePath(profile_dir);
+    {
+        var dir = try path_mod.makePathAndOpenDir(profile_dir);
+        dir.close(io);
+    }
 
     // Create a stale temp symlink
-    var profile_dir_handle = try std.fs.openDirAbsolute(profile_dir, .{});
-    defer profile_dir_handle.close();
-    try profile_dir_handle.symLink("gen-old", CURRENT_SYMLINK_TEMP, .{});
+    var profile_dir_handle = try std.Io.Dir.openDirAbsolute(io, profile_dir, .{});
+    defer profile_dir_handle.close(io);
+    try profile_dir_handle.symLink(io, "gen-old", CURRENT_SYMLINK_TEMP, .{});
 
     // Create a generation with manifest
     const gen_path = try std.fs.path.join(allocator, &.{ profile_dir, "gen-1" });
     defer allocator.free(gen_path);
-    try std.fs.cwd().makePath(gen_path);
+    {
+        var dir = try path_mod.makePathAndOpenDir(gen_path);
+        dir.close(io);
+    }
 
     var manifest = generation.GenerationManifest.init(allocator, 1);
     defer manifest.deinit();
@@ -440,17 +483,24 @@ test "switchProfileGeneration can switch between generations" {
     }
 
     const allocator = test_env.ctx.allocator;
+    const io = path_mod.currentIo();
 
     // Create profile directory
     const profile_dir = try std.fs.path.join(allocator, &.{ test_env.path, "mere", "profiles", "system" });
     defer allocator.free(profile_dir);
-    try std.fs.cwd().makePath(profile_dir);
+    {
+        var dir = try path_mod.makePathAndOpenDir(profile_dir);
+        dir.close(io);
+    }
 
     // Create two generations
     for ([_]u32{ 1, 2 }) |n| {
         const gen_path = try std.fmt.allocPrint(allocator, "{s}/gen-{d}", .{ profile_dir, n });
         defer allocator.free(gen_path);
-        try std.fs.cwd().makePath(gen_path);
+        {
+            var dir = try path_mod.makePathAndOpenDir(gen_path);
+            dir.close(io);
+        }
 
         var manifest = generation.GenerationManifest.init(allocator, n);
         defer manifest.deinit();
@@ -479,11 +529,15 @@ test "switchProfileGeneration creates GC roots" {
     }
 
     const allocator = test_env.ctx.allocator;
+    const io = path_mod.currentIo();
 
     // Create profile directory
     const profile_dir = try std.fs.path.join(allocator, &.{ test_env.path, "mere", "profiles", "system" });
     defer allocator.free(profile_dir);
-    try std.fs.cwd().makePath(profile_dir);
+    {
+        var dir = try path_mod.makePathAndOpenDir(profile_dir);
+        dir.close(io);
+    }
 
     const gc_roots_dir = try std.fs.path.join(allocator, &.{ test_env.path, "mere", "gc-roots" });
     defer allocator.free(gc_roots_dir);
@@ -492,7 +546,10 @@ test "switchProfileGeneration creates GC roots" {
     for ([_]u32{ 1, 2, 3 }) |n| {
         const gen_path = try std.fmt.allocPrint(allocator, "{s}/gen-{d}", .{ profile_dir, n });
         defer allocator.free(gen_path);
-        try std.fs.cwd().makePath(gen_path);
+        {
+            var dir = try path_mod.makePathAndOpenDir(gen_path);
+            dir.close(io);
+        }
 
         var manifest = generation.GenerationManifest.init(allocator, n);
         defer manifest.deinit();
@@ -508,7 +565,7 @@ test "switchProfileGeneration creates GC roots" {
 
     const current_root = try std.fs.path.join(allocator, &.{ profile_gc_dir, "current" });
     defer allocator.free(current_root);
-    std.fs.accessAbsolute(current_root, .{}) catch {
+    std.Io.Dir.accessAbsolute(io, current_root, .{}) catch {
         return error.TestUnexpectedResult;
     };
 
@@ -528,14 +585,21 @@ test "switchProfileGeneration rejects store path that shares prefix but escapes 
     }
 
     const allocator = test_env.ctx.allocator;
+    const io = path_mod.currentIo();
 
     const profile_dir = try std.fs.path.join(allocator, &.{ test_env.path, "mere", "profiles", "system" });
     defer allocator.free(profile_dir);
-    try std.fs.cwd().makePath(profile_dir);
+    {
+        var dir = try path_mod.makePathAndOpenDir(profile_dir);
+        dir.close(io);
+    }
 
     const gen_path = try std.fs.path.join(allocator, &.{ profile_dir, "gen-1" });
     defer allocator.free(gen_path);
-    try std.fs.cwd().makePath(gen_path);
+    {
+        var dir = try path_mod.makePathAndOpenDir(gen_path);
+        dir.close(io);
+    }
 
     const escaped_store_path = try std.fs.path.join(allocator, &.{ test_env.path, "mere", "store-evil", "badpkg" });
     defer allocator.free(escaped_store_path);
@@ -559,7 +623,7 @@ test "switchProfileGeneration rejects store path that shares prefix but escapes 
 }
 
 test "applyEtcTemplatesForManifest preserves PermissionDenied from etc template processing" {
-    if (std.posix.geteuid() == 0) return error.SkipZigTest;
+    if (std.os.linux.geteuid() == 0) return error.SkipZigTest;
 
     const th = @import("test_helpers.zig");
     var test_env = try th.createTestEnv();
@@ -569,26 +633,36 @@ test "applyEtcTemplatesForManifest preserves PermissionDenied from etc template 
     }
 
     const allocator = test_env.ctx.allocator;
+    const io = path_mod.currentIo();
 
     const profile_dir = try std.fs.path.join(allocator, &.{ test_env.path, "mere", "profiles", "user" });
     defer allocator.free(profile_dir);
-    try std.fs.cwd().makePath(profile_dir);
+    {
+        var dir = try path_mod.makePathAndOpenDir(profile_dir);
+        dir.close(io);
+    }
 
     const gen_path = try std.fs.path.join(allocator, &.{ profile_dir, "gen-1" });
     defer allocator.free(gen_path);
-    try std.fs.cwd().makePath(gen_path);
+    {
+        var dir = try path_mod.makePathAndOpenDir(gen_path);
+        dir.close(io);
+    }
 
     const store_path = try std.fs.path.join(allocator, &.{ test_env.path, "mere", "store", "hash-testpkg-1.0.0" });
     defer allocator.free(store_path);
     const template_subdir = try std.fs.path.join(allocator, &.{ store_path, "etc-defaults", "subdir" });
     defer allocator.free(template_subdir);
-    try std.fs.cwd().makePath(template_subdir);
+    {
+        var dir = try path_mod.makePathAndOpenDir(template_subdir);
+        dir.close(io);
+    }
 
     const template_file = try std.fs.path.join(allocator, &.{ template_subdir, "service.conf" });
     defer allocator.free(template_file);
-    var tf = try std.fs.createFileAbsolute(template_file, .{});
-    defer tf.close();
-    try tf.writeAll("key=value\n");
+    var tf = try std.Io.Dir.createFileAbsolute(io, template_file, .{});
+    defer tf.close(io);
+    try tf.writeStreamingAll(io, "key=value\n");
 
     var manifest = generation.GenerationManifest.init(allocator, 1);
     defer manifest.deinit();
@@ -604,9 +678,14 @@ test "applyEtcTemplatesForManifest preserves PermissionDenied from etc template 
 
     const etc_dir = try std.fs.path.join(allocator, &.{ test_env.path, "etc" });
     defer allocator.free(etc_dir);
-    try std.fs.cwd().makePath(etc_dir);
-    try std.posix.fchmodat(std.posix.AT.FDCWD, etc_dir, 0o555, 0);
-    defer std.posix.fchmodat(std.posix.AT.FDCWD, etc_dir, 0o755, 0) catch {};
+    {
+        var dir = try path_mod.makePathAndOpenDir(etc_dir);
+        dir.close(io);
+    }
+    var etc_handle = try path_mod.openExistingDir(etc_dir);
+    defer etc_handle.close(io);
+    try etc_handle.setPermissions(io, .fromMode(0o555));
+    defer etc_handle.setPermissions(io, .fromMode(0o755)) catch {};
 
     var loaded_manifest = try loadValidatedTargetManifest(&test_env.ctx, profile_dir, 1, false);
     defer loaded_manifest.deinit();
@@ -630,14 +709,21 @@ test "activateSystemGeneration rolls back created /etc files and does not switch
     }
 
     const allocator = test_env.ctx.allocator;
+    const io = path_mod.currentIo();
 
     const profile_dir = try std.fs.path.join(allocator, &.{ test_env.path, "mere", "profiles", "system" });
     defer allocator.free(profile_dir);
-    try std.fs.cwd().makePath(profile_dir);
+    {
+        var dir = try path_mod.makePathAndOpenDir(profile_dir);
+        dir.close(io);
+    }
 
     const gen1_path = try std.fs.path.join(allocator, &.{ profile_dir, "gen-1" });
     defer allocator.free(gen1_path);
-    try std.fs.cwd().makePath(gen1_path);
+    {
+        var dir = try path_mod.makePathAndOpenDir(gen1_path);
+        dir.close(io);
+    }
 
     var manifest1 = generation.GenerationManifest.init(allocator, 1);
     defer manifest1.deinit();
@@ -647,33 +733,42 @@ test "activateSystemGeneration rolls back created /etc files and does not switch
 
     const gen2_path = try std.fs.path.join(allocator, &.{ profile_dir, "gen-2" });
     defer allocator.free(gen2_path);
-    try std.fs.cwd().makePath(gen2_path);
+    {
+        var dir = try path_mod.makePathAndOpenDir(gen2_path);
+        dir.close(io);
+    }
 
     const store_path = try std.fs.path.join(allocator, &.{ test_env.path, "mere", "store", "hash-testpkg-2.0.0" });
     defer allocator.free(store_path);
 
     const defaults_root = try std.fs.path.join(allocator, &.{ store_path, "etc-defaults" });
     defer allocator.free(defaults_root);
-    try std.fs.cwd().makePath(defaults_root);
+    {
+        var dir = try path_mod.makePathAndOpenDir(defaults_root);
+        dir.close(io);
+    }
 
     const copied_template = try std.fs.path.join(allocator, &.{ defaults_root, "copied.conf" });
     defer allocator.free(copied_template);
     {
-        var copied = try std.fs.createFileAbsolute(copied_template, .{});
-        defer copied.close();
-        try copied.writeAll("copied=true\n");
+        var copied = try std.Io.Dir.createFileAbsolute(io, copied_template, .{});
+        defer copied.close(io);
+        try copied.writeStreamingAll(io, "copied=true\n");
     }
 
     const conflict_dir = try std.fs.path.join(allocator, &.{ defaults_root, "service" });
     defer allocator.free(conflict_dir);
-    try std.fs.cwd().makePath(conflict_dir);
+    {
+        var dir = try path_mod.makePathAndOpenDir(conflict_dir);
+        dir.close(io);
+    }
 
     const conflict_template = try std.fs.path.join(allocator, &.{ conflict_dir, "config.conf" });
     defer allocator.free(conflict_template);
     {
-        var conflict = try std.fs.createFileAbsolute(conflict_template, .{});
-        defer conflict.close();
-        try conflict.writeAll("new-value=true\n");
+        var conflict = try std.Io.Dir.createFileAbsolute(io, conflict_template, .{});
+        defer conflict.close(io);
+        try conflict.writeStreamingAll(io, "new-value=true\n");
     }
 
     var manifest2 = generation.GenerationManifest.init(allocator, 2);
@@ -690,18 +785,24 @@ test "activateSystemGeneration rolls back created /etc files and does not switch
 
     const etc_dir = try std.fs.path.join(allocator, &.{ test_env.path, "etc" });
     defer allocator.free(etc_dir);
-    try std.fs.cwd().makePath(etc_dir);
+    {
+        var dir = try path_mod.makePathAndOpenDir(etc_dir);
+        dir.close(io);
+    }
 
     const existing_dir = try std.fs.path.join(allocator, &.{ etc_dir, "service" });
     defer allocator.free(existing_dir);
-    try std.fs.cwd().makePath(existing_dir);
+    {
+        var dir = try path_mod.makePathAndOpenDir(existing_dir);
+        dir.close(io);
+    }
 
     const existing_file = try std.fs.path.join(allocator, &.{ existing_dir, "config.conf" });
     defer allocator.free(existing_file);
     {
-        var existing = try std.fs.createFileAbsolute(existing_file, .{});
-        defer existing.close();
-        try existing.writeAll("old-value=true\n");
+        var existing = try std.Io.Dir.createFileAbsolute(io, existing_file, .{});
+        defer existing.close(io);
+        try existing.writeStreamingAll(io, "old-value=true\n");
     }
 
     const created_file = try std.fs.path.join(allocator, &.{ etc_dir, "copied.conf" });
@@ -709,15 +810,17 @@ test "activateSystemGeneration rolls back created /etc files and does not switch
     const new_file = try std.fmt.allocPrint(allocator, "{s}.new", .{existing_file});
     defer allocator.free(new_file);
 
-    std.fs.accessAbsolute(created_file, .{}) catch |err| {
+    std.Io.Dir.accessAbsolute(io, created_file, .{}) catch |err| {
         try std.testing.expectEqual(error.FileNotFound, err);
     };
-    std.fs.accessAbsolute(new_file, .{}) catch |err| {
+    std.Io.Dir.accessAbsolute(io, new_file, .{}) catch |err| {
         try std.testing.expectEqual(error.FileNotFound, err);
     };
 
-    try std.posix.fchmodat(std.posix.AT.FDCWD, etc_dir, 0o555, 0);
-    defer std.posix.fchmodat(std.posix.AT.FDCWD, etc_dir, 0o755, 0) catch {};
+    var etc_handle = try path_mod.openExistingDir(etc_dir);
+    defer etc_handle.close(io);
+    try etc_handle.setPermissions(io, .fromMode(0o555));
+    defer etc_handle.setPermissions(io, .fromMode(0o755)) catch {};
 
     try std.testing.expectError(
         ActivationError.PermissionDenied,
@@ -726,10 +829,10 @@ test "activateSystemGeneration rolls back created /etc files and does not switch
 
     try std.testing.expectEqual(@as(?u32, 1), try generation.getCurrentGeneration(profile_dir));
 
-    std.fs.accessAbsolute(created_file, .{}) catch |err| {
+    std.Io.Dir.accessAbsolute(io, created_file, .{}) catch |err| {
         try std.testing.expectEqual(error.FileNotFound, err);
     };
-    std.fs.accessAbsolute(new_file, .{}) catch |err| {
+    std.Io.Dir.accessAbsolute(io, new_file, .{}) catch |err| {
         try std.testing.expectEqual(error.FileNotFound, err);
     };
 }

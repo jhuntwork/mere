@@ -1,5 +1,6 @@
 const std = @import("std");
 const errors = @import("errors.zig");
+const path_mod = @import("path.zig");
 
 const Std = errors.StandardErrors;
 pub const PathSafetyError = Std.OutOfMemory || Std.FileSystem || Std.InvalidInput || error{
@@ -146,18 +147,19 @@ fn resolveSymlinkTarget(
 
 fn readSymlinkAlloc(allocator: std.mem.Allocator, path: []const u8) ![]const u8 {
     var buf: [std.fs.max_path_bytes]u8 = undefined;
-    const target = try std.fs.readLinkAbsolute(path, &buf);
-    return try allocator.dupe(u8, target);
+    const len = try std.Io.Dir.readLinkAbsolute(path_mod.currentIo(), path, &buf);
+    return try allocator.dupe(u8, buf[0..len]);
 }
 
 pub fn validateStorePayload(
     allocator: std.mem.Allocator,
     store_root: []const u8,
 ) PathSafetyError!void {
-    var dir = std.fs.openDirAbsolute(store_root, .{ .iterate = true }) catch {
+    const io = path_mod.currentIo();
+    var dir = std.Io.Dir.openDirAbsolute(io, store_root, .{ .iterate = true }) catch {
         return PathSafetyError.FileSystem;
     };
-    defer dir.close();
+    defer dir.close(io);
 
     var walker = dir.walk(allocator) catch {
         return PathSafetyError.OutOfMemory;
@@ -165,7 +167,7 @@ pub fn validateStorePayload(
     defer walker.deinit();
 
     while (true) {
-        const entry = walker.next() catch {
+        const entry = walker.next(io) catch {
             return PathSafetyError.FileSystem;
         };
         if (entry == null) break;
@@ -286,16 +288,16 @@ test "resolveWithinBoundary rejects escape via .." {
     defer allocator.free(boundary);
     const subdir = try std.fs.path.join(allocator, &.{ boundary, "subdir" });
     defer allocator.free(subdir);
-    try std.fs.cwd().makePath(subdir);
+    try path_mod.ensureDirExists(subdir);
 
     // Create a symlink that escapes via ..
     const escape_link = try std.fs.path.join(allocator, &.{ subdir, "escape" });
     defer allocator.free(escape_link);
 
     // Create symlink pointing outside boundary
-    var dir = try std.fs.openDirAbsolute(subdir, .{});
-    defer dir.close();
-    try dir.symLink("../../outside", "escape", .{});
+    var dir = try path_mod.openExistingDir(subdir);
+    defer dir.close(path_mod.currentIo());
+    try dir.symLink(path_mod.currentIo(), "../../outside", "escape", .{});
 
     // Should fail with EscapesBoundary
     const result = resolveWithinBoundary(allocator, escape_link, boundary);
@@ -317,23 +319,23 @@ test "resolveWithinBoundary succeeds for valid internal symlink" {
     defer allocator.free(boundary);
     const subdir = try std.fs.path.join(allocator, &.{ boundary, "subdir" });
     defer allocator.free(subdir);
-    try std.fs.cwd().makePath(subdir);
+    try path_mod.ensureDirExists(subdir);
 
     // Create a target file
     const target_file = try std.fs.path.join(allocator, &.{ boundary, "target.txt" });
     defer allocator.free(target_file);
     {
-        var f = try std.fs.createFileAbsolute(target_file, .{});
-        f.close();
+        var f = try std.Io.Dir.createFileAbsolute(path_mod.currentIo(), target_file, .{});
+        f.close(path_mod.currentIo());
     }
 
     // Create symlink pointing to target within boundary
     const link_path = try std.fs.path.join(allocator, &.{ subdir, "link" });
     defer allocator.free(link_path);
 
-    var dir = try std.fs.openDirAbsolute(subdir, .{});
-    defer dir.close();
-    try dir.symLink("../target.txt", "link", .{});
+    var dir = try path_mod.openExistingDir(subdir);
+    defer dir.close(path_mod.currentIo());
+    try dir.symLink(path_mod.currentIo(), "../target.txt", "link", .{});
 
     // Should succeed
     const result = try resolveWithinBoundary(allocator, link_path, boundary);
@@ -357,13 +359,13 @@ test "resolveWithinBoundary detects loops" {
     // Create directory
     const dir_path = try std.fs.path.join(allocator, &.{ test_env.path, "loopdir" });
     defer allocator.free(dir_path);
-    try std.fs.cwd().makePath(dir_path);
+    try path_mod.ensureDirExists(dir_path);
 
     // Create symlink loop: a -> b, b -> a
-    var dir = try std.fs.openDirAbsolute(dir_path, .{});
-    defer dir.close();
-    try dir.symLink("b", "a", .{});
-    try dir.symLink("a", "b", .{});
+    var dir = try path_mod.openExistingDir(dir_path);
+    defer dir.close(path_mod.currentIo());
+    try dir.symLink(path_mod.currentIo(), "b", "a", .{});
+    try dir.symLink(path_mod.currentIo(), "a", "b", .{});
 
     const link_a = try std.fs.path.join(allocator, &.{ dir_path, "a" });
     defer allocator.free(link_a);
@@ -437,21 +439,21 @@ test "validateStorePayload with valid symlinks" {
     defer allocator.free(store_root);
     const lib_dir = try std.fs.path.join(allocator, &.{ store_root, "lib" });
     defer allocator.free(lib_dir);
-    try std.fs.cwd().makePath(lib_dir);
+    try path_mod.ensureDirExists(lib_dir);
 
     // Create a real file
     const real_file = try std.fs.path.join(allocator, &.{ lib_dir, "libfoo.so.1.0" });
     defer allocator.free(real_file);
     {
-        var f = try std.fs.createFileAbsolute(real_file, .{});
-        f.close();
+        var f = try std.Io.Dir.createFileAbsolute(path_mod.currentIo(), real_file, .{});
+        f.close(path_mod.currentIo());
     }
 
     // Create internal symlinks (valid)
-    var dir = try std.fs.openDirAbsolute(lib_dir, .{});
-    defer dir.close();
-    try dir.symLink("libfoo.so.1.0", "libfoo.so.1", .{});
-    try dir.symLink("libfoo.so.1", "libfoo.so", .{});
+    var dir = try path_mod.openExistingDir(lib_dir);
+    defer dir.close(path_mod.currentIo());
+    try dir.symLink(path_mod.currentIo(), "libfoo.so.1.0", "libfoo.so.1", .{});
+    try dir.symLink(path_mod.currentIo(), "libfoo.so.1", "libfoo.so", .{});
 
     // Validation should pass
     try validateStorePayload(allocator, store_root);
@@ -470,12 +472,12 @@ test "validateStorePayload rejects escaping symlink" {
     // Create a mock store root
     const store_root = try std.fs.path.join(allocator, &.{ test_env.path, "store" });
     defer allocator.free(store_root);
-    try std.fs.cwd().makePath(store_root);
+    try path_mod.ensureDirExists(store_root);
 
     // Create a symlink that escapes
-    var dir = try std.fs.openDirAbsolute(store_root, .{});
-    defer dir.close();
-    try dir.symLink("/etc/passwd", "escape", .{});
+    var dir = try path_mod.openExistingDir(store_root);
+    defer dir.close(path_mod.currentIo());
+    try dir.symLink(path_mod.currentIo(), "/etc/passwd", "escape", .{});
 
     // Validation should fail
     const result = validateStorePayload(allocator, store_root);

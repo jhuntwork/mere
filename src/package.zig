@@ -375,14 +375,15 @@ fn setScanDiagnosticContext(
 /// Returns a DirScanResult allocated with ctx.allocator.
 /// Caller owns returned memory and must call deinit() on the result.
 pub fn scanDir(ctx: *Context, dir_path: []const u8, target_arch: []const u8) !DirScanResult {
+    const io = p.currentIo();
     var result = DirScanResult.init(ctx.allocator);
     errdefer result.deinit();
     // Open the directory
-    var dir = std.fs.openDirAbsolute(dir_path, .{ .iterate = true }) catch |err| {
+    var dir = std.Io.Dir.openDirAbsolute(io, dir_path, .{ .iterate = true }) catch |err| {
         setScanDiagnosticContext(ctx, dir_path, null, "package scan root open failed ({s})", .{@errorName(err)});
         return err;
     };
-    defer dir.close();
+    defer dir.close(io);
 
     var walker = dir.walk(ctx.allocator) catch |err| {
         setScanDiagnosticContext(ctx, dir_path, null, "package scan ELF walker creation failed ({s})", .{@errorName(err)});
@@ -391,7 +392,7 @@ pub fn scanDir(ctx: *Context, dir_path: []const u8, target_arch: []const u8) !Di
     defer walker.deinit();
 
     while (true) {
-        const maybe_entry = walker.next() catch |err| {
+        const maybe_entry = walker.next(io) catch |err| {
             setScanDiagnosticContext(ctx, dir_path, null, "package scan ELF walk failed ({s})", .{@errorName(err)});
             return err;
         };
@@ -399,11 +400,11 @@ pub fn scanDir(ctx: *Context, dir_path: []const u8, target_arch: []const u8) !Di
         const entry = maybe_entry.?;
         if (entry.kind != .file) continue;
 
-        const file = dir.openFile(entry.path, .{}) catch |err| {
+        const file = dir.openFile(io, entry.path, .{}) catch |err| {
             setScanDiagnosticContext(ctx, dir_path, entry.path, "package scan ELF pass failed to open file ({s})", .{@errorName(err)});
             return err;
         };
-        defer file.close();
+        defer file.close(io);
 
         const abs_path = std.fs.path.join(ctx.allocator, &.{ dir_path, entry.path }) catch |err| {
             setScanDiagnosticContext(ctx, dir_path, entry.path, "package scan ELF pass failed to build absolute path ({s})", .{@errorName(err)});
@@ -486,18 +487,18 @@ pub fn scanDir(ctx: *Context, dir_path: []const u8, target_arch: []const u8) !Di
 
     // Second pass: symlinks, script interpreter detection and bin discovery.
     {
-        var dir2 = std.fs.openDirAbsolute(dir_path, .{ .iterate = true }) catch |err| {
+        var dir2 = std.Io.Dir.openDirAbsolute(io, dir_path, .{ .iterate = true }) catch |err| {
             setScanDiagnosticContext(ctx, dir_path, null, "package scan secondary root open failed ({s})", .{@errorName(err)});
             return err;
         };
-        defer dir2.close();
+        defer dir2.close(io);
         var walker2 = dir2.walk(ctx.allocator) catch |err| {
             setScanDiagnosticContext(ctx, dir_path, null, "package scan secondary walker creation failed ({s})", .{@errorName(err)});
             return err;
         };
         defer walker2.deinit();
         while (true) {
-            const maybe_entry = walker2.next() catch |err| {
+            const maybe_entry = walker2.next(io) catch |err| {
                 setScanDiagnosticContext(ctx, dir_path, null, "package scan secondary walk failed ({s})", .{@errorName(err)});
                 return err;
             };
@@ -506,10 +507,11 @@ pub fn scanDir(ctx: *Context, dir_path: []const u8, target_arch: []const u8) !Di
             if (entry.kind == .sym_link) {
                 const symlink_name = std.fs.path.basename(entry.path);
                 var target_buf: [std.fs.max_path_bytes]u8 = undefined;
-                const target_path = dir2.readLink(entry.path, &target_buf) catch |err| {
+                const target_len = dir2.readLink(io, entry.path, &target_buf) catch |err| {
                     setScanDiagnosticContext(ctx, dir_path, entry.path, "package scan symlink pass failed to read link ({s})", .{@errorName(err)});
                     return err;
                 };
+                const target_path = target_buf[0..target_len];
                 // For relative symlinks, resolve relative to the symlink's directory
                 const abs_target = if (std.fs.path.isAbsolute(target_path))
                     target_path
@@ -525,7 +527,7 @@ pub fn scanDir(ctx: *Context, dir_path: []const u8, target_arch: []const u8) !Di
                 defer if (owns_abs_target) ctx.allocator.free(abs_target);
 
                 var target_exists = true;
-                std.fs.accessAbsolute(abs_target, .{}) catch |e| {
+                std.Io.Dir.accessAbsolute(io, abs_target, .{}) catch |e| {
                     if (e == error.FileNotFound) {
                         target_exists = false;
                         ctx.debug("package scan: symlink target missing for {s} -> {s}", .{ entry.path, target_path });
@@ -535,11 +537,11 @@ pub fn scanDir(ctx: *Context, dir_path: []const u8, target_arch: []const u8) !Di
                     }
                 };
                 if (target_exists) {
-                    const file = std.fs.openFileAbsolute(abs_target, .{}) catch |err| {
+                    const file = std.Io.Dir.openFileAbsolute(io, abs_target, .{}) catch |err| {
                         ctx.debug("package scan: skipping symlink target open for {s} -> {s}: {s}", .{ entry.path, target_path, @errorName(err) });
                         continue;
                     };
-                    defer file.close();
+                    defer file.close(io);
                     if (filetype.detect(&file)) |kind| {
                         if (kind == .elf) {
                             const norm_path = if (entry.path[0] == '.' and entry.path.len > 1 and entry.path[1] == '/')
@@ -624,20 +626,20 @@ pub fn scanDir(ctx: *Context, dir_path: []const u8, target_arch: []const u8) !Di
                 };
                 defer ctx.allocator.free(abs);
 
-                const f = std.fs.openFileAbsolute(abs, .{}) catch |err| {
+                const f = std.Io.Dir.openFileAbsolute(io, abs, .{}) catch |err| {
                     ctx.debug("package scan: skipping file open for {s}: {s}", .{ abs, @errorName(err) });
                     continue;
                 };
-                defer f.close();
-                const stat = f.stat() catch |err| {
+                defer f.close(io);
+                const stat = f.stat(io) catch |err| {
                     ctx.debug("package scan: skipping stat for {s}: {s}", .{ abs, @errorName(err) });
                     continue;
                 };
-                const is_executable = (stat.mode & 0o111) != 0;
+                const is_executable = (stat.permissions.toMode() & 0o111) != 0;
 
                 // Read a small header to detect shebangs
                 var header_buf: [256]u8 = undefined;
-                const read_len = f.read(header_buf[0..]) catch 0;
+                const read_len = f.readPositionalAll(io, header_buf[0..], 0) catch 0;
                 if (is_executable and read_len >= 2 and header_buf[0] == '#' and header_buf[1] == '!') {
                     // Parse first line up to newline
                     var nl_index: usize = read_len;
@@ -791,9 +793,9 @@ test "Package scanDirectory" {
 
     // Get absolute path to source test file and verify it
     var src_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const src_path = try std.fs.cwd().realpath("test/testdata/libtest.so", &src_buf);
+    const src_path = try p.resolveToAbsolutePath("test/testdata/libtest.so", &src_buf);
 
-    try std.fs.copyFileAbsolute(src_path, lib_path, .{});
+    try p.copyFile(src_path, lib_path);
 
     // Scan the directory
     try pkg.scanDirectory(test_env.path);
@@ -824,9 +826,9 @@ test "Package scanDirectory" {
 
     // Get absolute path to source test file and verify it
     var dummy_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const dummy_src_path = try std.fs.cwd().realpath("test/testdata/dummy", &dummy_buf);
+    const dummy_src_path = try p.resolveToAbsolutePath("test/testdata/dummy", &dummy_buf);
 
-    try std.fs.copyFileAbsolute(dummy_src_path, dummy_path, .{});
+    try p.copyFile(dummy_src_path, dummy_path);
 
     // Scan the directory again
     try pkg.scanDirectory(test_env.path);
@@ -848,7 +850,7 @@ test "Package scanDirectory" {
     defer std.testing.allocator.free(bin_dir_path);
 
     ctx.debug("creating bin directory: {s}", .{bin_dir_path});
-    try std.fs.cwd().makePath(bin_dir_path);
+    try p.ensureDirExists(bin_dir_path);
 
     const test_bin_path = try std.fs.path.join(std.testing.allocator, &.{ bin_dir_path, "sh" });
     defer std.testing.allocator.free(test_bin_path);
@@ -856,16 +858,15 @@ test "Package scanDirectory" {
 
     // Create a simple executable file
     {
-        const bin_file = try std.fs.createFileAbsolute(test_bin_path, .{});
-        try bin_file.writeAll("#!/bin/sh\necho 'test'\n");
-        bin_file.close();
+        var bin_file = try std.Io.Dir.createFileAbsolute(p.currentIo(), test_bin_path, .{});
+        try bin_file.writeStreamingAll(p.currentIo(), "#!/bin/sh\necho 'test'\n");
+        bin_file.close(p.currentIo());
     }
 
     // Make it executable (0o755 = rwxr-xr-x)
-    const file = try std.fs.openFileAbsolute(test_bin_path, .{});
-    defer file.close();
-    const permissions = std.fs.File.Permissions{ .inner = .{ .mode = 0o755 } };
-    try file.setPermissions(permissions);
+    const file = try std.Io.Dir.openFileAbsolute(p.currentIo(), test_bin_path, .{});
+    defer file.close(p.currentIo());
+    try file.setPermissions(p.currentIo(), .executable_file);
 
     // Scan the directory again
     try pkg.scanDirectory(test_env.path);
@@ -885,11 +886,11 @@ test "Package scanDirectory" {
     // Non-executable files with shebangs should not produce script interpreter dependencies.
     const nonexec_shebang_path = try std.fs.path.join(std.testing.allocator, &.{ test_env.path, "usr", "lib", "test-nonexec.pm" });
     defer std.testing.allocator.free(nonexec_shebang_path);
-    try std.fs.cwd().makePath(std.fs.path.dirname(nonexec_shebang_path).?);
+    try p.ensureDirExists(std.fs.path.dirname(nonexec_shebang_path).?);
     {
-        const nonexec_file = try std.fs.createFileAbsolute(nonexec_shebang_path, .{});
-        defer nonexec_file.close();
-        try nonexec_file.writeAll("#!./perl -w\npackage Test::NonExec;\n");
+        const nonexec_file = try std.Io.Dir.createFileAbsolute(p.currentIo(), nonexec_shebang_path, .{});
+        defer nonexec_file.close(p.currentIo());
+        try nonexec_file.writeStreamingAll(p.currentIo(), "#!./perl -w\npackage Test::NonExec;\n");
     }
 
     try pkg.scanDirectory(test_env.path);
@@ -940,24 +941,22 @@ test "scanDirectory handles musl absolute symlink in package tree" {
     // Create lib/ and place a test ELF as libc.so
     const lib_dir = try std.fs.path.join(std.testing.allocator, &.{ test_env.path, "lib" });
     defer std.testing.allocator.free(lib_dir);
-    try std.fs.cwd().makePath(lib_dir);
+    try p.ensureDirExists(lib_dir);
 
     var src_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const src_lib = try std.fs.cwd().realpath("test/testdata/libtest.so", &src_buf);
+    const src_lib = try p.resolveToAbsolutePath("test/testdata/libtest.so", &src_buf);
     const dest_lib = try std.fs.path.join(std.testing.allocator, &.{ lib_dir, "libc.so" });
     defer std.testing.allocator.free(dest_lib);
-    try std.fs.copyFileAbsolute(src_lib, dest_lib, .{});
+    try p.copyFile(src_lib, dest_lib);
 
     // Create an absolute symlink that points to /lib/libc.so (as found in some archives)
     const symlink_path = try std.fs.path.join(std.testing.allocator, &.{ lib_dir, "ld-musl-x86_64.so.1" });
     defer std.testing.allocator.free(symlink_path);
-    const symlink_path_z = try std.testing.allocator.dupeZ(u8, symlink_path);
-    defer std.testing.allocator.free(symlink_path_z);
-    const target_z = try std.testing.allocator.dupeZ(u8, "/lib/libc.so");
-    defer std.testing.allocator.free(target_z);
-
-    const rc = std.os.linux.symlink(target_z, symlink_path_z);
-    try std.testing.expect(rc == 0);
+    {
+        var lib_dir_handle = try p.openExistingDir(lib_dir);
+        defer lib_dir_handle.close(p.currentIo());
+        try lib_dir_handle.symLink(p.currentIo(), "/lib/libc.so", "ld-musl-x86_64.so.1", .{});
+    }
 
     var pkg = Package.init(&ctx);
     defer pkg.deinit();
@@ -986,22 +985,21 @@ test "scanDirectory treats shared-library symlink name as elf soname provide" {
 
     const lib_dir = try std.fs.path.join(std.testing.allocator, &.{ test_env.path, "lib" });
     defer std.testing.allocator.free(lib_dir);
-    try std.fs.cwd().makePath(lib_dir);
+    try p.ensureDirExists(lib_dir);
 
     var src_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const src_lib = try std.fs.cwd().realpath("test/testdata/libtest.so", &src_buf);
+    const src_lib = try p.resolveToAbsolutePath("test/testdata/libtest.so", &src_buf);
     const dest_lib = try std.fs.path.join(std.testing.allocator, &.{ lib_dir, "libtest.so" });
     defer std.testing.allocator.free(dest_lib);
-    try std.fs.copyFileAbsolute(src_lib, dest_lib, .{});
+    try p.copyFile(src_lib, dest_lib);
 
     const symlink_path = try std.fs.path.join(std.testing.allocator, &.{ lib_dir, "libtest.so.1" });
     defer std.testing.allocator.free(symlink_path);
-    const symlink_path_z = try std.testing.allocator.dupeZ(u8, symlink_path);
-    defer std.testing.allocator.free(symlink_path_z);
-    const target_z = try std.testing.allocator.dupeZ(u8, "libtest.so");
-    defer std.testing.allocator.free(target_z);
-    const rc = std.os.linux.symlink(target_z, symlink_path_z);
-    try std.testing.expect(rc == 0);
+    {
+        var lib_dir_handle = try p.openExistingDir(lib_dir);
+        defer lib_dir_handle.close(p.currentIo());
+        try lib_dir_handle.symLink(p.currentIo(), "libtest.so", "libtest.so.1", .{});
+    }
 
     var pkg = Package.init(&ctx);
     defer pkg.deinit();
@@ -1080,8 +1078,8 @@ test "scanDirectory skips foreign-target ELF runtime metadata" {
     const foreign_path = try std.fs.path.join(std.testing.allocator, &.{ test_env.path, "libforeign.so" });
     defer std.testing.allocator.free(foreign_path);
 
-    var file = try std.fs.createFileAbsolute(foreign_path, .{});
-    defer file.close();
+    var file = try std.Io.Dir.createFileAbsolute(p.currentIo(), foreign_path, .{});
+    defer file.close(p.currentIo());
 
     var header = [_]u8{0} ** 64;
     header[0] = 0x7f;
@@ -1095,7 +1093,7 @@ test "scanDirectory skips foreign-target ELF runtime metadata" {
     header[17] = @intCast(@intFromEnum(std.elf.ET.DYN));
     header[18] = 0;
     header[19] = @intCast(@intFromEnum(std.elf.EM.S390));
-    try file.writeAll(&header);
+    try file.writeStreamingAll(p.currentIo(), &header);
 
     var pkg = Package.init(&test_env.ctx);
     defer pkg.deinit();

@@ -52,7 +52,7 @@ fn computeRecipeHashHex(allocator: std.mem.Allocator, recipe_buf: ?[]const u8) !
 
 fn envMapToCArray(
     allocator: std.mem.Allocator,
-    env_map: *std.process.EnvMap,
+    env_map: *std.process.Environ.Map,
 ) ![]const [*:0]const u8 {
     const count = env_map.count();
     var result = try allocator.alloc([*:0]const u8, count);
@@ -168,8 +168,8 @@ const SplitStagingReport = struct {
 
     fn init() SplitStagingReport {
         return .{
-            .conflicts = .{},
-            .unassigned_paths = .{},
+            .conflicts = .empty,
+            .unassigned_paths = .empty,
         };
     }
 
@@ -230,14 +230,15 @@ fn collectSplitStagingReport(
             };
         }
     }
-    var dest_dir = std.fs.openDirAbsolute(workspace_destdir, .{ .iterate = true }) catch |err| {
+    const io = path_mod.currentIo();
+    var dest_dir = path_mod.openExistingDir(workspace_destdir) catch |err| {
         return ctx.fail(
             if (err == error.OutOfMemory) error.OutOfMemory else error.FileSystem,
             workspace_destdir,
             "report: unable to inspect destdir",
         );
     };
-    defer dest_dir.close();
+    defer dest_dir.close(io);
 
     var walker = dest_dir.walk(allocator) catch |err| {
         return ctx.fail(
@@ -249,7 +250,7 @@ fn collectSplitStagingReport(
     defer walker.deinit();
 
     while (true) {
-        const entry = walker.next() catch |err| {
+        const entry = walker.next(io) catch |err| {
             return ctx.fail(
                 if (err == error.OutOfMemory) error.OutOfMemory else error.FileSystem,
                 workspace_destdir,
@@ -415,27 +416,28 @@ fn writeBuildReport(
     const report_path = try buildReportPath(allocator, workspace.recipe_root);
     defer allocator.free(report_path);
 
-    var content = std.ArrayList(u8){};
+    var content: std.ArrayList(u8) = .empty;
     defer content.deinit(allocator);
-    var writer = content.writer(allocator);
+    var out_buf: std.Io.Writer.Allocating = .fromArrayList(allocator, &content);
+    const out = &out_buf.writer;
 
-    try writer.writeAll("build-report {\n");
-    try writer.writeAll("  recipe ");
-    try writeKdlQuotedString(&writer, parsed_recipe.name);
-    try writer.writeByte('\n');
-    try writer.writeAll("  version ");
-    try writeKdlQuotedString(&writer, parsed_recipe.version);
-    try writer.writeByte('\n');
-    try writer.print("  release {d}\n", .{parsed_recipe.release});
-    try writer.writeAll("  arch ");
-    try writeKdlQuotedString(&writer, parsed_recipe.arch orelse "unknown");
-    try writer.writeByte('\n');
-    try writer.writeAll("  workspace ");
-    try writeKdlQuotedString(&writer, workspace.recipe_root);
-    try writer.writeByte('\n');
-    try writer.writeAll("}\n\n");
+    try out.writeAll("build-report {\n");
+    try out.writeAll("  recipe ");
+    try writeKdlQuotedString(out, parsed_recipe.name);
+    try out.writeByte('\n');
+    try out.writeAll("  version ");
+    try writeKdlQuotedString(out, parsed_recipe.version);
+    try out.writeByte('\n');
+    try out.print("  release {d}\n", .{parsed_recipe.release});
+    try out.writeAll("  arch ");
+    try writeKdlQuotedString(out, parsed_recipe.arch orelse "unknown");
+    try out.writeByte('\n');
+    try out.writeAll("  workspace ");
+    try writeKdlQuotedString(out, workspace.recipe_root);
+    try out.writeByte('\n');
+    try out.writeAll("}\n\n");
 
-    try writer.print(
+    try out.print(
         "split-staging assigned={d} unique={d} conflicts={d} unassigned={d}\n",
         .{
             report.total_assigned_paths,
@@ -446,26 +448,27 @@ fn writeBuildReport(
     );
 
     for (report.conflicts.items) |entry| {
-        try writer.writeAll("conflict ");
-        try writer.writeAll("path=");
-        try writeKdlQuotedString(&writer, entry.path);
-        try writer.writeAll(" first-package=");
-        try writeKdlQuotedString(&writer, parsed_recipe.packages.items[entry.first_pkg].name);
-        try writer.writeAll(" second-package=");
-        try writeKdlQuotedString(&writer, parsed_recipe.packages.items[entry.second_pkg].name);
-        try writer.writeByte('\n');
+        try out.writeAll("conflict ");
+        try out.writeAll("path=");
+        try writeKdlQuotedString(out, entry.path);
+        try out.writeAll(" first-package=");
+        try writeKdlQuotedString(out, parsed_recipe.packages.items[entry.first_pkg].name);
+        try out.writeAll(" second-package=");
+        try writeKdlQuotedString(out, parsed_recipe.packages.items[entry.second_pkg].name);
+        try out.writeByte('\n');
     }
 
     for (report.unassigned_paths.items) |entry| {
-        try writer.writeAll("unassigned ");
-        try writeKdlQuotedString(&writer, entry);
-        try writer.writeByte('\n');
+        try out.writeAll("unassigned ");
+        try writeKdlQuotedString(out, entry);
+        try out.writeByte('\n');
     }
 
     try path_mod.ensureParent(report_path);
-    const file = try std.fs.createFileAbsolute(report_path, .{ .truncate = true });
-    defer file.close();
-    try file.writeAll(content.items);
+    const file = try std.Io.Dir.createFileAbsolute(path_mod.currentIo(), report_path, .{ .truncate = true });
+    defer file.close(path_mod.currentIo());
+    content = out_buf.toArrayList();
+    try file.writeStreamingAll(path_mod.currentIo(), content.items);
 }
 
 fn emitFinalBuildArtifactPaths(
@@ -473,17 +476,18 @@ fn emitFinalBuildArtifactPaths(
     workspace: *const workspace_manager.Workspace,
 ) void {
     const allocator = ctx.allocator;
+    const io = path_mod.currentIo();
     emitBuildLabelDetail(ctx, .info, "workspace", workspace.recipe_root);
 
     const log_path = buildLogPath(allocator, workspace.recipe_root) catch return;
     defer allocator.free(log_path);
-    if (std.fs.accessAbsolute(log_path, .{})) |_| {
+    if (std.Io.Dir.accessAbsolute(io, log_path, .{})) |_| {
         emitBuildLabelDetail(ctx, .info, "build log", log_path);
     } else |_| {}
 
     const report_path = buildReportPath(allocator, workspace.recipe_root) catch return;
     defer allocator.free(report_path);
-    if (std.fs.accessAbsolute(report_path, .{})) |_| {
+    if (std.Io.Dir.accessAbsolute(io, report_path, .{})) |_| {
         emitBuildLabelDetail(ctx, .info, "build report", report_path);
     } else |_| {}
 }
@@ -507,7 +511,7 @@ pub const BuildExecutionState = struct {
     parsed_recipe: ?*recipe.Recipe,
     src_working_dir: ?[]const u8,
     src_working_dir_buffer: ?[]u8,
-    host_env: ?std.process.EnvMap,
+    host_env: ?std.process.Environ.Map,
     pkg_install_dir: ?[]u8,
     build_profile_instance: ?build_profile.BuildProfile,
     namespace_runner: NamespaceRunnerFn,
@@ -541,11 +545,11 @@ pub const BuildExecutionState = struct {
             .namespace_runner = &namespace.forkAndEnterEnv,
             .recipe_loaded = false,
             .execution = .{},
-            .staged_packages = .{},
+            .staged_packages = .empty,
             .split_staging_errors_encountered = false,
             .stage_package_files_fn = &package_staging.stagePackageFiles,
             .packaging_errors_encountered = false,
-            .packaged_archives = .{},
+            .packaged_archives = .empty,
             .create_package_artifact_fn = &defaultCreatePackageArtifact,
         };
     }
@@ -593,7 +597,7 @@ pub const BuildExecutionState = struct {
 
     pub fn takePackagedArchives(self: *BuildExecutionState) std.ArrayList([]const u8) {
         const taken = self.packaged_archives;
-        self.packaged_archives = .{};
+        self.packaged_archives = .empty;
         return taken;
     }
 };
@@ -778,7 +782,7 @@ pub const BuildPlan = struct {
     fn runRecipeExecutionStage(
         self: *BuildPlan,
         workspace: *const workspace_manager.Workspace,
-        host_env: *std.process.EnvMap,
+        host_env: *std.process.Environ.Map,
     ) !void {
         emitBuildStepStart(self.state.ctx, "recipe execution", false);
         executePhases(&self.state, &self.parsed_recipe, host_env, workspace) catch |err| {
@@ -1060,18 +1064,18 @@ fn stageRecipeCompanionFiles(state: *BuildExecutionState, workspace: *const work
     // Some tests construct recipes from in-memory text and intentionally leave recipe_dir empty.
     if (state.recipe_dir.len == 0) return;
 
-    var recipe_dir = std.fs.openDirAbsolute(state.recipe_dir, .{ .iterate = true }) catch |err| {
+    var recipe_dir = path_mod.openExistingDir(state.recipe_dir) catch |err| {
         ctx.setDiagnosticContext(state.recipe_dir, "failed to open recipe directory");
         return switch (err) {
             error.AccessDenied => BuildError.PermissionDenied,
             else => BuildError.FileSystem,
         };
     };
-    defer recipe_dir.close();
+    defer recipe_dir.close(path_mod.currentIo());
 
     var it = recipe_dir.iterate();
     while (true) {
-        const entry = it.next() catch |iter_err| {
+        const entry = it.next(path_mod.currentIo()) catch |iter_err| {
             ctx.setDiagnosticContext(state.recipe_dir, "failed to iterate recipe directory");
             return switch (iter_err) {
                 error.AccessDenied => BuildError.PermissionDenied,
@@ -1097,7 +1101,7 @@ fn stageRecipeCompanionFiles(state: *BuildExecutionState, workspace: *const work
         defer state.allocator.free(dest_path);
 
         var dest_exists = true;
-        std.fs.accessAbsolute(dest_path, .{}) catch |access_err| switch (access_err) {
+        std.Io.Dir.accessAbsolute(path_mod.currentIo(), dest_path, .{}) catch |access_err| switch (access_err) {
             error.FileNotFound => dest_exists = false,
             error.AccessDenied => return ctx.fail(BuildError.PermissionDenied, dest_path, "cannot access workspace source path"),
             else => return ctx.fail(BuildError.FileSystem, dest_path, "failed to check existing workspace source"),
@@ -1107,12 +1111,8 @@ fn stageRecipeCompanionFiles(state: *BuildExecutionState, workspace: *const work
             continue;
         }
 
-        std.fs.copyFileAbsolute(src_path, dest_path, .{}) catch |copy_err| {
+        path_mod.copyFile(src_path, dest_path) catch |copy_err| {
             return switch (copy_err) {
-                error.PathAlreadyExists => {
-                    ctx.debug("companion source already staged: {s}", .{dest_path});
-                    continue;
-                },
                 error.AccessDenied => ctx.fail(BuildError.PermissionDenied, src_path, "failed to stage companion source"),
                 else => ctx.fail(BuildError.FileSystem, src_path, "failed to stage companion source"),
             };
@@ -1343,7 +1343,7 @@ fn recordPackageArchiveNode(
     try recordNodeResult(state, .package_archive, execution_kind, .package_archive, key_hex, digest_hex, null);
 }
 
-fn prepareEnvironment(state: *BuildExecutionState, parsed_recipe: *const recipe.Recipe, workspace: *const workspace_manager.Workspace) BuildError!*std.process.EnvMap {
+fn prepareEnvironment(state: *BuildExecutionState, parsed_recipe: *const recipe.Recipe, workspace: *const workspace_manager.Workspace) BuildError!*std.process.Environ.Map {
     const allocator = state.allocator;
     const ctx = state.ctx;
 
@@ -1516,7 +1516,7 @@ fn installDependenciesToBuildProfile(
 fn executePhases(
     state: *BuildExecutionState,
     parsed_recipe: *const recipe.Recipe,
-    host_env: *std.process.EnvMap,
+    host_env: *std.process.Environ.Map,
     workspace: *const workspace_manager.Workspace,
 ) BuildError!void {
     const working_dir = state.src_working_dir orelse {
@@ -1534,7 +1534,7 @@ fn restoreOrExecutePhases(
     state: *BuildExecutionState,
     parsed_recipe: *const recipe.Recipe,
     host_working_dir: []const u8,
-    host_env: *std.process.EnvMap,
+    host_env: *std.process.Environ.Map,
     workspace: *const workspace_manager.Workspace,
 ) BuildError!void {
     var exec_ctx = try prepareNamespaceExecution(state, host_working_dir, workspace);
@@ -1556,7 +1556,7 @@ fn executePreparedPhases(
     parsed_recipe: *const recipe.Recipe,
     workspace: *const workspace_manager.Workspace,
     exec_ctx: *NamespaceExecutionContext,
-    host_env: *std.process.EnvMap,
+    host_env: *std.process.Environ.Map,
     profile_tree_hash: []const u8,
 ) BuildError!void {
     const phases = [_]struct { name: []const u8, script: ?[]const u8 }{
@@ -1669,7 +1669,7 @@ fn prepareNamespaceExecution(
         };
     errdefer allocator.free(profile_root);
 
-    std.fs.accessAbsolute(profile_root, .{}) catch {
+    std.Io.Dir.accessAbsolute(path_mod.currentIo(), profile_root, .{}) catch {
         return ctx.fail(BuildError.InvalidInput, profile_root, "profile not found");
     };
 
@@ -1708,7 +1708,7 @@ fn runOneNamespacePhase(
     parsed_recipe: *const recipe.Recipe,
     workspace: *const workspace_manager.Workspace,
     exec_ctx: *NamespaceExecutionContext,
-    host_env: *std.process.EnvMap,
+    host_env: *std.process.Environ.Map,
     phase_name: []const u8,
     phase_script_opt: ?[]const u8,
 ) BuildError!void {
@@ -1836,7 +1836,7 @@ fn resolveSystemProfileRoot(allocator: std.mem.Allocator, root_path: []const u8)
 }
 
 const ScriptOutputCapture = struct {
-    log_file: ?std.fs.File = null,
+    log_file: ?std.Io.File = null,
 
     fn init(allocator: std.mem.Allocator, recipe_root: []const u8) ScriptOutputCapture {
         var self = ScriptOutputCapture{
@@ -1845,13 +1845,13 @@ const ScriptOutputCapture = struct {
 
         const log_path = std.fs.path.join(allocator, &.{ recipe_root, "build.log" }) catch return self;
         defer allocator.free(log_path);
-        self.log_file = std.fs.createFileAbsolute(log_path, .{ .truncate = true }) catch null;
+        self.log_file = std.Io.Dir.createFileAbsolute(path_mod.currentIo(), log_path, .{ .truncate = true }) catch null;
         return self;
     }
 
     fn deinit(self: *ScriptOutputCapture) void {
         if (self.log_file) |file| {
-            file.close();
+            file.close(path_mod.currentIo());
             self.log_file = null;
         }
     }
@@ -1863,12 +1863,12 @@ const ScriptOutputCapture = struct {
 
     fn onChunk(self: *ScriptOutputCapture, bytes: []const u8, is_stderr: bool) void {
         if (self.log_file) |*file| {
-            _ = file.writeAll(bytes) catch {};
+            _ = file.writeStreamingAll(path_mod.currentIo(), bytes) catch {};
         }
         if (is_stderr) {
-            _ = std.fs.File.stderr().writeAll(bytes) catch {};
+            _ = std.Io.File.stderr().writeStreamingAll(path_mod.currentIo(), bytes) catch {};
         } else {
-            _ = std.fs.File.stdout().writeAll(bytes) catch {};
+            _ = std.Io.File.stdout().writeStreamingAll(path_mod.currentIo(), bytes) catch {};
         }
     }
 };
@@ -1971,26 +1971,24 @@ pub fn buildOutputsRoot(ctx: *mere.Context) ![]const u8 {
 pub fn clearBuildOutputs(ctx: *mere.Context) !usize {
     const output_root = try buildOutputsRoot(ctx);
     defer ctx.allocator.free(output_root);
+    const io = path_mod.currentIo();
 
-    var dir = std.fs.openDirAbsolute(output_root, .{ .iterate = true }) catch |err| switch (err) {
+    var dir = std.Io.Dir.openDirAbsolute(io, output_root, .{ .iterate = true }) catch |err| switch (err) {
         error.FileNotFound => return 0,
         else => return err,
     };
-    defer dir.close();
+    defer dir.close(io);
 
     var removed: usize = 0;
     var iter = dir.iterate();
-    while (try iter.next()) |entry| {
-        const entry_path = try std.fs.path.join(ctx.allocator, &.{ output_root, entry.name });
-        defer ctx.allocator.free(entry_path);
-
+    while (try iter.next(io)) |entry| {
         switch (entry.kind) {
             .file, .sym_link => {
-                try std.fs.deleteFileAbsolute(entry_path);
+                try dir.deleteFile(io, entry.name);
                 removed += 1;
             },
             .directory => {
-                try std.fs.deleteTreeAbsolute(entry_path);
+                try dir.deleteTree(io, entry.name);
                 removed += 1;
             },
             else => {},
@@ -2003,27 +2001,28 @@ pub fn clearBuildOutputs(ctx: *mere.Context) !usize {
 pub fn collectBuildOutputPackageArchives(ctx: *mere.Context, out_paths: *std.ArrayList([]const u8)) !void {
     const outputs_dir = try buildOutputsRoot(ctx);
     defer ctx.allocator.free(outputs_dir);
+    const io = path_mod.currentIo();
 
-    var dir = std.fs.openDirAbsolute(outputs_dir, .{ .iterate = true }) catch |err| {
+    var dir = std.Io.Dir.openDirAbsolute(io, outputs_dir, .{ .iterate = true }) catch |err| {
         return switch (err) {
             error.FileNotFound => error.InvalidInput,
             error.AccessDenied => error.PermissionDenied,
             else => error.FileSystem,
         };
     };
-    defer dir.close();
+    defer dir.close(io);
 
     var iter = dir.iterate();
-    while (try iter.next()) |entry| {
+    while (try iter.next(io)) |entry| {
         if (entry.kind == .directory) {
             const subdir_path = try std.fs.path.join(ctx.allocator, &.{ outputs_dir, entry.name });
             defer ctx.allocator.free(subdir_path);
 
-            var subdir = std.fs.openDirAbsolute(subdir_path, .{ .iterate = true }) catch continue;
-            defer subdir.close();
+            var subdir = std.Io.Dir.openDirAbsolute(io, subdir_path, .{ .iterate = true }) catch continue;
+            defer subdir.close(io);
 
             var sub_iter = subdir.iterate();
-            while (try sub_iter.next()) |sub_entry| {
+            while (try sub_iter.next(io)) |sub_entry| {
                 if (sub_entry.kind != .file) continue;
                 if (!std.mem.endsWith(u8, sub_entry.name, ".pkg.tar.zst")) continue;
 
@@ -2050,29 +2049,45 @@ fn exportPackagedArchives(
 ) !void {
     const output_root = try buildOutputsRoot(ctx);
     defer ctx.allocator.free(output_root);
+    const io = path_mod.currentIo();
 
     const output_dir = try std.fs.path.join(allocator, &.{ output_root, build_subdir });
     defer allocator.free(output_dir);
 
     // Wipe and recreate so the subdir always reflects exactly this build
-    std.fs.deleteTreeAbsolute(output_dir) catch |err| switch (err) {
-        error.FileNotFound => {},
-        else => return ctx.fail(
-            if (err == error.OutOfMemory) BuildError.OutOfMemory else BuildError.FileSystem,
-            output_dir,
-            "failed to clean build output directory",
-        ),
-    };
+    if (std.fs.path.dirname(output_dir)) |parent_dir_path| {
+        var parent_dir = try path_mod.makePathAndOpenDir(parent_dir_path);
+        defer parent_dir.close(io);
+        if (std.Io.Dir.accessAbsolute(io, output_dir, .{})) |_| {
+            parent_dir.deleteTree(io, std.fs.path.basename(output_dir)) catch |err| {
+                return ctx.fail(
+                    if (err == error.OutOfMemory) BuildError.OutOfMemory else BuildError.FileSystem,
+                    output_dir,
+                    "failed to clean build output directory",
+                );
+            };
+        } else |err| switch (err) {
+            error.FileNotFound => {},
+            else => {
+                return ctx.fail(
+                    if (err == error.OutOfMemory) BuildError.OutOfMemory else BuildError.FileSystem,
+                    output_dir,
+                    "failed to inspect build output directory",
+                );
+            },
+        }
+    }
 
-    std.fs.cwd().makePath(output_dir) catch |err| {
+    var output_dir_handle = path_mod.makePathAndOpenDir(output_dir) catch |err| {
         return ctx.fail(
             if (err == error.OutOfMemory) BuildError.OutOfMemory else BuildError.FileSystem,
             output_dir,
             "failed to create build output directory",
         );
     };
+    output_dir_handle.close(io);
 
-    var exported: std.ArrayList([]const u8) = .{};
+    var exported: std.ArrayList([]const u8) = .empty;
     defer {
         for (exported.items) |p| allocator.free(p);
         exported.deinit(allocator);
@@ -2225,7 +2240,7 @@ const CaptureEmitter = struct {
         return .{
             .emitter = .{ .emitFn = onEmit },
             .allocator = allocator,
-            .lines = .{},
+            .lines = .empty,
         };
     }
 
@@ -2248,7 +2263,7 @@ const CaptureEmitter = struct {
             },
             .log_segments => {
                 const segments = event.data.log_segments;
-                var buf = std.ArrayList(u8){};
+                var buf: std.ArrayList(u8) = .empty;
                 defer buf.deinit(self.allocator);
 
                 for (segments) |seg| {
@@ -2425,10 +2440,10 @@ test "createWorkspace initializes workspace and updates state" {
     const workspace = workspace_stage.workspace;
     try std.testing.expect(state.src_working_dir != null);
     try std.testing.expect(std.mem.eql(u8, state.src_working_dir.?, workspace.src_dir));
-    try std.fs.cwd().access(workspace.recipe_root, .{});
-    try std.fs.cwd().access(workspace.sources_dir, .{});
-    try std.fs.cwd().access(workspace.src_dir, .{});
-    try std.fs.cwd().access(workspace.destdir, .{});
+    try std.Io.Dir.accessAbsolute(path_mod.currentIo(), workspace.recipe_root, .{});
+    try std.Io.Dir.accessAbsolute(path_mod.currentIo(), workspace.sources_dir, .{});
+    try std.Io.Dir.accessAbsolute(path_mod.currentIo(), workspace.src_dir, .{});
+    try std.Io.Dir.accessAbsolute(path_mod.currentIo(), workspace.destdir, .{});
 }
 
 test "downloadSources errors when download client missing" {
@@ -2532,9 +2547,9 @@ test "downloadSources resolves local source paths relative to recipe directory" 
     const local_path = try std.fs.path.join(test_env.ctx.allocator, &.{ test_env.path, local_name });
     defer test_env.ctx.allocator.free(local_path);
     {
-        var file = try std.fs.createFileAbsolute(local_path, .{});
-        defer file.close();
-        try file.writeAll(local_content);
+        var file = try std.Io.Dir.createFileAbsolute(path_mod.currentIo(), local_path, .{});
+        defer file.close(path_mod.currentIo());
+        try file.writeStreamingAll(path_mod.currentIo(), local_content);
     }
 
     const kdl_text =
@@ -2576,7 +2591,7 @@ test "downloadSources resolves local source paths relative to recipe directory" 
 
     const copied_path = try std.fs.path.join(test_env.ctx.allocator, &.{ workspace_stage.workspace.sources_dir, local_name });
     defer test_env.ctx.allocator.free(copied_path);
-    const copied = try std.fs.cwd().readFileAlloc(test_env.ctx.allocator, copied_path, 1024);
+    const copied = try std.Io.Dir.readFileAlloc(std.Io.Dir.cwd(), path_mod.currentIo(), copied_path, test_env.ctx.allocator, .limited(1024));
     defer test_env.ctx.allocator.free(copied);
     try std.testing.expectEqualStrings(local_content, copied);
 }
@@ -2594,9 +2609,9 @@ test "downloadSources stages recipe directory companion files without source ent
     const companion_path = try std.fs.path.join(test_env.ctx.allocator, &.{ test_env.path, companion_name });
     defer test_env.ctx.allocator.free(companion_path);
     {
-        var file = try std.fs.createFileAbsolute(companion_path, .{});
-        defer file.close();
-        try file.writeAll(companion_content);
+        var file = try std.Io.Dir.createFileAbsolute(path_mod.currentIo(), companion_path, .{});
+        defer file.close(path_mod.currentIo());
+        try file.writeStreamingAll(path_mod.currentIo(), companion_content);
     }
 
     const kdl_text =
@@ -2631,7 +2646,7 @@ test "downloadSources stages recipe directory companion files without source ent
 
     const staged_path = try std.fs.path.join(test_env.ctx.allocator, &.{ workspace_stage.workspace.sources_dir, companion_name });
     defer test_env.ctx.allocator.free(staged_path);
-    const staged = try std.fs.cwd().readFileAlloc(test_env.ctx.allocator, staged_path, 1024);
+    const staged = try std.Io.Dir.readFileAlloc(std.Io.Dir.cwd(), path_mod.currentIo(), staged_path, test_env.ctx.allocator, .limited(1024));
     defer test_env.ctx.allocator.free(staged);
     try std.testing.expectEqualStrings(companion_content, staged);
 }
@@ -2717,9 +2732,9 @@ test "unpackSources sets actual source dir when source present" {
 
     const src_file_path = try std.fs.path.join(test_env.ctx.allocator, &.{ workspace_stage.workspace.sources_dir, "dummy.txt" });
     defer test_env.ctx.allocator.free(src_file_path);
-    var src_file = try std.fs.createFileAbsolute(src_file_path, .{});
-    try src_file.writeAll("dummy");
-    src_file.close();
+    var src_file = try std.Io.Dir.createFileAbsolute(path_mod.currentIo(), src_file_path, .{});
+    try src_file.writeStreamingAll(path_mod.currentIo(), "dummy");
+    src_file.close(path_mod.currentIo());
 
     try unpackSources(&state, &parsed, &workspace_stage.workspace);
 
@@ -2729,8 +2744,8 @@ test "unpackSources sets actual source dir when source present" {
 
     const dest_file_path = try std.fs.path.join(test_env.ctx.allocator, &.{ state.src_working_dir.?, "dummy.txt" });
     defer test_env.ctx.allocator.free(dest_file_path);
-    var dest_file = try std.fs.openFileAbsolute(dest_file_path, .{});
-    dest_file.close();
+    const dest_file = try path_mod.openExistingFile(dest_file_path);
+    dest_file.close(path_mod.currentIo());
 }
 
 test "prepareEnvironment populates workspace variables and pkg install dir" {
@@ -2932,7 +2947,8 @@ test "emitPackageMetadataReport logs dependencies and provisions" {
 
     const staging_dir = try std.fs.path.join(test_env.ctx.allocator, &.{ test_env.path, "report-staging" });
     defer test_env.ctx.allocator.free(staging_dir);
-    try std.fs.cwd().makePath(staging_dir);
+    var staging_dir_handle = try path_mod.makePathAndOpenDir(staging_dir);
+    staging_dir_handle.close(path_mod.currentIo());
 
     var pkg_meta = meta.Data.init(test_env.ctx.allocator);
     defer pkg_meta.deinit();
@@ -2990,8 +3006,8 @@ test "finalizeResult assembles success BuildResult" {
     defer test_env.ctx.allocator.free(workspace_archive_path);
     {
         var f = try path_mod.makePathAndOpenFile(workspace_archive_path);
-        defer f.close();
-        try f.writeAll("pkg");
+        defer f.close(path_mod.currentIo());
+        try f.writeStreamingAll(path_mod.currentIo(), "pkg");
     }
 
     const outputs_root = try buildOutputsRoot(&test_env.ctx);
@@ -3005,17 +3021,17 @@ test "finalizeResult assembles success BuildResult" {
     const log_path = try buildLogPath(test_env.ctx.allocator, workspace.recipe_root);
     defer test_env.ctx.allocator.free(log_path);
     {
-        const file = try std.fs.createFileAbsolute(log_path, .{ .truncate = true });
-        defer file.close();
-        try file.writeAll("build log");
+        const file = try std.Io.Dir.createFileAbsolute(path_mod.currentIo(), log_path, .{ .truncate = true });
+        defer file.close(path_mod.currentIo());
+        try file.writeStreamingAll(path_mod.currentIo(), "build log");
     }
 
     const report_path = try buildReportPath(test_env.ctx.allocator, workspace.recipe_root);
     defer test_env.ctx.allocator.free(report_path);
     {
-        const file = try std.fs.createFileAbsolute(report_path, .{ .truncate = true });
-        defer file.close();
-        try file.writeAll("build-report");
+        const file = try std.Io.Dir.createFileAbsolute(path_mod.currentIo(), report_path, .{ .truncate = true });
+        defer file.close(path_mod.currentIo());
+        try file.writeStreamingAll(path_mod.currentIo(), "build-report");
     }
 
     var result = try finalizeResult(&state, &workspace, &parsed);
@@ -3026,8 +3042,8 @@ test "finalizeResult assembles success BuildResult" {
     try std.testing.expectEqualStrings(expected_path, result.packages_created.items[0]);
     try std.testing.expectEqual(@as(usize, 0), state.packaged_archives.items.len);
     try std.testing.expectEqual(@as(usize, 1), state.progress_recorder.completed_steps);
-    try std.fs.accessAbsolute(expected_path, .{});
-    try std.fs.accessAbsolute(workspace.recipe_root, .{});
+    try std.Io.Dir.accessAbsolute(path_mod.currentIo(), expected_path, .{});
+    try std.Io.Dir.accessAbsolute(path_mod.currentIo(), workspace.recipe_root, .{});
     try std.testing.expect(capture.contains("workspace: "));
     try std.testing.expect(capture.contains("build log: "));
     try std.testing.expect(capture.contains("build report: "));
@@ -3047,19 +3063,20 @@ test "clearBuildOutputs removes exported package files" {
     // Create a per-build subdir with a package file
     const subdir = try std.fs.path.join(test_env.ctx.allocator, &.{ outputs_root, "foo-1.0-1-x86_64" });
     defer test_env.ctx.allocator.free(subdir);
-    try std.fs.cwd().makePath(subdir);
+    var subdir_handle = try path_mod.makePathAndOpenDir(subdir);
+    subdir_handle.close(path_mod.currentIo());
 
     const pkg_path = try std.fs.path.join(test_env.ctx.allocator, &.{ subdir, "cleanup.pkg.tar.zst" });
     defer test_env.ctx.allocator.free(pkg_path);
     {
         var f = try path_mod.makePathAndOpenFile(pkg_path);
-        defer f.close();
-        try f.writeAll("pkg");
+        defer f.close(path_mod.currentIo());
+        try f.writeStreamingAll(path_mod.currentIo(), "pkg");
     }
 
     const removed = try clearBuildOutputs(&test_env.ctx);
     try std.testing.expectEqual(@as(usize, 1), removed);
-    try std.testing.expectError(error.FileNotFound, std.fs.accessAbsolute(subdir, .{}));
+    try std.testing.expectError(error.FileNotFound, std.Io.Dir.accessAbsolute(path_mod.currentIo(), subdir, .{}));
 }
 
 test "collectBuildOutputPackageArchives returns sorted package outputs" {
@@ -3076,21 +3093,22 @@ test "collectBuildOutputPackageArchives returns sorted package outputs" {
     // Create a per-build subdir with package files
     const subdir = try std.fs.path.join(test_env.ctx.allocator, &.{ outputs_dir, "test-1.0-1-x86_64" });
     defer test_env.ctx.allocator.free(subdir);
-    try std.fs.cwd().makePath(subdir);
+    var subdir_handle = try path_mod.makePathAndOpenDir(subdir);
+    subdir_handle.close(path_mod.currentIo());
 
     const pkg_b = try std.fs.path.join(test_env.ctx.allocator, &.{ subdir, "b.pkg.tar.zst" });
     defer test_env.ctx.allocator.free(pkg_b);
-    try std.fs.cwd().writeFile(.{ .sub_path = pkg_b, .data = "b" });
+    try std.Io.Dir.cwd().writeFile(path_mod.currentIo(), .{ .sub_path = pkg_b, .data = "b" });
 
     const note = try std.fs.path.join(test_env.ctx.allocator, &.{ subdir, "note.txt" });
     defer test_env.ctx.allocator.free(note);
-    try std.fs.cwd().writeFile(.{ .sub_path = note, .data = "note" });
+    try std.Io.Dir.cwd().writeFile(path_mod.currentIo(), .{ .sub_path = note, .data = "note" });
 
     const pkg_a = try std.fs.path.join(test_env.ctx.allocator, &.{ subdir, "a.pkg.tar.zst" });
     defer test_env.ctx.allocator.free(pkg_a);
-    try std.fs.cwd().writeFile(.{ .sub_path = pkg_a, .data = "a" });
+    try std.Io.Dir.cwd().writeFile(path_mod.currentIo(), .{ .sub_path = pkg_a, .data = "a" });
 
-    var package_paths = std.ArrayList([]const u8){};
+    var package_paths: std.ArrayList([]const u8) = .empty;
     defer {
         for (package_paths.items) |pkg_path| test_env.ctx.allocator.free(pkg_path);
         package_paths.deinit(test_env.ctx.allocator);
@@ -3143,8 +3161,8 @@ test "finalizeResult reports partial failure and fires progress callback" {
     defer test_env.ctx.allocator.free(expected_path);
     {
         var f = try path_mod.makePathAndOpenFile(expected_path);
-        defer f.close();
-        try f.writeAll("pkg");
+        defer f.close(path_mod.currentIo());
+        try f.writeStreamingAll(path_mod.currentIo(), "pkg");
     }
     const dup_path = try state.allocator.dupe(u8, expected_path);
     try state.packaged_archives.append(state.allocator, dup_path);
@@ -3162,12 +3180,12 @@ test "finalizeResult reports partial failure and fires progress callback" {
     try std.testing.expectEqual(@as(usize, 1), state.progress_recorder.completed_steps);
     try std.testing.expectEqual(@as(usize, 1), recorder.completed_steps);
     try std.testing.expectEqualStrings(expected_path, result.packages_created.items[0]);
-    try std.fs.accessAbsolute(workspace.recipe_root, .{});
+    try std.Io.Dir.accessAbsolute(path_mod.currentIo(), workspace.recipe_root, .{});
 }
 
 test "envMapToCArray formats key-value entries" {
     const allocator = std.testing.allocator;
-    var env = std.process.EnvMap.init(allocator);
+    var env = std.process.Environ.Map.init(allocator);
     defer env.deinit();
 
     try env.put("FOO", "bar");
@@ -3202,7 +3220,7 @@ test "build step emit helpers publish expected events" {
             var self = @This(){
                 .emitter = undefined,
                 .allocator = allocator,
-                .events = .{},
+                .events = .empty,
             };
             self.emitter = .{ .emitFn = onEmit };
             return self;
@@ -3246,7 +3264,7 @@ test "emitBuildStepFailure emits only step_end failure" {
             var self = @This(){
                 .emitter = undefined,
                 .allocator = allocator,
-                .events = .{},
+                .events = .empty,
             };
             self.emitter = .{ .emitFn = onEmit };
             return self;
@@ -3304,22 +3322,24 @@ test "emitSplitStagingReport logs conflicts and unassigned files" {
 
     const workspace_destdir = try std.fs.path.join(test_env.ctx.allocator, &.{ test_env.path, "split-dest" });
     defer test_env.ctx.allocator.free(workspace_destdir);
-    try std.fs.cwd().makePath(workspace_destdir);
+    var workspace_destdir_handle = try path_mod.makePathAndOpenDir(workspace_destdir);
+    workspace_destdir_handle.close(path_mod.currentIo());
 
     const shared_file = try std.fs.path.join(test_env.ctx.allocator, &.{ workspace_destdir, "usr", "bin", "shared" });
     defer test_env.ctx.allocator.free(shared_file);
-    try std.fs.cwd().makePath(std.fs.path.dirname(shared_file) orelse workspace_destdir);
-    var sf = try std.fs.createFileAbsolute(shared_file, .{});
-    defer sf.close();
-    try sf.writeAll("shared");
+    var shared_parent_handle = try path_mod.makePathAndOpenDir(std.fs.path.dirname(shared_file) orelse workspace_destdir);
+    shared_parent_handle.close(path_mod.currentIo());
+    var sf = try std.Io.Dir.createFileAbsolute(path_mod.currentIo(), shared_file, .{});
+    defer sf.close(path_mod.currentIo());
+    try sf.writeStreamingAll(path_mod.currentIo(), "shared");
 
     const orphan_file = try std.fs.path.join(test_env.ctx.allocator, &.{ workspace_destdir, "usr", "bin", "orphan" });
     defer test_env.ctx.allocator.free(orphan_file);
-    var of = try std.fs.createFileAbsolute(orphan_file, .{});
-    defer of.close();
-    try of.writeAll("orphan");
+    var of = try std.Io.Dir.createFileAbsolute(path_mod.currentIo(), orphan_file, .{});
+    defer of.close(path_mod.currentIo());
+    try of.writeStreamingAll(path_mod.currentIo(), "orphan");
 
-    var staged_packages = std.ArrayList(StagedPackage){};
+    var staged_packages: std.ArrayList(StagedPackage) = .empty;
     defer {
         split_staging_stage.clearStagedPackages(test_env.ctx.allocator, &staged_packages);
         staged_packages.deinit(test_env.ctx.allocator);
@@ -3350,7 +3370,8 @@ test "emitSplitStagingReport logs conflicts and unassigned files" {
 
     const workspace_root = try std.fs.path.join(test_env.ctx.allocator, &.{ test_env.path, "split-workspace" });
     defer test_env.ctx.allocator.free(workspace_root);
-    try std.fs.cwd().makePath(workspace_root);
+    var workspace_root_handle = try path_mod.makePathAndOpenDir(workspace_root);
+    workspace_root_handle.close(path_mod.currentIo());
 
     var workspace = workspace_manager.Workspace{
         .recipe_root = try test_env.ctx.allocator.dupe(u8, workspace_root),
@@ -3366,7 +3387,7 @@ test "emitSplitStagingReport logs conflicts and unassigned files" {
 
     const report_path = try buildReportPath(test_env.ctx.allocator, workspace.recipe_root);
     defer test_env.ctx.allocator.free(report_path);
-    const report_text = try std.fs.cwd().readFileAlloc(test_env.ctx.allocator, report_path, 128 * 1024);
+    const report_text = try std.Io.Dir.readFileAlloc(std.Io.Dir.cwd(), path_mod.currentIo(), report_path, test_env.ctx.allocator, .limited(128 * 1024));
     defer test_env.ctx.allocator.free(report_text);
 
     try std.testing.expect(capture.contains("split report: assigned=2 unique=1 conflicts=1 unassigned=1"));
@@ -3492,9 +3513,9 @@ test "executeBuild restores unpacked source tree from cache on unchanged rebuild
     const source_path = try std.fs.path.join(test_env.ctx.allocator, &.{ test_env.path, source_name });
     defer test_env.ctx.allocator.free(source_path);
     {
-        var file = try std.fs.createFileAbsolute(source_path, .{});
-        defer file.close();
-        try file.writeAll("hello from source\n");
+        var file = try std.Io.Dir.createFileAbsolute(path_mod.currentIo(), source_path, .{});
+        defer file.close(path_mod.currentIo());
+        try file.writeStreamingAll(path_mod.currentIo(), "hello from source\n");
     }
 
     const kdl_text =

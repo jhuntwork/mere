@@ -1,7 +1,7 @@
 const std = @import("std");
 const Context = @import("mere.zig").Context;
 const hash = @import("hash.zig");
-const path_utils = @import("path.zig");
+const path_mod = @import("path.zig");
 const sign_crypto = @import("sign_crypto.zig");
 const sign_io = @import("sign_io.zig");
 const errors = @import("errors.zig");
@@ -58,13 +58,13 @@ fn defaultSigner(ctx: *Context, key_path: []const u8, file_path: []const u8) Sig
 }
 
 pub fn getDefaultKeyDirectory(ctx: *Context) ![]const u8 {
-    return path_utils.getDefaultMereKeysDirectory(ctx) catch {
+    return path_mod.getDefaultMereKeysDirectory(ctx) catch {
         return SignError.FileSystem;
     };
 }
 
 fn getDefaultKeyPath(ctx: *Context) ![]const u8 {
-    return path_utils.getDefaultSigningKeyPath(ctx) catch {
+    return path_mod.getDefaultSigningKeyPath(ctx) catch {
         return SignError.FileSystem;
     };
 }
@@ -168,10 +168,10 @@ pub fn generateKeyPair() !struct { public_key: PublicKey, secret_key: SecretKey 
 }
 
 pub fn generateAndSaveKeyPair(ctx: *Context, output_dir: []const u8) !struct { public_key_path: []const u8, secret_key_path: []const u8 } {
-    var dir = path_utils.makePathAndOpenDir(output_dir) catch {
+    var dir = path_mod.makePathAndOpenDir(output_dir) catch {
         return SignError.FileSystem;
     };
-    defer dir.close();
+    defer dir.close(path_mod.currentIo());
 
     const key_pair = try generateKeyPair();
 
@@ -187,26 +187,26 @@ pub fn generateAndSaveKeyPair(ctx: *Context, output_dir: []const u8) !struct { p
     const secret_tmp_path = try std.fs.path.join(ctx.allocator, &.{ output_dir, ".mere.key.tmp" });
     defer ctx.allocator.free(secret_tmp_path);
 
-    if (path_utils.fileExists(public_key_path) or path_utils.fileExists(secret_key_path)) {
+    if (path_mod.fileExists(public_key_path) or path_mod.fileExists(secret_key_path)) {
         return SignError.FileSystem;
     }
 
     key_pair.public_key.saveToFile(public_tmp_path) catch {
         return SignError.FileSystem;
     };
-    errdefer std.fs.deleteFileAbsolute(public_tmp_path) catch {};
+    errdefer std.Io.Dir.deleteFileAbsolute(path_mod.currentIo(), public_tmp_path) catch {};
 
     key_pair.secret_key.saveToFile(secret_tmp_path) catch {
         return SignError.FileSystem;
     };
-    errdefer std.fs.deleteFileAbsolute(secret_tmp_path) catch {};
+    errdefer std.Io.Dir.deleteFileAbsolute(path_mod.currentIo(), secret_tmp_path) catch {};
 
-    std.fs.renameAbsolute(public_tmp_path, public_key_path) catch {
+    std.Io.Dir.renameAbsolute(public_tmp_path, public_key_path, path_mod.currentIo()) catch {
         return SignError.FileSystem;
     };
-    errdefer std.fs.deleteFileAbsolute(public_key_path) catch {};
+    errdefer std.Io.Dir.deleteFileAbsolute(path_mod.currentIo(), public_key_path) catch {};
 
-    std.fs.renameAbsolute(secret_tmp_path, secret_key_path) catch {
+    std.Io.Dir.renameAbsolute(secret_tmp_path, secret_key_path, path_mod.currentIo()) catch {
         return SignError.FileSystem;
     };
 
@@ -227,7 +227,7 @@ pub fn writePublicKeyFromSecretFile(secret_key_path: []const u8, pub_path: []con
 
 fn getFileHash(ctx: *Context, file_path: []const u8) SignError![32]u8 {
     var file_path_abs_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const file_path_abs = path_utils.resolveToAbsolutePath(file_path, &file_path_abs_buf) catch {
+    const file_path_abs = path_mod.resolveToAbsolutePath(file_path, &file_path_abs_buf) catch {
         return SignError.FileSystem;
     };
 
@@ -379,24 +379,24 @@ pub const LoadedKey = struct {
 /// Caller owns the returned ArrayList and all its contents; must call deinit() on each
 /// LoadedKey and then deinit the ArrayList itself.
 pub fn scanKeyDirectory(allocator: std.mem.Allocator, dir_path: []const u8) SignError!std.ArrayList(LoadedKey) {
-    var keys = std.ArrayList(LoadedKey){};
+    var keys: std.ArrayList(LoadedKey) = .empty;
     errdefer {
         for (keys.items) |*k| k.deinit(allocator);
         keys.deinit(allocator);
     }
 
-    var dir = std.fs.openDirAbsolute(dir_path, .{ .iterate = true }) catch |err| {
+    var dir = std.Io.Dir.openDirAbsolute(path_mod.currentIo(), dir_path, .{ .iterate = true }) catch |err| {
         return switch (err) {
             error.FileNotFound => keys,
             error.AccessDenied, error.PermissionDenied => SignError.PermissionDenied,
             else => SignError.FileSystem,
         };
     };
-    defer dir.close();
+    defer dir.close(path_mod.currentIo());
 
     var iter = dir.iterate();
     while (true) {
-        const entry = iter.next() catch |err| {
+        const entry = iter.next(path_mod.currentIo()) catch |err| {
             return switch (err) {
                 error.AccessDenied => SignError.PermissionDenied,
                 else => SignError.FileSystem,
@@ -441,7 +441,7 @@ pub fn scanKeyDirectory(allocator: std.mem.Allocator, dir_path: []const u8) Sign
 /// Returns an ArrayList of LoadedKey structs containing all discovered keys.
 /// Caller owns the returned ArrayList and must free it.
 pub fn loadAllKeys(ctx: *Context) SignError!std.ArrayList(LoadedKey) {
-    var all_keys = std.ArrayList(LoadedKey){};
+    var all_keys: std.ArrayList(LoadedKey) = .empty;
     errdefer {
         for (all_keys.items) |*k| k.deinit(ctx.allocator);
         all_keys.deinit(ctx.allocator);
@@ -673,9 +673,9 @@ test "generateKeyPair, signFile and verifySignature" {
     defer testing.allocator.free(test_file_path);
 
     ctx.debug("test: create test file", .{});
-    const test_file = try std.fs.createFileAbsolute(test_file_path, .{});
-    try test_file.writeAll("This is a test file to sign");
-    test_file.close();
+    const test_file = try std.Io.Dir.createFileAbsolute(path_mod.currentIo(), test_file_path, .{});
+    try test_file.writeStreamingAll(path_mod.currentIo(), "This is a test file to sign");
+    test_file.close(path_mod.currentIo());
 
     ctx.debug("test: create key paths", .{});
     const secret_key_path = try std.fs.path.join(testing.allocator, &.{ test_env.path, "test.key" });
@@ -703,8 +703,8 @@ test "generateKeyPair, signFile and verifySignature" {
     _ = try writeSignatureFileWithResolver(&ctx, test_file_path, sig_path, null, null);
 
     ctx.debug("test: verify signature exists", .{});
-    const sig_file = try std.fs.openFileAbsolute(sig_path, .{});
-    sig_file.close();
+    const sig_file = try std.Io.Dir.openFileAbsolute(path_mod.currentIo(), sig_path, .{});
+    sig_file.close(path_mod.currentIo());
 
     ctx.debug("test: verifySignature", .{});
     ctx.debug("attempting to verify signature...", .{});
@@ -754,9 +754,9 @@ test "handle malformed inputs" {
         const invalid_pub_path = try std.fs.path.join(testing.allocator, &.{ test_env.path, "invalid.pub" });
         defer testing.allocator.free(invalid_pub_path);
 
-        const invalid_pub_file = try std.fs.createFileAbsolute(invalid_pub_path, .{});
-        try invalid_pub_file.writeAll("too short");
-        invalid_pub_file.close();
+        const invalid_pub_file = try std.Io.Dir.createFileAbsolute(path_mod.currentIo(), invalid_pub_path, .{});
+        try invalid_pub_file.writeStreamingAll(path_mod.currentIo(), "too short");
+        invalid_pub_file.close(path_mod.currentIo());
 
         try testing.expectError(SignError.InvalidKey, PublicKey.loadFromFile(invalid_pub_path));
     }
@@ -767,17 +767,17 @@ test "handle malformed inputs" {
         const test_path = try std.fs.path.join(testing.allocator, &.{ test_env.path, "test.txt" });
         defer testing.allocator.free(test_path);
 
-        const test_file = try std.fs.createFileAbsolute(test_path, .{});
-        try test_file.writeAll("Test content");
-        test_file.close();
+        const test_file = try std.Io.Dir.createFileAbsolute(path_mod.currentIo(), test_path, .{});
+        try test_file.writeStreamingAll(path_mod.currentIo(), "Test content");
+        test_file.close(path_mod.currentIo());
 
         // Create invalid signature
         const sig_path = try std.fs.path.join(testing.allocator, &.{ test_env.path, "invalid.sig" });
         defer testing.allocator.free(sig_path);
 
-        const sig_file = try std.fs.createFileAbsolute(sig_path, .{});
-        try sig_file.writeAll("invalid signature");
-        sig_file.close();
+        const sig_file = try std.Io.Dir.createFileAbsolute(path_mod.currentIo(), sig_path, .{});
+        try sig_file.writeStreamingAll(path_mod.currentIo(), "invalid signature");
+        sig_file.close(path_mod.currentIo());
 
         // Generate a valid key pair
         const key_pair = try generateKeyPair();
@@ -806,13 +806,13 @@ test "verifySignature fails when file is mutated concurrently" {
     const test_file_path = try std.fs.path.join(testing.allocator, &.{ test_env.path, "concurrent-verify.bin" });
     defer testing.allocator.free(test_file_path);
     {
-        var file = try std.fs.createFileAbsolute(test_file_path, .{});
-        defer file.close();
+        var file = try std.Io.Dir.createFileAbsolute(path_mod.currentIo(), test_file_path, .{});
+        defer file.close(path_mod.currentIo());
         var chunk: [1024 * 1024]u8 = undefined;
         @memset(&chunk, 'A');
         var i: usize = 0;
         while (i < 16) : (i += 1) {
-            try file.writeAll(&chunk);
+            try file.writeStreamingAll(path_mod.currentIo(), &chunk);
         }
     }
 
@@ -832,15 +832,14 @@ test "verifySignature fails when file is mutated concurrently" {
 
     const Mutator = struct {
         fn run(stop: *std.atomic.Value(bool), path: []const u8) void {
-            var file = std.fs.openFileAbsolute(path, .{ .mode = .read_write }) catch return;
-            defer file.close();
+            var file = std.Io.Dir.openFileAbsolute(path_mod.currentIo(), path, .{ .mode = .read_write }) catch return;
+            defer file.close(path_mod.currentIo());
 
             var value: u8 = 1;
             var block: [4096]u8 = undefined;
             while (!stop.load(.monotonic)) {
                 @memset(&block, value);
-                file.seekTo(0) catch break;
-                file.writeAll(&block) catch break;
+                file.writePositionalAll(path_mod.currentIo(), &block, 0) catch break;
                 value +%= 1;
                 if (value == 0) value = 1;
             }
@@ -895,15 +894,15 @@ test "generateAndSaveKeyPair creates directory and saves keys" {
     defer ctx.allocator.free(result.secret_key_path);
 
     // Verify the directory was created
-    var dir = try std.fs.openDirAbsolute(key_dir, .{});
-    dir.close();
+    var dir = try path_mod.openExistingDir(key_dir);
+    dir.close(path_mod.currentIo());
 
     // Verify the key files exist
-    const pub_file = try std.fs.openFileAbsolute(result.public_key_path, .{});
-    pub_file.close();
+    const pub_file = try std.Io.Dir.openFileAbsolute(path_mod.currentIo(), result.public_key_path, .{});
+    pub_file.close(path_mod.currentIo());
 
-    const sec_file = try std.fs.openFileAbsolute(result.secret_key_path, .{});
-    sec_file.close();
+    const sec_file = try std.Io.Dir.openFileAbsolute(path_mod.currentIo(), result.secret_key_path, .{});
+    sec_file.close(path_mod.currentIo());
 
     // Verify the key files have the correct names
     try testing.expect(std.mem.endsWith(u8, result.public_key_path, "mere.pub"));
@@ -930,7 +929,7 @@ test "generateAndSaveKeyPair with existing directory" {
     defer testing.allocator.free(key_dir);
 
     // Create the directory first
-    try std.fs.cwd().makePath(key_dir);
+    try path_mod.ensureDirExists(key_dir);
 
     // Generate and save key pair to the existing directory
     const result = try generateAndSaveKeyPair(&ctx, key_dir);
@@ -938,11 +937,11 @@ test "generateAndSaveKeyPair with existing directory" {
     defer ctx.allocator.free(result.secret_key_path);
 
     // Verify the key files exist
-    const pub_file = try std.fs.openFileAbsolute(result.public_key_path, .{});
-    pub_file.close();
+    const pub_file = try std.Io.Dir.openFileAbsolute(path_mod.currentIo(), result.public_key_path, .{});
+    pub_file.close(path_mod.currentIo());
 
-    const sec_file = try std.fs.openFileAbsolute(result.secret_key_path, .{});
-    sec_file.close();
+    const sec_file = try std.Io.Dir.openFileAbsolute(path_mod.currentIo(), result.secret_key_path, .{});
+    sec_file.close(path_mod.currentIo());
 }
 
 // Spec #5: Key generation
@@ -962,7 +961,7 @@ test "generateAndSaveKeyPair with absolute path" {
 
     // Create an absolute directory path for testing
     var buf: [std.fs.max_path_bytes]u8 = undefined;
-    const abs_path = try std.fs.realpath(test_env.path, &buf);
+    const abs_path = try path_mod.resolveToAbsolutePath(test_env.path, &buf);
     const key_dir = try std.fs.path.join(testing.allocator, &.{ abs_path, "abs_keys" });
     defer testing.allocator.free(key_dir);
 
@@ -972,15 +971,15 @@ test "generateAndSaveKeyPair with absolute path" {
     defer ctx.allocator.free(result.secret_key_path);
 
     // Verify the directory was created
-    var dir = try std.fs.openDirAbsolute(key_dir, .{});
-    dir.close();
+    var dir = try path_mod.openExistingDir(key_dir);
+    dir.close(path_mod.currentIo());
 
     // Verify the key files exist
-    const pub_file = try std.fs.openFileAbsolute(result.public_key_path, .{});
-    pub_file.close();
+    const pub_file = try std.Io.Dir.openFileAbsolute(path_mod.currentIo(), result.public_key_path, .{});
+    pub_file.close(path_mod.currentIo());
 
-    const sec_file = try std.fs.openFileAbsolute(result.secret_key_path, .{});
-    sec_file.close();
+    const sec_file = try std.Io.Dir.openFileAbsolute(path_mod.currentIo(), result.secret_key_path, .{});
+    sec_file.close(path_mod.currentIo());
 }
 
 // Spec #5: Key generation
@@ -1003,7 +1002,7 @@ test "generateAndSaveKeyPair does not overwrite existing key files" {
     defer testing.allocator.free(key_dir);
 
     // Create the directory
-    try std.fs.cwd().makePath(key_dir);
+    try path_mod.ensureDirExists(key_dir);
 
     // Create file paths for the keys
     const pub_key_path = try std.fs.path.join(testing.allocator, &.{ key_dir, "mere.pub" });
@@ -1017,15 +1016,15 @@ test "generateAndSaveKeyPair does not overwrite existing key files" {
     const original_sec_content = "ORIGINAL_SECRET_KEY_CONTENT";
 
     {
-        const pub_file = try std.fs.createFileAbsolute(pub_key_path, .{});
-        defer pub_file.close();
-        try pub_file.writeAll(original_pub_content);
+        const pub_file = try std.Io.Dir.createFileAbsolute(path_mod.currentIo(), pub_key_path, .{});
+        defer pub_file.close(path_mod.currentIo());
+        try pub_file.writeStreamingAll(path_mod.currentIo(), original_pub_content);
     }
 
     {
-        const sec_file = try std.fs.createFileAbsolute(sec_key_path, .{});
-        defer sec_file.close();
-        try sec_file.writeAll(original_sec_content);
+        const sec_file = try std.Io.Dir.createFileAbsolute(path_mod.currentIo(), sec_key_path, .{});
+        defer sec_file.close(path_mod.currentIo());
+        try sec_file.writeStreamingAll(path_mod.currentIo(), original_sec_content);
     }
 
     // Attempt to generate and save key pair to the same directory
@@ -1034,20 +1033,20 @@ test "generateAndSaveKeyPair does not overwrite existing key files" {
 
     // Verify the original files still contain the original content
     {
-        const pub_file = try std.fs.openFileAbsolute(pub_key_path, .{});
-        defer pub_file.close();
+        const pub_file = try std.Io.Dir.openFileAbsolute(path_mod.currentIo(), pub_key_path, .{});
+        defer pub_file.close(path_mod.currentIo());
 
         var pub_buffer: [100]u8 = undefined;
-        const pub_bytes_read = try pub_file.readAll(&pub_buffer);
+        const pub_bytes_read = try pub_file.readPositionalAll(path_mod.currentIo(), &pub_buffer, 0);
         try testing.expectEqualStrings(original_pub_content, pub_buffer[0..pub_bytes_read]);
     }
 
     {
-        const sec_file = try std.fs.openFileAbsolute(sec_key_path, .{});
-        defer sec_file.close();
+        const sec_file = try std.Io.Dir.openFileAbsolute(path_mod.currentIo(), sec_key_path, .{});
+        defer sec_file.close(path_mod.currentIo());
 
         var sec_buffer: [100]u8 = undefined;
-        const sec_bytes_read = try sec_file.readAll(&sec_buffer);
+        const sec_bytes_read = try sec_file.readPositionalAll(path_mod.currentIo(), &sec_buffer, 0);
         try testing.expectEqualStrings(original_sec_content, sec_buffer[0..sec_bytes_read]);
     }
 }
@@ -1066,21 +1065,21 @@ test "generateAndSaveKeyPair leaves no partial files on failure" {
 
     const key_dir = try std.fs.path.join(testing.allocator, &.{ test_env.path, "key_dir_partial_failure" });
     defer testing.allocator.free(key_dir);
-    try std.fs.cwd().makePath(key_dir);
+    try path_mod.ensureDirExists(key_dir);
 
     const secret_key_path = try std.fs.path.join(testing.allocator, &.{ key_dir, "mere.key" });
     defer testing.allocator.free(secret_key_path);
     {
-        const file = try std.fs.createFileAbsolute(secret_key_path, .{});
-        defer file.close();
-        try file.writeAll("existing");
+        const file = try std.Io.Dir.createFileAbsolute(path_mod.currentIo(), secret_key_path, .{});
+        defer file.close(path_mod.currentIo());
+        try file.writeStreamingAll(path_mod.currentIo(), "existing");
     }
 
     try testing.expectError(SignError.FileSystem, generateAndSaveKeyPair(&ctx, key_dir));
 
     const public_key_path = try std.fs.path.join(testing.allocator, &.{ key_dir, "mere.pub" });
     defer testing.allocator.free(public_key_path);
-    try testing.expect(!path_utils.fileExists(public_key_path));
+    try testing.expect(!path_mod.fileExists(public_key_path));
 }
 
 // Spec #5: Key generation
@@ -1105,9 +1104,9 @@ test "PublicKey.saveToFile does not overwrite existing file" {
     // Create a file with known content
     const original_content = "ORIGINAL_PUBLIC_KEY_CONTENT";
     {
-        const file = try std.fs.createFileAbsolute(pub_key_path, .{});
-        defer file.close();
-        try file.writeAll(original_content);
+        const file = try std.Io.Dir.createFileAbsolute(path_mod.currentIo(), pub_key_path, .{});
+        defer file.close(path_mod.currentIo());
+        try file.writeStreamingAll(path_mod.currentIo(), original_content);
     }
 
     // Attempt to save the public key to the same file
@@ -1115,11 +1114,11 @@ test "PublicKey.saveToFile does not overwrite existing file" {
     try testing.expectError(SignError.FileSystem, key_pair.public_key.saveToFile(pub_key_path));
 
     // Verify the original file still contains the original content
-    const file = try std.fs.openFileAbsolute(pub_key_path, .{});
-    defer file.close();
+    const file = try std.Io.Dir.openFileAbsolute(path_mod.currentIo(), pub_key_path, .{});
+    defer file.close(path_mod.currentIo());
 
     var buffer: [100]u8 = undefined;
-    const bytes_read = try file.readAll(&buffer);
+    const bytes_read = try file.readPositionalAll(path_mod.currentIo(), &buffer, 0);
     try testing.expectEqualStrings(original_content, buffer[0..bytes_read]);
 }
 
@@ -1142,9 +1141,9 @@ test "signFile with relative paths" {
     const test_file_path = try std.fs.path.join(testing.allocator, &.{ test_env.path, "rel_test_file.txt" });
     defer testing.allocator.free(test_file_path);
 
-    const test_file = try std.fs.createFileAbsolute(test_file_path, .{});
-    try test_file.writeAll("This is a test file for relative path signing");
-    test_file.close();
+    const test_file = try std.Io.Dir.createFileAbsolute(path_mod.currentIo(), test_file_path, .{});
+    try test_file.writeStreamingAll(path_mod.currentIo(), "This is a test file for relative path signing");
+    test_file.close(path_mod.currentIo());
 
     // Generate a new key pair for testing
     const secret_key_path = try std.fs.path.join(testing.allocator, &.{ test_env.path, "rel_test.key" });
@@ -1164,25 +1163,25 @@ test "signFile with relative paths" {
     ctx.debug("secret_key_path after save: {s}", .{secret_key_path});
     // Check existence and size after saving
     {
-        const pub_file = try std.fs.openFileAbsolute(public_key_path, .{});
-        const pub_stat = try pub_file.stat();
+        const pub_file = try std.Io.Dir.openFileAbsolute(path_mod.currentIo(), public_key_path, .{});
+        const pub_stat = try pub_file.stat(path_mod.currentIo());
         ctx.debug("public_key_path exists, size: {}", .{pub_stat.size});
-        pub_file.close();
-        const sec_file = try std.fs.openFileAbsolute(secret_key_path, .{});
-        const sec_stat = try sec_file.stat();
+        pub_file.close(path_mod.currentIo());
+        const sec_file = try std.Io.Dir.openFileAbsolute(path_mod.currentIo(), secret_key_path, .{});
+        const sec_stat = try sec_file.stat(path_mod.currentIo());
         ctx.debug("secret_key_path exists, size: {}", .{sec_stat.size});
-        sec_file.close();
+        sec_file.close(path_mod.currentIo());
     }
 
     // Save current working directory before switching
     var buf: [std.fs.max_path_bytes]u8 = undefined;
-    const original_cwd = try std.fs.cwd().realpath(".", &buf);
-    defer std.posix.chdir(original_cwd) catch |err| {
+    const original_cwd = try path_mod.resolveToAbsolutePath(".", &buf);
+    defer std.process.setCurrentPath(path_mod.currentIo(), original_cwd) catch |err| {
         ctx.debug("Failed to restore cwd: {}\n", .{err});
     };
 
     // Change directories to the test environment path
-    try std.posix.chdir(test_env.path);
+    try std.process.setCurrentPath(path_mod.currentIo(), test_env.path);
 
     // Set context signing_key_path to relative key file
     ctx.signing_key_path = "rel_test.key";
@@ -1198,8 +1197,8 @@ test "signFile with relative paths" {
     // Verify the signature exists (sig_path declared above)
 
     // Check if the signature file exists
-    const sig_file = try std.fs.cwd().openFile(sig_path, .{});
-    sig_file.close();
+    const sig_file = try std.Io.Dir.cwd().openFile(path_mod.currentIo(), sig_path, .{});
+    sig_file.close(path_mod.currentIo());
 
     // Verify the signature
     const rel_pub_path = std.fs.path.basename(public_key_path);
@@ -1228,9 +1227,9 @@ test "SecretKey.saveToFile does not overwrite existing file" {
     // Create a file with known content
     const original_content = "ORIGINAL_SECRET_KEY_CONTENT";
     {
-        const file = try std.fs.createFileAbsolute(sec_key_path, .{});
-        defer file.close();
-        try file.writeAll(original_content);
+        const file = try std.Io.Dir.createFileAbsolute(path_mod.currentIo(), sec_key_path, .{});
+        defer file.close(path_mod.currentIo());
+        try file.writeStreamingAll(path_mod.currentIo(), original_content);
     }
 
     // Attempt to save the secret key to the same file
@@ -1238,11 +1237,11 @@ test "SecretKey.saveToFile does not overwrite existing file" {
     try testing.expectError(SignError.FileSystem, key_pair.secret_key.saveToFile(sec_key_path));
 
     // Verify the original file still contains the original content
-    const file = try std.fs.openFileAbsolute(sec_key_path, .{});
-    defer file.close();
+    const file = try std.Io.Dir.openFileAbsolute(path_mod.currentIo(), sec_key_path, .{});
+    defer file.close(path_mod.currentIo());
 
     var buffer: [100]u8 = undefined;
-    const bytes_read = try file.readAll(&buffer);
+    const bytes_read = try file.readPositionalAll(path_mod.currentIo(), &buffer, 0);
     try testing.expectEqualStrings(original_content, buffer[0..bytes_read]);
 }
 
@@ -1269,17 +1268,17 @@ test "SecretKey.saveToFile sets restrictive permissions" {
     try key_pair.secret_key.saveToFile(sec_key_path);
 
     // Open the file and check its permissions
-    const file = try std.fs.openFileAbsolute(sec_key_path, .{});
-    defer file.close();
+    const file = try std.Io.Dir.openFileAbsolute(path_mod.currentIo(), sec_key_path, .{});
+    defer file.close(path_mod.currentIo());
 
     // Get the file stat
-    const stat = try file.stat();
+    const stat = try file.stat(path_mod.currentIo());
 
     // Check if the permissions match 0600 (owner read/write only)
     // Note: We're checking that only the owner read/write bits are set (0o600)
     // and no other bits are set (like group or other permissions)
     const expected_mode = 0o600;
-    const actual_mode = stat.mode & 0o777; // Apply mask to get just permission bits
+    const actual_mode = stat.permissions.toMode() & 0o777; // Apply mask to get just permission bits
 
     try testing.expectEqual(expected_mode, actual_mode);
 }
@@ -1309,9 +1308,9 @@ test "writeSignatureFileWithResolver produces valid signature" {
     const test_file_path = try std.fs.path.join(testing.allocator, &.{ test_env.path, "test_file_bytes.txt" });
     defer testing.allocator.free(test_file_path);
 
-    const test_file = try std.fs.createFileAbsolute(test_file_path, .{});
-    try test_file.writeAll("This is a test file for writeSignatureFileWithResolver");
-    test_file.close();
+    const test_file = try std.Io.Dir.createFileAbsolute(path_mod.currentIo(), test_file_path, .{});
+    try test_file.writeStreamingAll(path_mod.currentIo(), "This is a test file for writeSignatureFileWithResolver");
+    test_file.close(path_mod.currentIo());
 
     // Generate a new key pair for testing
     const secret_key_path = try std.fs.path.join(testing.allocator, &.{ test_env.path, "test_bytes.key" });
@@ -1457,9 +1456,9 @@ test "standardized error handling" {
     defer testing.allocator.free(invalid_key_path);
 
     // Create a file with invalid key content
-    const invalid_key_file = try std.fs.createFileAbsolute(invalid_key_path, .{});
-    try invalid_key_file.writeAll("invalid key content");
-    invalid_key_file.close();
+    const invalid_key_file = try std.Io.Dir.createFileAbsolute(path_mod.currentIo(), invalid_key_path, .{});
+    try invalid_key_file.writeStreamingAll(path_mod.currentIo(), "invalid key content");
+    invalid_key_file.close(path_mod.currentIo());
 
     try testing.expectError(SignError.InvalidKey, SecretKey.loadFromFile(invalid_key_path));
 
@@ -1576,9 +1575,9 @@ test "Property 2: Diagnostic Context Preservation in sign module error propagati
 
                 // Create test file
                 {
-                    const f = try std.fs.createFileAbsolute(test_file, .{});
-                    try f.writeAll("test content");
-                    f.close();
+                    const f = try std.Io.Dir.createFileAbsolute(path_mod.currentIo(), test_file, .{});
+                    try f.writeStreamingAll(path_mod.currentIo(), "test content");
+                    f.close(path_mod.currentIo());
                 }
 
                 const nonexistent_key = try std.fs.path.join(testing.allocator, &.{ test_env.path, "nonexistent.key" });
@@ -1591,9 +1590,9 @@ test "Property 2: Diagnostic Context Preservation in sign module error propagati
                 const invalid_pub_path = try std.fs.path.join(testing.allocator, &.{ test_env.path, "invalid.pub" });
                 defer testing.allocator.free(invalid_pub_path);
 
-                const invalid_pub_file = try std.fs.createFileAbsolute(invalid_pub_path, .{});
-                try invalid_pub_file.writeAll("too short");
-                invalid_pub_file.close();
+                const invalid_pub_file = try std.Io.Dir.createFileAbsolute(path_mod.currentIo(), invalid_pub_path, .{});
+                try invalid_pub_file.writeStreamingAll(path_mod.currentIo(), "too short");
+                invalid_pub_file.close(path_mod.currentIo());
 
                 try testing.expectError(SignError.InvalidKey, PublicKey.loadFromFile(invalid_pub_path));
             },
@@ -1602,9 +1601,9 @@ test "Property 2: Diagnostic Context Preservation in sign module error propagati
                 const invalid_sec_path = try std.fs.path.join(testing.allocator, &.{ test_env.path, "invalid.key" });
                 defer testing.allocator.free(invalid_sec_path);
 
-                const invalid_sec_file = try std.fs.createFileAbsolute(invalid_sec_path, .{});
-                try invalid_sec_file.writeAll("too short");
-                invalid_sec_file.close();
+                const invalid_sec_file = try std.Io.Dir.createFileAbsolute(path_mod.currentIo(), invalid_sec_path, .{});
+                try invalid_sec_file.writeStreamingAll(path_mod.currentIo(), "too short");
+                invalid_sec_file.close(path_mod.currentIo());
 
                 try testing.expectError(SignError.InvalidKey, SecretKey.loadFromFile(invalid_sec_path));
             },
@@ -1648,9 +1647,9 @@ test "SecretKey.loadFromFile rejects mismatched embedded public key" {
     var tampered = kp.secret_key.key;
     tampered[c.crypto_sign_SECRETKEYBYTES - 1] ^= 0x01;
 
-    const file = try std.fs.createFileAbsolute(key_path, .{});
-    defer file.close();
-    try file.writeAll(tampered[0..]);
+    const file = try std.Io.Dir.createFileAbsolute(path_mod.currentIo(), key_path, .{});
+    defer file.close(path_mod.currentIo());
+    try file.writeStreamingAll(path_mod.currentIo(), tampered[0..]);
 
     try testing.expectError(SignError.InvalidKey, SecretKey.loadFromFile(key_path));
 }
@@ -1695,7 +1694,7 @@ test "scanKeyDirectory loads keys from directory" {
     // Create a keys directory
     const keys_dir = try std.fs.path.join(testing.allocator, &.{ test_env.path, "keys" });
     defer testing.allocator.free(keys_dir);
-    try std.fs.cwd().makePath(keys_dir);
+    try path_mod.ensureDirExists(keys_dir);
 
     // Generate two key pairs and save them
     const kp1 = try generateKeyPair();
@@ -1713,9 +1712,9 @@ test "scanKeyDirectory loads keys from directory" {
     const other_file = try std.fs.path.join(testing.allocator, &.{ keys_dir, "readme.txt" });
     defer testing.allocator.free(other_file);
     {
-        const f = try std.fs.createFileAbsolute(other_file, .{});
-        try f.writeAll("not a key");
-        f.close();
+        const f = try std.Io.Dir.createFileAbsolute(path_mod.currentIo(), other_file, .{});
+        try f.writeStreamingAll(path_mod.currentIo(), "not a key");
+        f.close(path_mod.currentIo());
     }
 
     // Scan the directory
@@ -1747,7 +1746,7 @@ test "scanKeyDirectory returns empty for nonexistent directory" {
 }
 
 test "scanKeyDirectory returns PermissionDenied for unreadable directory" {
-    if (std.posix.geteuid() == 0) return error.SkipZigTest;
+    if (std.os.linux.geteuid() == 0) return error.SkipZigTest;
 
     const testing = std.testing;
     const th = @import("test_helpers.zig");
@@ -1760,12 +1759,12 @@ test "scanKeyDirectory returns PermissionDenied for unreadable directory" {
 
     const keys_dir = try std.fs.path.join(testing.allocator, &.{ test_env.path, "restricted-keys" });
     defer testing.allocator.free(keys_dir);
-    try std.fs.cwd().makePath(keys_dir);
+    try path_mod.ensureDirExists(keys_dir);
 
-    var restricted = try std.fs.openDirAbsolute(keys_dir, .{});
-    defer restricted.close();
-    try restricted.chmod(0o000);
-    defer restricted.chmod(0o755) catch {};
+    var restricted = try path_mod.openExistingDir(keys_dir);
+    defer restricted.close(path_mod.currentIo());
+    try restricted.setPermissions(path_mod.currentIo(), .fromMode(0o000));
+    defer restricted.setPermissions(path_mod.currentIo(), .fromMode(0o755)) catch {};
 
     const result = scanKeyDirectory(testing.allocator, keys_dir);
     if (result) |loaded_keys| {
@@ -1796,7 +1795,7 @@ test "verifyWithTrustedFingerprints succeeds with matching fingerprint" {
     // Create user keys directory (test home_dir is test_env.path)
     const keys_dir = try std.fs.path.join(testing.allocator, &.{ test_env.path, ".mere", "keys" });
     defer testing.allocator.free(keys_dir);
-    try std.fs.cwd().makePath(keys_dir);
+    try path_mod.ensureDirExists(keys_dir);
 
     // Generate key and save to user keys dir
     const kp = try generateKeyPair();
@@ -1812,9 +1811,9 @@ test "verifyWithTrustedFingerprints succeeds with matching fingerprint" {
     const test_file = try std.fs.path.join(testing.allocator, &.{ test_env.path, "testfile.txt" });
     defer testing.allocator.free(test_file);
     {
-        const f = try std.fs.createFileAbsolute(test_file, .{});
-        try f.writeAll("test content for signing");
-        f.close();
+        const f = try std.Io.Dir.createFileAbsolute(path_mod.currentIo(), test_file, .{});
+        try f.writeStreamingAll(path_mod.currentIo(), "test content for signing");
+        f.close(path_mod.currentIo());
     }
 
     // Save secret key for signing
@@ -1859,7 +1858,7 @@ test "verifyWithTrustedFingerprints fails with untrusted fingerprint" {
     // Create user keys directory
     const keys_dir = try std.fs.path.join(testing.allocator, &.{ test_env.path, ".mere", "keys" });
     defer testing.allocator.free(keys_dir);
-    try std.fs.cwd().makePath(keys_dir);
+    try path_mod.ensureDirExists(keys_dir);
 
     // Generate key and save
     const kp = try generateKeyPair();
@@ -1871,9 +1870,9 @@ test "verifyWithTrustedFingerprints fails with untrusted fingerprint" {
     const test_file = try std.fs.path.join(testing.allocator, &.{ test_env.path, "testfile.txt" });
     defer testing.allocator.free(test_file);
     {
-        const f = try std.fs.createFileAbsolute(test_file, .{});
-        try f.writeAll("test content for signing");
-        f.close();
+        const f = try std.Io.Dir.createFileAbsolute(path_mod.currentIo(), test_file, .{});
+        try f.writeStreamingAll(path_mod.currentIo(), "test content for signing");
+        f.close(path_mod.currentIo());
     }
 
     // Save secret key for signing
@@ -1915,9 +1914,9 @@ test "verifyWithTrustedFingerprints fails with empty fingerprint list" {
     const test_file = try std.fs.path.join(testing.allocator, &.{ test_env.path, "testfile.txt" });
     defer testing.allocator.free(test_file);
     {
-        const f = try std.fs.createFileAbsolute(test_file, .{});
-        try f.writeAll("test content");
-        f.close();
+        const f = try std.Io.Dir.createFileAbsolute(path_mod.currentIo(), test_file, .{});
+        try f.writeStreamingAll(path_mod.currentIo(), "test content");
+        f.close(path_mod.currentIo());
     }
 
     const empty_trusted: []const []const u8 = &.{};

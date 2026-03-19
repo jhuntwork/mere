@@ -71,7 +71,7 @@ pub fn validateConstraintExpr(expr: []const u8) ConstraintError!void {
 
 pub fn canonicalizeConstraintExpr(allocator: std.mem.Allocator, expr: []const u8) ![]const u8 {
     try validateConstraintExpr(expr);
-    var out = std.ArrayList(u8){};
+    var out: std.ArrayList(u8) = .empty;
     defer out.deinit(allocator);
 
     var it = std.mem.splitScalar(u8, expr, ',');

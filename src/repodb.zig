@@ -232,7 +232,7 @@ pub const RepoDB = struct {
 
         _ = c.sqlite3_bind_text(stmt.?, 1, pkg_name.ptr, @intCast(pkg_name.len), null);
 
-        var candidates: std.ArrayList(package.Package) = .{};
+        var candidates: std.ArrayList(package.Package) = .empty;
         errdefer {
             for (candidates.items) |*pkg| pkg.deinit();
             candidates.deinit(allocator);
@@ -311,7 +311,7 @@ pub const RepoDB = struct {
             pkg: package.Package,
         };
 
-        var candidates: std.ArrayList(Candidate) = .{};
+        var candidates: std.ArrayList(Candidate) = .empty;
         defer {
             for (candidates.items) |*cand| cand.pkg.deinit();
             candidates.deinit(allocator);
@@ -378,7 +378,7 @@ pub const RepoDB = struct {
             pkg: package.Package,
         };
 
-        var candidates: std.ArrayList(Candidate) = .{};
+        var candidates: std.ArrayList(Candidate) = .empty;
         defer {
             for (candidates.items) |*cand| cand.pkg.deinit();
             candidates.deinit(allocator);
@@ -398,7 +398,7 @@ pub const RepoDB = struct {
             return self.ctx.fail(RepoDBError.PackageNotFound, pkg_name, null);
         }
 
-        var selected: std.ArrayList(package.Package) = .{};
+        var selected: std.ArrayList(package.Package) = .empty;
         errdefer {
             for (selected.items) |*pkg| pkg.deinit();
             selected.deinit(allocator);
@@ -473,7 +473,7 @@ pub const RepoDB = struct {
     /// Search for packages whose name contains the given substring (case-insensitive).
     /// Returns the latest version of each matching (name, arch) pair.
     pub fn searchByName(self: *RepoDB, allocator: std.mem.Allocator, term: []const u8) !std.ArrayList(package.Package) {
-        var results = std.ArrayList(package.Package){};
+        var results: std.ArrayList(package.Package) = .empty;
         errdefer {
             for (results.items) |*pkg| pkg.deinit();
             results.deinit(allocator);
@@ -537,7 +537,7 @@ pub const RepoDB = struct {
 
         // Collect all versions and find the best using vercmp
         const Candidate = struct { id: i32, version_str: []const u8, rel: u32 };
-        var candidates: std.ArrayList(Candidate) = .{};
+        var candidates: std.ArrayList(Candidate) = .empty;
         defer {
             for (candidates.items) |cand| allocator.free(cand.version_str);
             candidates.deinit(allocator);
@@ -630,7 +630,7 @@ pub const RepoDB = struct {
     ) !std.ArrayList(DependencyRequirement) {
         if (self.db == null) return RepoDBError.FileSystem;
 
-        var deps = std.ArrayList(DependencyRequirement){};
+        var deps: std.ArrayList(DependencyRequirement) = .empty;
         errdefer {
             for (deps.items) |*dep| dep.deinit(allocator);
             deps.deinit(allocator);
@@ -707,7 +707,7 @@ pub const RepoDB = struct {
 
         _ = c.sqlite3_bind_text(stmt.?, 1, resource.ptr, @intCast(resource.len), null);
 
-        var candidates: std.ArrayList(package.Package) = .{};
+        var candidates: std.ArrayList(package.Package) = .empty;
         errdefer {
             for (candidates.items) |*pkg| pkg.deinit();
             candidates.deinit(allocator);
@@ -801,7 +801,7 @@ pub const RepoDB = struct {
 
         _ = c.sqlite3_bind_text(stmt.?, 1, bare_name.ptr, @intCast(bare_name.len), null);
 
-        var candidates: std.ArrayList(package.Package) = .{};
+        var candidates: std.ArrayList(package.Package) = .empty;
         errdefer {
             for (candidates.items) |*pkg| pkg.deinit();
             candidates.deinit(allocator);
@@ -1387,7 +1387,7 @@ pub const RepoDB = struct {
     /// Return the set of distinct (name, arch) pairs present in the packages table.
     /// Caller owns the returned list and each string within it; free with allocator.
     pub fn getDistinctPackageNameArch(self: *RepoDB, allocator: std.mem.Allocator) RepoDBError!std.ArrayList(NameArch) {
-        var result = std.ArrayList(NameArch){};
+        var result: std.ArrayList(NameArch) = .empty;
         errdefer {
             for (result.items) |item| {
                 allocator.free(item.name);
@@ -1557,7 +1557,7 @@ test "RepoDB basic usage: init, schema, prepareStatement" {
 
     {
         const f = try path.makePathAndOpenFile(db_path);
-        f.close();
+        f.close(path.currentIo());
     }
 
     var db = try RepoDB.init(&test_env.ctx, db_path, false);
@@ -1637,7 +1637,7 @@ test "RepoDB deletePackage cascades to dependencies and provisions" {
     // Create and open DB
     {
         const f = try path.makePathAndOpenFile(db_path);
-        f.close();
+        f.close(path.currentIo());
     }
     var db = try RepoDB.init(&test_env.ctx, db_path, false);
     defer {
@@ -1750,7 +1750,7 @@ test "RepoDB deletePackage returns PackageNotFound for non-existent package" {
 
     {
         const f = try path.makePathAndOpenFile(db_path);
-        f.close();
+        f.close(path.currentIo());
     }
     var db = try RepoDB.init(&test_env.ctx, db_path, false);
     defer {
@@ -1777,7 +1777,7 @@ test "RepoDB: getLatestPackageByName, getDependenciesForPackage, getLatestPackag
     // Create and open DB
     {
         const f = try path.makePathAndOpenFile(db_path);
-        f.close();
+        f.close(path.currentIo());
     }
     var db = try RepoDB.init(&test_env.ctx, db_path, false);
     defer {
@@ -1880,7 +1880,7 @@ test "RepoDB: getLatestPackageByBinBasename matches bare names against bin provi
 
     {
         const f = try path.makePathAndOpenFile(db_path);
-        f.close();
+        f.close(path.currentIo());
     }
     var db = try RepoDB.init(&test_env.ctx, db_path, false);
     defer {
@@ -1991,7 +1991,7 @@ test "RepoDB resolveTransitiveDependencies resolves all dependencies recursively
     defer allocator.free(db_path);
     {
         const f = try path.makePathAndOpenFile(db_path);
-        f.close();
+        f.close(path.currentIo());
     }
     var db = try RepoDB.init(&ctx, db_path, false);
     defer {
@@ -2060,7 +2060,7 @@ test "RepoDB vercmp correctly orders 1.10 > 1.9" {
 
     {
         const f = try path.makePathAndOpenFile(db_path);
-        f.close();
+        f.close(path.currentIo());
     }
     var db = try RepoDB.init(&test_env.ctx, db_path, false);
     defer {
@@ -2119,7 +2119,7 @@ test "RepoDB vercmp handles epoch correctly" {
 
     {
         const f = try path.makePathAndOpenFile(db_path);
-        f.close();
+        f.close(path.currentIo());
     }
     var db = try RepoDB.init(&test_env.ctx, db_path, false);
     defer {
@@ -2174,7 +2174,7 @@ test "RepoDB vercmp handles tilde pre-release correctly" {
 
     {
         const f = try path.makePathAndOpenFile(db_path);
-        f.close();
+        f.close(path.currentIo());
     }
     var db = try RepoDB.init(&test_env.ctx, db_path, false);
     defer {

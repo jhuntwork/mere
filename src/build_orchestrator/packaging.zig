@@ -5,6 +5,7 @@ const manpage_compress = @import("../manpage_compress.zig");
 const mere = @import("../mere.zig");
 const meta = @import("../meta.zig");
 const hash = @import("../hash.zig");
+const path_mod = @import("../path.zig");
 const recipe = @import("../recipe.zig");
 const packaging = @import("../packaging.zig");
 const strip = @import("../strip.zig");
@@ -36,7 +37,7 @@ const InjectedDepsForPackage = struct {
     items: std.ArrayList(packaging.InjectedDependency),
 
     fn init() InjectedDepsForPackage {
-        return .{ .items = .{} };
+        return .{ .items = .empty };
     }
 
     fn deinit(self: *InjectedDepsForPackage, allocator: std.mem.Allocator) void {
@@ -93,7 +94,7 @@ const PackageArchiveWorkerShared = struct {
     create_package_artifact_fn: CreatePackageArtifactFn,
     parsed_recipe: *recipe.Recipe,
     jobs: []PackageArchiveJobState,
-    mutex: std.Thread.Mutex = .{},
+    mutex: std.Io.Mutex = .init,
     next_index: usize = 0,
     failure_seen: bool = false,
 };
@@ -109,8 +110,8 @@ const PackageArchiveWorker = struct {
     }
 
     fn nextJobIndex(self: *@This()) ?usize {
-        self.shared.mutex.lock();
-        defer self.shared.mutex.unlock();
+        self.shared.mutex.lockUncancelable(path_mod.currentIo());
+        defer self.shared.mutex.unlock(path_mod.currentIo());
 
         if (self.shared.stop_on_error and self.shared.failure_seen) return null;
         if (self.shared.next_index >= self.shared.jobs.len) return null;
@@ -121,8 +122,8 @@ const PackageArchiveWorker = struct {
     }
 
     fn noteFailure(self: *@This()) void {
-        self.shared.mutex.lock();
-        defer self.shared.mutex.unlock();
+        self.shared.mutex.lockUncancelable(path_mod.currentIo());
+        defer self.shared.mutex.unlock(path_mod.currentIo());
         self.shared.failure_seen = true;
     }
 
@@ -179,7 +180,7 @@ pub fn packageArtifacts(
         allocator.free(injected_by_pkg);
     }
 
-    var package_jobs = std.ArrayList(PackageArchiveJobState){};
+    var package_jobs: std.ArrayList(PackageArchiveJobState) = .empty;
     defer {
         for (package_jobs.items) |*job| job.deinit();
         package_jobs.deinit(allocator);
@@ -240,14 +241,14 @@ fn prepareArtifactStaging(
     };
     defer allocator.free(etc_defaults_path);
 
-    std.fs.accessAbsolute(etc_path, .{}) catch |err| {
+    std.Io.Dir.accessAbsolute(path_mod.currentIo(), etc_path, .{}) catch |err| {
         if (err != error.FileNotFound) {
             ctx.setDiagnosticContext(etc_path, "failed to access etc directory");
             ctx.debug("etc access check failed: {s}", .{@errorName(err)});
         }
     };
 
-    std.fs.renameAbsolute(etc_path, etc_defaults_path) catch |err| {
+    std.Io.Dir.renameAbsolute(etc_path, etc_defaults_path, path_mod.currentIo()) catch |err| {
         if (err != error.FileNotFound) {
             ctx.setDiagnosticContext(etc_path, "failed to relocate etc directory");
             ctx.debug("etc relocation skipped: {s}", .{@errorName(err)});
@@ -794,7 +795,8 @@ test "packageArtifacts records archive metadata for staged packages" {
 
     const staging_dir = try std.fs.path.join(test_env.ctx.allocator, &.{ test_env.path, "staging-pack" });
     defer test_env.ctx.allocator.free(staging_dir);
-    try std.fs.cwd().makePath(staging_dir);
+    var staging_dir_handle = try path_mod.makePathAndOpenDir(staging_dir);
+    staging_dir_handle.close(path_mod.currentIo());
 
     const copied_files = try test_env.ctx.allocator.alloc([]const u8, 0);
     var staged_packages = [_]split_staging.StagedPackage{
@@ -808,7 +810,7 @@ test "packageArtifacts records archive metadata for staged packages" {
         staged_packages[0].deinit(test_env.ctx.allocator);
     }
 
-    var packaged_archives = std.ArrayList([]const u8){};
+    var packaged_archives: std.ArrayList([]const u8) = .empty;
     defer {
         for (packaged_archives.items) |p| test_env.ctx.allocator.free(p);
         packaged_archives.deinit(test_env.ctx.allocator);
@@ -826,7 +828,7 @@ test "packageArtifacts records archive metadata for staged packages" {
             calls += 1;
             try std.testing.expectEqualStrings(expected_staging_dir, cfg.staging_dir);
             const archive_path = try std.fs.path.join(ctx.allocator, &.{ cfg.staging_dir, "stub.pkg.tar.zst" });
-            try std.fs.cwd().writeFile(.{ .sub_path = archive_path, .data = "archive" });
+            try std.Io.Dir.cwd().writeFile(path_mod.currentIo(), .{ .sub_path = archive_path, .data = "archive" });
             const content_hash = try ctx.allocator.dupe(u8, "hash");
             const archive_hash = try hash.calculateFileHash(ctx.allocator, archive_path);
             const package_name = try ctx.allocator.dupe(u8, cfg.artifact.name);
@@ -892,7 +894,8 @@ test "packageArtifacts returns error when archive creation fails under stop poli
 
     const staging_dir = try std.fs.path.join(test_env.ctx.allocator, &.{ test_env.path, "staging-pack-fail-stop" });
     defer test_env.ctx.allocator.free(staging_dir);
-    try std.fs.cwd().makePath(staging_dir);
+    var staging_dir_handle = try path_mod.makePathAndOpenDir(staging_dir);
+    staging_dir_handle.close(path_mod.currentIo());
 
     const copied_files = try test_env.ctx.allocator.alloc([]const u8, 0);
     var staged_packages = [_]split_staging.StagedPackage{
@@ -906,7 +909,7 @@ test "packageArtifacts returns error when archive creation fails under stop poli
         staged_packages[0].deinit(test_env.ctx.allocator);
     }
 
-    var packaged_archives = std.ArrayList([]const u8){};
+    var packaged_archives: std.ArrayList([]const u8) = .empty;
     defer packaged_archives.deinit(test_env.ctx.allocator);
     var packaging_errors_encountered = false;
 
@@ -969,13 +972,14 @@ test "packageArtifacts compresses man pages by default before packaging" {
     defer test_env.ctx.allocator.free(staging_dir);
     const man_dir = try std.fs.path.join(test_env.ctx.allocator, &.{ staging_dir, "usr", "share", "man", "man1" });
     defer test_env.ctx.allocator.free(man_dir);
-    try std.fs.cwd().makePath(man_dir);
+    var man_dir_handle = try path_mod.makePathAndOpenDir(man_dir);
+    man_dir_handle.close(path_mod.currentIo());
 
     const manpage_path = try std.fs.path.join(test_env.ctx.allocator, &.{ man_dir, "mere.1" });
     defer test_env.ctx.allocator.free(manpage_path);
-    var manpage = try std.fs.createFileAbsolute(manpage_path, .{});
-    try manpage.writeAll("manual page");
-    manpage.close();
+    var manpage = try std.Io.Dir.createFileAbsolute(path_mod.currentIo(), manpage_path, .{});
+    defer manpage.close(path_mod.currentIo());
+    try manpage.writeStreamingAll(path_mod.currentIo(), "manual page");
 
     const copied_files = try test_env.ctx.allocator.alloc([]const u8, 0);
     var staged_packages = [_]split_staging.StagedPackage{
@@ -987,7 +991,7 @@ test "packageArtifacts compresses man pages by default before packaging" {
     };
     defer staged_packages[0].deinit(test_env.ctx.allocator);
 
-    var packaged_archives = std.ArrayList([]const u8){};
+    var packaged_archives: std.ArrayList([]const u8) = .empty;
     defer {
         for (packaged_archives.items) |p| test_env.ctx.allocator.free(p);
         packaged_archives.deinit(test_env.ctx.allocator);
@@ -997,7 +1001,7 @@ test "packageArtifacts compresses man pages by default before packaging" {
     const StubPackager = struct {
         pub fn create(ctx: *mere.Context, cfg: packaging.PackageArtifactConfig) anyerror!packaging.PackageArtifactResult {
             const archive_path = try std.fs.path.join(ctx.allocator, &.{ cfg.staging_dir, "stub.pkg.tar.zst" });
-            try std.fs.cwd().writeFile(.{ .sub_path = archive_path, .data = "archive" });
+            try std.Io.Dir.cwd().writeFile(path_mod.currentIo(), .{ .sub_path = archive_path, .data = "archive" });
             const archive_hash = try hash.calculateFileHash(ctx.allocator, archive_path);
             return .{
                 .archive_path = archive_path,
@@ -1030,8 +1034,8 @@ test "packageArtifacts compresses man pages by default before packaging" {
     try std.testing.expect(!packaging_errors_encountered);
     const compressed_path = try std.fmt.allocPrint(test_env.ctx.allocator, "{s}.zst", .{manpage_path});
     defer test_env.ctx.allocator.free(compressed_path);
-    try std.fs.accessAbsolute(compressed_path, .{});
-    try std.testing.expectError(error.FileNotFound, std.fs.accessAbsolute(manpage_path, .{}));
+    try std.Io.Dir.accessAbsolute(path_mod.currentIo(), compressed_path, .{});
+    try std.testing.expectError(error.FileNotFound, std.Io.Dir.accessAbsolute(path_mod.currentIo(), manpage_path, .{}));
 }
 
 test "packageArtifacts respects compress-manpages false" {
@@ -1064,13 +1068,14 @@ test "packageArtifacts respects compress-manpages false" {
     defer test_env.ctx.allocator.free(staging_dir);
     const man_dir = try std.fs.path.join(test_env.ctx.allocator, &.{ staging_dir, "usr", "share", "man", "man1" });
     defer test_env.ctx.allocator.free(man_dir);
-    try std.fs.cwd().makePath(man_dir);
+    var man_dir_handle = try path_mod.makePathAndOpenDir(man_dir);
+    man_dir_handle.close(path_mod.currentIo());
 
     const manpage_path = try std.fs.path.join(test_env.ctx.allocator, &.{ man_dir, "mere.1" });
     defer test_env.ctx.allocator.free(manpage_path);
-    var manpage = try std.fs.createFileAbsolute(manpage_path, .{});
-    try manpage.writeAll("manual page");
-    manpage.close();
+    var manpage = try std.Io.Dir.createFileAbsolute(path_mod.currentIo(), manpage_path, .{});
+    defer manpage.close(path_mod.currentIo());
+    try manpage.writeStreamingAll(path_mod.currentIo(), "manual page");
 
     const copied_files = try test_env.ctx.allocator.alloc([]const u8, 0);
     var staged_packages = [_]split_staging.StagedPackage{
@@ -1082,7 +1087,7 @@ test "packageArtifacts respects compress-manpages false" {
     };
     defer staged_packages[0].deinit(test_env.ctx.allocator);
 
-    var packaged_archives = std.ArrayList([]const u8){};
+    var packaged_archives: std.ArrayList([]const u8) = .empty;
     defer {
         for (packaged_archives.items) |p| test_env.ctx.allocator.free(p);
         packaged_archives.deinit(test_env.ctx.allocator);
@@ -1092,7 +1097,7 @@ test "packageArtifacts respects compress-manpages false" {
     const StubPackager = struct {
         pub fn create(ctx: *mere.Context, cfg: packaging.PackageArtifactConfig) anyerror!packaging.PackageArtifactResult {
             const archive_path = try std.fs.path.join(ctx.allocator, &.{ cfg.staging_dir, "stub.pkg.tar.zst" });
-            try std.fs.cwd().writeFile(.{ .sub_path = archive_path, .data = "archive" });
+            try std.Io.Dir.cwd().writeFile(path_mod.currentIo(), .{ .sub_path = archive_path, .data = "archive" });
             const archive_hash = try hash.calculateFileHash(ctx.allocator, archive_path);
             return .{
                 .archive_path = archive_path,
@@ -1123,10 +1128,10 @@ test "packageArtifacts respects compress-manpages false" {
     );
 
     try std.testing.expect(!packaging_errors_encountered);
-    try std.fs.accessAbsolute(manpage_path, .{});
+    try std.Io.Dir.accessAbsolute(path_mod.currentIo(), manpage_path, .{});
     const compressed_path = try std.fmt.allocPrint(test_env.ctx.allocator, "{s}.zst", .{manpage_path});
     defer test_env.ctx.allocator.free(compressed_path);
-    try std.testing.expectError(error.FileNotFound, std.fs.accessAbsolute(compressed_path, .{}));
+    try std.testing.expectError(error.FileNotFound, std.Io.Dir.accessAbsolute(path_mod.currentIo(), compressed_path, .{}));
 }
 
 test "packageArtifacts continues on archive failure under continue policy" {
@@ -1154,7 +1159,8 @@ test "packageArtifacts continues on archive failure under continue policy" {
 
     const staging_dir = try std.fs.path.join(test_env.ctx.allocator, &.{ test_env.path, "staging-pack-fail-continue" });
     defer test_env.ctx.allocator.free(staging_dir);
-    try std.fs.cwd().makePath(staging_dir);
+    var staging_dir_handle = try path_mod.makePathAndOpenDir(staging_dir);
+    staging_dir_handle.close(path_mod.currentIo());
 
     const copied_files = try test_env.ctx.allocator.alloc([]const u8, 0);
     var staged_packages = [_]split_staging.StagedPackage{
@@ -1168,7 +1174,7 @@ test "packageArtifacts continues on archive failure under continue policy" {
         staged_packages[0].deinit(test_env.ctx.allocator);
     }
 
-    var packaged_archives = std.ArrayList([]const u8){};
+    var packaged_archives: std.ArrayList([]const u8) = .empty;
     defer packaged_archives.deinit(test_env.ctx.allocator);
     var packaging_errors_encountered = false;
 
@@ -1225,7 +1231,8 @@ test "packageArtifacts emits per-package metadata report callback" {
 
     const staging_dir = try std.fs.path.join(test_env.ctx.allocator, &.{ test_env.path, "staging-pack-report" });
     defer test_env.ctx.allocator.free(staging_dir);
-    try std.fs.cwd().makePath(staging_dir);
+    var staging_dir_handle = try path_mod.makePathAndOpenDir(staging_dir);
+    staging_dir_handle.close(path_mod.currentIo());
 
     const copied_files = try test_env.ctx.allocator.alloc([]const u8, 1);
     copied_files[0] = try test_env.ctx.allocator.dupe(u8, "usr/bin/pack-report");
@@ -1240,7 +1247,7 @@ test "packageArtifacts emits per-package metadata report callback" {
         staged_packages[0].deinit(test_env.ctx.allocator);
     }
 
-    var packaged_archives = std.ArrayList([]const u8){};
+    var packaged_archives: std.ArrayList([]const u8) = .empty;
     defer {
         for (packaged_archives.items) |p| test_env.ctx.allocator.free(p);
         packaged_archives.deinit(test_env.ctx.allocator);
@@ -1250,7 +1257,7 @@ test "packageArtifacts emits per-package metadata report callback" {
     const StubPackager = struct {
         pub fn create(ctx_inner: *mere.Context, cfg: packaging.PackageArtifactConfig) anyerror!packaging.PackageArtifactResult {
             const archive_path = try std.fs.path.join(ctx_inner.allocator, &.{ cfg.staging_dir, "stub.pkg.tar.zst" });
-            try std.fs.cwd().writeFile(.{ .sub_path = archive_path, .data = "archive" });
+            try std.Io.Dir.cwd().writeFile(path_mod.currentIo(), .{ .sub_path = archive_path, .data = "archive" });
             const content_hash = try ctx_inner.allocator.dupe(u8, "hash");
             const archive_hash = try hash.calculateFileHash(ctx_inner.allocator, archive_path);
             const package_name = try ctx_inner.allocator.dupe(u8, cfg.artifact.name);
@@ -1350,10 +1357,11 @@ test "packageArtifacts creates package archives concurrently and preserves outpu
     }
 
     for (&staged_packages) |staged| {
-        try std.fs.cwd().makePath(staged.staging_dir);
+        var staged_dir_handle = try path_mod.makePathAndOpenDir(staged.staging_dir);
+        staged_dir_handle.close(path_mod.currentIo());
     }
 
-    var packaged_archives = std.ArrayList([]const u8){};
+    var packaged_archives: std.ArrayList([]const u8) = .empty;
     defer {
         for (packaged_archives.items) |p| test_env.ctx.allocator.free(p);
         packaged_archives.deinit(test_env.ctx.allocator);
@@ -1361,20 +1369,20 @@ test "packageArtifacts creates package archives concurrently and preserves outpu
     var packaging_errors_encountered = false;
 
     const ParallelTracker = struct {
-        mutex: std.Thread.Mutex = .{},
+        mutex: std.Io.Mutex = .init,
         active: usize = 0,
         max_active: usize = 0,
 
         fn begin(self: *@This()) void {
-            self.mutex.lock();
-            defer self.mutex.unlock();
+            self.mutex.lockUncancelable(path_mod.currentIo());
+            defer self.mutex.unlock(path_mod.currentIo());
             self.active += 1;
             if (self.active > self.max_active) self.max_active = self.active;
         }
 
         fn end(self: *@This()) void {
-            self.mutex.lock();
-            defer self.mutex.unlock();
+            self.mutex.lockUncancelable(path_mod.currentIo());
+            defer self.mutex.unlock(path_mod.currentIo());
             self.active -= 1;
         }
     };
@@ -1386,13 +1394,13 @@ test "packageArtifacts creates package archives concurrently and preserves outpu
             tracker.begin();
             defer tracker.end();
 
-            std.Thread.sleep(50 * std.time.ns_per_ms);
+            try std.Io.sleep(path_mod.currentIo(), .fromMilliseconds(50), .awake);
 
             const archive_name = try std.fmt.allocPrint(ctx.allocator, "{s}.pkg.tar.zst", .{cfg.artifact.name});
             defer ctx.allocator.free(archive_name);
 
             const archive_path = try std.fs.path.join(ctx.allocator, &.{ cfg.output_dir, archive_name });
-            try std.fs.cwd().writeFile(.{ .sub_path = archive_path, .data = "archive" });
+            try std.Io.Dir.cwd().writeFile(path_mod.currentIo(), .{ .sub_path = archive_path, .data = "archive" });
             const archive_hash = try hash.calculateFileHash(ctx.allocator, archive_path);
 
             return packaging.PackageArtifactResult{
@@ -1466,27 +1474,30 @@ test "buildInjectedDependenciesForSplit injects exact split runtime dependency f
     defer test_env.ctx.allocator.free(runtime_lib_dir);
     const dev_lib_dir = try std.fs.path.join(test_env.ctx.allocator, &.{ dev_staging, "usr/lib" });
     defer test_env.ctx.allocator.free(dev_lib_dir);
-    try std.fs.cwd().makePath(runtime_lib_dir);
-    try std.fs.cwd().makePath(dev_lib_dir);
+    var runtime_lib_dir_handle = try path_mod.makePathAndOpenDir(runtime_lib_dir);
+    runtime_lib_dir_handle.close(path_mod.currentIo());
+    var dev_lib_dir_handle = try path_mod.makePathAndOpenDir(dev_lib_dir);
+    dev_lib_dir_handle.close(path_mod.currentIo());
 
     const runtime_lib = try std.fs.path.join(test_env.ctx.allocator, &.{ runtime_staging, "usr/lib/libfoo.so.1.2.3" });
     defer test_env.ctx.allocator.free(runtime_lib);
-    try std.fs.cwd().writeFile(.{ .sub_path = runtime_lib, .data = "x" });
+    try std.Io.Dir.cwd().writeFile(path_mod.currentIo(), .{ .sub_path = runtime_lib, .data = "x" });
 
     const runtime_link = try std.fs.path.join(test_env.ctx.allocator, &.{ runtime_staging, "usr/lib/libfoo.so" });
     defer test_env.ctx.allocator.free(runtime_link);
-    try std.posix.symlinkat("libfoo.so.1.2.3", std.fs.cwd().fd, runtime_link);
+    try std.Io.Dir.cwd().symLink(path_mod.currentIo(), "libfoo.so.1.2.3", runtime_link, .{});
 
     const dev_static = try std.fs.path.join(test_env.ctx.allocator, &.{ dev_staging, "usr/lib/libfoo.a" });
     defer test_env.ctx.allocator.free(dev_static);
-    try std.fs.cwd().writeFile(.{ .sub_path = dev_static, .data = "archive" });
+    try std.Io.Dir.cwd().writeFile(path_mod.currentIo(), .{ .sub_path = dev_static, .data = "archive" });
 
     const dev_pkgconfig_dir = try std.fs.path.join(test_env.ctx.allocator, &.{ dev_staging, "usr/lib/pkgconfig" });
     defer test_env.ctx.allocator.free(dev_pkgconfig_dir);
-    try std.fs.cwd().makePath(dev_pkgconfig_dir);
+    var dev_pkgconfig_dir_handle = try path_mod.makePathAndOpenDir(dev_pkgconfig_dir);
+    dev_pkgconfig_dir_handle.close(path_mod.currentIo());
     const dev_pkgconfig = try std.fs.path.join(test_env.ctx.allocator, &.{ dev_pkgconfig_dir, "libfoo.pc" });
     defer test_env.ctx.allocator.free(dev_pkgconfig);
-    try std.fs.cwd().writeFile(.{ .sub_path = dev_pkgconfig, .data = "Name: libfoo\n" });
+    try std.Io.Dir.cwd().writeFile(path_mod.currentIo(), .{ .sub_path = dev_pkgconfig, .data = "Name: libfoo\n" });
 
     const runtime_files = try test_env.ctx.allocator.alloc([]const u8, 2);
     runtime_files[0] = try test_env.ctx.allocator.dupe(u8, "usr/lib/libfoo.so.1.2.3");
@@ -1570,9 +1581,12 @@ test "buildInjectedDependenciesForSplit rejects ambiguous sibling runtime owners
     const dev_lib_dir = try std.fs.path.join(test_env.ctx.allocator, &.{ dev_staging, "usr/lib" });
     defer test_env.ctx.allocator.free(dev_lib_dir);
 
-    try std.fs.cwd().makePath(runtime_one_lib_dir);
-    try std.fs.cwd().makePath(runtime_two_lib_dir);
-    try std.fs.cwd().makePath(dev_lib_dir);
+    var runtime_one_lib_dir_handle = try path_mod.makePathAndOpenDir(runtime_one_lib_dir);
+    runtime_one_lib_dir_handle.close(path_mod.currentIo());
+    var runtime_two_lib_dir_handle = try path_mod.makePathAndOpenDir(runtime_two_lib_dir);
+    runtime_two_lib_dir_handle.close(path_mod.currentIo());
+    var dev_lib_dir_handle = try path_mod.makePathAndOpenDir(dev_lib_dir);
+    dev_lib_dir_handle.close(path_mod.currentIo());
 
     const runtime_one_lib = try std.fs.path.join(test_env.ctx.allocator, &.{ runtime_one, "usr/lib/libfoo.so.1.2.3" });
     defer test_env.ctx.allocator.free(runtime_one_lib);
@@ -1581,9 +1595,9 @@ test "buildInjectedDependenciesForSplit rejects ambiguous sibling runtime owners
     const dev_static = try std.fs.path.join(test_env.ctx.allocator, &.{ dev_staging, "usr/lib/libfoo.a" });
     defer test_env.ctx.allocator.free(dev_static);
 
-    try std.fs.cwd().writeFile(.{ .sub_path = runtime_one_lib, .data = "x" });
-    try std.fs.cwd().writeFile(.{ .sub_path = runtime_two_lib, .data = "x" });
-    try std.fs.cwd().writeFile(.{ .sub_path = dev_static, .data = "archive" });
+    try std.Io.Dir.cwd().writeFile(path_mod.currentIo(), .{ .sub_path = runtime_one_lib, .data = "x" });
+    try std.Io.Dir.cwd().writeFile(path_mod.currentIo(), .{ .sub_path = runtime_two_lib, .data = "x" });
+    try std.Io.Dir.cwd().writeFile(path_mod.currentIo(), .{ .sub_path = dev_static, .data = "archive" });
 
     const runtime_one_files = try test_env.ctx.allocator.alloc([]const u8, 1);
     runtime_one_files[0] = try test_env.ctx.allocator.dupe(u8, "usr/lib/libfoo.so.1.2.3");

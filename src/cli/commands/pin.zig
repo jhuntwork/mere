@@ -222,7 +222,7 @@ pub fn handleList(ctx: *mere.Context, args: *const types.ParsedArgs) MereError!t
     }
 
     // Build output string
-    var output: std.ArrayList(u8) = .{};
+    var output: std.ArrayList(u8) = .empty;
     defer output.deinit(ctx.allocator);
 
     const writer = output.writer(ctx.allocator);

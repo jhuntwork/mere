@@ -16,32 +16,33 @@ const projection_index = @import("projection_index.zig");
 const Repository = repository.Repository;
 
 fn makeWritable(dir_path: []const u8) void {
-    var dir = std.fs.openDirAbsolute(dir_path, .{ .iterate = true }) catch return;
-    defer dir.close();
+    const io = path.currentIo();
+    var dir = std.Io.Dir.openDirAbsolute(io, dir_path, .{ .iterate = true }) catch return;
+    defer dir.close(io);
 
     var walker = dir.walk(std.heap.page_allocator) catch return;
     defer walker.deinit();
 
-    while (walker.next() catch null) |entry| {
+    while (walker.next(io) catch null) |entry| {
         switch (entry.kind) {
             .directory => {
-                var subdir = dir.openDir(entry.path, .{}) catch continue;
-                defer subdir.close();
-                const stat = subdir.stat() catch continue;
-                subdir.chmod(stat.mode | 0o200) catch {};
+                var subdir = dir.openDir(io, entry.path, .{}) catch continue;
+                defer subdir.close(io);
+                const stat = subdir.stat(io) catch continue;
+                subdir.setPermissions(io, .fromMode(stat.permissions.toMode() | 0o200)) catch {};
             },
             .file => {
-                var file = dir.openFile(entry.path, .{}) catch continue;
-                defer file.close();
-                const stat = file.stat() catch continue;
-                file.chmod(stat.mode | 0o200) catch {};
+                var file = dir.openFile(io, entry.path, .{}) catch continue;
+                defer file.close(io);
+                const stat = file.stat(io) catch continue;
+                file.setPermissions(io, .fromMode(stat.permissions.toMode() | 0o200)) catch {};
             },
             else => {},
         }
     }
 
-    const stat = dir.stat() catch return;
-    dir.chmod(stat.mode | 0o200) catch {};
+    const stat = dir.stat(io) catch return;
+    dir.setPermissions(io, .fromMode(stat.permissions.toMode() | 0o200)) catch {};
 }
 
 /// Simple test env struct that holds a temporary directory and its path
@@ -80,7 +81,8 @@ pub fn createTestEnv() !*TestEnv {
 
     // Get the absolute path of the temporary directory
     var buf: [std.fs.max_path_bytes]u8 = undefined;
-    const temp_dir_path_slice = try test_env.tmp.dir.realpath(".", &buf);
+    const temp_dir_path_len = try test_env.tmp.dir.realPath(path.currentIo(), &buf);
+    const temp_dir_path_slice = buf[0..temp_dir_path_len];
 
     // Allocate memory for the path to ensure it remains valid
     test_env.path = try allocator.dupe(u8, temp_dir_path_slice);
@@ -95,7 +97,7 @@ pub fn createTestEnv() !*TestEnv {
     // explicitly set ctx.signing_key_path.
     const key_dir = try std.fs.path.join(allocator, &.{ test_env.path, ".mere", "keys" });
     defer allocator.free(key_dir);
-    try std.fs.cwd().makePath(key_dir);
+    try std.Io.Dir.cwd().createDirPath(path.currentIo(), key_dir);
 
     const r = try sign.generateAndSaveKeyPair(&test_env.ctx, key_dir);
     test_env.ctx.allocator.free(r.public_key_path);
@@ -112,15 +114,15 @@ pub fn createTestTarFile(ctx: *Context, name: []const u8, output_path: []const u
     // Create a temp staging directory
     const staging_dir = try std.fs.path.join(ctx.allocator, &.{ ctx.home_dir.?, ".test_tar_staging" });
     defer ctx.allocator.free(staging_dir);
-    try std.fs.cwd().makePath(staging_dir);
-    defer std.fs.cwd().deleteTree(staging_dir) catch {};
+    try std.Io.Dir.cwd().createDirPath(path.currentIo(), staging_dir);
+    defer std.Io.Dir.cwd().deleteTree(path.currentIo(), staging_dir) catch {};
 
     // Create the file with content
     const file_path = try std.fs.path.join(ctx.allocator, &.{ staging_dir, name });
     defer ctx.allocator.free(file_path);
     var f = try path.makePathAndOpenFile(file_path);
-    try f.writeAll("test content");
-    f.close();
+    try f.writeStreamingAll(path.currentIo(), "test content");
+    f.close(path.currentIo());
 
     // Create a package archive using libarchive + zstd
     try archive.createPackageArchive(ctx, staging_dir, output_path);
@@ -214,9 +216,14 @@ pub fn dummy_download_file(
         if (mapped.len > 0 or !std.mem.startsWith(u8, clean_url, "file://")) break :blk mapped;
 
         const file_path = clean_url["file://".len..];
-        const file = std.fs.openFileAbsolute(file_path, .{}) catch return error.FileSystem;
-        defer file.close();
-        break :blk try file.readToEndAlloc(client.allocator, 1024 * 1024 * 50);
+        const file = path.openExistingFile(file_path) catch return error.FileSystem;
+        defer file.close(path.currentIo());
+        const stat = file.stat(path.currentIo()) catch return error.FileSystem;
+        const file_len: usize = @intCast(stat.size);
+        const data = try client.allocator.alloc(u8, file_len);
+        errdefer client.allocator.free(data);
+        const bytes_read = file.readPositionalAll(path.currentIo(), data, 0) catch return error.FileSystem;
+        break :blk data[0..bytes_read];
     };
     defer if (std.mem.startsWith(u8, clean_url, "file://") and client.getBody(clean_url).len == 0) client.allocator.free(body);
 
@@ -228,39 +235,33 @@ pub fn dummy_download_file(
     defer ctx.allocator.free(temp_path);
 
     const temp_exists = blk: {
-        std.fs.accessAbsolute(temp_path, .{}) catch break :blk false;
+        std.Io.Dir.accessAbsolute(path.currentIo(), temp_path, .{}) catch break :blk false;
         break :blk true;
     };
 
     var initial_size: u64 = 0;
     var can_resume = false;
     if (options.allow_resume and temp_exists) {
-        const temp_file = std.fs.openFileAbsolute(temp_path, .{ .mode = .read_write }) catch {
+        const temp_file = std.Io.Dir.openFileAbsolute(path.currentIo(), temp_path, .{ .mode = .read_write }) catch {
             return ctx.fail(error.FileSystem, temp_path, "failed to open partial download file");
         };
-        initial_size = temp_file.getEndPos() catch {
-            temp_file.close();
+        initial_size = temp_file.length(path.currentIo()) catch {
+            temp_file.close(path.currentIo());
             return ctx.fail(error.FileSystem, temp_path, "failed to get partial download size");
         };
-        temp_file.close();
+        temp_file.close(path.currentIo());
         can_resume = initial_size > 0;
     }
 
     const file = if (can_resume)
-        std.fs.openFileAbsolute(temp_path, .{ .mode = .read_write }) catch {
+        std.Io.Dir.openFileAbsolute(path.currentIo(), temp_path, .{ .mode = .read_write }) catch {
             return ctx.fail(error.FileSystem, temp_path, "failed to open download file");
         }
     else
-        std.fs.createFileAbsolute(temp_path, .{ .read = true, .truncate = true }) catch {
+        std.Io.Dir.createFileAbsolute(path.currentIo(), temp_path, .{ .read = true, .truncate = true }) catch {
             return ctx.fail(error.FileSystem, temp_path, "failed to create download file");
         };
-    defer file.close();
-
-    if (can_resume) {
-        file.seekTo(initial_size) catch {
-            return ctx.fail(error.FileSystem, temp_path, "failed to seek partial download file");
-        };
-    }
+    defer file.close(path.currentIo());
 
     const body_to_write = blk: {
         if (!can_resume) break :blk body;
@@ -268,7 +269,7 @@ pub fn dummy_download_file(
         break :blk body[@intCast(initial_size)..];
     };
 
-    file.writeAll(body_to_write) catch {
+    file.writePositionalAll(path.currentIo(), body_to_write, initial_size) catch {
         return ctx.fail(error.FileSystem, temp_path, "failed to write downloaded data");
     };
 
@@ -291,18 +292,18 @@ pub fn dummy_download_file(
     }
 
     const dest_exists = blk: {
-        std.fs.accessAbsolute(dest_abs, .{}) catch break :blk false;
+        std.Io.Dir.accessAbsolute(path.currentIo(), dest_abs, .{}) catch break :blk false;
         break :blk true;
     };
     if (!dest_exists) {
-        std.fs.renameAbsolute(temp_path, dest_abs) catch {
+        std.Io.Dir.renameAbsolute(temp_path, dest_abs, path.currentIo()) catch {
             return ctx.fail(error.FileSystem, dest_abs, "failed to move download into destination");
         };
     } else if (options.force) {
-        std.fs.deleteFileAbsolute(dest_abs) catch {
+        std.Io.Dir.deleteFileAbsolute(path.currentIo(), dest_abs) catch {
             return ctx.fail(error.FileSystem, dest_abs, "failed to remove existing destination file");
         };
-        std.fs.renameAbsolute(temp_path, dest_abs) catch {
+        std.Io.Dir.renameAbsolute(temp_path, dest_abs, path.currentIo()) catch {
             return ctx.fail(error.FileSystem, dest_abs, "failed to replace destination file");
         };
     }
@@ -339,7 +340,7 @@ pub fn MockPubWriter(ctx: *Context, _: []const u8, pub_path: []const u8) sign.Si
 pub fn resolveActiveRepoStateDir(allocator: std.mem.Allocator, repo_root: []const u8) ![]const u8 {
     const current_dir = try std.fs.path.join(allocator, &.{ repo_root, "current" });
     errdefer allocator.free(current_dir);
-    std.fs.accessAbsolute(current_dir, .{}) catch return error.FileNotFound;
+    std.Io.Dir.accessAbsolute(path.currentIo(), current_dir, .{}) catch return error.FileNotFound;
     return current_dir;
 }
 
@@ -350,7 +351,7 @@ pub fn resolveActiveRepoDbPath(allocator: std.mem.Allocator, repo_root: []const 
     defer allocator.free(active_state_dir);
 
     const db_path = try std.fs.path.join(allocator, &.{ active_state_dir, "repo.db" });
-    std.fs.accessAbsolute(db_path, .{}) catch return error.FileNotFound;
+    std.Io.Dir.accessAbsolute(path.currentIo(), db_path, .{}) catch return error.FileNotFound;
     return db_path;
 }
 
@@ -371,15 +372,15 @@ pub fn setupTestImport(
     // Create a temp directory with the package contents to compute hash
     const content_dir = try std.fs.path.join(ctx.allocator, &.{ test_env.path, "pkg_content" });
     defer ctx.allocator.free(content_dir);
-    try std.fs.cwd().makePath(content_dir);
+    try path.ensureDirExists(content_dir);
 
     // Create a dummy file in the content directory so we have content to hash
     const dummy_file_path = try std.fs.path.join(ctx.allocator, &.{ content_dir, "dummy.txt" });
     defer ctx.allocator.free(dummy_file_path);
     {
-        const f = try std.fs.createFileAbsolute(dummy_file_path, .{});
-        try f.writeAll("test content");
-        f.close();
+        var f = try path.makePathAndOpenFile(dummy_file_path);
+        try f.writeStreamingAll(path.currentIo(), "test content");
+        f.close(path.currentIo());
     }
 
     // Compute content hash for the package content
@@ -393,7 +394,7 @@ pub fn setupTestImport(
     // Create manifest.v1 binary data
     const pkg_manifest = manifest.PackageManifestV1{
         .schema_version = 1,
-        .created_at = @intCast(@as(u64, @bitCast(std.time.timestamp()))),
+        .created_at = @intCast(std.Io.Clock.real.now(path.currentIo()).toSeconds()),
         .release = pkg.release orelse 1,
         .arch = pkg.arch orelse "x86_64",
         .name = pkg.name orelse "testpkg",
@@ -446,7 +447,7 @@ pub fn createTestManifest(allocator: std.mem.Allocator, name: []const u8, versio
 
     const pkg_manifest = manifest.PackageManifestV1{
         .schema_version = 1,
-        .created_at = @intCast(@as(u64, @bitCast(std.time.timestamp()))),
+        .created_at = @intCast(std.Io.Clock.real.now(path.currentIo()).toSeconds()),
         .release = release,
         .arch = arch,
         .name = name,
@@ -474,7 +475,7 @@ pub fn createTestRepoConfig(
         .name = name_copy,
         .url = url_copy,
         .priority = 100,
-        .trusted_fingerprints = std.ArrayList([]const u8){},
+        .trusted_fingerprints = .empty,
         .ctx = ctx,
     };
 }
@@ -495,16 +496,16 @@ test "createTestEnvironment creates a valid test environment" {
     const test_content = "Hello, world!";
 
     // Create a file directly in the temporary directory
-    const file = try test_env.tmp.dir.createFile(test_file, .{});
-    try file.writeAll(test_content);
-    file.close();
+    const file = try test_env.tmp.dir.createFile(path.currentIo(), test_file, .{});
+    try file.writeStreamingAll(path.currentIo(), test_content);
+    file.close(path.currentIo());
 
     // Verify that the file exists and has the correct content
-    const read_file = try test_env.tmp.dir.openFile(test_file, .{});
-    defer read_file.close();
+    const read_file = try test_env.tmp.dir.openFile(path.currentIo(), test_file, .{});
+    defer read_file.close(path.currentIo());
 
     var buffer: [100]u8 = undefined;
-    const bytes_read = try read_file.readAll(&buffer);
+    const bytes_read = try read_file.readPositionalAll(path.currentIo(), &buffer, 0);
     try std.testing.expectEqualStrings(test_content, buffer[0..bytes_read]);
 
     test_env.ctx.debug("test file created: {s}", .{test_file});
@@ -520,17 +521,17 @@ test "resolveActiveRepoDbPath follows current state layout" {
     const allocator = test_env.ctx.allocator;
     const repo_root = try std.fs.path.join(allocator, &.{ test_env.path, "mere", "dev", "repo", "fixture" });
     defer allocator.free(repo_root);
-    try std.fs.cwd().makePath(repo_root);
+    try path.ensureDirExists(repo_root);
 
     const current_dir = try std.fs.path.join(allocator, &.{ repo_root, "current" });
     defer allocator.free(current_dir);
-    try std.fs.cwd().makePath(current_dir);
+    try path.ensureDirExists(current_dir);
 
     const db_path = try std.fs.path.join(allocator, &.{ current_dir, "repo.db" });
     defer allocator.free(db_path);
     {
-        const f = try std.fs.createFileAbsolute(db_path, .{});
-        f.close();
+        var f = try path.makePathAndOpenFile(db_path);
+        f.close(path.currentIo());
     }
 
     const resolved = try resolveActiveRepoDbPath(allocator, repo_root);
@@ -565,7 +566,7 @@ test "setupTestImport returns active current-state repo.db path" {
     try std.testing.expect(std.mem.endsWith(u8, result.db_path, "/repo.db"));
     try std.testing.expect(std.mem.containsAtLeast(u8, result.db_path, 1, "/current/"));
     try std.testing.expect(!std.mem.containsAtLeast(u8, result.db_path, 1, "import.db"));
-    try std.fs.accessAbsolute(result.db_path, .{});
+    try std.Io.Dir.accessAbsolute(path.currentIo(), result.db_path, .{});
 }
 
 pub fn ensurePackageArchiveCached(
@@ -580,10 +581,10 @@ pub fn ensurePackageArchiveCached(
     // Ensure cache directory exists
     const archive_dir = try cache.archiveCacheDir();
     defer ctx.allocator.free(archive_dir);
-    try std.fs.cwd().makePath(archive_dir);
+    try path.ensureDirExists(archive_dir);
 
     var need_download = false;
-    std.fs.accessAbsolute(cache_path, .{}) catch {
+    std.Io.Dir.accessAbsolute(path.currentIo(), cache_path, .{}) catch {
         need_download = true;
     };
 
@@ -619,7 +620,7 @@ pub fn hostNamespaceRunner(
         host_argv[i] = try rewriteNamespaceWorkPath(allocator, arg, workspace_root);
     }
 
-    var env_map = std.process.EnvMap.init(allocator);
+    var env_map = std.process.Environ.Map.init(allocator);
     defer env_map.deinit();
     if (opts.env) |envp| {
         for (envp) |entry| {
@@ -634,12 +635,12 @@ pub fn hostNamespaceRunner(
     const host_cwd = try rewriteNamespaceWorkPath(allocator, requested_cwd, workspace_root);
     defer allocator.free(host_cwd);
 
-    const result = try std.process.Child.run(.{
-        .allocator = allocator,
+    const result = try std.process.run(allocator, path.currentIo(), .{
         .argv = host_argv,
-        .cwd = host_cwd,
-        .env_map = &env_map,
-        .max_output_bytes = 1024 * 1024,
+        .cwd = .{ .path = host_cwd },
+        .environ_map = &env_map,
+        .stdout_limit = .limited(1024 * 1024),
+        .stderr_limit = .limited(1024 * 1024),
     });
     defer allocator.free(result.stdout);
     defer allocator.free(result.stderr);
@@ -650,7 +651,7 @@ pub fn hostNamespaceRunner(
     }
 
     return switch (result.term) {
-        .Exited => |code| @intCast(code),
+        .exited => |code| @intCast(code),
         else => 1,
     };
 }
@@ -684,7 +685,7 @@ pub fn setupBusyboxRepo(test_env: *TestEnv) !TestRepoSetup {
 
     const repo_dir = try std.fs.path.join(ctx.allocator, &.{ test_env.path, "repo" });
     errdefer ctx.allocator.free(repo_dir);
-    try std.fs.cwd().makePath(repo_dir);
+    try path.ensureDirExists(repo_dir);
 
     const keypair = try sign.generateKeyPair();
     const key_path = try std.fs.path.join(ctx.allocator, &.{ repo_dir, "repo.key" });
@@ -696,7 +697,7 @@ pub fn setupBusyboxRepo(test_env: *TestEnv) !TestRepoSetup {
 
     const packages_dir = try std.fs.path.join(ctx.allocator, &.{ repo_dir, "packages" });
     defer ctx.allocator.free(packages_dir);
-    try std.fs.cwd().makePath(packages_dir);
+    try path.ensureDirExists(packages_dir);
 
     var pkg = package.init(ctx);
     defer pkg.deinit();
@@ -707,24 +708,24 @@ pub fn setupBusyboxRepo(test_env: *TestEnv) !TestRepoSetup {
 
     const pkg_staging = try std.fs.path.join(ctx.allocator, &.{ test_env.path, "busybox_staging" });
     defer ctx.allocator.free(pkg_staging);
-    try std.fs.cwd().makePath(pkg_staging);
+    try path.ensureDirExists(pkg_staging);
 
     const bin_dir = try std.fs.path.join(ctx.allocator, &.{ pkg_staging, "bin" });
     defer ctx.allocator.free(bin_dir);
-    try std.fs.cwd().makePath(bin_dir);
+    try path.ensureDirExists(bin_dir);
 
     const sh_path = try std.fs.path.join(ctx.allocator, &.{ bin_dir, "sh" });
     defer ctx.allocator.free(sh_path);
     var sh_file = try path.makePathAndOpenFile(sh_path);
-    try sh_file.writeAll("#!/bin/sh\nexit 0\n");
-    sh_file.close();
+    try sh_file.writeStreamingAll(path.currentIo(), "#!/bin/sh\nexit 0\n");
+    sh_file.close(path.currentIo());
 
     const content_hash_str = try hash.calculateStoreContentHash(ctx.allocator, pkg_staging, null);
     defer ctx.allocator.free(content_hash_str);
 
     const mere_dir = try std.fs.path.join(ctx.allocator, &.{ pkg_staging, manifest.META_DIR });
     defer ctx.allocator.free(mere_dir);
-    try std.fs.cwd().makePath(mere_dir);
+    try path.ensureDirExists(mere_dir);
 
     var content_hash_bytes: [32]u8 = undefined;
     _ = std.fmt.hexToBytes(&content_hash_bytes, content_hash_str) catch unreachable;
@@ -755,7 +756,7 @@ pub fn setupBusyboxRepo(test_env: *TestEnv) !TestRepoSetup {
     defer ctx.allocator.free(pkg_canon);
     const pkg_file = try std.fs.path.join(ctx.allocator, &.{ packages_dir, pkg_canon });
     defer ctx.allocator.free(pkg_file);
-    try std.fs.renameAbsolute(tmp_pkg_file, pkg_file);
+    try std.Io.Dir.renameAbsolute(tmp_pkg_file, pkg_file, path.currentIo());
 
     ctx.signing_key_path = try ctx.allocator.dupe(u8, key_path);
     const sig_bytes = try sign.signWithResolvedKey(ctx, pkg_file, null, null);
@@ -771,12 +772,12 @@ pub fn setupBusyboxRepo(test_env: *TestEnv) !TestRepoSetup {
 
     const user_keys_dir = try std.fs.path.join(ctx.allocator, &.{ test_env.path, ".mere", "keys" });
     defer ctx.allocator.free(user_keys_dir);
-    try std.fs.cwd().makePath(user_keys_dir);
+    try path.ensureDirExists(user_keys_dir);
     const user_pub = try std.fs.path.join(ctx.allocator, &.{ user_keys_dir, "repo.pub" });
     defer ctx.allocator.free(user_pub);
     try keypair.public_key.saveToFile(user_pub);
 
-    var fps = std.ArrayList([]const u8){};
+    var fps: std.ArrayList([]const u8) = .empty;
     try fps.append(ctx.allocator, try ctx.allocator.dupe(u8, fingerprint));
 
     const repo_url = try std.fmt.allocPrint(ctx.allocator, "file://{s}", .{repo_dir});

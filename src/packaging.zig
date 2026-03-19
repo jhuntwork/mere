@@ -10,6 +10,7 @@ const sign = @import("sign.zig");
 const manifest = @import("manifest.zig");
 const meta = @import("meta.zig");
 const projection_index = @import("projection_index.zig");
+const path_mod = @import("path.zig");
 const path_safety = @import("path_safety.zig");
 const errors = @import("errors.zig");
 
@@ -87,6 +88,7 @@ pub const Packager = struct {
 
     /// Create a complete package artifact with metadata and signing.
     pub fn createPackageArtifact(self: *Self, config: PackageArtifactConfig) !PackageArtifactResult {
+        const io = path_mod.currentIo();
         if (config.staging_dir.len == 0 or config.output_dir.len == 0) {
             return self.fail("package_artifact_config", "staging_dir or output_dir is empty", PackagingError.InvalidInput);
         }
@@ -171,7 +173,7 @@ pub const Packager = struct {
             return self.fail(config.staging_dir, "failed to build .mere directory path", if (err == error.OutOfMemory) PackagingError.OutOfMemory else PackagingError.CreationFailed);
         };
         defer self.ctx.allocator.free(mere_dir);
-        std.fs.cwd().makePath(mere_dir) catch {
+        path_mod.ensureDirExists(mere_dir) catch {
             self.ctx.allocator.free(content_hash);
             return self.fail(mere_dir, "failed to create .mere directory", PackagingError.FileSystem);
         };
@@ -184,7 +186,7 @@ pub const Packager = struct {
 
         const pkg_manifest = manifest.PackageManifestV1{
             .schema_version = manifest.SCHEMA_VERSION,
-            .created_at = @intCast(@as(u64, @bitCast(std.time.timestamp()))),
+            .created_at = @intCast(std.Io.Clock.Timestamp.now(io, .real).raw.toSeconds()),
             .release = pkg.release orelse 1,
             .arch = pkg.arch orelse "any",
             .name = pkg.name orelse pkg_name,
@@ -204,12 +206,12 @@ pub const Packager = struct {
         };
         defer self.ctx.allocator.free(manifest_path);
 
-        var manifest_file = std.fs.createFileAbsolute(manifest_path, .{}) catch {
+        var manifest_file = std.Io.Dir.createFileAbsolute(io, manifest_path, .{}) catch {
             self.ctx.allocator.free(content_hash);
             return self.fail(manifest_path, "failed to create manifest file", PackagingError.FileSystem);
         };
-        defer manifest_file.close();
-        manifest_file.writeAll(manifest_data) catch {
+        defer manifest_file.close(io);
+        manifest_file.writeStreamingAll(io, manifest_data) catch {
             self.ctx.allocator.free(content_hash);
             return self.fail(manifest_path, "failed to write manifest", PackagingError.FileSystem);
         };
@@ -244,12 +246,12 @@ pub const Packager = struct {
         };
         defer self.ctx.allocator.free(manifest_sig_path);
 
-        var sig_file = std.fs.createFileAbsolute(manifest_sig_path, .{}) catch {
+        var sig_file = std.Io.Dir.createFileAbsolute(io, manifest_sig_path, .{}) catch {
             self.ctx.allocator.free(content_hash);
             return self.fail(manifest_sig_path, "failed to create manifest sig file", PackagingError.FileSystem);
         };
-        defer sig_file.close();
-        sig_file.writeAll(&signature) catch {
+        defer sig_file.close(io);
+        sig_file.writeStreamingAll(io, &signature) catch {
             self.ctx.allocator.free(content_hash);
             return self.fail(manifest_sig_path, "failed to write manifest signature", PackagingError.FileSystem);
         };
@@ -356,7 +358,7 @@ pub const Packager = struct {
         };
         errdefer self.ctx.allocator.free(archive_final);
 
-        std.fs.renameAbsolute(archive_temp, archive_final) catch {
+        std.Io.Dir.renameAbsolute(archive_temp, archive_final, io) catch {
             self.ctx.allocator.free(content_hash);
             return self.fail(archive_final, "failed to finalize package archive path", PackagingError.FileSystem);
         };
@@ -400,7 +402,7 @@ test "Packager creates package artifacts with metadata independently" {
     // Generate a test keypair and set the signing key path
     const keys_dir = try std.fs.path.join(test_env.ctx.allocator, &.{ test_env.path, "keys" });
     defer test_env.ctx.allocator.free(keys_dir);
-    try std.fs.cwd().makePath(keys_dir);
+    try path_mod.ensureDirExists(keys_dir);
 
     const key_path = try std.fs.path.join(test_env.ctx.allocator, &.{ keys_dir, "mere.key" });
     defer test_env.ctx.allocator.free(key_path);
@@ -415,13 +417,13 @@ test "Packager creates package artifacts with metadata independently" {
     // Create a staging directory with a test file
     const staging_dir = try std.fs.path.join(test_env.ctx.allocator, &.{ test_env.path, "staging" });
     defer test_env.ctx.allocator.free(staging_dir);
-    try std.fs.makeDirAbsolute(staging_dir);
+    try path_mod.ensureDirExists(staging_dir);
 
     const test_file_path = try std.fs.path.join(test_env.ctx.allocator, &.{ staging_dir, "test_file.txt" });
     defer test_env.ctx.allocator.free(test_file_path);
-    const test_file = try std.fs.createFileAbsolute(test_file_path, .{});
-    defer test_file.close();
-    try test_file.writeAll("test content");
+    const test_file = try std.Io.Dir.createFileAbsolute(path_mod.currentIo(), test_file_path, .{});
+    defer test_file.close(path_mod.currentIo());
+    try test_file.writeStreamingAll(path_mod.currentIo(), "test content");
 
     // Prepare a Recipe and BuildArtifact (createPackage expects pointers)
     var test_recipe = try recipe.Recipe.init(test_env.ctx.allocator, &test_env.ctx);
@@ -448,19 +450,19 @@ test "Packager creates package artifacts with metadata independently" {
     try std.testing.expect(result.content_hash.len > 0);
 
     // Verify archive exists
-    var _f = try std.fs.openFileAbsolute(result.archive_path, .{});
-    defer _f.close();
+    var _f = try std.Io.Dir.openFileAbsolute(path_mod.currentIo(), result.archive_path, .{});
+    defer _f.close(path_mod.currentIo());
 
     // Verify manifest.v1.sig exists in staging (was written before archiving)
     const manifest_sig_path = try std.fs.path.join(test_env.ctx.allocator, &.{ staging_dir, manifest.MANIFEST_SIG_FILENAME });
     defer test_env.ctx.allocator.free(manifest_sig_path);
-    var _sigf = try std.fs.openFileAbsolute(manifest_sig_path, .{});
-    defer _sigf.close();
+    var _sigf = try std.Io.Dir.openFileAbsolute(path_mod.currentIo(), manifest_sig_path, .{});
+    defer _sigf.close(path_mod.currentIo());
 
     const projection_path = try std.fs.path.join(test_env.ctx.allocator, &.{ staging_dir, manifest.PROJECTION_FILENAME });
     defer test_env.ctx.allocator.free(projection_path);
-    var _projf = try std.fs.openFileAbsolute(projection_path, .{});
-    defer _projf.close();
+    var _projf = try std.Io.Dir.openFileAbsolute(path_mod.currentIo(), projection_path, .{});
+    defer _projf.close(path_mod.currentIo());
 }
 
 test "Packager handles signing and metadata generation" {
@@ -473,7 +475,7 @@ test "Packager handles signing and metadata generation" {
     // Generate a test keypair and set the signing key path
     const keys_dir = try std.fs.path.join(test_env.ctx.allocator, &.{ test_env.path, "keys" });
     defer test_env.ctx.allocator.free(keys_dir);
-    try std.fs.cwd().makePath(keys_dir);
+    try path_mod.ensureDirExists(keys_dir);
 
     const key_path = try std.fs.path.join(test_env.ctx.allocator, &.{ keys_dir, "mere.key" });
     defer test_env.ctx.allocator.free(key_path);
@@ -502,13 +504,13 @@ test "Packager handles signing and metadata generation" {
     // Create staging directory with content
     const staging_dir = try std.fs.path.join(test_env.ctx.allocator, &.{ test_env.path, "staging2" });
     defer test_env.ctx.allocator.free(staging_dir);
-    try std.fs.cwd().makePath(staging_dir);
+    try path_mod.ensureDirExists(staging_dir);
 
     const content_file_path = try std.fs.path.join(test_env.ctx.allocator, &.{ staging_dir, "content.dat" });
     defer test_env.ctx.allocator.free(content_file_path);
-    var content_file = try std.fs.createFileAbsolute(content_file_path, .{});
-    defer content_file.close();
-    try content_file.writeAll("package content for signing");
+    var content_file = try std.Io.Dir.createFileAbsolute(path_mod.currentIo(), content_file_path, .{});
+    defer content_file.close(path_mod.currentIo());
+    try content_file.writeStreamingAll(path_mod.currentIo(), "package content for signing");
 
     var result = try packager.createPackageArtifact(.{
         .staging_dir = staging_dir,
@@ -531,8 +533,8 @@ test "Packager handles signing and metadata generation" {
     // Verify manifest.v1.sig exists in staging (was written before archiving)
     const manifest_sig_path = try std.fs.path.join(test_env.ctx.allocator, &.{ staging_dir, manifest.MANIFEST_SIG_FILENAME });
     defer test_env.ctx.allocator.free(manifest_sig_path);
-    var _sigf = try std.fs.openFileAbsolute(manifest_sig_path, .{});
-    defer _sigf.close();
+    var _sigf = try std.Io.Dir.openFileAbsolute(path_mod.currentIo(), manifest_sig_path, .{});
+    defer _sigf.close(path_mod.currentIo());
 }
 
 test "Packager writes manifest.v1 and final archive" {
@@ -545,7 +547,7 @@ test "Packager writes manifest.v1 and final archive" {
     // Generate a test keypair and set the signing key path
     const keys_dir = try std.fs.path.join(test_env.ctx.allocator, &.{ test_env.path, "keys" });
     defer test_env.ctx.allocator.free(keys_dir);
-    try std.fs.cwd().makePath(keys_dir);
+    try path_mod.ensureDirExists(keys_dir);
 
     const key_path = try std.fs.path.join(test_env.ctx.allocator, &.{ keys_dir, "mere.key" });
     defer test_env.ctx.allocator.free(key_path);
@@ -559,13 +561,13 @@ test "Packager writes manifest.v1 and final archive" {
     // Create staging directory with a test file
     const staging_dir = try std.fs.path.join(test_env.ctx.allocator, &.{ test_env.path, "staging_atomic" });
     defer test_env.ctx.allocator.free(staging_dir);
-    try std.fs.cwd().makePath(staging_dir);
+    try path_mod.ensureDirExists(staging_dir);
 
     const test_file_path = try std.fs.path.join(test_env.ctx.allocator, &.{ staging_dir, "file.txt" });
     defer test_env.ctx.allocator.free(test_file_path);
-    const test_file = try std.fs.createFileAbsolute(test_file_path, .{});
-    defer test_file.close();
-    try test_file.writeAll("atomic content");
+    const test_file = try std.Io.Dir.createFileAbsolute(path_mod.currentIo(), test_file_path, .{});
+    defer test_file.close(path_mod.currentIo());
+    try test_file.writeStreamingAll(path_mod.currentIo(), "atomic content");
 
     // Prepare recipe and artifact
     var test_recipe = try recipe.Recipe.init(test_env.ctx.allocator, &test_env.ctx);
@@ -590,18 +592,18 @@ test "Packager writes manifest.v1 and final archive" {
     // Verify .mere/manifest.v1 exists in the staging dir
     const manifest_path = try std.fmt.allocPrint(test_env.ctx.allocator, "{s}/{s}", .{ staging_dir, manifest.MANIFEST_FILENAME });
     defer test_env.ctx.allocator.free(manifest_path);
-    var manifest_file = try std.fs.openFileAbsolute(manifest_path, .{});
-    defer manifest_file.close();
+    var manifest_file = try std.Io.Dir.openFileAbsolute(path_mod.currentIo(), manifest_path, .{});
+    defer manifest_file.close(path_mod.currentIo());
 
     // Verify .mere/manifest.v1.sig exists
     const sig_path = try std.fmt.allocPrint(test_env.ctx.allocator, "{s}/{s}", .{ staging_dir, manifest.MANIFEST_SIG_FILENAME });
     defer test_env.ctx.allocator.free(sig_path);
-    var sig_file = try std.fs.openFileAbsolute(sig_path, .{});
-    defer sig_file.close();
+    var sig_file = try std.Io.Dir.openFileAbsolute(path_mod.currentIo(), sig_path, .{});
+    defer sig_file.close(path_mod.currentIo());
 
     // Verify final archive exists.
-    var archive_file = try std.fs.openFileAbsolute(result.archive_path, .{});
-    archive_file.close();
+    var archive_file = try std.Io.Dir.openFileAbsolute(path_mod.currentIo(), result.archive_path, .{});
+    archive_file.close(path_mod.currentIo());
 }
 
 test "Packager round-trips duplicate payload files as hard links" {
@@ -613,7 +615,7 @@ test "Packager round-trips duplicate payload files as hard links" {
 
     const keys_dir = try std.fs.path.join(test_env.ctx.allocator, &.{ test_env.path, "keys" });
     defer test_env.ctx.allocator.free(keys_dir);
-    try std.fs.cwd().makePath(keys_dir);
+    try path_mod.ensureDirExists(keys_dir);
 
     const key_path = try std.fs.path.join(test_env.ctx.allocator, &.{ keys_dir, "mere.key" });
     defer test_env.ctx.allocator.free(key_path);
@@ -626,11 +628,11 @@ test "Packager round-trips duplicate payload files as hard links" {
 
     const staging_dir = try std.fs.path.join(test_env.ctx.allocator, &.{ test_env.path, "staging_hardlinks" });
     defer test_env.ctx.allocator.free(staging_dir);
-    try std.fs.cwd().makePath(staging_dir);
+    try path_mod.ensureDirExists(staging_dir);
 
     const nested_dir = try std.fs.path.join(test_env.ctx.allocator, &.{ staging_dir, "nested" });
     defer test_env.ctx.allocator.free(nested_dir);
-    try std.fs.cwd().makePath(nested_dir);
+    try path_mod.ensureDirExists(nested_dir);
 
     const duplicate_content = "shared duplicate payload";
     const alpha_path = try std.fs.path.join(test_env.ctx.allocator, &.{ staging_dir, "alpha.txt" });
@@ -641,19 +643,19 @@ test "Packager round-trips duplicate payload files as hard links" {
     defer test_env.ctx.allocator.free(gamma_path);
 
     {
-        const file = try std.fs.createFileAbsolute(alpha_path, .{});
-        defer file.close();
-        try file.writeAll(duplicate_content);
+        const file = try std.Io.Dir.createFileAbsolute(path_mod.currentIo(), alpha_path, .{});
+        defer file.close(path_mod.currentIo());
+        try file.writeStreamingAll(path_mod.currentIo(), duplicate_content);
     }
     {
-        const file = try std.fs.createFileAbsolute(beta_path, .{});
-        defer file.close();
-        try file.writeAll(duplicate_content);
+        const file = try std.Io.Dir.createFileAbsolute(path_mod.currentIo(), beta_path, .{});
+        defer file.close(path_mod.currentIo());
+        try file.writeStreamingAll(path_mod.currentIo(), duplicate_content);
     }
     {
-        const file = try std.fs.createFileAbsolute(gamma_path, .{});
-        defer file.close();
-        try file.writeAll(duplicate_content);
+        const file = try std.Io.Dir.createFileAbsolute(path_mod.currentIo(), gamma_path, .{});
+        defer file.close(path_mod.currentIo());
+        try file.writeStreamingAll(path_mod.currentIo(), duplicate_content);
     }
 
     var test_recipe = try recipe.Recipe.init(test_env.ctx.allocator, &test_env.ctx);
@@ -679,7 +681,7 @@ test "Packager round-trips duplicate payload files as hard links" {
 
     const extract_dir = try std.fs.path.join(test_env.ctx.allocator, &.{ test_env.path, "extracted_hardlinks" });
     defer test_env.ctx.allocator.free(extract_dir);
-    try std.fs.cwd().makePath(extract_dir);
+    try path_mod.ensureDirExists(extract_dir);
 
     try extract.into(&test_env.ctx, result.archive_path, extract_dir);
 
@@ -690,16 +692,16 @@ test "Packager round-trips duplicate payload files as hard links" {
     const extracted_gamma = try std.fs.path.join(test_env.ctx.allocator, &.{ extract_dir, "nested", "gamma.txt" });
     defer test_env.ctx.allocator.free(extracted_gamma);
 
-    const alpha_stat = try std.fs.cwd().statFile(extracted_alpha);
-    const beta_stat = try std.fs.cwd().statFile(extracted_beta);
-    const gamma_stat = try std.fs.cwd().statFile(extracted_gamma);
+    const alpha_stat = try std.Io.Dir.cwd().statFile(path_mod.currentIo(), extracted_alpha, .{});
+    const beta_stat = try std.Io.Dir.cwd().statFile(path_mod.currentIo(), extracted_beta, .{});
+    const gamma_stat = try std.Io.Dir.cwd().statFile(path_mod.currentIo(), extracted_gamma, .{});
 
     try std.testing.expectEqual(alpha_stat.inode, beta_stat.inode);
     try std.testing.expectEqual(alpha_stat.inode, gamma_stat.inode);
 
-    const alpha_file = try std.fs.openFileAbsolute(extracted_alpha, .{});
-    defer alpha_file.close();
+    const alpha_file = try std.Io.Dir.openFileAbsolute(path_mod.currentIo(), extracted_alpha, .{});
+    defer alpha_file.close(path_mod.currentIo());
     var buf: [128]u8 = undefined;
-    const len = try alpha_file.readAll(&buf);
+    const len = try alpha_file.readPositionalAll(path_mod.currentIo(), &buf, 0);
     try std.testing.expectEqualStrings(duplicate_content, buf[0..len]);
 }

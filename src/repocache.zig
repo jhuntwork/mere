@@ -225,7 +225,7 @@ pub const RepoCache = struct {
 
         const allocator = self.ctx.allocator;
         const cache_dir = self.cache_dir;
-        const now: u64 = if (options.now) |forced| forced else @intCast(std.time.timestamp());
+        const now: u64 = if (options.now) |forced| forced else @intCast(std.Io.Clock.real.now(path.currentIo()).toSeconds());
 
         if (!options.force) {
             if (try shouldSkipSync(self, now, options.ttl_seconds)) {
@@ -241,7 +241,7 @@ pub const RepoCache = struct {
                 else => RepoCacheError.FileSystem,
             };
         };
-        cache_dir_handle.close();
+        cache_dir_handle.close(path.currentIo());
 
         // Build remote URLs (null-terminated for curl client).
         // Remote repo URLs are directory roots that contain repo.db, repo.db.sig, and packages/.
@@ -354,7 +354,7 @@ pub const RepoCache = struct {
         defer freeRollbackState(&state, self.ctx.allocator);
 
         // Remove all entries matching this (name, arch) regardless of signer
-        var to_remove = std.ArrayList([]const u8){};
+        var to_remove: std.ArrayList([]const u8) = .empty;
         defer to_remove.deinit(self.ctx.allocator);
 
         var iter = state.iterator();
@@ -425,7 +425,7 @@ pub const RepoCache = struct {
         var state = try loadRollbackState(self, allocator);
         defer freeRollbackState(&state, allocator);
 
-        var to_remove = std.ArrayList([]const u8){};
+        var to_remove: std.ArrayList([]const u8) = .empty;
         defer to_remove.deinit(allocator);
 
         var iter = state.iterator();
@@ -524,11 +524,11 @@ pub const RepoCache = struct {
         const dest_path = try self.archiveCachePath(pkg);
         defer self.ctx.allocator.free(dest_path);
 
-        std.fs.accessAbsolute(dest_path, .{}) catch {
+        std.Io.Dir.accessAbsolute(path.currentIo(), dest_path, .{}) catch {
             const cache_dir = try self.archiveCacheDir();
             defer self.ctx.allocator.free(cache_dir);
 
-            std.fs.cwd().makePath(cache_dir) catch |err| {
+            path.ensureDirExists(cache_dir) catch |err| {
                 return self.ctx.fail(err, cache_dir, "failed to create package cache directory");
             };
 
@@ -611,16 +611,17 @@ fn loadRollbackState(
     const path_buf = try rollbackStatePath(self);
     defer allocator.free(path_buf);
 
-    const file = std.fs.openFileAbsolute(path_buf, .{}) catch |err| {
+    const io = path.currentIo();
+    const file = std.Io.Dir.openFileAbsolute(io, path_buf, .{}) catch |err| {
         return switch (err) {
             error.FileNotFound => state,
             error.AccessDenied => RepoCacheError.PermissionDenied,
             else => RepoCacheError.FileSystem,
         };
     };
-    defer file.close();
+    defer file.close(io);
 
-    const stat = file.stat() catch |err| {
+    const stat = file.stat(io) catch |err| {
         return switch (err) {
             error.AccessDenied => RepoCacheError.PermissionDenied,
             else => RepoCacheError.FileSystem,
@@ -636,7 +637,7 @@ fn loadRollbackState(
     };
     defer allocator.free(buffer);
 
-    const bytes_read = file.readAll(buffer) catch |err| {
+    const bytes_read = file.readPositionalAll(io, buffer, 0) catch |err| {
         return switch (err) {
             error.AccessDenied => RepoCacheError.PermissionDenied,
             else => RepoCacheError.FileSystem,
@@ -697,13 +698,14 @@ fn writeRollbackState(self: *RepoCache, state: *const std.StringHashMap(u64)) Re
     };
     defer self.ctx.allocator.free(tmp_path);
 
-    const file = std.fs.createFileAbsolute(tmp_path, .{}) catch |err| {
+    const io = path.currentIo();
+    const file = std.Io.Dir.createFileAbsolute(io, tmp_path, .{}) catch |err| {
         return switch (err) {
             error.AccessDenied => RepoCacheError.PermissionDenied,
             else => RepoCacheError.FileSystem,
         };
     };
-    defer file.close();
+    defer file.close(io);
 
     var iter = state.iterator();
     while (iter.next()) |entry| {
@@ -721,7 +723,7 @@ fn writeRollbackState(self: *RepoCache, state: *const std.StringHashMap(u64)) Re
             return RepoCacheError.OutOfMemory;
         };
         defer self.ctx.allocator.free(line);
-        file.writeAll(line) catch |err| {
+        file.writeStreamingAll(io, line) catch |err| {
             return switch (err) {
                 error.AccessDenied => RepoCacheError.PermissionDenied,
                 else => RepoCacheError.FileSystem,
@@ -729,7 +731,7 @@ fn writeRollbackState(self: *RepoCache, state: *const std.StringHashMap(u64)) Re
         };
     }
 
-    std.fs.renameAbsolute(tmp_path, path_buf) catch |err| {
+    std.Io.Dir.renameAbsolute(tmp_path, path_buf, io) catch |err| {
         return switch (err) {
             error.FileNotFound => RepoCacheError.FileSystem,
             error.AccessDenied => RepoCacheError.PermissionDenied,
@@ -742,16 +744,17 @@ fn readLastSync(self: *RepoCache, allocator: std.mem.Allocator) RepoCacheError!?
     const path_buf = try lastSyncPath(self);
     defer allocator.free(path_buf);
 
-    const file = std.fs.openFileAbsolute(path_buf, .{}) catch |err| {
+    const io = path.currentIo();
+    const file = std.Io.Dir.openFileAbsolute(io, path_buf, .{}) catch |err| {
         return switch (err) {
             error.FileNotFound => null,
             error.AccessDenied => RepoCacheError.PermissionDenied,
             else => RepoCacheError.FileSystem,
         };
     };
-    defer file.close();
+    defer file.close(io);
 
-    const stat = file.stat() catch |err| {
+    const stat = file.stat(io) catch |err| {
         return switch (err) {
             error.AccessDenied => RepoCacheError.PermissionDenied,
             else => RepoCacheError.FileSystem,
@@ -767,7 +770,7 @@ fn readLastSync(self: *RepoCache, allocator: std.mem.Allocator) RepoCacheError!?
     };
     defer allocator.free(buffer);
 
-    const bytes_read = file.readAll(buffer) catch |err| {
+    const bytes_read = file.readPositionalAll(io, buffer, 0) catch |err| {
         return switch (err) {
             error.AccessDenied => RepoCacheError.PermissionDenied,
             else => RepoCacheError.FileSystem,
@@ -812,16 +815,17 @@ fn writeLastSync(self: *RepoCache, timestamp: u64) RepoCacheError!void {
     };
     defer self.ctx.allocator.free(tmp_path);
 
-    const file = std.fs.createFileAbsolute(tmp_path, .{}) catch |err| return mapFsAccessError(err);
-    defer file.close();
+    const io = path.currentIo();
+    const file = std.Io.Dir.createFileAbsolute(io, tmp_path, .{}) catch |err| return mapFsAccessError(err);
+    defer file.close(io);
 
     const line = std.fmt.allocPrint(self.ctx.allocator, "sync at={d}\n", .{timestamp}) catch {
         return RepoCacheError.OutOfMemory;
     };
     defer self.ctx.allocator.free(line);
-    file.writeAll(line) catch |err| return mapFsAccessError(err);
+    file.writeStreamingAll(io, line) catch |err| return mapFsAccessError(err);
 
-    std.fs.renameAbsolute(tmp_path, path_buf) catch |err| return mapFsAccessError(err);
+    std.Io.Dir.renameAbsolute(tmp_path, path_buf, io) catch |err| return mapFsAccessError(err);
 }
 
 fn buildRepoPaths(self: *RepoCache, allocator: std.mem.Allocator) RepoCacheError!struct {
@@ -884,11 +888,12 @@ fn shouldSkipSync(self: *RepoCache, now: u64, ttl_seconds: u64) RepoCacheError!b
     return false;
 }
 
-fn pathExists(path_buf: []const u8) std.fs.File.OpenError!bool {
-    const file = std.fs.openFileAbsolute(path_buf, .{}) catch |err| {
+fn pathExists(path_buf: []const u8) anyerror!bool {
+    const io = path.currentIo();
+    const file = std.Io.Dir.openFileAbsolute(io, path_buf, .{}) catch |err| {
         return err;
     };
-    file.close();
+    file.close(io);
     return true;
 }
 
@@ -928,8 +933,8 @@ fn syncDownloadAndVerify(
 
     if (self.trusted_fingerprints.len == 0) {
         self.ctx.setDiagnosticContext(self.name, "no trusted fingerprints configured for repository");
-        std.fs.deleteFileAbsolute(db_tmp) catch {};
-        std.fs.deleteFileAbsolute(sig_tmp) catch {};
+        std.Io.Dir.deleteFileAbsolute(path.currentIo(), db_tmp) catch {};
+        std.Io.Dir.deleteFileAbsolute(path.currentIo(), sig_tmp) catch {};
         return RepoCacheError.SignatureInvalid;
     }
 
@@ -941,8 +946,8 @@ fn syncDownloadAndVerify(
             self.ctx.setDiagnosticContext(self.name, "failed to verify repository database signature");
         }
         // Clean up temp files if verification fails
-        std.fs.deleteFileAbsolute(db_tmp) catch {};
-        std.fs.deleteFileAbsolute(sig_tmp) catch {};
+        std.Io.Dir.deleteFileAbsolute(path.currentIo(), db_tmp) catch {};
+        std.Io.Dir.deleteFileAbsolute(path.currentIo(), sig_tmp) catch {};
         return RepoCacheError.SignatureInvalid;
     };
     result.deinit(self.ctx.allocator);
@@ -964,42 +969,42 @@ fn replaceCachedDbAndSigWithRollback(
     const sig_backup = std.fmt.allocPrint(allocator, "{s}.bak", .{live_sig_path}) catch return RepoCacheError.OutOfMemory;
     defer allocator.free(sig_backup);
 
-    std.fs.deleteFileAbsolute(db_backup) catch {};
-    std.fs.deleteFileAbsolute(sig_backup) catch {};
+    std.Io.Dir.deleteFileAbsolute(path.currentIo(), db_backup) catch {};
+    std.Io.Dir.deleteFileAbsolute(path.currentIo(), sig_backup) catch {};
 
     var moved_live_db = false;
     var moved_live_sig = false;
 
-    std.fs.renameAbsolute(live_db_path, db_backup) catch |err| switch (err) {
+    std.Io.Dir.renameAbsolute(live_db_path, db_backup, path.currentIo()) catch |err| switch (err) {
         error.FileNotFound => {},
         else => return mapFsAccessError(err),
     };
     moved_live_db = pathExists(db_backup) catch false;
 
-    std.fs.renameAbsolute(live_sig_path, sig_backup) catch |err| switch (err) {
+    std.Io.Dir.renameAbsolute(live_sig_path, sig_backup, path.currentIo()) catch |err| switch (err) {
         error.FileNotFound => {},
         else => {
-            if (moved_live_db) std.fs.renameAbsolute(db_backup, live_db_path) catch {};
+            if (moved_live_db) std.Io.Dir.renameAbsolute(db_backup, live_db_path, path.currentIo()) catch {};
             return mapFsAccessError(err);
         },
     };
     moved_live_sig = pathExists(sig_backup) catch false;
 
-    std.fs.renameAbsolute(new_db_tmp, live_db_path) catch |err| {
-        if (moved_live_sig) std.fs.renameAbsolute(sig_backup, live_sig_path) catch {};
-        if (moved_live_db) std.fs.renameAbsolute(db_backup, live_db_path) catch {};
+    std.Io.Dir.renameAbsolute(new_db_tmp, live_db_path, path.currentIo()) catch |err| {
+        if (moved_live_sig) std.Io.Dir.renameAbsolute(sig_backup, live_sig_path, path.currentIo()) catch {};
+        if (moved_live_db) std.Io.Dir.renameAbsolute(db_backup, live_db_path, path.currentIo()) catch {};
         return mapFsAccessError(err);
     };
 
-    std.fs.renameAbsolute(new_sig_tmp, live_sig_path) catch |err| {
-        std.fs.deleteFileAbsolute(live_db_path) catch {};
-        if (moved_live_db) std.fs.renameAbsolute(db_backup, live_db_path) catch {};
-        if (moved_live_sig) std.fs.renameAbsolute(sig_backup, live_sig_path) catch {};
+    std.Io.Dir.renameAbsolute(new_sig_tmp, live_sig_path, path.currentIo()) catch |err| {
+        std.Io.Dir.deleteFileAbsolute(path.currentIo(), live_db_path) catch {};
+        if (moved_live_db) std.Io.Dir.renameAbsolute(db_backup, live_db_path, path.currentIo()) catch {};
+        if (moved_live_sig) std.Io.Dir.renameAbsolute(sig_backup, live_sig_path, path.currentIo()) catch {};
         return mapFsAccessError(err);
     };
 
-    std.fs.deleteFileAbsolute(db_backup) catch {};
-    std.fs.deleteFileAbsolute(sig_backup) catch {};
+    std.Io.Dir.deleteFileAbsolute(path.currentIo(), db_backup) catch {};
+    std.Io.Dir.deleteFileAbsolute(path.currentIo(), sig_backup) catch {};
 }
 
 fn isLocalRepo(self: *const RepoCache) bool {
@@ -1047,9 +1052,9 @@ test "RepoCache.sync downloads and verifies DB and signature" {
 
     // Write dummy DB file
     {
-        const f = try std.fs.createFileAbsolute(db_file, .{});
-        try f.writeAll(db_bytes);
-        f.close();
+        const f = try std.Io.Dir.createFileAbsolute(path.currentIo(), db_file, .{});
+        try f.writeStreamingAll(path.currentIo(), db_bytes);
+        f.close(path.currentIo());
     }
 
     // Generate keypair and sign the DB
@@ -1061,7 +1066,7 @@ test "RepoCache.sync downloads and verifies DB and signature" {
     // Store the public key in user keys directory so verifyWithTrustedFingerprints can find it
     const user_keys_dir = try std.fs.path.join(ctx.allocator, &.{ test_env.path, ".mere", "keys" });
     defer ctx.allocator.free(user_keys_dir);
-    try std.fs.cwd().makePath(user_keys_dir);
+    try path.ensureDirExists(user_keys_dir);
 
     const pubkey_path = try std.fs.path.join(ctx.allocator, &.{ user_keys_dir, "testrepo.pub" });
     defer ctx.allocator.free(pubkey_path);
@@ -1109,23 +1114,23 @@ test "RepoCache.sync downloads and verifies DB and signature" {
     const cache_dir = repocache.cacheDir();
 
     var cache_dir_handle = try path.makePathAndOpenDir(cache_dir);
-    defer cache_dir_handle.close();
+    defer cache_dir_handle.close(path.currentIo());
 
     var db_exists = true;
-    cache_dir_handle.access(repo_history.REPO_DB_FILENAME, .{}) catch {
+    cache_dir_handle.access(path.currentIo(), repo_history.REPO_DB_FILENAME, .{}) catch {
         db_exists = false;
     };
     try std.testing.expect(db_exists);
 
     var sig_exists = true;
-    cache_dir_handle.access(repo_history.REPO_SIG_FILENAME, .{}) catch {
+    cache_dir_handle.access(path.currentIo(), repo_history.REPO_SIG_FILENAME, .{}) catch {
         sig_exists = false;
     };
     try std.testing.expect(sig_exists);
 }
 
 test "writeLastSync reports permission denied for read-only cache dir" {
-    if (std.posix.geteuid() == 0) return error.SkipZigTest;
+    if (std.os.linux.geteuid() == 0) return error.SkipZigTest;
 
     const th = @import("test_helpers.zig");
     var test_env = try th.createTestEnv();
@@ -1138,12 +1143,12 @@ test "writeLastSync reports permission denied for read-only cache dir" {
 
     const cache_dir = try std.fs.path.join(allocator, &.{ test_env.path, "readonly-cache" });
     defer allocator.free(cache_dir);
-    try std.fs.cwd().makePath(cache_dir);
+    try path.ensureDirExists(cache_dir);
 
-    var cache_dir_handle = try std.fs.openDirAbsolute(cache_dir, .{});
-    defer cache_dir_handle.close();
-    try cache_dir_handle.chmod(0o555);
-    defer cache_dir_handle.chmod(0o755) catch {};
+    var cache_dir_handle = try path.openExistingDir(cache_dir);
+    defer cache_dir_handle.close(path.currentIo());
+    try cache_dir_handle.setPermissions(path.currentIo(), .fromMode(0o555));
+    defer cache_dir_handle.setPermissions(path.currentIo(), .fromMode(0o755)) catch {};
 
     const repo_url = try std.fmt.allocPrint(allocator, "file://{s}", .{cache_dir});
     defer allocator.free(repo_url);
@@ -1165,7 +1170,7 @@ test "replaceCachedDbAndSigWithRollback restores live pair when sig swap fails" 
 
     const cache_dir = try std.fs.path.join(allocator, &.{ test_env.path, "swap-rollback" });
     defer allocator.free(cache_dir);
-    try std.fs.cwd().makePath(cache_dir);
+    try path.ensureDirExists(cache_dir);
 
     const live_db = try std.fs.path.join(allocator, &.{ cache_dir, repo_history.REPO_DB_FILENAME });
     defer allocator.free(live_db);
@@ -1177,19 +1182,19 @@ test "replaceCachedDbAndSigWithRollback restores live pair when sig swap fails" 
     defer allocator.free(missing_sig_tmp);
 
     {
-        const f = try std.fs.createFileAbsolute(live_db, .{});
-        defer f.close();
-        try f.writeAll("old-db");
+        const f = try std.Io.Dir.createFileAbsolute(path.currentIo(), live_db, .{});
+        defer f.close(path.currentIo());
+        try f.writeStreamingAll(path.currentIo(), "old-db");
     }
     {
-        const f = try std.fs.createFileAbsolute(live_sig, .{});
-        defer f.close();
-        try f.writeAll("old-sig");
+        const f = try std.Io.Dir.createFileAbsolute(path.currentIo(), live_sig, .{});
+        defer f.close(path.currentIo());
+        try f.writeStreamingAll(path.currentIo(), "old-sig");
     }
     {
-        const f = try std.fs.createFileAbsolute(new_db_tmp, .{});
-        defer f.close();
-        try f.writeAll("new-db");
+        const f = try std.Io.Dir.createFileAbsolute(path.currentIo(), new_db_tmp, .{});
+        defer f.close(path.currentIo());
+        try f.writeStreamingAll(path.currentIo(), "new-db");
     }
     // Intentionally do not create missing_sig_tmp so second rename fails.
 
@@ -1199,18 +1204,18 @@ test "replaceCachedDbAndSigWithRollback restores live pair when sig swap fails" 
     );
 
     {
-        const f = try std.fs.openFileAbsolute(live_db, .{});
-        defer f.close();
-        const content = try f.readToEndAlloc(allocator, 64);
-        defer allocator.free(content);
-        try std.testing.expectEqualStrings("old-db", content);
+        const f = try std.Io.Dir.openFileAbsolute(path.currentIo(), live_db, .{});
+        defer f.close(path.currentIo());
+        var buf: [64]u8 = undefined;
+        const n = try f.readPositionalAll(path.currentIo(), &buf, 0);
+        try std.testing.expectEqualStrings("old-db", buf[0..n]);
     }
     {
-        const f = try std.fs.openFileAbsolute(live_sig, .{});
-        defer f.close();
-        const content = try f.readToEndAlloc(allocator, 64);
-        defer allocator.free(content);
-        try std.testing.expectEqualStrings("old-sig", content);
+        const f = try std.Io.Dir.openFileAbsolute(path.currentIo(), live_sig, .{});
+        defer f.close(path.currentIo());
+        var buf: [64]u8 = undefined;
+        const n = try f.readPositionalAll(path.currentIo(), &buf, 0);
+        try std.testing.expectEqualStrings("old-sig", buf[0..n]);
     }
 }
 
@@ -1254,9 +1259,9 @@ test "ensurePackageArchiveCached uses dummy HTTP client" {
     const archive_path = try cache.ensurePackageArchiveCached(&pkg, client);
     defer ctx.allocator.free(archive_path);
 
-    const file = try std.fs.openFileAbsolute(archive_path, .{});
-    defer file.close();
+    const file = try std.Io.Dir.openFileAbsolute(path.currentIo(), archive_path, .{});
+    defer file.close(path.currentIo());
     var buf: [32]u8 = undefined;
-    const n = try file.readAll(&buf);
+    const n = try file.readPositionalAll(path.currentIo(), &buf, 0);
     try std.testing.expectEqualStrings("archive-bytes", buf[0..n]);
 }

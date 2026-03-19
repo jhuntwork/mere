@@ -10,8 +10,8 @@ pub const BuildEnvironmentConfig = struct {
     recipe_env: []const recipe.KV = &.{},
 };
 
-pub fn createHostBuildEnv(ctx: *mere.Context, config: BuildEnvironmentConfig) !std.process.EnvMap {
-    var env = std.process.EnvMap.init(ctx.allocator);
+pub fn createHostBuildEnv(ctx: *mere.Context, config: BuildEnvironmentConfig) !std.process.Environ.Map {
+    var env = std.process.Environ.Map.init(ctx.allocator);
     errdefer env.deinit();
 
     try setVar(ctx, &env, "PATH", "/bin:/usr/bin:/sbin:/usr/sbin");
@@ -31,22 +31,22 @@ pub fn createHostBuildEnv(ctx: *mere.Context, config: BuildEnvironmentConfig) !s
 
 pub fn createPhaseHostEnv(
     ctx: *mere.Context,
-    base_env: *const std.process.EnvMap,
+    base_env: *const std.process.Environ.Map,
     phase_env: []const recipe.KV,
-) !std.process.EnvMap {
+) !std.process.Environ.Map {
     var env = try cloneEnvMap(ctx.allocator, base_env);
     errdefer env.deinit();
     try applyEnvOverrides(ctx, &env, phase_env);
     return env;
 }
 
-fn setVar(ctx: *mere.Context, env: *std.process.EnvMap, key: []const u8, value: []const u8) !void {
+fn setVar(ctx: *mere.Context, env: *std.process.Environ.Map, key: []const u8, value: []const u8) !void {
     env.put(key, value) catch {
         return ctx.fail(error.OutOfMemory, key, "failed to set environment variable");
     };
 }
 
-fn setBuildAppDataDirs(ctx: *mere.Context, env: *std.process.EnvMap, build_dir: []const u8) !void {
+fn setBuildAppDataDirs(ctx: *mere.Context, env: *std.process.Environ.Map, build_dir: []const u8) !void {
     try setVar(ctx, env, "HOME", build_dir);
     try setBuildSubdirVar(ctx, env, build_dir, ".cache", "XDG_CACHE_HOME");
     try setBuildSubdirVar(ctx, env, build_dir, ".config", "XDG_CONFIG_HOME");
@@ -56,7 +56,7 @@ fn setBuildAppDataDirs(ctx: *mere.Context, env: *std.process.EnvMap, build_dir: 
 
 fn setBuildSubdirVar(
     ctx: *mere.Context,
-    env: *std.process.EnvMap,
+    env: *std.process.Environ.Map,
     build_dir: []const u8,
     subdir: []const u8,
     key: []const u8,
@@ -68,14 +68,14 @@ fn setBuildSubdirVar(
     try setVar(ctx, env, key, path);
 }
 
-fn applyEnvOverrides(ctx: *mere.Context, env: *std.process.EnvMap, vars: []const recipe.KV) !void {
+fn applyEnvOverrides(ctx: *mere.Context, env: *std.process.Environ.Map, vars: []const recipe.KV) !void {
     for (vars) |kv| {
         try setVar(ctx, env, kv.key, kv.value);
     }
 }
 
-fn cloneEnvMap(allocator: std.mem.Allocator, src: *const std.process.EnvMap) !std.process.EnvMap {
-    var env = std.process.EnvMap.init(allocator);
+fn cloneEnvMap(allocator: std.mem.Allocator, src: *const std.process.Environ.Map) !std.process.Environ.Map {
+    var env = std.process.Environ.Map.init(allocator);
     errdefer env.deinit();
 
     var it = src.iterator();

@@ -55,23 +55,24 @@ pub const RequestedPackage = struct {
 /// Load requested packages from a requested.kdl file.
 /// Returns an ArrayList of RequestedPackage entries. Caller owns the memory.
 pub fn loadRequested(allocator: std.mem.Allocator, file_path: []const u8) RequestedError!std.ArrayList(RequestedPackage) {
-    var packages = std.ArrayList(RequestedPackage){};
+    var packages: std.ArrayList(RequestedPackage) = .empty;
     errdefer {
         for (packages.items) |*pkg| pkg.deinit(allocator);
         packages.deinit(allocator);
     }
 
     // Try to open the file
-    const file = std.fs.openFileAbsolute(file_path, .{}) catch |err| {
+    const io = path.currentIo();
+    const file = std.Io.Dir.openFileAbsolute(io, file_path, .{}) catch |err| {
         if (err == error.FileNotFound) {
             return packages; // Return empty list if file doesn't exist
         }
         return RequestedError.FileSystem;
     };
-    defer file.close();
+    defer file.close(io);
 
     // Read file content
-    const content = file.readToEndAlloc(allocator, 1024 * 1024) catch {
+    const content = std.Io.Dir.cwd().readFileAlloc(io, file_path, allocator, .limited(1024 * 1024)) catch {
         return RequestedError.OutOfMemory;
     };
     defer allocator.free(content);
@@ -122,24 +123,25 @@ pub fn loadRequested(allocator: std.mem.Allocator, file_path: []const u8) Reques
 /// Creates parent directories if they don't exist.
 pub fn saveRequested(allocator: std.mem.Allocator, file_path: []const u8, packages: []const RequestedPackage) RequestedError!void {
     // Build KDL content
-    var content = std.ArrayList(u8){};
+    var content: std.ArrayList(u8) = .empty;
     defer content.deinit(allocator);
-    var writer = content.writer(allocator);
+    var out_buf: std.Io.Writer.Allocating = .fromArrayList(allocator, &content);
+    const out = &out_buf.writer;
 
     // Write header comment
-    writer.writeAll("// Requested packages for this profile\n") catch return RequestedError.OutOfMemory;
-    writer.writeAll("// Edit this file to add or remove packages\n\n") catch return RequestedError.OutOfMemory;
+    out.writeAll("// Requested packages for this profile\n") catch return RequestedError.OutOfMemory;
+    out.writeAll("// Edit this file to add or remove packages\n\n") catch return RequestedError.OutOfMemory;
 
     // Write each package
     for (packages) |pkg| {
-        try writer.writeAll("package ");
-        try writeKdlQuotedString(&writer, pkg.name);
+        out.writeAll("package ") catch return RequestedError.OutOfMemory;
+        try writeKdlQuotedString(out, pkg.name);
         if (pkg.version) |version| {
-            try writer.writeAll(" version=");
-            try writeKdlQuotedString(&writer, version);
-            try writer.writeByte('\n');
+            out.writeAll(" version=") catch return RequestedError.OutOfMemory;
+            try writeKdlQuotedString(out, version);
+            out.writeByte('\n') catch return RequestedError.OutOfMemory;
         } else {
-            try writer.writeByte('\n');
+            out.writeByte('\n') catch return RequestedError.OutOfMemory;
         }
     }
 
@@ -147,12 +149,14 @@ pub fn saveRequested(allocator: std.mem.Allocator, file_path: []const u8, packag
     path.ensureParent(file_path) catch return RequestedError.FileSystem;
 
     // Write file
-    const file = std.fs.createFileAbsolute(file_path, .{ .truncate = true }) catch {
+    const io = path.currentIo();
+    const file = std.Io.Dir.createFileAbsolute(io, file_path, .{ .truncate = true }) catch {
         return RequestedError.FileSystem;
     };
-    defer file.close();
+    defer file.close(io);
 
-    file.writeAll(content.items) catch return RequestedError.FileSystem;
+    content = out_buf.toArrayList();
+    file.writeStreamingAll(io, content.items) catch return RequestedError.FileSystem;
 }
 
 fn writeKdlQuotedString(writer: anytype, raw: []const u8) RequestedError!void {
@@ -294,7 +298,8 @@ test "saveRequested and loadRequested roundtrip" {
     defer tmp.cleanup();
 
     var buf: [std.fs.max_path_bytes]u8 = undefined;
-    const tmp_path = try tmp.dir.realpath(".", &buf);
+    const tmp_path_len = try tmp.dir.realPath(path.currentIo(), &buf);
+    const tmp_path = buf[0..tmp_path_len];
     const file_path = try std.fs.path.join(allocator, &.{ tmp_path, "requested.kdl" });
     defer allocator.free(file_path);
 
@@ -327,7 +332,8 @@ test "addPackage adds new package" {
     defer tmp.cleanup();
 
     var buf: [std.fs.max_path_bytes]u8 = undefined;
-    const tmp_path = try tmp.dir.realpath(".", &buf);
+    const tmp_path_len = try tmp.dir.realPath(path.currentIo(), &buf);
+    const tmp_path = buf[0..tmp_path_len];
     const file_path = try std.fs.path.join(allocator, &.{ tmp_path, "requested.kdl" });
     defer allocator.free(file_path);
 
@@ -352,7 +358,8 @@ test "addPackage updates existing package version" {
     defer tmp.cleanup();
 
     var buf: [std.fs.max_path_bytes]u8 = undefined;
-    const tmp_path = try tmp.dir.realpath(".", &buf);
+    const tmp_path_len = try tmp.dir.realPath(path.currentIo(), &buf);
+    const tmp_path = buf[0..tmp_path_len];
     const file_path = try std.fs.path.join(allocator, &.{ tmp_path, "requested.kdl" });
     defer allocator.free(file_path);
 
@@ -379,7 +386,8 @@ test "removePackage removes existing package" {
     defer tmp.cleanup();
 
     var buf: [std.fs.max_path_bytes]u8 = undefined;
-    const tmp_path = try tmp.dir.realpath(".", &buf);
+    const tmp_path_len = try tmp.dir.realPath(path.currentIo(), &buf);
+    const tmp_path = buf[0..tmp_path_len];
     const file_path = try std.fs.path.join(allocator, &.{ tmp_path, "requested.kdl" });
     defer allocator.free(file_path);
 
@@ -409,7 +417,8 @@ test "removePackage returns false for missing package" {
     defer tmp.cleanup();
 
     var buf: [std.fs.max_path_bytes]u8 = undefined;
-    const tmp_path = try tmp.dir.realpath(".", &buf);
+    const tmp_path_len = try tmp.dir.realPath(path.currentIo(), &buf);
+    const tmp_path = buf[0..tmp_path_len];
     const file_path = try std.fs.path.join(allocator, &.{ tmp_path, "requested.kdl" });
     defer allocator.free(file_path);
 
@@ -428,7 +437,8 @@ test "saveRequested escapes KDL strings and loadRequested roundtrips escaped val
     defer tmp.cleanup();
 
     var buf: [std.fs.max_path_bytes]u8 = undefined;
-    const tmp_path = try tmp.dir.realpath(".", &buf);
+    const tmp_path_len = try tmp.dir.realPath(path.currentIo(), &buf);
+    const tmp_path = buf[0..tmp_path_len];
     const file_path = try std.fs.path.join(allocator, &.{ tmp_path, "requested.kdl" });
     defer allocator.free(file_path);
 
@@ -456,13 +466,14 @@ test "loadRequested rejects package node missing required name argument" {
     defer tmp.cleanup();
 
     var buf: [std.fs.max_path_bytes]u8 = undefined;
-    const tmp_path = try tmp.dir.realpath(".", &buf);
+    const tmp_path_len = try tmp.dir.realPath(path.currentIo(), &buf);
+    const tmp_path = buf[0..tmp_path_len];
     const file_path = try std.fs.path.join(allocator, &.{ tmp_path, "requested.kdl" });
     defer allocator.free(file_path);
 
-    const file = try std.fs.createFileAbsolute(file_path, .{ .truncate = true });
-    defer file.close();
-    try file.writeAll("package version=\"1.2\"\n");
+    const file = try std.Io.Dir.createFileAbsolute(path.currentIo(), file_path, .{ .truncate = true });
+    defer file.close(path.currentIo());
+    try file.writeStreamingAll(path.currentIo(), "package version=\"1.2\"\n");
 
     try std.testing.expectError(RequestedError.ParseError, loadRequested(allocator, file_path));
 }
@@ -474,13 +485,14 @@ test "loadRequested rejects non-string package version property" {
     defer tmp.cleanup();
 
     var buf: [std.fs.max_path_bytes]u8 = undefined;
-    const tmp_path = try tmp.dir.realpath(".", &buf);
+    const tmp_path_len = try tmp.dir.realPath(path.currentIo(), &buf);
+    const tmp_path = buf[0..tmp_path_len];
     const file_path = try std.fs.path.join(allocator, &.{ tmp_path, "requested.kdl" });
     defer allocator.free(file_path);
 
-    const file = try std.fs.createFileAbsolute(file_path, .{ .truncate = true });
-    defer file.close();
-    try file.writeAll("package \"foo\" version=123\n");
+    const file = try std.Io.Dir.createFileAbsolute(path.currentIo(), file_path, .{ .truncate = true });
+    defer file.close(path.currentIo());
+    try file.writeStreamingAll(path.currentIo(), "package \"foo\" version=123\n");
 
     try std.testing.expectError(RequestedError.ParseError, loadRequested(allocator, file_path));
 }

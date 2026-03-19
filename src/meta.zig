@@ -2,6 +2,7 @@ const std = @import("std");
 const kdl = @import("kdl.zig");
 const manifest = @import("manifest.zig");
 const errors = @import("errors.zig");
+const path = @import("path.zig");
 
 const Std = errors.StandardErrors;
 pub const MetaError = Std.OutOfMemory || Std.FileSystem || Std.PermissionDenied || Std.InvalidInput || error{ParseError};
@@ -75,8 +76,8 @@ pub const Data = struct {
 
     pub fn init(allocator: std.mem.Allocator) Data {
         return Data{
-            .dependencies = std.ArrayList(Dependency){},
-            .provisions = std.ArrayList(Provision){},
+            .dependencies = .empty,
+            .provisions = .empty,
             .allocator = allocator,
         };
     }
@@ -149,7 +150,7 @@ pub const Data = struct {
     }
 
     pub fn encode(self: *const Data, allocator: std.mem.Allocator) MetaError![]u8 {
-        var buffer = std.ArrayList(u8){};
+        var buffer: std.ArrayList(u8) = .empty;
         errdefer buffer.deinit(allocator);
 
         if (self.dependencies.items.len > 0) {
@@ -268,7 +269,8 @@ pub fn readFile(allocator: std.mem.Allocator, dir_path: []const u8) MetaError!Da
     };
     defer allocator.free(meta_path);
 
-    const file = std.fs.openFileAbsolute(meta_path, .{}) catch |err| {
+    const io = path.currentIo();
+    const file = path.openExistingFile(meta_path) catch |err| {
         return switch (err) {
             error.FileNotFound => {
                 return Data.init(allocator);
@@ -277,9 +279,9 @@ pub fn readFile(allocator: std.mem.Allocator, dir_path: []const u8) MetaError!Da
             else => MetaError.FileSystem,
         };
     };
-    defer file.close();
+    defer file.close(io);
 
-    const stat = file.stat() catch |err| {
+    const stat = file.stat(io) catch |err| {
         return switch (err) {
             error.AccessDenied => MetaError.PermissionDenied,
             else => MetaError.FileSystem,
@@ -295,7 +297,7 @@ pub fn readFile(allocator: std.mem.Allocator, dir_path: []const u8) MetaError!Da
     };
     defer allocator.free(buffer);
 
-    const bytes_read = file.readAll(buffer) catch |err| {
+    const bytes_read = file.readPositionalAll(io, buffer, 0) catch |err| {
         return switch (err) {
             error.AccessDenied => MetaError.PermissionDenied,
             else => MetaError.FileSystem,
@@ -310,6 +312,7 @@ pub fn readFile(allocator: std.mem.Allocator, dir_path: []const u8) MetaError!Da
 }
 
 pub fn writeFile(allocator: std.mem.Allocator, dir_path: []const u8, pkg_meta: *const Data) MetaError!void {
+    const io = path.currentIo();
     const content = try pkg_meta.encode(allocator);
     defer allocator.free(content);
 
@@ -321,7 +324,7 @@ pub fn writeFile(allocator: std.mem.Allocator, dir_path: []const u8, pkg_meta: *
         return MetaError.OutOfMemory;
     };
     defer allocator.free(meta_dir_path);
-    std.fs.cwd().makePath(meta_dir_path) catch |err| {
+    path.ensureDirExists(meta_dir_path) catch |err| {
         return switch (err) {
             error.AccessDenied => MetaError.PermissionDenied,
             else => MetaError.FileSystem,
@@ -333,15 +336,15 @@ pub fn writeFile(allocator: std.mem.Allocator, dir_path: []const u8, pkg_meta: *
     };
     defer allocator.free(meta_path);
 
-    const file = std.fs.createFileAbsolute(meta_path, .{}) catch |err| {
+    const file = std.Io.Dir.createFileAbsolute(io, meta_path, .{}) catch |err| {
         return switch (err) {
             error.AccessDenied => MetaError.PermissionDenied,
             else => MetaError.FileSystem,
         };
     };
-    defer file.close();
+    defer file.close(io);
 
-    file.writeAll(content) catch |err| {
+    file.writeStreamingAll(io, content) catch |err| {
         return switch (err) {
             error.AccessDenied => MetaError.PermissionDenied,
             else => MetaError.FileSystem,

@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const mere = @import("mere.zig");
 const errors = @import("errors.zig");
 
@@ -9,14 +10,15 @@ pub const PathError = Std.OutOfMemory || Std.FileSystem || Std.PermissionDenied 
 };
 
 pub const TempDir = struct {
-    dir: std.fs.Dir,
-    parent_dir: std.fs.Dir,
+    dir: std.Io.Dir,
+    parent_dir: std.Io.Dir,
     sub_path: []const u8,
 
     pub fn cleanup(self: *TempDir) void {
-        self.dir.close();
-        self.parent_dir.deleteTree(self.sub_path) catch {};
-        self.parent_dir.close();
+        const io = currentIo();
+        self.dir.close(io);
+        self.parent_dir.deleteTree(io, self.sub_path) catch {};
+        self.parent_dir.close(io);
         std.heap.page_allocator.free(self.sub_path);
         self.* = undefined;
     }
@@ -25,11 +27,16 @@ pub const TempDir = struct {
     const encoded_size = random_bytes_count * 2;
 };
 
+pub fn currentIo() std.Io {
+    return if (builtin.is_test) std.testing.io else std.Options.debug_io;
+}
+
 pub fn createTempDir(
     prefix: []const u8,
 ) !TempDir {
+    const io = currentIo();
     var random_bytes: [TempDir.random_bytes_count]u8 = undefined;
-    std.crypto.random.bytes(&random_bytes);
+    io.random(&random_bytes);
 
     var encoded_buf: [TempDir.encoded_size]u8 = undefined;
     _ = std.fmt.bufPrint(&encoded_buf, "{s}", .{std.fmt.bytesToHex(random_bytes, .lower)}) catch unreachable;
@@ -38,13 +45,15 @@ pub fn createTempDir(
     var dir_name_buf: [TempDir.encoded_size + 32]u8 = undefined;
     const dir_name = try std.fmt.bufPrint(&dir_name_buf, "{s}_{s}", .{ prefix, encoded });
 
-    var parent_dir = try std.fs.openDirAbsolute("/tmp", .{});
-    errdefer parent_dir.close();
+    var parent_dir = try std.Io.Dir.openDirAbsolute(io, "/tmp", .{});
+    errdefer parent_dir.close(io);
 
-    var dir = try parent_dir.makeOpenPath(dir_name, .{ .iterate = true });
+    var dir = try parent_dir.createDirPathOpen(io, dir_name, .{
+        .open_options = .{ .iterate = true },
+    });
     errdefer {
-        parent_dir.deleteTree(dir_name) catch {};
-        dir.close();
+        parent_dir.deleteTree(io, dir_name) catch {};
+        dir.close(io);
     }
 
     const sub_path_copy = try std.heap.page_allocator.dupe(u8, dir_name);
@@ -58,74 +67,92 @@ pub fn createTempDir(
 
 pub fn makePathAndOpenDir(
     target_path: []const u8,
-) !std.fs.Dir {
+) !std.Io.Dir {
+    const io = currentIo();
     if (std.fs.path.isAbsolute(target_path)) {
-        var root_dir = try std.fs.openDirAbsolute("/", .{});
-        defer root_dir.close();
-        return root_dir.makeOpenPath(target_path, .{
-            .iterate = true,
+        var root_dir = try std.Io.Dir.openDirAbsolute(io, "/", .{});
+        defer root_dir.close(io);
+        return root_dir.createDirPathOpen(io, target_path, .{
+            .open_options = .{
+                .iterate = true,
+            },
         });
     }
 
-    return std.fs.cwd().makeOpenPath(target_path, .{
-        .iterate = true,
+    return std.Io.Dir.cwd().createDirPathOpen(io, target_path, .{
+        .open_options = .{
+            .iterate = true,
+        },
     });
 }
 
-pub fn openExistingDir(target_path: []const u8) !std.fs.Dir {
+pub fn ensureDirExists(target_path: []const u8) !void {
+    var dir = try makePathAndOpenDir(target_path);
+    dir.close(currentIo());
+}
+
+pub fn openExistingDir(target_path: []const u8) !std.Io.Dir {
+    const io = currentIo();
     if (std.fs.path.isAbsolute(target_path)) {
-        return std.fs.openDirAbsolute(target_path, .{ .iterate = true });
+        return std.Io.Dir.openDirAbsolute(io, target_path, .{ .iterate = true });
     }
-    return std.fs.cwd().openDir(target_path, .{ .iterate = true });
+    return std.Io.Dir.cwd().openDir(io, target_path, .{ .iterate = true });
 }
 
 pub fn makePathAndOpenFile(
     file_path: []const u8,
-) !std.fs.File {
+) !std.Io.File {
+    const io = currentIo();
     const dirname = std.fs.path.dirname(file_path) orelse ".";
     var dir = try makePathAndOpenDir(dirname);
-    defer dir.close();
+    defer dir.close(io);
     const basename = std.fs.path.basename(file_path);
-    return dir.createFile(basename, .{});
+    return dir.createFile(io, basename, .{});
 }
 
 pub fn ensureParent(file_path: []const u8) !void {
+    const io = currentIo();
     const dirname = std.fs.path.dirname(file_path) orelse ".";
     var dir = try makePathAndOpenDir(dirname);
-    defer dir.close();
+    defer dir.close(io);
     return;
 }
 
 pub fn fileExists(path: []const u8) bool {
+    const io = currentIo();
     if (std.fs.path.isAbsolute(path)) {
-        const f = std.fs.openFileAbsolute(path, .{}) catch return false;
-        f.close();
+        const f = std.Io.Dir.openFileAbsolute(io, path, .{}) catch return false;
+        f.close(io);
         return true;
     } else {
-        const f = std.fs.cwd().openFile(path, .{}) catch return false;
-        f.close();
+        const f = std.Io.Dir.cwd().openFile(io, path, .{}) catch return false;
+        f.close(io);
         return true;
     }
 }
-pub fn openExistingFile(file_path: []const u8) !std.fs.File {
+pub fn openExistingFile(file_path: []const u8) !std.Io.File {
+    const io = currentIo();
     if (std.fs.path.isAbsolute(file_path)) {
-        return std.fs.openFileAbsolute(file_path, .{});
+        return std.Io.Dir.openFileAbsolute(io, file_path, .{});
     } else {
-        return std.fs.cwd().openFile(file_path, .{});
+        return std.Io.Dir.cwd().openFile(io, file_path, .{});
     }
 }
 
 pub fn copyFile(src_path: []const u8, dst_path: []const u8) !void {
-    const src = try std.fs.openFileAbsolute(src_path, .{});
-    defer src.close();
-    const dst = try makePathAndOpenFile(dst_path);
-    defer dst.close();
-    var buf: [4096]u8 = undefined;
-    while (true) {
-        const n = try src.read(&buf);
-        if (n == 0) break;
-        try dst.writeAll(buf[0..n]);
-    }
+    try std.Io.Dir.copyFileAbsolute(src_path, dst_path, currentIo(), .{
+        .make_path = true,
+        .replace = true,
+    });
+}
+
+pub fn deleteTreeAbsolute(target_path: []const u8) !void {
+    const io = currentIo();
+    const parent = std.fs.path.dirname(target_path) orelse "/";
+    const basename = std.fs.path.basename(target_path);
+    var parent_dir = try openExistingDir(parent);
+    defer parent_dir.close(io);
+    try parent_dir.deleteTree(io, basename);
 }
 
 pub fn isValidInputPath(destpath: []const u8) bool {
@@ -164,9 +191,8 @@ fn getHomeDirectory(ctx: *const mere.Context) ![]const u8 {
     if (ctx.home_dir) |hd| {
         return try ctx.allocator.dupe(u8, hd);
     }
-    return std.process.getEnvVarOwned(ctx.allocator, "HOME") catch {
-        return PathError.HomeNotFound;
-    };
+    const home_z = std.c.getenv("HOME") orelse return PathError.HomeNotFound;
+    return try ctx.allocator.dupe(u8, std.mem.span(home_z));
 }
 
 pub fn getDefaultMereConfigDirectory(ctx: *const mere.Context) ![]const u8 {
@@ -194,7 +220,8 @@ pub fn resolveToAbsolutePath(path: []const u8, buffer: *[std.fs.max_path_bytes]u
         return path;
     } else {
         var cwd_buf: [std.fs.max_path_bytes]u8 = undefined;
-        const cwd = try std.fs.cwd().realpath(".", &cwd_buf);
+        const cwd_len = try std.process.currentPath(currentIo(), &cwd_buf);
+        const cwd = cwd_buf[0..cwd_len];
 
         const parts = &[_][]const u8{ cwd, path };
         const resolved = try std.fs.path.resolvePosix(std.heap.page_allocator, parts);
@@ -232,9 +259,9 @@ test "ensureResolvedPathWithin accepts descendant path" {
     const testing = std.testing;
     const alloc = testing.allocator;
 
-    const base = try std.fs.path.resolve(alloc, &[_][]const u8{ "/tmp/mere-base" });
+    const base = try std.fs.path.resolve(alloc, &[_][]const u8{"/tmp/mere-base"});
     defer alloc.free(base);
-    const combined = try std.fs.path.resolve(alloc, &[_][]const u8{ "/tmp/mere-base/subdir/file.txt" });
+    const combined = try std.fs.path.resolve(alloc, &[_][]const u8{"/tmp/mere-base/subdir/file.txt"});
     defer alloc.free(combined);
 
     try ensureResolvedPathWithin(alloc, base, combined);
@@ -244,9 +271,9 @@ test "ensureResolvedPathWithin rejects sibling-prefix escape" {
     const testing = std.testing;
     const alloc = testing.allocator;
 
-    const base = try std.fs.path.resolve(alloc, &[_][]const u8{ "/tmp/mere-base" });
+    const base = try std.fs.path.resolve(alloc, &[_][]const u8{"/tmp/mere-base"});
     defer alloc.free(base);
-    const combined = try std.fs.path.resolve(alloc, &[_][]const u8{ "/tmp/mere-base-evil/file.txt" });
+    const combined = try std.fs.path.resolve(alloc, &[_][]const u8{"/tmp/mere-base-evil/file.txt"});
     defer alloc.free(combined);
 
     try testing.expectError(error.InvalidArgument, ensureResolvedPathWithin(alloc, base, combined));
@@ -279,10 +306,11 @@ test "Make an absolute path with leading dirs" {
 
     // Create the target dir using a full path
     var dir = try makePathAndOpenDir(abs_target);
-    defer dir.close();
+    defer dir.close(currentIo());
 
     // Compare the created dir realpath matches the expected target
-    const actual_path = try dir.realpath(".", &buf);
+    const actual_path_len = try dir.realPath(currentIo(), &buf);
+    const actual_path = buf[0..actual_path_len];
     try testing.expectEqualStrings(abs_target, actual_path);
 }
 
@@ -297,15 +325,17 @@ test "Make a relative path with leading dirs" {
     }
 
     var buf: [std.fs.max_path_bytes]u8 = undefined;
+    var original_cwd_buf: [std.fs.max_path_bytes]u8 = undefined;
 
     // Save current working directory before switching
-    const original_cwd = try std.fs.cwd().realpath(".", &buf);
-    defer std.posix.chdir(original_cwd) catch |err| {
+    const original_cwd_len = try std.process.currentPath(currentIo(), &original_cwd_buf);
+    const original_cwd = original_cwd_buf[0..original_cwd_len];
+    defer std.Io.Threaded.chdir(original_cwd) catch |err| {
         test_env.ctx.debug("Failed to restore cwd: {}\n", .{err});
     };
 
     // Change directories to the test environment path
-    try std.posix.chdir(test_env.path);
+    try std.Io.Threaded.chdir(test_env.path);
 
     // Set up some vars for testing
     const rel_path = "some/relative/path";
@@ -315,10 +345,11 @@ test "Make a relative path with leading dirs" {
 
     // Create the target dir using a relative path
     var dir = try makePathAndOpenDir(rel_path);
-    defer dir.close();
+    defer dir.close(currentIo());
 
     // Compare the created dir realpath matches the expected target
-    const actual_path = try dir.realpath(".", &buf);
+    const actual_path_len = try dir.realPath(currentIo(), &buf);
+    const actual_path = buf[0..actual_path_len];
     try testing.expectEqualStrings(abs_target, actual_path);
 }
 
@@ -338,16 +369,16 @@ test "copyFile copies contents and creates parent dirs" {
 
     {
         var f = try makePathAndOpenFile(src_path);
-        defer f.close();
-        try f.writeAll("copy test");
+        defer f.close(currentIo());
+        try f.writeStreamingAll(currentIo(), "copy test");
     }
 
     try copyFile(src_path, dst_path);
 
-    var f = try std.fs.openFileAbsolute(dst_path, .{});
-    defer f.close();
+    var f = try std.Io.Dir.openFileAbsolute(currentIo(), dst_path, .{});
+    defer f.close(currentIo());
     var buf: [16]u8 = undefined;
-    const n = try f.read(&buf);
+    const n = try f.readPositionalAll(currentIo(), &buf, 0);
     try std.testing.expectEqualStrings("copy test", buf[0..n]);
 }
 
@@ -407,16 +438,16 @@ test "makePathAndOpenFile creates file for absolute path" {
 
     // Attempt to create the file using the helper which should create parent dirs
     var f = try makePathAndOpenFile(abs_file);
-    defer f.close();
-    try f.writeAll("regtest");
+    defer f.close(currentIo());
+    try f.writeStreamingAll(currentIo(), "regtest");
 
     // Verify the file exists and contains the expected content
-    const st = try std.fs.cwd().statFile(abs_file);
+    const st = try std.Io.Dir.cwd().statFile(currentIo(), abs_file, .{});
     try std.testing.expect(st.size == 7);
 
-    var r = try std.fs.openFileAbsolute(abs_file, .{});
-    defer r.close();
+    var r = try std.Io.Dir.openFileAbsolute(currentIo(), abs_file, .{});
+    defer r.close(currentIo());
     var buf: [16]u8 = undefined;
-    const n = try r.read(&buf);
+    const n = try r.readPositionalAll(currentIo(), &buf, 0);
     try std.testing.expectEqualStrings("regtest", buf[0..n]);
 }

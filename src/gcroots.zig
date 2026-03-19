@@ -2,6 +2,7 @@ const std = @import("std");
 const generation = @import("generation.zig");
 const mere = @import("mere.zig");
 const errors = @import("errors.zig");
+const path_mod = @import("path.zig");
 
 const Std = errors.StandardErrors;
 pub const GCRootsError = Std.OutOfMemory || Std.FileSystem || Std.PermissionDenied || Std.InvalidInput || error{
@@ -48,7 +49,7 @@ pub fn isExplicitlyKept(
     };
     defer allocator.free(keep_path);
 
-    std.fs.accessAbsolute(keep_path, .{}) catch |err| {
+    std.Io.Dir.accessAbsolute(path_mod.currentIo(), keep_path, .{}) catch |err| {
         return switch (err) {
             error.FileNotFound => false,
             else => mapGCRootFsError(err),
@@ -69,7 +70,7 @@ pub fn keepGeneration(
     };
     defer allocator.free(gen_path);
 
-    std.fs.accessAbsolute(gen_path, .{}) catch |err| {
+    std.Io.Dir.accessAbsolute(path_mod.currentIo(), gen_path, .{}) catch |err| {
         return switch (err) {
             error.FileNotFound => GCRootsError.GenerationNotFound,
             else => mapGCRootFsError(err),
@@ -81,10 +82,10 @@ pub fn keepGeneration(
     };
     defer allocator.free(keep_path);
 
-    var file = std.fs.createFileAbsolute(keep_path, .{}) catch |err| {
+    var file = std.Io.Dir.createFileAbsolute(path_mod.currentIo(), keep_path, .{}) catch |err| {
         return mapGCRootFsError(err);
     };
-    file.close();
+    file.close(path_mod.currentIo());
 
     if (note) |n| {
         const note_path = std.fs.path.join(allocator, &.{ gen_path, KEEP_NOTE }) catch {
@@ -92,11 +93,11 @@ pub fn keepGeneration(
         };
         defer allocator.free(note_path);
 
-        var note_file = std.fs.createFileAbsolute(note_path, .{}) catch {
+        var note_file = std.Io.Dir.createFileAbsolute(path_mod.currentIo(), note_path, .{}) catch {
             return; // Best effort
         };
-        defer note_file.close();
-        note_file.writeAll(n) catch {};
+        defer note_file.close(path_mod.currentIo());
+        note_file.writeStreamingAll(path_mod.currentIo(), n) catch {};
     }
 }
 
@@ -116,7 +117,7 @@ pub fn unkeepGeneration(
     };
     defer allocator.free(keep_path);
 
-    std.fs.deleteFileAbsolute(keep_path) catch |err| {
+    std.Io.Dir.deleteFileAbsolute(path_mod.currentIo(), keep_path) catch |err| {
         switch (err) {
             error.FileNotFound => {},
             else => return mapGCRootFsError(err),
@@ -128,7 +129,7 @@ pub fn unkeepGeneration(
     };
     defer allocator.free(note_path);
 
-    std.fs.deleteFileAbsolute(note_path) catch {};
+    std.Io.Dir.deleteFileAbsolute(path_mod.currentIo(), note_path) catch {};
 }
 
 /// Determine which generations should be kept according to retention policy.
@@ -154,7 +155,7 @@ pub fn getKeptGenerations(
         };
     }
 
-    var kept: std.ArrayList(u32) = .{};
+    var kept: std.ArrayList(u32) = .empty;
     errdefer kept.deinit(allocator);
 
     const start_idx = if (all_gens.len > retention_count)
@@ -257,9 +258,8 @@ fn buildRootUpdateState(
     profile_dir: []const u8,
     retention_count: u32,
 ) GCRootsError!RootUpdateState {
-    std.fs.cwd().makePath(profile_gc_dir) catch |err| {
-        return mapGCRootFsError(err);
-    };
+    var profile_gc_dir_handle = path_mod.makePathAndOpenDir(profile_gc_dir) catch |err| return mapGCRootFsError(err);
+    profile_gc_dir_handle.close(path_mod.currentIo());
 
     const kept_gens = try getKeptGenerations(allocator, profile_dir, retention_count);
     errdefer allocator.free(kept_gens);
@@ -342,7 +342,7 @@ fn updateCurrentRoot(
     defer allocator.free(target);
 
     // Remove existing symlink if present
-    std.fs.deleteFileAbsolute(root_path) catch |err| {
+    std.Io.Dir.deleteFileAbsolute(path_mod.currentIo(), root_path) catch |err| {
         switch (err) {
             error.FileNotFound => {},
             else => return mapGCRootFsError(err),
@@ -350,7 +350,7 @@ fn updateCurrentRoot(
     };
 
     // Create new symlink
-    std.posix.symlinkat(target, std.fs.cwd().fd, root_path) catch |err| {
+    std.Io.Dir.symLinkAbsolute(path_mod.currentIo(), target, root_path, .{}) catch |err| {
         return mapGCRootFsError(err);
     };
 }
@@ -369,9 +369,8 @@ fn ensureGenerationRoot(
     };
     defer allocator.free(kept_dir);
 
-    std.fs.cwd().makePath(kept_dir) catch |err| {
-        return mapGCRootFsError(err);
-    };
+    var kept_dir_handle = path_mod.makePathAndOpenDir(kept_dir) catch |err| return mapGCRootFsError(err);
+    kept_dir_handle.close(path_mod.currentIo());
 
     const root_name = generation.formatGenerationName(allocator, gen_num) catch {
         return GCRootsError.OutOfMemory;
@@ -390,18 +389,19 @@ fn ensureGenerationRoot(
 
     // Check if root already exists and points to correct target
     var link_buf: [std.fs.max_path_bytes]u8 = undefined;
-    if (std.fs.readLinkAbsolute(root_path, &link_buf)) |existing_target| {
+    if (std.Io.Dir.readLinkAbsolute(path_mod.currentIo(), root_path, &link_buf)) |target_len| {
+        const existing_target = link_buf[0..target_len];
         if (std.mem.eql(u8, existing_target, target)) {
             return; // Already correct
         }
         // Remove incorrect symlink
-        std.fs.deleteFileAbsolute(root_path) catch {};
+        std.Io.Dir.deleteFileAbsolute(path_mod.currentIo(), root_path) catch {};
     } else |_| {
         // Doesn't exist, will create
     }
 
     // Create symlink
-    std.posix.symlinkat(target, std.fs.cwd().fd, root_path) catch |err| {
+    std.Io.Dir.symLinkAbsolute(path_mod.currentIo(), target, root_path, .{}) catch |err| {
         return mapGCRootFsError(err);
     };
 }
@@ -428,7 +428,7 @@ fn removeGenerationRoot(
     };
     defer allocator.free(root_path);
 
-    std.fs.deleteFileAbsolute(root_path) catch |err| {
+    std.Io.Dir.deleteFileAbsolute(path_mod.currentIo(), root_path) catch |err| {
         switch (err) {
             error.FileNotFound => {}, // OK
             else => return mapGCRootFsError(err),
@@ -473,11 +473,8 @@ pub fn deleteGeneration(
     };
     defer ctx.allocator.free(gen_path);
 
-    std.fs.deleteTreeAbsolute(gen_path) catch |err| {
-        return switch (err) {
-            error.FileNotFound => GCRootsError.GenerationNotFound,
-            else => mapGCRootFsError(err),
-        };
+    std.Io.Dir.cwd().deleteTree(path_mod.currentIo(), gen_path) catch |err| {
+        return mapGCRootFsError(err);
     };
 }
 
@@ -491,20 +488,20 @@ pub fn listGenerationRoots(
     };
     defer allocator.free(kept_dir);
 
-    var dir = std.fs.openDirAbsolute(kept_dir, .{ .iterate = true }) catch |err| {
+    var dir = std.Io.Dir.openDirAbsolute(path_mod.currentIo(), kept_dir, .{ .iterate = true }) catch |err| {
         return switch (err) {
             error.FileNotFound => allocator.alloc(u32, 0) catch return GCRootsError.OutOfMemory,
             else => mapGCRootFsError(err),
         };
     };
-    defer dir.close();
+    defer dir.close(path_mod.currentIo());
 
-    var roots: std.ArrayList(u32) = .{};
+    var roots: std.ArrayList(u32) = .empty;
     errdefer roots.deinit(allocator);
 
     var iter = dir.iterate();
     while (true) {
-        const entry = iter.next() catch |err| {
+        const entry = iter.next(path_mod.currentIo()) catch |err| {
             return mapGCRootFsError(err);
         };
         if (entry == null) break;
@@ -573,7 +570,8 @@ test "isExplicitlyKept returns false when no marker" {
 
     const gen_path = try std.fs.path.join(allocator, &.{ profile_dir, "gen-1" });
     defer allocator.free(gen_path);
-    try std.fs.cwd().makePath(gen_path);
+    var gen_dir = try path_mod.makePathAndOpenDir(gen_path);
+    gen_dir.close(path_mod.currentIo());
     var manifest = generation.GenerationManifest.init(allocator, 1);
     defer manifest.deinit();
     try generation.writeManifest(allocator, gen_path, &manifest);
@@ -598,7 +596,8 @@ test "keepGeneration creates marker" {
 
     const gen_path = try std.fs.path.join(allocator, &.{ profile_dir, "gen-1" });
     defer allocator.free(gen_path);
-    try std.fs.cwd().makePath(gen_path);
+    var gen_dir = try path_mod.makePathAndOpenDir(gen_path);
+    gen_dir.close(path_mod.currentIo());
 
     // Keep with a note
     try keepGeneration(allocator, profile_dir, 1, "Important release");
@@ -609,7 +608,7 @@ test "keepGeneration creates marker" {
     // Verify note exists
     const note_path = try std.fs.path.join(allocator, &.{ gen_path, KEEP_NOTE });
     defer allocator.free(note_path);
-    std.fs.accessAbsolute(note_path, .{}) catch {
+    std.Io.Dir.accessAbsolute(path_mod.currentIo(), note_path, .{}) catch {
         return error.TestUnexpectedResult;
     };
 }
@@ -630,7 +629,8 @@ test "unkeepGeneration removes marker" {
 
     const gen_path = try std.fs.path.join(allocator, &.{ profile_dir, "gen-1" });
     defer allocator.free(gen_path);
-    try std.fs.cwd().makePath(gen_path);
+    var gen_dir = try path_mod.makePathAndOpenDir(gen_path);
+    gen_dir.close(path_mod.currentIo());
 
     try keepGeneration(allocator, profile_dir, 1, null);
     try std.testing.expect(try isExplicitlyKept(allocator, profile_dir, 1));
@@ -652,13 +652,15 @@ test "getKeptGenerations returns last K generations" {
 
     const profile_dir = try std.fs.path.join(allocator, &.{ test_env.path, "profiles", "system" });
     defer allocator.free(profile_dir);
-    try std.fs.cwd().makePath(profile_dir);
+    var profile_dir_handle = try path_mod.makePathAndOpenDir(profile_dir);
+    profile_dir_handle.close(path_mod.currentIo());
 
     // Create generations 1-5
     for ([_]u32{ 1, 2, 3, 4, 5 }) |n| {
         const gen_path = try std.fmt.allocPrint(allocator, "{s}/gen-{d}", .{ profile_dir, n });
         defer allocator.free(gen_path);
-        try std.fs.cwd().makePath(gen_path);
+        var gen_dir = try path_mod.makePathAndOpenDir(gen_path);
+        gen_dir.close(path_mod.currentIo());
         var manifest = generation.GenerationManifest.init(allocator, n);
         defer manifest.deinit();
         try generation.writeManifest(allocator, gen_path, &manifest);
@@ -686,13 +688,15 @@ test "getKeptGenerations includes explicitly kept" {
 
     const profile_dir = try std.fs.path.join(allocator, &.{ test_env.path, "profiles", "system" });
     defer allocator.free(profile_dir);
-    try std.fs.cwd().makePath(profile_dir);
+    var profile_dir_handle = try path_mod.makePathAndOpenDir(profile_dir);
+    profile_dir_handle.close(path_mod.currentIo());
 
     // Create generations 1-5
     for ([_]u32{ 1, 2, 3, 4, 5 }) |n| {
         const gen_path = try std.fmt.allocPrint(allocator, "{s}/gen-{d}", .{ profile_dir, n });
         defer allocator.free(gen_path);
-        try std.fs.cwd().makePath(gen_path);
+        var gen_dir = try path_mod.makePathAndOpenDir(gen_path);
+        gen_dir.close(path_mod.currentIo());
         var manifest = generation.GenerationManifest.init(allocator, n);
         defer manifest.deinit();
         try generation.writeManifest(allocator, gen_path, &manifest);
@@ -721,7 +725,8 @@ test "updateRoots creates correct symlinks" {
 
     const profile_dir = try std.fs.path.join(allocator, &.{ test_env.path, "profiles", "system" });
     defer allocator.free(profile_dir);
-    try std.fs.cwd().makePath(profile_dir);
+    var profile_dir_handle = try path_mod.makePathAndOpenDir(profile_dir);
+    profile_dir_handle.close(path_mod.currentIo());
 
     const gc_roots_dir = try std.fs.path.join(allocator, &.{ test_env.path, "gc-roots" });
     defer allocator.free(gc_roots_dir);
@@ -730,16 +735,17 @@ test "updateRoots creates correct symlinks" {
     for ([_]u32{ 1, 2, 3 }) |n| {
         const gen_path = try std.fmt.allocPrint(allocator, "{s}/gen-{d}", .{ profile_dir, n });
         defer allocator.free(gen_path);
-        try std.fs.cwd().makePath(gen_path);
+        var gen_dir = try path_mod.makePathAndOpenDir(gen_path);
+        gen_dir.close(path_mod.currentIo());
         var manifest = generation.GenerationManifest.init(allocator, n);
         defer manifest.deinit();
         try generation.writeManifest(allocator, gen_path, &manifest);
     }
 
     // Create current symlink in profile (simulating activation)
-    var profile_handle = try std.fs.openDirAbsolute(profile_dir, .{});
-    defer profile_handle.close();
-    profile_handle.symLink("gen-3", "current", .{}) catch {};
+    var profile_handle = try std.Io.Dir.openDirAbsolute(path_mod.currentIo(), profile_dir, .{});
+    defer profile_handle.close(path_mod.currentIo());
+    profile_handle.symLink(path_mod.currentIo(), "gen-3", "current", .{}) catch {};
 
     // Update roots with retention_count=2
     try updateRoots(allocator, gc_roots_dir, profile_dir, 2);
@@ -757,7 +763,7 @@ test "updateRoots creates correct symlinks" {
     // Check current root exists at profiles/system/current
     const current_root = try std.fs.path.join(allocator, &.{ profile_gc_dir, "current" });
     defer allocator.free(current_root);
-    std.fs.accessAbsolute(current_root, .{}) catch {
+    std.Io.Dir.accessAbsolute(path_mod.currentIo(), current_root, .{}) catch {
         return error.TestUnexpectedResult;
     };
 }
@@ -775,26 +781,29 @@ test "deleteGeneration removes directory and root" {
 
     const profile_dir = try std.fs.path.join(allocator, &.{ test_env.path, "profiles", "system" });
     defer allocator.free(profile_dir);
-    try std.fs.cwd().makePath(profile_dir);
+    var profile_dir_handle = try path_mod.makePathAndOpenDir(profile_dir);
+    profile_dir_handle.close(path_mod.currentIo());
 
     const gc_roots_dir = try std.fs.path.join(allocator, &.{ test_env.path, "gc-roots" });
     defer allocator.free(gc_roots_dir);
-    try std.fs.cwd().makePath(gc_roots_dir);
+    var gc_roots_dir_handle = try path_mod.makePathAndOpenDir(gc_roots_dir);
+    gc_roots_dir_handle.close(path_mod.currentIo());
 
     // Create generations 1 and 2
     for ([_]u32{ 1, 2 }) |n| {
         const gen_path = try std.fmt.allocPrint(allocator, "{s}/gen-{d}", .{ profile_dir, n });
         defer allocator.free(gen_path);
-        try std.fs.cwd().makePath(gen_path);
+        var gen_dir = try path_mod.makePathAndOpenDir(gen_path);
+        gen_dir.close(path_mod.currentIo());
         var manifest = generation.GenerationManifest.init(allocator, n);
         defer manifest.deinit();
         try generation.writeManifest(allocator, gen_path, &manifest);
     }
 
     // Activate generation 2
-    var profile_handle = try std.fs.openDirAbsolute(profile_dir, .{});
-    defer profile_handle.close();
-    profile_handle.symLink("gen-2", "current", .{}) catch {};
+    var profile_handle = try std.Io.Dir.openDirAbsolute(path_mod.currentIo(), profile_dir, .{});
+    defer profile_handle.close(path_mod.currentIo());
+    profile_handle.symLink(path_mod.currentIo(), "gen-2", "current", .{}) catch {};
 
     // Create root for generation 1 using the profile-specific gc dir
     const profile_gc_dir = try std.fs.path.join(allocator, &.{ gc_roots_dir, "profiles", "system" });
@@ -807,7 +816,7 @@ test "deleteGeneration removes directory and root" {
     // Verify directory is gone
     const gen1_path = try std.fs.path.join(allocator, &.{ profile_dir, "gen-1" });
     defer allocator.free(gen1_path);
-    std.fs.accessAbsolute(gen1_path, .{}) catch |err| {
+    std.Io.Dir.accessAbsolute(path_mod.currentIo(), gen1_path, .{}) catch |err| {
         try std.testing.expectEqual(error.FileNotFound, err);
         return;
     };
@@ -827,23 +836,26 @@ test "deleteGeneration fails for active generation" {
 
     const profile_dir = try std.fs.path.join(allocator, &.{ test_env.path, "profiles", "system" });
     defer allocator.free(profile_dir);
-    try std.fs.cwd().makePath(profile_dir);
+    var profile_dir_handle = try path_mod.makePathAndOpenDir(profile_dir);
+    profile_dir_handle.close(path_mod.currentIo());
 
     const gc_roots_dir = try std.fs.path.join(allocator, &.{ test_env.path, "gc-roots" });
     defer allocator.free(gc_roots_dir);
-    try std.fs.cwd().makePath(gc_roots_dir);
+    var gc_roots_dir_handle = try path_mod.makePathAndOpenDir(gc_roots_dir);
+    gc_roots_dir_handle.close(path_mod.currentIo());
 
     // Create and activate generation 1
     const gen_path = try std.fs.path.join(allocator, &.{ profile_dir, "gen-1" });
     defer allocator.free(gen_path);
-    try std.fs.cwd().makePath(gen_path);
+    var gen_dir = try path_mod.makePathAndOpenDir(gen_path);
+    gen_dir.close(path_mod.currentIo());
     var manifest = generation.GenerationManifest.init(allocator, 1);
     defer manifest.deinit();
     try generation.writeManifest(allocator, gen_path, &manifest);
 
-    var profile_handle = try std.fs.openDirAbsolute(profile_dir, .{});
-    defer profile_handle.close();
-    profile_handle.symLink("gen-1", "current", .{}) catch {};
+    var profile_handle = try std.Io.Dir.openDirAbsolute(path_mod.currentIo(), profile_dir, .{});
+    defer profile_handle.close(path_mod.currentIo());
+    profile_handle.symLink(path_mod.currentIo(), "gen-1", "current", .{}) catch {};
 
     // Try to delete active generation - should fail
     const result = deleteGeneration(&test_env.ctx, gc_roots_dir, profile_dir, 1);

@@ -22,19 +22,10 @@ const known = [_]Signature{
     .{ .kind = .zst, .magic = "\x28\xB5\x2F\xFD" },
 };
 
-pub fn detect(file: *const std.fs.File) FileTypeError!Kind {
-    const original_pos = file.getPos() catch {
-        return error.FileSystem;
-    };
-    defer {
-        file.seekTo(original_pos) catch {};
-    }
-
-    file.seekTo(0) catch {
-        return error.FileSystem;
-    };
+pub fn detect(file: *const std.Io.File) FileTypeError!Kind {
+    const io = p.currentIo();
     var buffer: [512]u8 = undefined;
-    const read_bytes = file.readAll(&buffer) catch {
+    const read_bytes = file.readPositionalAll(io, &buffer, 0) catch {
         return error.FileSystem;
     };
 
@@ -42,11 +33,8 @@ pub fn detect(file: *const std.fs.File) FileTypeError!Kind {
         return .tar;
     }
 
-    file.seekTo(0) catch {
-        return error.FileSystem;
-    };
     var header_buffer: [8]u8 = undefined;
-    const header_bytes = file.readAll(&header_buffer) catch {
+    const header_bytes = file.readPositionalAll(io, &header_buffer, 0) catch {
         return error.FileSystem;
     };
 
@@ -60,8 +48,8 @@ pub fn detect(file: *const std.fs.File) FileTypeError!Kind {
 }
 
 test "detect ELF" {
-    const elf_file = try std.fs.cwd().openFile("test/testdata/libtest.so", .{});
-    defer elf_file.close();
+    const elf_file = try std.Io.Dir.cwd().openFile(p.currentIo(), "test/testdata/libtest.so", .{});
+    defer elf_file.close(p.currentIo());
 
     const kind = try detect(&elf_file);
     try std.testing.expectEqual(Kind.elf, kind);
@@ -89,12 +77,12 @@ test "detect tar" {
 
     const tar_contents = try std.testing.allocator.dupe(u8, buffer.written());
     defer std.testing.allocator.free(tar_contents);
-    const out = try std.fs.createFileAbsolute(abs_target, .{});
-    defer out.close();
-    try out.writeAll(tar_contents);
+    const out = try std.Io.Dir.createFileAbsolute(p.currentIo(), abs_target, .{});
+    defer out.close(p.currentIo());
+    try out.writeStreamingAll(p.currentIo(), tar_contents);
 
-    const created_tar = try std.fs.openFileAbsolute(abs_target, .{});
-    defer created_tar.close();
+    const created_tar = try std.Io.Dir.openFileAbsolute(p.currentIo(), abs_target, .{});
+    defer created_tar.close(p.currentIo());
     const kind = try detect(&created_tar);
     try std.testing.expectEqual(Kind.tar, kind);
 }
@@ -112,18 +100,16 @@ test "detect zst" {
     defer std.testing.allocator.free(test_file_path);
 
     {
-        const test_file = try std.fs.createFileAbsolute(test_file_path, .{});
-        defer test_file.close();
-        try test_file.writeAll("test content");
+        const test_file = try std.Io.Dir.createFileAbsolute(p.currentIo(), test_file_path, .{});
+        defer test_file.close(p.currentIo());
+        try test_file.writeStreamingAll(p.currentIo(), "test content");
     }
 
     const compressed_name = "test.txt.zst";
     const compressed_path = try std.fs.path.join(std.testing.allocator, &.{ test_env.path, compressed_name });
     defer std.testing.allocator.free(compressed_path);
 
-    const file = try std.fs.openFileAbsolute(test_file_path, .{});
-    defer file.close();
-    const uncompressed = try file.readToEndAlloc(std.testing.allocator, 4096);
+    const uncompressed = try std.Io.Dir.cwd().readFileAlloc(p.currentIo(), test_file_path, std.testing.allocator, .limited(4096));
     defer std.testing.allocator.free(uncompressed);
     const compressed_buf = @import("zstd_c.zig").compressOneShot(std.testing.allocator, uncompressed) catch |err| {
         test_env.ctx.debug("zstd compression failed: {s}", .{@errorName(err)});
@@ -131,11 +117,11 @@ test "detect zst" {
     };
     defer std.testing.allocator.free(compressed_buf);
     const out_file = try p.makePathAndOpenFile(compressed_path);
-    defer out_file.close();
-    try out_file.writeAll(compressed_buf);
+    defer out_file.close(p.currentIo());
+    try out_file.writeStreamingAll(p.currentIo(), compressed_buf);
 
-    const compressed_file = try std.fs.openFileAbsolute(compressed_path, .{});
-    defer compressed_file.close();
+    const compressed_file = try std.Io.Dir.openFileAbsolute(p.currentIo(), compressed_path, .{});
+    defer compressed_file.close(p.currentIo());
 
     const kind = try detect(&compressed_file);
     try std.testing.expectEqual(Kind.zst, kind);

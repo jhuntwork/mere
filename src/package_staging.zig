@@ -2,6 +2,7 @@
 const std = @import("std");
 const mere = @import("mere.zig");
 const errors = @import("errors.zig");
+const path_mod = @import("path.zig");
 const path_safety = @import("path_safety.zig");
 const c = @cImport({
     @cInclude("fnmatch.h");
@@ -74,14 +75,14 @@ fn basePattern(pattern: []const u8) []const u8 {
     return pattern;
 }
 
-fn isUsrLocalPath(path: []const u8) bool {
-    return std.mem.eql(u8, path, "usr/local") or std.mem.startsWith(u8, path, "usr/local/");
+fn isUsrLocalPath(rel_path: []const u8) bool {
+    return std.mem.eql(u8, rel_path, "usr/local") or std.mem.startsWith(u8, rel_path, "usr/local/");
 }
 
-fn matchesRecursiveDirPattern(path: []const u8, pattern: []const u8) bool {
+fn matchesRecursiveDirPattern(rel_path: []const u8, pattern: []const u8) bool {
     if (!isRecursiveDirPattern(pattern)) return false;
     const root = pattern[0 .. pattern.len - 1];
-    return std.mem.eql(u8, path, root) or std.mem.startsWith(u8, path, pattern);
+    return std.mem.eql(u8, rel_path, root) or std.mem.startsWith(u8, rel_path, pattern);
 }
 
 /// Convert an absolute symlink target to a relative path if it points within source_dir.
@@ -111,7 +112,7 @@ fn convertAbsoluteSymlinkToRelative(
         return ctx.fail(PackageStagingError.InvalidInput, symlink_path, "symlink path escapes source boundary");
     }
 
-    const target_relative_to_source = std.mem.trimLeft(u8, absolute_target, "/");
+    const target_relative_to_source = std.mem.trimStart(u8, absolute_target, "/");
     const candidate_target = std.fs.path.resolve(allocator, &[_][]const u8{ normalized_source_dir, target_relative_to_source }) catch {
         return ctx.fail(PackageStagingError.OutOfMemory, absolute_target, "failed to resolve symlink target");
     };
@@ -121,12 +122,12 @@ fn convertAbsoluteSymlinkToRelative(
         return ctx.fail(PackageStagingError.InvalidInput, symlink_path, "symlink target escapes boundary");
     }
 
-    std.fs.accessAbsolute(candidate_target, .{}) catch {
+    std.Io.Dir.accessAbsolute(path_mod.currentIo(), candidate_target, .{}) catch {
         return ctx.fail(PackageStagingError.InvalidInput, symlink_path, "symlink target does not exist within source boundary");
     };
 
     const symlink_dir = std.fs.path.dirname(normalized_symlink_path) orelse normalized_source_dir;
-    return std.fs.path.relative(allocator, symlink_dir, candidate_target) catch {
+    return std.fs.path.relative(allocator, "", null, symlink_dir, candidate_target) catch {
         return ctx.fail(PackageStagingError.OutOfMemory, symlink_path, "failed to compute relative symlink target");
     };
 }
@@ -145,19 +146,19 @@ pub fn stagePackageFiles(ctx: *mere.Context, config: PackageStagingConfig) !Pack
 }
 
 fn ensureEmptyDestination(ctx: *mere.Context, destination: []const u8) void {
-    std.fs.deleteTreeAbsolute(destination) catch |err| {
+    path_mod.deleteTreeAbsolute(destination) catch |err| {
         if (err != error.FileNotFound) {
             ctx.debug("failed to clean staging directory after error: {s}", .{@errorName(err)});
         }
     };
-    std.fs.cwd().makePath(destination) catch |err| {
+    path_mod.ensureDirExists(destination) catch |err| {
         ctx.debug("failed to recreate staging directory after cleanup: {s}", .{@errorName(err)});
     };
 }
 
 fn analyzePackageMatches(ctx: *mere.Context, source_dir_path: []const u8, patterns: []const []const u8) !PackageStagingPlan {
     const allocator = ctx.allocator;
-    var matched_entries = std.ArrayList(MatchedEntry){};
+    var matched_entries: std.ArrayList(MatchedEntry) = .empty;
     defer {
         for (matched_entries.items) |entry| allocator.free(entry.rel_path);
         matched_entries.deinit(allocator);
@@ -168,14 +169,14 @@ fn analyzePackageMatches(ctx: *mere.Context, source_dir_path: []const u8, patter
     var pattern_matched_directory = try allocator.alloc(bool, patterns.len);
     defer allocator.free(pattern_matched_directory);
     @memset(pattern_matched_directory, false);
-    var patterns_z = std.ArrayList([:0]u8){};
+    var patterns_z: std.ArrayList([:0]u8) = .empty;
     defer {
         for (patterns_z.items) |pattern_z| {
             allocator.free(pattern_z);
         }
         patterns_z.deinit(allocator);
     }
-    var rel_path_z_buf = std.ArrayList(u8){};
+    var rel_path_z_buf: std.ArrayList(u8) = .empty;
     defer rel_path_z_buf.deinit(allocator);
 
     const fail = struct {
@@ -198,10 +199,10 @@ fn analyzePackageMatches(ctx: *mere.Context, source_dir_path: []const u8, patter
     }
 
     // Open source directory
-    var source_dir = std.fs.openDirAbsolute(source_dir_path, .{ .iterate = true }) catch {
+    var source_dir = std.Io.Dir.openDirAbsolute(path_mod.currentIo(), source_dir_path, .{ .iterate = true }) catch {
         return fail(ctx, source_dir_path, "failed to open source directory", PackageStagingError.FileSystem);
     };
-    defer source_dir.close();
+    defer source_dir.close(path_mod.currentIo());
 
     // Walk through source directory
     var walker = source_dir.walk(allocator) catch {
@@ -210,7 +211,7 @@ fn analyzePackageMatches(ctx: *mere.Context, source_dir_path: []const u8, patter
     defer walker.deinit();
 
     while (true) {
-        const entry = walker.next() catch {
+        const entry = walker.next(path_mod.currentIo()) catch {
             return fail(ctx, source_dir_path, "failed to read directory entry", PackageStagingError.FileSystem);
         };
         if (entry == null) break;
@@ -334,7 +335,7 @@ fn materializePackagePlan(ctx: *mere.Context, config: PackageStagingConfig, plan
     const allocator = ctx.allocator;
     var files_copied: usize = 0;
     var destination_touched = false;
-    var copied_files = std.ArrayList([]const u8){};
+    var copied_files: std.ArrayList([]const u8) = .empty;
     defer copied_files.deinit(allocator);
     errdefer {
         for (copied_files.items) |file_path| {
@@ -362,7 +363,7 @@ fn materializePackagePlan(ctx: *mere.Context, config: PackageStagingConfig, plan
 
         if (entry.kind == .directory) {
             destination_touched = true;
-            std.fs.cwd().makePath(dest_file_path) catch {
+            path_mod.ensureDirExists(dest_file_path) catch {
                 return fail(ctx, dest_file_path, "failed to create destination directory", PackageStagingError.FileSystem);
             };
             continue;
@@ -370,15 +371,16 @@ fn materializePackagePlan(ctx: *mere.Context, config: PackageStagingConfig, plan
 
         const dest_parent = std.fs.path.dirname(dest_file_path) orelse "";
         destination_touched = true;
-        std.fs.cwd().makePath(dest_parent) catch {
+        path_mod.ensureDirExists(dest_parent) catch {
             return fail(ctx, dest_parent, "failed to create destination directory", PackageStagingError.FileSystem);
         };
 
         if (entry.kind == .sym_link) {
             var buf: [std.fs.max_path_bytes]u8 = undefined;
-            const target = std.fs.readLinkAbsolute(src_file_path, &buf) catch {
+            const target_len = std.Io.Dir.readLinkAbsolute(path_mod.currentIo(), src_file_path, &buf) catch {
                 return fail(ctx, src_file_path, "failed to read symlink", PackageStagingError.FileSystem);
             };
+            const target = buf[0..target_len];
 
             const final_target = if (std.fs.path.isAbsolute(target))
                 try convertAbsoluteSymlinkToRelative(allocator, ctx, target, src_file_path, config.source_dir)
@@ -389,13 +391,13 @@ fn materializePackagePlan(ctx: *mere.Context, config: PackageStagingConfig, plan
             defer allocator.free(final_target);
 
             const dest_dir = std.fs.path.dirname(dest_file_path) orelse "";
-            var dir = std.fs.openDirAbsolute(dest_dir, .{}) catch {
+            var dir = std.Io.Dir.openDirAbsolute(path_mod.currentIo(), dest_dir, .{}) catch {
                 return fail(ctx, dest_dir, "failed to open destination directory", PackageStagingError.FileSystem);
             };
-            defer dir.close();
+            defer dir.close(path_mod.currentIo());
 
             const dest_basename = std.fs.path.basename(dest_file_path);
-            dir.symLink(final_target, dest_basename, .{}) catch |link_err| {
+            dir.symLink(path_mod.currentIo(), final_target, dest_basename, .{}) catch |link_err| {
                 ctx.setDiagnosticContextFmt(
                     dest_file_path,
                     "failed to create symlink ({s}); link_name={s}; target={s}; source={s}",
@@ -415,31 +417,28 @@ fn materializePackagePlan(ctx: *mere.Context, config: PackageStagingConfig, plan
             continue;
         }
 
-        var src_file = std.fs.openFileAbsolute(src_file_path, .{}) catch {
+        var src_file = std.Io.Dir.openFileAbsolute(path_mod.currentIo(), src_file_path, .{}) catch {
             return fail(ctx, src_file_path, "failed to open source file", PackageStagingError.FileSystem);
         };
-        defer src_file.close();
+        defer src_file.close(path_mod.currentIo());
 
-        var dest_file = std.fs.createFileAbsolute(dest_file_path, .{}) catch {
+        var dest_file = std.Io.Dir.createFileAbsolute(path_mod.currentIo(), dest_file_path, .{}) catch {
             return fail(ctx, dest_file_path, "failed to create destination file", PackageStagingError.FileSystem);
         };
-        defer dest_file.close();
+        defer dest_file.close(path_mod.currentIo());
 
         var buf: [8192]u8 = undefined;
-        while (true) {
-            const n = src_file.read(&buf) catch {
-                return fail(ctx, src_file_path, "failed to read source file", PackageStagingError.FileSystem);
-            };
-            if (n == 0) break;
-            dest_file.writeAll(buf[0..n]) catch {
-                return fail(ctx, dest_file_path, "failed to write destination file", PackageStagingError.FileSystem);
-            };
-        }
+        const n = src_file.readPositionalAll(path_mod.currentIo(), &buf, 0) catch {
+            return fail(ctx, src_file_path, "failed to read source file", PackageStagingError.FileSystem);
+        };
+        dest_file.writeStreamingAll(path_mod.currentIo(), buf[0..n]) catch {
+            return fail(ctx, dest_file_path, "failed to write destination file", PackageStagingError.FileSystem);
+        };
 
-        const file_stat = src_file.stat() catch {
+        const file_stat = src_file.stat(path_mod.currentIo()) catch {
             return fail(ctx, src_file_path, "failed to stat source file", PackageStagingError.FileSystem);
         };
-        dest_file.chmod(file_stat.mode) catch {
+        dest_file.setPermissions(path_mod.currentIo(), .fromMode(file_stat.permissions.toMode())) catch {
             return fail(ctx, dest_file_path, "failed to set destination permissions", PackageStagingError.FileSystem);
         };
 
@@ -475,29 +474,29 @@ test "PackageStaging copies files based on patterns" {
     // Create source directory with test files
     const source_dir = try std.fs.path.join(test_env.ctx.allocator, &.{ test_env.path, "source" });
     defer test_env.ctx.allocator.free(source_dir);
-    try std.fs.cwd().makePath(source_dir);
+    try path_mod.ensureDirExists(source_dir);
 
     // Create subdirectories and files to match patterns
     const bin_dir = try std.fs.path.join(test_env.ctx.allocator, &.{ source_dir, "usr", "bin" });
     defer test_env.ctx.allocator.free(bin_dir);
-    try std.fs.cwd().makePath(bin_dir);
+    try path_mod.ensureDirExists(bin_dir);
 
     const lib_dir = try std.fs.path.join(test_env.ctx.allocator, &.{ source_dir, "usr", "lib" });
     defer test_env.ctx.allocator.free(lib_dir);
-    try std.fs.cwd().makePath(lib_dir);
+    try path_mod.ensureDirExists(lib_dir);
 
     // Create test files
     const app_path = try std.fs.path.join(test_env.ctx.allocator, &.{ bin_dir, "myapp" });
     defer test_env.ctx.allocator.free(app_path);
-    var app_file = try std.fs.createFileAbsolute(app_path, .{});
-    defer app_file.close();
-    try app_file.writeAll("#!/bin/bash\necho hello");
+    var app_file = try std.Io.Dir.createFileAbsolute(path_mod.currentIo(), app_path, .{});
+    defer app_file.close(path_mod.currentIo());
+    try app_file.writeStreamingAll(path_mod.currentIo(), "#!/bin/bash\necho hello");
 
     const lib_path = try std.fs.path.join(test_env.ctx.allocator, &.{ lib_dir, "libtest.so" });
     defer test_env.ctx.allocator.free(lib_path);
-    var lib_file = try std.fs.createFileAbsolute(lib_path, .{});
-    defer lib_file.close();
-    try lib_file.writeAll("binary content");
+    var lib_file = try std.Io.Dir.createFileAbsolute(path_mod.currentIo(), lib_path, .{});
+    defer lib_file.close(path_mod.currentIo());
+    try lib_file.writeStreamingAll(path_mod.currentIo(), "binary content");
 
     // Create destination directory
     const dest_dir = try std.fs.path.join(test_env.ctx.allocator, &.{ test_env.path, "dest" });
@@ -527,13 +526,13 @@ test "PackageStaging handles exact pattern matches" {
     // Create source with specific file
     const source_dir = try std.fs.path.join(test_env.ctx.allocator, &.{ test_env.path, "source" });
     defer test_env.ctx.allocator.free(source_dir);
-    try std.fs.cwd().makePath(source_dir);
+    try path_mod.ensureDirExists(source_dir);
 
     const config_path = try std.fs.path.join(test_env.ctx.allocator, &.{ source_dir, "config.txt" });
     defer test_env.ctx.allocator.free(config_path);
-    var config_file = try std.fs.createFileAbsolute(config_path, .{});
-    defer config_file.close();
-    try config_file.writeAll("key=value");
+    var config_file = try std.Io.Dir.createFileAbsolute(path_mod.currentIo(), config_path, .{});
+    defer config_file.close(path_mod.currentIo());
+    try config_file.writeStreamingAll(path_mod.currentIo(), "key=value");
 
     const dest_dir = try std.fs.path.join(test_env.ctx.allocator, &.{ test_env.path, "dest" });
     defer test_env.ctx.allocator.free(dest_dir);
@@ -562,16 +561,15 @@ test "PackageStaging preserves file permissions" {
     defer test_env.ctx.allocator.free(source_dir);
     const bin_dir = try std.fs.path.join(test_env.ctx.allocator, &.{ source_dir, "bin" });
     defer test_env.ctx.allocator.free(bin_dir);
-    try std.fs.cwd().makePath(bin_dir);
+    try path_mod.ensureDirExists(bin_dir);
 
     // Create an executable file
     const exec_path = try std.fs.path.join(test_env.ctx.allocator, &.{ bin_dir, "myapp" });
     defer test_env.ctx.allocator.free(exec_path);
-    var exec_file = try std.fs.createFileAbsolute(exec_path, .{});
-    try exec_file.writeAll("#!/bin/sh\necho hello");
-    // Set executable permissions (0755)
-    try exec_file.chmod(0o755);
-    exec_file.close();
+    var exec_file = try std.Io.Dir.createFileAbsolute(path_mod.currentIo(), exec_path, .{});
+    try exec_file.writeStreamingAll(path_mod.currentIo(), "#!/bin/sh\necho hello");
+    try exec_file.setPermissions(path_mod.currentIo(), .executable_file);
+    exec_file.close(path_mod.currentIo());
 
     // Create destination directory
     const dest_dir = try std.fs.path.join(test_env.ctx.allocator, &.{ test_env.path, "dest" });
@@ -591,14 +589,18 @@ test "PackageStaging preserves file permissions" {
     const dest_exec_path = try std.fs.path.join(test_env.ctx.allocator, &.{ dest_dir, "bin", "myapp" });
     defer test_env.ctx.allocator.free(dest_exec_path);
 
-    const dest_file = try std.fs.openFileAbsolute(dest_exec_path, .{});
-    defer dest_file.close();
+    const dest_file = try std.Io.Dir.openFileAbsolute(path_mod.currentIo(), dest_exec_path, .{});
+    defer dest_file.close(path_mod.currentIo());
 
-    const stat = try dest_file.stat();
+    const source_file = try std.Io.Dir.openFileAbsolute(path_mod.currentIo(), exec_path, .{});
+    defer source_file.close(path_mod.currentIo());
+
+    const stat = try dest_file.stat(path_mod.currentIo());
+    const source_stat = try source_file.stat(path_mod.currentIo());
     // Check that executable bits are set (owner, group, other)
-    try std.testing.expect((stat.mode & 0o111) != 0);
-    // Check that the full mode matches (0755)
-    try std.testing.expectEqual(@as(u32, 0o755), stat.mode & 0o777);
+    try std.testing.expect((stat.permissions.toMode() & 0o111) != 0);
+    // Check that the full mode matches the source file.
+    try std.testing.expectEqual(source_stat.permissions.toMode() & 0o777, stat.permissions.toMode() & 0o777);
 }
 
 test "PackageStaging rejects non-recursive patterns that match only directories" {
@@ -614,13 +616,13 @@ test "PackageStaging rejects non-recursive patterns that match only directories"
 
     const bin_dir = try std.fs.path.join(test_env.ctx.allocator, &.{ source_dir, "usr", "bin" });
     defer test_env.ctx.allocator.free(bin_dir);
-    try std.fs.cwd().makePath(bin_dir);
+    try path_mod.ensureDirExists(bin_dir);
 
     const bin_path = try std.fs.path.join(test_env.ctx.allocator, &.{ bin_dir, "perl" });
     defer test_env.ctx.allocator.free(bin_path);
-    var bin = try std.fs.createFileAbsolute(bin_path, .{});
-    defer bin.close();
-    try bin.writeAll("binary");
+    var bin = try std.Io.Dir.createFileAbsolute(path_mod.currentIo(), bin_path, .{});
+    defer bin.close(path_mod.currentIo());
+    try bin.writeStreamingAll(path_mod.currentIo(), "binary");
 
     const dest_dir = try std.fs.path.join(test_env.ctx.allocator, &.{ test_env.path, "dest" });
     defer test_env.ctx.allocator.free(dest_dir);
@@ -646,13 +648,13 @@ test "PackageStaging rejects exact non-recursive directory paths" {
 
     const bin_dir = try std.fs.path.join(test_env.ctx.allocator, &.{ source_dir, "usr", "bin" });
     defer test_env.ctx.allocator.free(bin_dir);
-    try std.fs.cwd().makePath(bin_dir);
+    try path_mod.ensureDirExists(bin_dir);
 
     const bin_path = try std.fs.path.join(test_env.ctx.allocator, &.{ bin_dir, "perl" });
     defer test_env.ctx.allocator.free(bin_path);
-    var bin = try std.fs.createFileAbsolute(bin_path, .{});
-    defer bin.close();
-    try bin.writeAll("binary");
+    var bin = try std.Io.Dir.createFileAbsolute(path_mod.currentIo(), bin_path, .{});
+    defer bin.close(path_mod.currentIo());
+    try bin.writeStreamingAll(path_mod.currentIo(), "binary");
 
     const dest_dir = try std.fs.path.join(test_env.ctx.allocator, &.{ test_env.path, "dest" });
     defer test_env.ctx.allocator.free(dest_dir);
@@ -678,13 +680,13 @@ test "PackageStaging supports fnmatch bracket expressions" {
 
     const bin_dir = try std.fs.path.join(test_env.ctx.allocator, &.{ source_dir, "usr", "bin" });
     defer test_env.ctx.allocator.free(bin_dir);
-    try std.fs.cwd().makePath(bin_dir);
+    try path_mod.ensureDirExists(bin_dir);
 
     const app_path = try std.fs.path.join(test_env.ctx.allocator, &.{ bin_dir, "perl1" });
     defer test_env.ctx.allocator.free(app_path);
-    var app = try std.fs.createFileAbsolute(app_path, .{});
-    defer app.close();
-    try app.writeAll("binary");
+    var app = try std.Io.Dir.createFileAbsolute(path_mod.currentIo(), app_path, .{});
+    defer app.close(path_mod.currentIo());
+    try app.writeStreamingAll(path_mod.currentIo(), "binary");
 
     const dest_dir = try std.fs.path.join(test_env.ctx.allocator, &.{ test_env.path, "dest" });
     defer test_env.ctx.allocator.free(dest_dir);
@@ -713,28 +715,28 @@ test "PackageStaging supports trailing slash recursive directory shorthand" {
 
     const doc_dir = try std.fs.path.join(test_env.ctx.allocator, &.{ source_dir, "usr", "share", "doc", "pkg", "nested" });
     defer test_env.ctx.allocator.free(doc_dir);
-    try std.fs.cwd().makePath(doc_dir);
+    try path_mod.ensureDirExists(doc_dir);
 
     const readme_path = try std.fs.path.join(test_env.ctx.allocator, &.{ source_dir, "usr", "share", "doc", "pkg", "README" });
     defer test_env.ctx.allocator.free(readme_path);
-    var readme = try std.fs.createFileAbsolute(readme_path, .{});
-    defer readme.close();
-    try readme.writeAll("readme");
+    var readme = try std.Io.Dir.createFileAbsolute(path_mod.currentIo(), readme_path, .{});
+    defer readme.close(path_mod.currentIo());
+    try readme.writeStreamingAll(path_mod.currentIo(), "readme");
 
     const nested_path = try std.fs.path.join(test_env.ctx.allocator, &.{ doc_dir, "guide.txt" });
     defer test_env.ctx.allocator.free(nested_path);
-    var nested = try std.fs.createFileAbsolute(nested_path, .{});
-    defer nested.close();
-    try nested.writeAll("guide");
+    var nested = try std.Io.Dir.createFileAbsolute(path_mod.currentIo(), nested_path, .{});
+    defer nested.close(path_mod.currentIo());
+    try nested.writeStreamingAll(path_mod.currentIo(), "guide");
 
     const outside_dir = try std.fs.path.join(test_env.ctx.allocator, &.{ source_dir, "usr", "bin" });
     defer test_env.ctx.allocator.free(outside_dir);
-    try std.fs.cwd().makePath(outside_dir);
+    try path_mod.ensureDirExists(outside_dir);
     const outside_path = try std.fs.path.join(test_env.ctx.allocator, &.{ outside_dir, "tool" });
     defer test_env.ctx.allocator.free(outside_path);
-    var outside = try std.fs.createFileAbsolute(outside_path, .{});
-    defer outside.close();
-    try outside.writeAll("tool");
+    var outside = try std.Io.Dir.createFileAbsolute(path_mod.currentIo(), outside_path, .{});
+    defer outside.close(path_mod.currentIo());
+    try outside.writeStreamingAll(path_mod.currentIo(), "tool");
 
     const dest_dir = try std.fs.path.join(test_env.ctx.allocator, &.{ test_env.path, "dest" });
     defer test_env.ctx.allocator.free(dest_dir);
@@ -770,19 +772,19 @@ test "PackageStaging supports exclusion patterns with ! prefix" {
     defer test_env.ctx.allocator.free(source_dir);
     const bin_dir = try std.fs.path.join(test_env.ctx.allocator, &.{ source_dir, "usr", "bin" });
     defer test_env.ctx.allocator.free(bin_dir);
-    try std.fs.cwd().makePath(bin_dir);
+    try path_mod.ensureDirExists(bin_dir);
 
     const keep_path = try std.fs.path.join(test_env.ctx.allocator, &.{ bin_dir, "keep" });
     defer test_env.ctx.allocator.free(keep_path);
-    var keep_file = try std.fs.createFileAbsolute(keep_path, .{});
-    defer keep_file.close();
-    try keep_file.writeAll("keep");
+    var keep_file = try std.Io.Dir.createFileAbsolute(path_mod.currentIo(), keep_path, .{});
+    defer keep_file.close(path_mod.currentIo());
+    try keep_file.writeStreamingAll(path_mod.currentIo(), "keep");
 
     const skip_path = try std.fs.path.join(test_env.ctx.allocator, &.{ bin_dir, "skip" });
     defer test_env.ctx.allocator.free(skip_path);
-    var skip_file = try std.fs.createFileAbsolute(skip_path, .{});
-    defer skip_file.close();
-    try skip_file.writeAll("skip");
+    var skip_file = try std.Io.Dir.createFileAbsolute(path_mod.currentIo(), skip_path, .{});
+    defer skip_file.close(path_mod.currentIo());
+    try skip_file.writeStreamingAll(path_mod.currentIo(), "skip");
 
     const dest_dir = try std.fs.path.join(test_env.ctx.allocator, &.{ test_env.path, "dest" });
     defer test_env.ctx.allocator.free(dest_dir);
@@ -810,13 +812,13 @@ test "PackageStaging exclusion patterns are not required to match" {
     defer test_env.ctx.allocator.free(source_dir);
     const bin_dir = try std.fs.path.join(test_env.ctx.allocator, &.{ source_dir, "usr", "bin" });
     defer test_env.ctx.allocator.free(bin_dir);
-    try std.fs.cwd().makePath(bin_dir);
+    try path_mod.ensureDirExists(bin_dir);
 
     const app_path = try std.fs.path.join(test_env.ctx.allocator, &.{ bin_dir, "ok" });
     defer test_env.ctx.allocator.free(app_path);
-    var app = try std.fs.createFileAbsolute(app_path, .{});
-    defer app.close();
-    try app.writeAll("ok");
+    var app = try std.Io.Dir.createFileAbsolute(path_mod.currentIo(), app_path, .{});
+    defer app.close(path_mod.currentIo());
+    try app.writeStreamingAll(path_mod.currentIo(), "ok");
 
     const dest_dir = try std.fs.path.join(test_env.ctx.allocator, &.{ test_env.path, "dest" });
     defer test_env.ctx.allocator.free(dest_dir);
@@ -845,27 +847,27 @@ test "PackageStaging supports recursive exclusion with trailing slash" {
 
     const root_doc_dir = try std.fs.path.join(test_env.ctx.allocator, &.{ source_dir, "usr", "share", "doc" });
     defer test_env.ctx.allocator.free(root_doc_dir);
-    try std.fs.cwd().makePath(root_doc_dir);
+    try path_mod.ensureDirExists(root_doc_dir);
 
     const keep_dir = try std.fs.path.join(test_env.ctx.allocator, &.{ root_doc_dir, "pkg" });
     defer test_env.ctx.allocator.free(keep_dir);
-    try std.fs.cwd().makePath(keep_dir);
+    try path_mod.ensureDirExists(keep_dir);
 
     const exclude_dir = try std.fs.path.join(test_env.ctx.allocator, &.{ keep_dir, "private" });
     defer test_env.ctx.allocator.free(exclude_dir);
-    try std.fs.cwd().makePath(exclude_dir);
+    try path_mod.ensureDirExists(exclude_dir);
 
     const keep_file_path = try std.fs.path.join(test_env.ctx.allocator, &.{ keep_dir, "README" });
     defer test_env.ctx.allocator.free(keep_file_path);
-    var keep_file = try std.fs.createFileAbsolute(keep_file_path, .{});
-    defer keep_file.close();
-    try keep_file.writeAll("readme");
+    var keep_file = try std.Io.Dir.createFileAbsolute(path_mod.currentIo(), keep_file_path, .{});
+    defer keep_file.close(path_mod.currentIo());
+    try keep_file.writeStreamingAll(path_mod.currentIo(), "readme");
 
     const excluded_file_path = try std.fs.path.join(test_env.ctx.allocator, &.{ exclude_dir, "secret.txt" });
     defer test_env.ctx.allocator.free(excluded_file_path);
-    var excluded_file = try std.fs.createFileAbsolute(excluded_file_path, .{});
-    defer excluded_file.close();
-    try excluded_file.writeAll("secret");
+    var excluded_file = try std.Io.Dir.createFileAbsolute(path_mod.currentIo(), excluded_file_path, .{});
+    defer excluded_file.close(path_mod.currentIo());
+    try excluded_file.writeStreamingAll(path_mod.currentIo(), "secret");
 
     const dest_dir = try std.fs.path.join(test_env.ctx.allocator, &.{ test_env.path, "dest" });
     defer test_env.ctx.allocator.free(dest_dir);
@@ -893,13 +895,13 @@ test "PackageStaging errors when any pattern matches no files" {
     defer test_env.ctx.allocator.free(source_dir);
     const bin_dir = try std.fs.path.join(test_env.ctx.allocator, &.{ source_dir, "usr", "bin" });
     defer test_env.ctx.allocator.free(bin_dir);
-    try std.fs.cwd().makePath(bin_dir);
+    try path_mod.ensureDirExists(bin_dir);
 
     const app_path = try std.fs.path.join(test_env.ctx.allocator, &.{ bin_dir, "ok" });
     defer test_env.ctx.allocator.free(app_path);
-    var app = try std.fs.createFileAbsolute(app_path, .{});
-    defer app.close();
-    try app.writeAll("ok");
+    var app = try std.Io.Dir.createFileAbsolute(path_mod.currentIo(), app_path, .{});
+    defer app.close(path_mod.currentIo());
+    try app.writeStreamingAll(path_mod.currentIo(), "ok");
 
     const dest_dir = try std.fs.path.join(test_env.ctx.allocator, &.{ test_env.path, "dest" });
     defer test_env.ctx.allocator.free(dest_dir);
@@ -925,23 +927,23 @@ test "PackageStaging ignores unmatched usr/local paths" {
 
     const good_dir = try std.fs.path.join(test_env.ctx.allocator, &.{ source_dir, "usr", "bin" });
     defer test_env.ctx.allocator.free(good_dir);
-    try std.fs.cwd().makePath(good_dir);
+    try path_mod.ensureDirExists(good_dir);
 
     const good_path = try std.fs.path.join(test_env.ctx.allocator, &.{ good_dir, "ok" });
     defer test_env.ctx.allocator.free(good_path);
-    var good_file = try std.fs.createFileAbsolute(good_path, .{});
-    defer good_file.close();
-    try good_file.writeAll("ok");
+    var good_file = try std.Io.Dir.createFileAbsolute(path_mod.currentIo(), good_path, .{});
+    defer good_file.close(path_mod.currentIo());
+    try good_file.writeStreamingAll(path_mod.currentIo(), "ok");
 
     const bad_dir = try std.fs.path.join(test_env.ctx.allocator, &.{ source_dir, "usr", "local", "bin" });
     defer test_env.ctx.allocator.free(bad_dir);
-    try std.fs.cwd().makePath(bad_dir);
+    try path_mod.ensureDirExists(bad_dir);
 
     const bad_path = try std.fs.path.join(test_env.ctx.allocator, &.{ bad_dir, "bad" });
     defer test_env.ctx.allocator.free(bad_path);
-    var bad_file = try std.fs.createFileAbsolute(bad_path, .{});
-    defer bad_file.close();
-    try bad_file.writeAll("bad");
+    var bad_file = try std.Io.Dir.createFileAbsolute(path_mod.currentIo(), bad_path, .{});
+    defer bad_file.close(path_mod.currentIo());
+    try bad_file.writeStreamingAll(path_mod.currentIo(), "bad");
 
     const dest_dir = try std.fs.path.join(test_env.ctx.allocator, &.{ test_env.path, "dest" });
     defer test_env.ctx.allocator.free(dest_dir);
@@ -971,13 +973,13 @@ test "PackageStaging rejects matched usr/local paths" {
 
     const bad_dir = try std.fs.path.join(test_env.ctx.allocator, &.{ source_dir, "usr", "local", "bin" });
     defer test_env.ctx.allocator.free(bad_dir);
-    try std.fs.cwd().makePath(bad_dir);
+    try path_mod.ensureDirExists(bad_dir);
 
     const bad_path = try std.fs.path.join(test_env.ctx.allocator, &.{ bad_dir, "bad" });
     defer test_env.ctx.allocator.free(bad_path);
-    var bad_file = try std.fs.createFileAbsolute(bad_path, .{});
-    defer bad_file.close();
-    try bad_file.writeAll("bad");
+    var bad_file = try std.Io.Dir.createFileAbsolute(path_mod.currentIo(), bad_path, .{});
+    defer bad_file.close(path_mod.currentIo());
+    try bad_file.writeStreamingAll(path_mod.currentIo(), "bad");
 
     const dest_dir = try std.fs.path.join(test_env.ctx.allocator, &.{ test_env.path, "dest" });
     defer test_env.ctx.allocator.free(dest_dir);
@@ -1003,11 +1005,11 @@ test "PackageStaging preserves empty directories matched by recursive patterns" 
 
     const root_doc_dir = try std.fs.path.join(test_env.ctx.allocator, &.{ source_dir, "usr", "share", "doc" });
     defer test_env.ctx.allocator.free(root_doc_dir);
-    try std.fs.cwd().makePath(root_doc_dir);
+    try path_mod.ensureDirExists(root_doc_dir);
 
     const empty_dir = try std.fs.path.join(test_env.ctx.allocator, &.{ root_doc_dir, "pkg", "empty" });
     defer test_env.ctx.allocator.free(empty_dir);
-    try std.fs.cwd().makePath(empty_dir);
+    try path_mod.ensureDirExists(empty_dir);
 
     const dest_dir = try std.fs.path.join(test_env.ctx.allocator, &.{ test_env.path, "dest" });
     defer test_env.ctx.allocator.free(dest_dir);
@@ -1023,8 +1025,8 @@ test "PackageStaging preserves empty directories matched by recursive patterns" 
 
     const staged_empty_dir = try std.fs.path.join(test_env.ctx.allocator, &.{ dest_dir, "usr", "share", "doc", "pkg", "empty" });
     defer test_env.ctx.allocator.free(staged_empty_dir);
-    var dir = try std.fs.openDirAbsolute(staged_empty_dir, .{});
-    dir.close();
+    var dir = try std.Io.Dir.openDirAbsolute(path_mod.currentIo(), staged_empty_dir, .{});
+    dir.close(path_mod.currentIo());
 }
 
 test "PackageStaging cleans partial output on late failure" {
@@ -1039,13 +1041,13 @@ test "PackageStaging cleans partial output on late failure" {
     defer test_env.ctx.allocator.free(source_dir);
     const bin_dir = try std.fs.path.join(test_env.ctx.allocator, &.{ source_dir, "usr", "bin" });
     defer test_env.ctx.allocator.free(bin_dir);
-    try std.fs.cwd().makePath(bin_dir);
+    try path_mod.ensureDirExists(bin_dir);
 
     const app_path = try std.fs.path.join(test_env.ctx.allocator, &.{ bin_dir, "ok" });
     defer test_env.ctx.allocator.free(app_path);
-    var app = try std.fs.createFileAbsolute(app_path, .{});
-    defer app.close();
-    try app.writeAll("ok");
+    var app = try std.Io.Dir.createFileAbsolute(path_mod.currentIo(), app_path, .{});
+    defer app.close(path_mod.currentIo());
+    try app.writeStreamingAll(path_mod.currentIo(), "ok");
 
     const dest_dir = try std.fs.path.join(test_env.ctx.allocator, &.{ test_env.path, "dest" });
     defer test_env.ctx.allocator.free(dest_dir);
@@ -1057,10 +1059,11 @@ test "PackageStaging cleans partial output on late failure" {
     });
     try std.testing.expectError(error.InvalidInput, result);
 
-    var dest_handle = try std.fs.openDirAbsolute(dest_dir, .{ .iterate = true });
-    defer dest_handle.close();
-    var iter = dest_handle.iterate();
-    try std.testing.expect((try iter.next()) == null);
+    var dest_handle = try std.Io.Dir.openDirAbsolute(path_mod.currentIo(), dest_dir, .{ .iterate = true });
+    defer dest_handle.close(path_mod.currentIo());
+    var walker = try dest_handle.walk(test_env.ctx.allocator);
+    defer walker.deinit();
+    try std.testing.expect((try walker.next(path_mod.currentIo())) == null);
 }
 
 test "PackageStaging converts absolute symlink target within source boundary" {
@@ -1076,21 +1079,25 @@ test "PackageStaging converts absolute symlink target within source boundary" {
 
     const lib_dir = try std.fs.path.join(test_env.ctx.allocator, &.{ source_dir, "lib" });
     defer test_env.ctx.allocator.free(lib_dir);
-    try std.fs.cwd().makePath(lib_dir);
+    try path_mod.ensureDirExists(lib_dir);
 
     const usr_lib_dir = try std.fs.path.join(test_env.ctx.allocator, &.{ source_dir, "usr", "lib" });
     defer test_env.ctx.allocator.free(usr_lib_dir);
-    try std.fs.cwd().makePath(usr_lib_dir);
+    try path_mod.ensureDirExists(usr_lib_dir);
 
     const target_path = try std.fs.path.join(test_env.ctx.allocator, &.{ usr_lib_dir, "libfoo.so.1" });
     defer test_env.ctx.allocator.free(target_path);
-    var target_file = try std.fs.createFileAbsolute(target_path, .{});
-    defer target_file.close();
-    try target_file.writeAll("libfoo");
+    var target_file = try std.Io.Dir.createFileAbsolute(path_mod.currentIo(), target_path, .{});
+    defer target_file.close(path_mod.currentIo());
+    try target_file.writeStreamingAll(path_mod.currentIo(), "libfoo");
 
     const symlink_path = try std.fs.path.join(test_env.ctx.allocator, &.{ lib_dir, "ld-musl-x86_64.so.1" });
     defer test_env.ctx.allocator.free(symlink_path);
-    try std.posix.symlinkat("/usr/lib/libfoo.so.1", std.fs.cwd().fd, symlink_path);
+    {
+        var lib_dir_handle = try path_mod.openExistingDir(lib_dir);
+        defer lib_dir_handle.close(path_mod.currentIo());
+        try lib_dir_handle.symLink(path_mod.currentIo(), "/usr/lib/libfoo.so.1", "ld-musl-x86_64.so.1", .{});
+    }
 
     const dest_dir = try std.fs.path.join(test_env.ctx.allocator, &.{ test_env.path, "dest" });
     defer test_env.ctx.allocator.free(dest_dir);
@@ -1107,7 +1114,8 @@ test "PackageStaging converts absolute symlink target within source boundary" {
     const staged_symlink = try std.fs.path.join(test_env.ctx.allocator, &.{ dest_dir, "lib", "ld-musl-x86_64.so.1" });
     defer test_env.ctx.allocator.free(staged_symlink);
     var link_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const staged_target = try std.fs.readLinkAbsolute(staged_symlink, &link_buf);
+    const staged_target_len = try std.Io.Dir.readLinkAbsolute(path_mod.currentIo(), staged_symlink, &link_buf);
+    const staged_target = link_buf[0..staged_target_len];
     try std.testing.expectEqualStrings("../usr/lib/libfoo.so.1", staged_target);
 }
 
@@ -1124,11 +1132,15 @@ test "PackageStaging rejects absolute symlink target outside source boundary" {
 
     const lib_dir = try std.fs.path.join(test_env.ctx.allocator, &.{ source_dir, "lib" });
     defer test_env.ctx.allocator.free(lib_dir);
-    try std.fs.cwd().makePath(lib_dir);
+    try path_mod.ensureDirExists(lib_dir);
 
     const symlink_path = try std.fs.path.join(test_env.ctx.allocator, &.{ lib_dir, "bad-link" });
     defer test_env.ctx.allocator.free(symlink_path);
-    try std.posix.symlinkat("/etc/passwd", std.fs.cwd().fd, symlink_path);
+    {
+        var lib_dir_handle = try path_mod.openExistingDir(lib_dir);
+        defer lib_dir_handle.close(path_mod.currentIo());
+        try lib_dir_handle.symLink(path_mod.currentIo(), "/etc/passwd", "bad-link", .{});
+    }
 
     const dest_dir = try std.fs.path.join(test_env.ctx.allocator, &.{ test_env.path, "dest" });
     defer test_env.ctx.allocator.free(dest_dir);

@@ -2,6 +2,7 @@ const std = @import("std");
 const Context = @import("mere.zig").Context;
 const sign = @import("sign.zig");
 const errors = @import("errors.zig");
+const path = @import("path.zig");
 
 const Std = errors.StandardErrors;
 pub const ManifestError = Std.OutOfMemory || Std.FileSystem || Std.PermissionDenied || Std.InvalidInput || error{SigningFailed};
@@ -148,16 +149,17 @@ pub fn readManifestFile(ctx: *Context, dir_path: []const u8) ManifestError![]u8 
     };
     defer ctx.allocator.free(manifest_path);
 
-    const file = std.fs.openFileAbsolute(manifest_path, .{}) catch |err| {
+    const io = path.currentIo();
+    const file = path.openExistingFile(manifest_path) catch |err| {
         return switch (err) {
             error.FileNotFound => ManifestError.InvalidInput,
             error.AccessDenied => ManifestError.PermissionDenied,
             else => ManifestError.FileSystem,
         };
     };
-    defer file.close();
+    defer file.close(io);
 
-    const stat = file.stat() catch |err| {
+    const stat = file.stat(io) catch |err| {
         return switch (err) {
             error.AccessDenied => ManifestError.PermissionDenied,
             else => ManifestError.FileSystem,
@@ -173,7 +175,7 @@ pub fn readManifestFile(ctx: *Context, dir_path: []const u8) ManifestError![]u8 
     };
     errdefer ctx.allocator.free(buffer);
 
-    const bytes_read = file.readAll(buffer) catch |err| {
+    const bytes_read = file.readPositionalAll(io, buffer, 0) catch |err| {
         return switch (err) {
             error.AccessDenied => ManifestError.PermissionDenied,
             else => ManifestError.FileSystem,
@@ -188,6 +190,7 @@ pub fn readManifestFile(ctx: *Context, dir_path: []const u8) ManifestError![]u8 
 }
 
 pub fn writeManifest(ctx: *Context, dir_path: []const u8, manifest: *const PackageManifestV1, secret_key: []const u8) ManifestError!void {
+    const io = path.currentIo();
     const manifest_bytes = try manifest.encode(ctx.allocator);
     defer ctx.allocator.free(manifest_bytes);
 
@@ -199,7 +202,7 @@ pub fn writeManifest(ctx: *Context, dir_path: []const u8, manifest: *const Packa
         return ManifestError.OutOfMemory;
     };
     defer ctx.allocator.free(meta_dir_path);
-    std.fs.cwd().makePath(meta_dir_path) catch |err| {
+    path.ensureDirExists(meta_dir_path) catch |err| {
         return switch (err) {
             error.AccessDenied => ManifestError.PermissionDenied,
             else => ManifestError.FileSystem,
@@ -212,14 +215,14 @@ pub fn writeManifest(ctx: *Context, dir_path: []const u8, manifest: *const Packa
     defer ctx.allocator.free(manifest_path);
 
     {
-        const file = std.fs.createFileAbsolute(manifest_path, .{}) catch |err| {
+        var file = std.Io.Dir.createFileAbsolute(io, manifest_path, .{}) catch |err| {
             return switch (err) {
                 error.AccessDenied => ManifestError.PermissionDenied,
                 else => ManifestError.FileSystem,
             };
         };
-        defer file.close();
-        file.writeAll(manifest_bytes) catch |err| {
+        defer file.close(io);
+        file.writeStreamingAll(io, manifest_bytes) catch |err| {
             return switch (err) {
                 error.AccessDenied => ManifestError.PermissionDenied,
                 else => ManifestError.FileSystem,
@@ -233,14 +236,14 @@ pub fn writeManifest(ctx: *Context, dir_path: []const u8, manifest: *const Packa
     defer ctx.allocator.free(sig_path);
 
     {
-        const file = std.fs.createFileAbsolute(sig_path, .{}) catch |err| {
+        var file = std.Io.Dir.createFileAbsolute(io, sig_path, .{}) catch |err| {
             return switch (err) {
                 error.AccessDenied => ManifestError.PermissionDenied,
                 else => ManifestError.FileSystem,
             };
         };
-        defer file.close();
-        file.writeAll(&signature) catch |err| {
+        defer file.close(io);
+        file.writeStreamingAll(io, &signature) catch |err| {
             return switch (err) {
                 error.AccessDenied => ManifestError.PermissionDenied,
                 else => ManifestError.FileSystem,
@@ -368,7 +371,7 @@ test "PackageManifestV1 encoded size matches formula" {
 }
 
 test "writeManifest maps makePath AccessDenied to PermissionDenied" {
-    if (std.posix.geteuid() == 0) return error.SkipZigTest;
+    if (std.os.linux.geteuid() == 0) return error.SkipZigTest;
 
     const th = @import("test_helpers.zig");
     var test_env = try th.createTestEnv();
@@ -386,9 +389,19 @@ test "writeManifest maps makePath AccessDenied to PermissionDenied" {
 
     const locked_parent = try std.fs.path.join(allocator, &.{ test_env.path, "locked-parent" });
     defer allocator.free(locked_parent);
-    try std.fs.cwd().makePath(locked_parent);
-    try std.posix.fchmodat(std.posix.AT.FDCWD, locked_parent, 0o555, 0);
-    defer std.posix.fchmodat(std.posix.AT.FDCWD, locked_parent, 0o755, 0) catch {};
+    try path.ensureDirExists(locked_parent);
+    {
+        var locked_parent_dir = try path.openExistingDir(locked_parent);
+        defer locked_parent_dir.close(path.currentIo());
+        try locked_parent_dir.setPermissions(path.currentIo(), .fromMode(0o555));
+    }
+    defer {
+        if (path.openExistingDir(locked_parent)) |locked_parent_dir| {
+            var dir_handle = locked_parent_dir;
+            defer dir_handle.close(path.currentIo());
+            dir_handle.setPermissions(path.currentIo(), .fromMode(0o755)) catch {};
+        } else |_| {}
+    }
 
     const target_dir = try std.fs.path.join(allocator, &.{ locked_parent, "pkg-root" });
     defer allocator.free(target_dir);
@@ -419,7 +432,7 @@ test "readManifestFile reports InvalidInput when manifest is missing" {
 
     const package_dir = try std.fs.path.join(test_env.ctx.allocator, &.{ test_env.path, "pkg-missing-manifest" });
     defer test_env.ctx.allocator.free(package_dir);
-    try std.fs.cwd().makePath(package_dir);
+    try path.ensureDirExists(package_dir);
 
     try std.testing.expectError(ManifestError.InvalidInput, readManifestFile(&test_env.ctx, package_dir));
 }

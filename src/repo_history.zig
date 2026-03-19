@@ -33,7 +33,7 @@ fn mapFs(err: anyerror) Error {
 }
 
 fn deleteTreeIfExists(path: []const u8) Error!void {
-    std.fs.deleteTreeAbsolute(path) catch |err| switch (err) {
+    path_mod.deleteTreeAbsolute(path) catch |err| switch (err) {
         error.FileNotFound => {},
         else => return mapFs(err),
     };
@@ -94,16 +94,16 @@ pub const Staged = struct {
 
         try deleteTreeIfExists(previous_path);
 
-        std.fs.renameAbsolute(current_path, previous_path) catch |err| {
+        std.Io.Dir.renameAbsolute(current_path, previous_path, path_mod.currentIo()) catch |err| {
             return switch (err) {
                 error.FileNotFound => Error.StateNotFound,
                 else => mapFs(err),
             };
         };
 
-        std.fs.renameAbsolute(self.state_path, current_path) catch |err| {
+        std.Io.Dir.renameAbsolute(self.state_path, current_path, path_mod.currentIo()) catch |err| {
             // Best effort rollback of slot move if stage activation fails.
-            std.fs.renameAbsolute(previous_path, current_path) catch {};
+            std.Io.Dir.renameAbsolute(previous_path, current_path, path_mod.currentIo()) catch {};
             return mapFs(err);
         };
 
@@ -117,11 +117,11 @@ pub const Staged = struct {
         self.ctx.allocator.destroy(self.db);
 
         if (!self.committed) {
-            std.fs.deleteTreeAbsolute(self.state_path) catch {};
+            path_mod.deleteTreeAbsolute(self.state_path) catch {};
         }
 
-        std.posix.flock(self.lock_fd, std.posix.LOCK.UN) catch {};
-        std.posix.close(self.lock_fd);
+        _ = std.c.flock(self.lock_fd, std.c.LOCK.UN);
+        _ = std.c.close(self.lock_fd);
 
         self.ctx.allocator.free(self.state_path);
         self.ctx.allocator.free(self.db_path);
@@ -146,19 +146,22 @@ pub fn stageNext(
     };
     defer allocator.free(lock_path);
 
-    const lock_file = std.fs.createFileAbsolute(lock_path, .{ .truncate = false }) catch |err| {
+    const lock_file = std.Io.Dir.createFileAbsolute(path_mod.currentIo(), lock_path, .{ .truncate = false }) catch |err| {
         return ctx.fail(mapFs(err), lock_path, "failed to open repo lock file");
     };
     const lock_fd = lock_file.handle;
 
-    std.posix.flock(lock_fd, std.posix.LOCK.EX) catch {
-        std.posix.close(lock_fd);
-        return ctx.fail(Error.FileSystem, lock_path, "failed to acquire repo lock");
-    };
+    switch (std.posix.errno(std.c.flock(lock_fd, std.c.LOCK.EX))) {
+        .SUCCESS => {},
+        else => {
+            _ = std.c.close(lock_fd);
+            return ctx.fail(Error.FileSystem, lock_path, "failed to acquire repo lock");
+        },
+    }
 
     errdefer {
-        std.posix.flock(lock_fd, std.posix.LOCK.UN) catch {};
-        std.posix.close(lock_fd);
+        _ = std.c.flock(lock_fd, std.c.LOCK.UN);
+        _ = std.c.close(lock_fd);
     }
 
     const src_db_path = currentDbPath(allocator, repo_dir) catch {
@@ -166,7 +169,7 @@ pub fn stageNext(
     };
     defer allocator.free(src_db_path);
 
-    std.fs.accessAbsolute(src_db_path, .{}) catch |err| {
+    std.Io.Dir.accessAbsolute(path_mod.currentIo(), src_db_path, .{}) catch |err| {
         return ctx.fail(switch (err) {
             error.FileNotFound => Error.StateNotFound,
             else => mapFs(err),
@@ -182,10 +185,10 @@ pub fn stageNext(
         return ctx.fail(err, state_path, "failed to remove stale staging state");
     };
 
-    std.fs.cwd().makePath(state_path) catch |err| {
+    path_mod.ensureDirExists(state_path) catch |err| {
         return ctx.fail(mapFs(err), state_path, "failed to create staging state directory");
     };
-    errdefer std.fs.deleteTreeAbsolute(state_path) catch {};
+    errdefer path_mod.deleteTreeAbsolute(state_path) catch {};
 
     const dst_db_path = std.fs.path.join(allocator, &.{ state_path, REPO_DB_FILENAME }) catch {
         return ctx.fail(Error.OutOfMemory, repo_dir, "failed to construct destination db path");
@@ -230,18 +233,19 @@ pub fn undo(ctx: *mere.Context, repo_dir: []const u8) Error!void {
     };
     defer ctx.allocator.free(lock_path);
 
-    const lock_file = std.fs.createFileAbsolute(lock_path, .{ .truncate = false }) catch |err| {
+    const lock_file = std.Io.Dir.createFileAbsolute(path_mod.currentIo(), lock_path, .{ .truncate = false }) catch |err| {
         return ctx.fail(mapFs(err), lock_path, "failed to open repo lock file");
     };
     const lock_fd = lock_file.handle;
-    errdefer std.posix.close(lock_fd);
+    errdefer _ = std.c.close(lock_fd);
 
-    std.posix.flock(lock_fd, std.posix.LOCK.EX) catch {
-        return ctx.fail(Error.FileSystem, lock_path, "failed to acquire repo lock");
-    };
+    switch (std.posix.errno(std.c.flock(lock_fd, std.c.LOCK.EX))) {
+        .SUCCESS => {},
+        else => return ctx.fail(Error.FileSystem, lock_path, "failed to acquire repo lock"),
+    }
     defer {
-        std.posix.flock(lock_fd, std.posix.LOCK.UN) catch {};
-        std.posix.close(lock_fd);
+        _ = std.c.flock(lock_fd, std.c.LOCK.UN);
+        _ = std.c.close(lock_fd);
     }
 
     const previous_db = previousDbPath(ctx.allocator, repo_dir) catch {
@@ -249,7 +253,7 @@ pub fn undo(ctx: *mere.Context, repo_dir: []const u8) Error!void {
     };
     defer ctx.allocator.free(previous_db);
 
-    std.fs.accessAbsolute(previous_db, .{}) catch |err| {
+    std.Io.Dir.accessAbsolute(path_mod.currentIo(), previous_db, .{}) catch |err| {
         return ctx.fail(switch (err) {
             error.FileNotFound => Error.StateNotFound,
             else => mapFs(err),
@@ -267,22 +271,22 @@ pub fn undo(ctx: *mere.Context, repo_dir: []const u8) Error!void {
 
     deleteTreeIfExists(swap_path) catch {};
 
-    std.fs.renameAbsolute(current_path, swap_path) catch |err| {
+    std.Io.Dir.renameAbsolute(current_path, swap_path, path_mod.currentIo()) catch |err| {
         return ctx.fail(switch (err) {
             error.FileNotFound => Error.StateNotFound,
             else => mapFs(err),
         }, current_path, "active state not accessible");
     };
 
-    std.fs.renameAbsolute(previous_path, current_path) catch |err| {
-        std.fs.renameAbsolute(swap_path, current_path) catch {};
+    std.Io.Dir.renameAbsolute(previous_path, current_path, path_mod.currentIo()) catch |err| {
+        std.Io.Dir.renameAbsolute(swap_path, current_path, path_mod.currentIo()) catch {};
         return ctx.fail(mapFs(err), previous_path, "failed to activate previous state");
     };
 
-    std.fs.renameAbsolute(swap_path, previous_path) catch |err| {
+    std.Io.Dir.renameAbsolute(swap_path, previous_path, path_mod.currentIo()) catch |err| {
         // Best effort rollback to preserve at least one active current slot.
-        std.fs.renameAbsolute(current_path, previous_path) catch {};
-        std.fs.renameAbsolute(swap_path, current_path) catch {};
+        std.Io.Dir.renameAbsolute(current_path, previous_path, path_mod.currentIo()) catch {};
+        std.Io.Dir.renameAbsolute(swap_path, current_path, path_mod.currentIo()) catch {};
         return ctx.fail(mapFs(err), swap_path, "failed to complete state swap");
     };
 }
@@ -320,7 +324,7 @@ pub fn pruneOldVersions(
     _ = c.sqlite3_bind_text(find_stmt.?, 2, arch.ptr, @intCast(arch.len), c.SQLITE_STATIC);
     _ = c.sqlite3_bind_int(find_stmt.?, 3, @intCast(keep_count));
 
-    var ids_to_delete: std.ArrayList(i64) = .{};
+    var ids_to_delete: std.ArrayList(i64) = .empty;
     defer ids_to_delete.deinit(db.ctx.allocator);
 
     while (c.sqlite3_step(find_stmt.?) == c.SQLITE_ROW) {
@@ -399,7 +403,7 @@ test "stageNextState uses .next and copies current db" {
 
     const staged_db_path = try std.fs.path.join(test_env.ctx.allocator, &.{ staged.state_path, REPO_DB_FILENAME });
     defer test_env.ctx.allocator.free(staged_db_path);
-    try std.fs.accessAbsolute(staged_db_path, .{});
+    try std.Io.Dir.accessAbsolute(path_mod.currentIo(), staged_db_path, .{});
 }
 
 test "Staged.commit rotates current to previous" {
@@ -423,7 +427,7 @@ test "Staged.commit rotates current to previous" {
 
     const key_dir = try std.fs.path.join(test_env.ctx.allocator, &.{ test_env.path, "keys" });
     defer test_env.ctx.allocator.free(key_dir);
-    try std.fs.cwd().makePath(key_dir);
+    try path_mod.ensureDirExists(key_dir);
     const kp = try sign_mod.generateKeyPair();
     const key_path = try std.fs.path.join(test_env.ctx.allocator, &.{ key_dir, "test.key" });
     defer test_env.ctx.allocator.free(key_path);
@@ -436,7 +440,7 @@ test "Staged.commit rotates current to previous" {
 
     const previous_db = try previousDbPath(test_env.ctx.allocator, repo_dir);
     defer test_env.ctx.allocator.free(previous_db);
-    try std.fs.accessAbsolute(previous_db, .{});
+    try std.Io.Dir.accessAbsolute(path_mod.currentIo(), previous_db, .{});
 }
 
 test "undoLastChange swaps current and previous" {
@@ -460,7 +464,7 @@ test "undoLastChange swaps current and previous" {
 
     const key_dir = try std.fs.path.join(test_env.ctx.allocator, &.{ test_env.path, "keys" });
     defer test_env.ctx.allocator.free(key_dir);
-    try std.fs.cwd().makePath(key_dir);
+    try path_mod.ensureDirExists(key_dir);
     const kp = try sign_mod.generateKeyPair();
     const key_path = try std.fs.path.join(test_env.ctx.allocator, &.{ key_dir, "test.key" });
     defer test_env.ctx.allocator.free(key_path);
@@ -477,8 +481,8 @@ test "undoLastChange swaps current and previous" {
     defer test_env.ctx.allocator.free(current_db);
     const previous_db = try previousDbPath(test_env.ctx.allocator, repo_dir);
     defer test_env.ctx.allocator.free(previous_db);
-    try std.fs.accessAbsolute(current_db, .{});
-    try std.fs.accessAbsolute(previous_db, .{});
+    try std.Io.Dir.accessAbsolute(path_mod.currentIo(), current_db, .{});
+    try std.Io.Dir.accessAbsolute(path_mod.currentIo(), previous_db, .{});
 }
 
 test "Staged.deinit without commit cleans up staging dir" {
@@ -507,7 +511,7 @@ test "Staged.deinit without commit cleans up staging dir" {
         staged.deinit();
     }
 
-    std.fs.accessAbsolute(staged_path, .{}) catch |err| {
+    std.Io.Dir.accessAbsolute(path_mod.currentIo(), staged_path, .{}) catch |err| {
         try std.testing.expect(err == error.FileNotFound);
         return;
     };

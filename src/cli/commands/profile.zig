@@ -114,7 +114,7 @@ pub fn handleList(ctx: *mere.Context, args: *const types.ParsedArgs) MereError!t
     defer dir.close();
 
     // Build output
-    var output: std.ArrayList(u8) = .{};
+    var output: std.ArrayList(u8) = .empty;
     defer output.deinit(ctx.allocator);
 
     const writer = output.writer(ctx.allocator);
@@ -319,7 +319,7 @@ pub fn handleCreate(ctx: *mere.Context, args: *const types.ParsedArgs) MereError
         };
 
         // Build package entries for the new generation
-        var packages: std.ArrayList(generation_mod.PackageEntry) = .{};
+        var packages: std.ArrayList(generation_mod.PackageEntry) = .empty;
         defer packages.deinit(ctx.allocator);
 
         for (manifest.packages.items) |pkg| {

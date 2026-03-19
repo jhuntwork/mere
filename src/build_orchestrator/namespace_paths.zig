@@ -39,10 +39,10 @@ pub fn translateWorkspacePathToNamespace(
 
 pub fn createNamespaceEnvMap(
     allocator: std.mem.Allocator,
-    host_env: ?*std.process.EnvMap,
+    host_env: ?*std.process.Environ.Map,
     workspace_root: []const u8,
-) !std.process.EnvMap {
-    var ns_env = std.process.EnvMap.init(allocator);
+) !std.process.Environ.Map {
+    var ns_env = std.process.Environ.Map.init(allocator);
     errdefer ns_env.deinit();
 
     if (host_env) |env| {
@@ -81,7 +81,7 @@ test "translateWorkspacePathToNamespace rewrites only boundary-contained paths" 
 
 test "createNamespaceEnvMap rewrites only namespace workspace path vars" {
     const allocator = std.testing.allocator;
-    var host = std.process.EnvMap.init(allocator);
+    var host = std.process.Environ.Map.init(allocator);
     defer host.deinit();
 
     try host.put("MERE_BUILD_DIR", "/tmp/workspace/build-src");

@@ -1,6 +1,7 @@
 const std = @import("std");
 const Context = @import("mere.zig").Context;
 const errors = @import("errors.zig");
+const path_mod = @import("path.zig");
 const path_safety = @import("path_safety.zig");
 
 /// Store operations error set
@@ -117,7 +118,7 @@ pub fn parseStorePath(store_path: []const u8) StoreError!StorePathComponents {
 
 /// Check if a store path exists and is valid.
 pub fn storePathExists(store_path: []const u8) bool {
-    std.fs.accessAbsolute(store_path, .{}) catch {
+    std.Io.Dir.accessAbsolute(path_mod.currentIo(), store_path, .{}) catch {
         return false;
     };
     return true;
@@ -125,7 +126,7 @@ pub fn storePathExists(store_path: []const u8) bool {
 
 /// Check if the current process is running with root privileges
 pub fn isPrivileged() bool {
-    return std.posix.getuid() == 0 and std.posix.geteuid() == 0;
+    return std.os.linux.getuid() == 0 and std.os.linux.geteuid() == 0;
 }
 
 /// Harden a store object for system use by changing ownership and permissions
@@ -170,10 +171,10 @@ pub fn hardenStoreObject(
     }
 
     // Open the store object directory
-    var dir = std.fs.openDirAbsolute(store_path, .{ .iterate = true }) catch {
+    var dir = path_mod.openExistingDir(store_path) catch {
         return ctx.fail(StoreError.FileSystem, store_path, "failed to open store directory");
     };
-    defer dir.close();
+    defer dir.close(path_mod.currentIo());
 
     // Walk the directory tree using lstat (don't follow symlinks)
     try hardenDirectory(ctx, dir, store_path, store_path);
@@ -182,27 +183,28 @@ pub fn hardenStoreObject(
 /// Recursively harden a directory
 fn hardenDirectory(
     ctx: *Context,
-    dir: std.fs.Dir,
+    dir: std.Io.Dir,
     dir_path: []const u8,
     store_root: []const u8,
 ) StoreError!void {
-    const dir_stat = dir.stat() catch {
+    const io = path_mod.currentIo();
+    const dir_stat = dir.stat(io) catch {
         return ctx.fail(StoreError.FileSystem, dir_path, "failed to stat directory");
     };
-    const dir_mode = dir_stat.mode & ~@as(std.fs.File.Mode, 0o222);
+    const dir_mode = dir_stat.permissions.toMode() & ~@as(u16, 0o222);
 
     // Capture mode before chown. Linux clears setuid/setgid on ownership change,
     // so we must restore the packaged mode after changing owner.
-    std.posix.fchown(dir.fd, 0, 0) catch {
+    dir.setOwner(io, 0, 0) catch {
         return ctx.fail(StoreError.PermissionDenied, dir_path, "failed to change ownership of directory");
     };
-    dir.chmod(dir_mode) catch {
+    dir.setPermissions(io, .fromMode(dir_mode)) catch {
         return ctx.fail(StoreError.PermissionDenied, dir_path, "failed to chmod directory to read-only");
     };
 
     // Iterate through directory contents
     var iter = dir.iterate();
-    while (iter.next() catch {
+    while (iter.next(io) catch {
         return ctx.fail(StoreError.FileSystem, dir_path, "failed to iterate directory");
     }) |entry| {
         const entry_path = std.fs.path.join(ctx.allocator, &.{ dir_path, entry.name }) catch {
@@ -213,31 +215,31 @@ fn hardenDirectory(
         switch (entry.kind) {
             .directory => {
                 // Recursively harden subdirectory
-                var subdir = dir.openDir(entry.name, .{ .iterate = true }) catch {
+                var subdir = dir.openDir(io, entry.name, .{ .iterate = true }) catch {
                     return ctx.fail(StoreError.FileSystem, entry_path, "failed to open subdirectory");
                 };
-                defer subdir.close();
+                defer subdir.close(io);
 
                 try hardenDirectory(ctx, subdir, entry_path, store_root);
             },
             .file => {
                 // Open file to get handle for operations
-                var file = dir.openFile(entry.name, .{ .mode = .read_only }) catch {
+                var file = dir.openFile(io, entry.name, .{ .mode = .read_only }) catch {
                     return ctx.fail(StoreError.FileSystem, entry_path, "failed to open file");
                 };
-                defer file.close();
+                defer file.close(io);
 
-                const stat = file.stat() catch {
+                const stat = file.stat(io) catch {
                     return ctx.fail(StoreError.FileSystem, entry_path, "failed to stat file");
                 };
-                const new_mode = stat.mode & ~@as(std.fs.File.Mode, 0o222);
+                const new_mode = stat.permissions.toMode() & ~@as(u16, 0o222);
 
                 // Capture mode before chown. Linux clears setuid/setgid on
                 // ownership change, so restore the packaged mode afterward.
-                std.posix.fchown(file.handle, 0, 0) catch {
+                file.setOwner(io, 0, 0) catch {
                     return ctx.fail(StoreError.PermissionDenied, entry_path, "failed to change file ownership");
                 };
-                file.chmod(new_mode) catch {
+                file.setPermissions(io, .fromMode(new_mode)) catch {
                     return ctx.fail(StoreError.PermissionDenied, entry_path, "failed to chmod file");
                 };
             },
@@ -418,7 +420,7 @@ test "hardenStoreObject validates store boundary" {
     // Create a path outside the store
     const outside_path = try std.fs.path.join(ctx.allocator, &.{ test_env.path, "not-store" });
     defer ctx.allocator.free(outside_path);
-    try std.fs.cwd().makePath(outside_path);
+    try path_mod.ensureDirExists(outside_path);
 
     // Should reject paths outside store
     if (isPrivileged()) {
@@ -447,7 +449,7 @@ test "hardenStoreObject rejects sibling-prefix path" {
         "a" ** 64 ++ "-pkg-1.0.0",
     });
     defer ctx.allocator.free(sibling_path);
-    try std.fs.cwd().makePath(sibling_path);
+    try path_mod.ensureDirExists(sibling_path);
 
     if (isPrivileged()) {
         try std.testing.expectError(StoreError.InvalidInput, hardenStoreObject(ctx, sibling_path));
@@ -471,7 +473,7 @@ test "hardenStoreObject requires privilege" {
     const hash = "a" ** 64;
     const store_path = try std.fs.path.join(ctx.allocator, &.{ test_env.path, "mere", "store", hash ++ "-test-1.0" });
     defer ctx.allocator.free(store_path);
-    try std.fs.cwd().makePath(store_path);
+    try path_mod.ensureDirExists(store_path);
 
     if (!isPrivileged()) {
         // Non-root should get PermissionDenied
@@ -497,12 +499,12 @@ test "path safety rejects escapes, loops, and deep chains" {
 
     const store_path = try std.fs.path.join(allocator, &.{ store_root, "a" ** 64 ++ "-test-1.0" });
     defer allocator.free(store_path);
-    try std.fs.cwd().makePath(store_path);
+    try path_mod.ensureDirExists(store_path);
 
     // 1) Escaping symlink
     const escape_link = try std.fs.path.join(allocator, &.{ store_path, "escape_link" });
     defer allocator.free(escape_link);
-    try std.posix.symlinkat("/etc/passwd", std.fs.cwd().fd, escape_link);
+    try std.Io.Dir.symLinkAbsolute(path_mod.currentIo(), "/etc/passwd", escape_link, .{});
     try std.testing.expectError(
         path_safety.PathSafetyError.EscapesBoundary,
         path_safety.resolveWithinBoundary(allocator, escape_link, store_path),
@@ -513,8 +515,12 @@ test "path safety rejects escapes, loops, and deep chains" {
     defer allocator.free(loop_a);
     const loop_b = try std.fs.path.join(allocator, &.{ store_path, "loop_b" });
     defer allocator.free(loop_b);
-    try std.posix.symlinkat("loop_b", std.fs.cwd().fd, loop_a);
-    try std.posix.symlinkat("loop_a", std.fs.cwd().fd, loop_b);
+    {
+        var store_dir_handle = try path_mod.openExistingDir(store_path);
+        defer store_dir_handle.close(path_mod.currentIo());
+        try store_dir_handle.symLink(path_mod.currentIo(), "loop_b", "loop_a", .{});
+        try store_dir_handle.symLink(path_mod.currentIo(), "loop_a", "loop_b", .{});
+    }
     try std.testing.expectError(
         path_safety.PathSafetyError.SymlinkLoop,
         path_safety.resolveWithinBoundary(allocator, loop_a, store_path),
@@ -523,7 +529,11 @@ test "path safety rejects escapes, loops, and deep chains" {
     // 3) Chain too deep
     const prev = try std.fmt.allocPrint(allocator, "{s}/chain_0", .{store_path});
     defer allocator.free(prev);
-    try std.posix.symlinkat("chain_1", std.fs.cwd().fd, prev);
+    {
+        var store_dir_handle = try path_mod.openExistingDir(store_path);
+        defer store_dir_handle.close(path_mod.currentIo());
+        try store_dir_handle.symLink(path_mod.currentIo(), "chain_1", "chain_0", .{});
+    }
 
     var idx: u32 = 1;
     while (idx <= path_safety.MAX_SYMLINK_DEPTH + 1) : (idx += 1) {
@@ -531,7 +541,11 @@ test "path safety rejects escapes, loops, and deep chains" {
         defer allocator.free(current);
         const next = try std.fmt.allocPrint(allocator, "chain_{d}", .{idx + 1});
         defer allocator.free(next);
-        try std.posix.symlinkat(next, std.fs.cwd().fd, current);
+        var store_dir_handle = try path_mod.openExistingDir(store_path);
+        defer store_dir_handle.close(path_mod.currentIo());
+        const current_name = try std.fmt.allocPrint(allocator, "chain_{d}", .{idx});
+        defer allocator.free(current_name);
+        try store_dir_handle.symLink(path_mod.currentIo(), next, current_name, .{});
     }
     try std.testing.expectError(
         path_safety.PathSafetyError.ChainTooDeep,
@@ -542,13 +556,17 @@ test "path safety rejects escapes, loops, and deep chains" {
     const data_file = try std.fs.path.join(allocator, &.{ store_path, "data.txt" });
     defer allocator.free(data_file);
     {
-        var f = try std.fs.createFileAbsolute(data_file, .{});
-        try f.writeAll("ok");
-        f.close();
+        var f = try path_mod.makePathAndOpenFile(data_file);
+        try f.writeStreamingAll(path_mod.currentIo(), "ok");
+        f.close(path_mod.currentIo());
     }
     const ok_link = try std.fs.path.join(allocator, &.{ store_path, "ok_link" });
     defer allocator.free(ok_link);
-    try std.posix.symlinkat("data.txt", std.fs.cwd().fd, ok_link);
+    {
+        var store_dir_handle = try path_mod.openExistingDir(store_path);
+        defer store_dir_handle.close(path_mod.currentIo());
+        try store_dir_handle.symLink(path_mod.currentIo(), "data.txt", "ok_link", .{});
+    }
     {
         const result = try path_safety.resolveWithinBoundary(allocator, ok_link, store_path);
         defer allocator.free(result.path);
@@ -557,7 +575,11 @@ test "path safety rejects escapes, loops, and deep chains" {
     // 5) Broken link is allowed
     const broken = try std.fs.path.join(allocator, &.{ store_path, "broken_link" });
     defer allocator.free(broken);
-    try std.posix.symlinkat("missing.txt", std.fs.cwd().fd, broken);
+    {
+        var store_dir_handle = try path_mod.openExistingDir(store_path);
+        defer store_dir_handle.close(path_mod.currentIo());
+        try store_dir_handle.symLink(path_mod.currentIo(), "missing.txt", "broken_link", .{});
+    }
     {
         const result = try path_safety.resolveWithinBoundary(allocator, broken, store_path);
         defer allocator.free(result.path);
@@ -585,14 +607,14 @@ test "hardenStoreObject detects escaping symlinks" {
     const hash = "b" ** 64;
     const store_path = try std.fs.path.join(ctx.allocator, &.{ test_env.path, "mere", "store", hash ++ "-escape-1.0" });
     defer ctx.allocator.free(store_path);
-    try std.fs.cwd().makePath(store_path);
+    try path_mod.ensureDirExists(store_path);
 
     // Create a symlink that escapes
     const link_path = try std.fs.path.join(ctx.allocator, &.{ store_path, "escape_link" });
     defer ctx.allocator.free(link_path);
 
     const outside_target = "/etc/passwd";
-    try std.posix.symlinkat(outside_target, std.fs.cwd().fd, link_path);
+    try std.Io.Dir.symLinkAbsolute(path_mod.currentIo(), outside_target, link_path, .{});
 
     // Should detect escape
     try std.testing.expectError(StoreError.SymlinkEscapesBoundary, hardenStoreObject(ctx, store_path));
@@ -613,14 +635,14 @@ test "store admission handles existing path idempotently" {
     const hash = "c" ** 64;
     const store_path = try std.fs.path.join(ctx.allocator, &.{ test_env.path, "mere", "store", hash ++ "-existing-1.0" });
     defer ctx.allocator.free(store_path);
-    try std.fs.cwd().makePath(store_path);
+    try path_mod.ensureDirExists(store_path);
 
     // Create a file in the existing store path to verify it's not empty
     const test_file = try std.fs.path.join(ctx.allocator, &.{ store_path, "test.txt" });
     defer ctx.allocator.free(test_file);
-    var file = try std.fs.createFileAbsolute(test_file, .{});
-    try file.writeAll("existing content");
-    file.close();
+    var file = try path_mod.makePathAndOpenFile(test_file);
+    try file.writeStreamingAll(path_mod.currentIo(), "existing content");
+    file.close(path_mod.currentIo());
 
     // Verify the path exists
     try std.testing.expect(storePathExists(store_path));
@@ -628,34 +650,28 @@ test "store admission handles existing path idempotently" {
     // Create a staging directory to simulate a second admission attempt
     const staging_path = try std.fs.path.join(ctx.allocator, &.{ test_env.path, "staging" });
     defer ctx.allocator.free(staging_path);
-    try std.fs.cwd().makePath(staging_path);
+    try path_mod.ensureDirExists(staging_path);
 
     const staging_file = try std.fs.path.join(ctx.allocator, &.{ staging_path, "test.txt" });
     defer ctx.allocator.free(staging_file);
-    var staging_f = try std.fs.createFileAbsolute(staging_file, .{});
-    try staging_f.writeAll("new content");
-    staging_f.close();
+    var staging_f = try path_mod.makePathAndOpenFile(staging_file);
+    try staging_f.writeStreamingAll(path_mod.currentIo(), "new content");
+    staging_f.close(path_mod.currentIo());
 
-    // Attempt atomic rename (simulating store admission) using std.posix.renameZ
-    // which properly converts raw syscall results to Zig errors
-    const staging_z = try ctx.allocator.dupeZ(u8, staging_path);
-    defer ctx.allocator.free(staging_z);
-    const store_z = try ctx.allocator.dupeZ(u8, store_path);
-    defer ctx.allocator.free(store_z);
-
-    // Should fail with PathAlreadyExists (EEXIST/ENOTEMPTY mapped by std.posix)
-    try std.testing.expectError(error.PathAlreadyExists, std.posix.renameZ(staging_z, store_z));
+    // Under the 0.16 Io rename API, replacing an existing non-empty directory
+    // surfaces as DirNotEmpty.
+    try std.testing.expectError(error.DirNotEmpty, std.Io.Dir.renameAbsolute(staging_path, store_path, path_mod.currentIo()));
 
     // Original store path should still exist with original content
     try std.testing.expect(storePathExists(store_path));
-    var verify_file = try std.fs.openFileAbsolute(test_file, .{});
-    defer verify_file.close();
+    var verify_file = try path_mod.openExistingFile(test_file);
+    defer verify_file.close(path_mod.currentIo());
     var buf: [100]u8 = undefined;
-    const n = try verify_file.readAll(&buf);
+    const n = try verify_file.readPositionalAll(path_mod.currentIo(), &buf, 0);
     try std.testing.expectEqualStrings("existing content", buf[0..n]);
 
     // Clean up staging directory (simulating what install.zig does)
-    std.fs.deleteTreeAbsolute(staging_path) catch {};
+    path_mod.deleteTreeAbsolute(staging_path) catch {};
 }
 
 // Spec #7: Relative symlink that stays within boundary is accepted
@@ -675,25 +691,29 @@ test "resolveWithinBoundary accepts relative symlink within store" {
 
     const store_path = try std.fs.path.join(allocator, &.{ store_root, "d" ** 64 ++ "-reltest-1.0" });
     defer allocator.free(store_path);
-    try std.fs.cwd().makePath(store_path);
+    try path_mod.ensureDirExists(store_path);
 
     // Create a subdirectory with a real file
     const lib_dir = try std.fs.path.join(allocator, &.{ store_path, "lib" });
     defer allocator.free(lib_dir);
-    try std.fs.cwd().makePath(lib_dir);
+    try path_mod.ensureDirExists(lib_dir);
 
     const real_file = try std.fs.path.join(allocator, &.{ lib_dir, "libfoo.so.1.0" });
     defer allocator.free(real_file);
     {
-        var f = try std.fs.createFileAbsolute(real_file, .{});
-        try f.writeAll("ELF...");
-        f.close();
+        var f = try path_mod.makePathAndOpenFile(real_file);
+        try f.writeStreamingAll(path_mod.currentIo(), "ELF...");
+        f.close(path_mod.currentIo());
     }
 
     // Create a relative symlink: lib/libfoo.so -> libfoo.so.1.0
     const rel_link = try std.fs.path.join(allocator, &.{ lib_dir, "libfoo.so" });
     defer allocator.free(rel_link);
-    try std.posix.symlinkat("libfoo.so.1.0", std.fs.cwd().fd, rel_link);
+    {
+        var lib_dir_handle = try path_mod.openExistingDir(lib_dir);
+        defer lib_dir_handle.close(path_mod.currentIo());
+        try lib_dir_handle.symLink(path_mod.currentIo(), "libfoo.so.1.0", "libfoo.so", .{});
+    }
 
     // resolveWithinBoundary should accept this relative symlink
     const result = try path_safety.resolveWithinBoundary(allocator, rel_link, store_path);

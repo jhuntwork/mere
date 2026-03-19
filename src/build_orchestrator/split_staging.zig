@@ -1,5 +1,6 @@
 const std = @import("std");
 const mere = @import("../mere.zig");
+const path_mod = @import("../path.zig");
 const recipe = @import("../recipe.zig");
 const package_staging = @import("../package_staging.zig");
 
@@ -118,14 +119,25 @@ pub fn resetPackageStagingDirs(
     };
     defer allocator.free(pkg_root);
 
-    std.fs.deleteTreeAbsolute(pkg_root) catch |err| {
-        if (err != error.FileNotFound) {
-            return ctx.fail(error.FileSystem, pkg_root, "failed to reset package workspace");
+    if (std.fs.path.dirname(pkg_root)) |parent_dir_path| {
+        var parent_dir = path_mod.makePathAndOpenDir(parent_dir_path) catch {
+            return ctx.fail(error.FileSystem, parent_dir_path, "failed to open package workspace parent");
+        };
+        defer parent_dir.close(path_mod.currentIo());
+        if (std.Io.Dir.accessAbsolute(path_mod.currentIo(), pkg_root, .{})) |_| {
+            parent_dir.deleteTree(path_mod.currentIo(), std.fs.path.basename(pkg_root)) catch {
+                return ctx.fail(error.FileSystem, pkg_root, "failed to reset package workspace");
+            };
+        } else |err| {
+            if (err != error.FileNotFound) {
+                return ctx.fail(error.FileSystem, pkg_root, "failed to inspect package workspace");
+            }
         }
-    };
-    std.fs.cwd().makePath(pkg_root) catch {
+    }
+    var pkg_root_handle = path_mod.makePathAndOpenDir(pkg_root) catch {
         return ctx.fail(error.FileSystem, pkg_root, "failed to create package workspace");
     };
+    pkg_root_handle.close(path_mod.currentIo());
 
     for (packages) |artifact| {
         const pkg_name = if (artifact.name.len > 0) artifact.name else "pkg";
@@ -134,9 +146,10 @@ pub fn resetPackageStagingDirs(
         };
         defer allocator.free(staging_dir);
 
-        std.fs.cwd().makePath(staging_dir) catch {
+        var staging_dir_handle = path_mod.makePathAndOpenDir(staging_dir) catch {
             return ctx.fail(error.FileSystem, staging_dir, "failed to create staging directory");
         };
+        staging_dir_handle.close(path_mod.currentIo());
     }
 }
 
@@ -216,23 +229,25 @@ test "resetPackageStagingDirs removes stale package workspace contents before st
 
     const workspace_root = try std.fs.path.join(test_env.ctx.allocator, &.{ test_env.path, "workspace-pack-reset" });
     defer test_env.ctx.allocator.free(workspace_root);
-    try std.fs.cwd().makePath(workspace_root);
+    var workspace_root_handle = try path_mod.makePathAndOpenDir(workspace_root);
+    workspace_root_handle.close(path_mod.currentIo());
 
     const stale_dir = try std.fs.path.join(test_env.ctx.allocator, &.{ workspace_root, "pkg", "pack-reset", "usr", "bin" });
     defer test_env.ctx.allocator.free(stale_dir);
-    try std.fs.cwd().makePath(stale_dir);
+    var stale_dir_handle = try path_mod.makePathAndOpenDir(stale_dir);
+    stale_dir_handle.close(path_mod.currentIo());
 
     const stale_path = try std.fs.path.join(test_env.ctx.allocator, &.{ stale_dir, "old-tool" });
     defer test_env.ctx.allocator.free(stale_path);
-    var stale_file = try std.fs.createFileAbsolute(stale_path, .{});
-    defer stale_file.close();
-    try stale_file.writeAll("stale");
+    var stale_file = try std.Io.Dir.createFileAbsolute(path_mod.currentIo(), stale_path, .{});
+    defer stale_file.close(path_mod.currentIo());
+    try stale_file.writeStreamingAll(path_mod.currentIo(), "stale");
 
     const stale_archive = try std.fs.path.join(test_env.ctx.allocator, &.{ workspace_root, "pkg", "pack-reset-1.0-1-x86_64-old.pkg.tar.zst" });
     defer test_env.ctx.allocator.free(stale_archive);
-    var stale_archive_file = try std.fs.createFileAbsolute(stale_archive, .{});
-    defer stale_archive_file.close();
-    try stale_archive_file.writeAll("stale archive");
+    var stale_archive_file = try std.Io.Dir.createFileAbsolute(path_mod.currentIo(), stale_archive, .{});
+    defer stale_archive_file.close(path_mod.currentIo());
+    try stale_archive_file.writeStreamingAll(path_mod.currentIo(), "stale archive");
 
     try resetPackageStagingDirs(
         test_env.ctx.allocator,
@@ -242,14 +257,14 @@ test "resetPackageStagingDirs removes stale package workspace contents before st
     );
 
     var stale_path_missing = false;
-    std.fs.accessAbsolute(stale_path, .{}) catch |err| {
+    std.Io.Dir.accessAbsolute(path_mod.currentIo(), stale_path, .{}) catch |err| {
         try std.testing.expectEqual(error.FileNotFound, err);
         stale_path_missing = true;
     };
     try std.testing.expect(stale_path_missing);
 
     var stale_archive_missing = false;
-    std.fs.accessAbsolute(stale_archive, .{}) catch |err| {
+    std.Io.Dir.accessAbsolute(path_mod.currentIo(), stale_archive, .{}) catch |err| {
         try std.testing.expectEqual(error.FileNotFound, err);
         stale_archive_missing = true;
     };

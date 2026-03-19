@@ -7,7 +7,7 @@ pub const HashError = Std.OutOfMemory || Std.FileSystem || Std.PermissionDenied 
 
 const TreeHashEntry = struct {
     entry_path: []const u8,
-    kind: std.fs.File.Kind,
+    kind: std.Io.File.Kind,
     mode: u32,
     size: u64,
     mtime: i128,
@@ -56,36 +56,39 @@ pub fn calculateFileHash(allocator: std.mem.Allocator, file_path: []const u8) Ha
     if (!path.isValidInputPath(file_path)) {
         return HashError.InvalidInput;
     }
-    var archive_file: std.fs.File = undefined;
+    const io = path.currentIo();
+    var archive_file: std.Io.File = undefined;
 
     if (std.fs.path.isAbsolute(file_path)) {
-        archive_file = std.fs.openFileAbsolute(file_path, .{}) catch |err| {
+        archive_file = std.Io.Dir.openFileAbsolute(io, file_path, .{}) catch |err| {
             return switch (err) {
                 error.FileNotFound => HashError.FileSystem,
                 else => mapHashFsError(err),
             };
         };
     } else {
-        archive_file = std.fs.cwd().openFile(file_path, .{}) catch |err| {
+        archive_file = std.Io.Dir.cwd().openFile(io, file_path, .{}) catch |err| {
             return switch (err) {
                 error.FileNotFound => HashError.FileSystem,
                 else => mapHashFsError(err),
             };
         };
     }
-    defer archive_file.close();
+    defer archive_file.close(io);
 
     var hasher = std.crypto.hash.Blake3.init(.{});
     var hash_buffer: [std.crypto.hash.Blake3.digest_length]u8 = undefined;
 
     {
         var buf: [8192]u8 = undefined;
+        var offset: u64 = 0;
         while (true) {
-            const bytes_read = archive_file.read(&buf) catch |err| {
+            const bytes_read = archive_file.readPositionalAll(io, &buf, offset) catch |err| {
                 return mapHashFsError(err);
             };
             if (bytes_read == 0) break;
             hasher.update(buf[0..bytes_read]);
+            offset += bytes_read;
         }
     }
 
@@ -131,16 +134,17 @@ fn calculateTreeHashInternal(
         return HashError.InvalidInput;
     }
 
-    var dir = std.fs.openDirAbsolute(dir_path, .{ .iterate = true }) catch |err| {
+    const io = path.currentIo();
+    var dir = std.Io.Dir.openDirAbsolute(io, dir_path, .{ .iterate = true }) catch |err| {
         setDiag(allocator, diag, dir_path, "open directory", err);
         return switch (err) {
             error.FileNotFound => HashError.FileSystem,
             else => mapHashFsError(err),
         };
     };
-    defer dir.close();
+    defer dir.close(io);
 
-    var entries: std.ArrayList(TreeHashEntry) = .{};
+    var entries: std.ArrayList(TreeHashEntry) = .empty;
     defer {
         for (entries.items) |entry| {
             allocator.free(entry.entry_path);
@@ -155,7 +159,7 @@ fn calculateTreeHashInternal(
     defer walker.deinit();
 
     while (true) {
-        const entry = walker.next() catch |err| {
+        const entry = walker.next(io) catch |err| {
             setDiag(allocator, diag, dir_path, "iterate directory walk", err);
             return mapHashFsError(err);
         };
@@ -179,7 +183,7 @@ fn calculateTreeHashInternal(
             },
         }
 
-        const stat = std.posix.fstatat(dir.fd, e.path, std.posix.AT.SYMLINK_NOFOLLOW) catch |err| {
+        const stat = dir.statFile(io, e.path, .{ .follow_symlinks = false }) catch |err| {
             allocator.free(path_copy);
             setDiag(allocator, diag, e.path, "stat entry", err);
             return switch (err) {
@@ -191,9 +195,9 @@ fn calculateTreeHashInternal(
         entries.append(allocator, .{
             .entry_path = path_copy,
             .kind = e.kind,
-            .mode = @intCast(stat.mode),
+            .mode = stat.permissions.toMode(),
             .size = if (e.kind == .file) @intCast(stat.size) else 0,
-            .mtime = timespecToNs(stat.mtime()),
+            .mtime = stat.mtime.nanoseconds,
         }) catch {
             allocator.free(path_copy);
             setDiag(allocator, diag, e.path, "record entry", error.OutOfMemory);
@@ -241,36 +245,39 @@ fn calculateTreeHashInternal(
 
             hasher.update(&std.mem.toBytes(entry.size));
 
-            const file = dir.openFile(entry.entry_path, .{}) catch |err| {
+            const file = dir.openFile(io, entry.entry_path, .{}) catch |err| {
                 setDiag(allocator, diag, entry.entry_path, "open file", err);
                 return switch (err) {
                     error.FileNotFound => HashError.FileSystem,
                     else => mapHashFsError(err),
                 };
             };
-            defer file.close();
+            defer file.close(io);
 
             var buf: [8192]u8 = undefined;
+            var offset: u64 = 0;
             while (true) {
-                const bytes_read = file.read(&buf) catch |err| {
+                const bytes_read = file.readPositionalAll(io, &buf, offset) catch |err| {
                     setDiag(allocator, diag, entry.entry_path, "read file", err);
                     return mapHashFsError(err);
                 };
                 if (bytes_read == 0) break;
                 hasher.update(buf[0..bytes_read]);
+                offset += bytes_read;
             }
         } else if (entry.kind == .sym_link) {
             var link_buf: [std.fs.max_path_bytes]u8 = undefined;
-            const target = dir.readLink(entry.entry_path, &link_buf) catch |err| {
+            const target_len = dir.readLink(io, entry.entry_path, &link_buf) catch |err| {
                 setDiag(allocator, diag, entry.entry_path, "read symlink", err);
                 return switch (err) {
                     error.FileNotFound => HashError.FileSystem,
                     else => mapHashFsError(err),
                 };
             };
+            const target = link_buf[0..target_len];
 
-            const target_len: u32 = @intCast(target.len);
-            hasher.update(&std.mem.toBytes(target_len));
+            const target_len_u32: u32 = @intCast(target.len);
+            hasher.update(&std.mem.toBytes(target_len_u32));
 
             hasher.update(target);
         }
@@ -302,10 +309,6 @@ fn setDiag(
     d.* = .{ .path = dup_path, .action = action_value, .os_error = os_error, .owns_path = true };
 }
 
-fn timespecToNs(ts: std.posix.timespec) i128 {
-    return (@as(i128, ts.sec) * std.time.ns_per_s) + ts.nsec;
-}
-
 // Spec #1: Store content hash determinism
 // Spec #1: Hash output is 64 lowercase hex characters
 test "calculateStoreContentHash computes deterministic hash for directory" {
@@ -323,12 +326,12 @@ test "calculateStoreContentHash computes deterministic hash for directory" {
     defer std.testing.allocator.free(file2_path);
 
     {
-        const f1 = try std.fs.createFileAbsolute(file1_path, .{});
-        try f1.writeAll("hello");
-        f1.close();
-        const f2 = try std.fs.createFileAbsolute(file2_path, .{});
-        try f2.writeAll("world");
-        f2.close();
+        var f1 = try std.Io.Dir.createFileAbsolute(path.currentIo(), file1_path, .{});
+        try f1.writeStreamingAll(path.currentIo(), "hello");
+        f1.close(path.currentIo());
+        var f2 = try std.Io.Dir.createFileAbsolute(path.currentIo(), file2_path, .{});
+        try f2.writeStreamingAll(path.currentIo(), "world");
+        f2.close(path.currentIo());
     }
 
     // Compute directory hash
@@ -345,7 +348,7 @@ test "calculateStoreContentHash computes deterministic hash for directory" {
     try std.testing.expectEqual(@as(usize, 64), hash1.len);
 
     // Remove a file and check hash changes
-    try std.fs.deleteFileAbsolute(file2_path);
+    try std.Io.Dir.deleteFileAbsolute(path.currentIo(), file2_path);
     const hash3 = try calculateStoreContentHash(test_env.ctx.allocator, test_env.path, null);
     defer test_env.ctx.allocator.free(hash3);
 
@@ -367,9 +370,9 @@ test "calculateStoreContentHash excludes .mere directory" {
     const content_path = try std.fs.path.join(std.testing.allocator, &.{ test_env.path, "content.txt" });
     defer std.testing.allocator.free(content_path);
     {
-        const f = try std.fs.createFileAbsolute(content_path, .{});
-        try f.writeAll("package content");
-        f.close();
+        var f = try std.Io.Dir.createFileAbsolute(path.currentIo(), content_path, .{});
+        try f.writeStreamingAll(path.currentIo(), "package content");
+        f.close(path.currentIo());
     }
 
     // Compute hash without .mere directory
@@ -379,14 +382,14 @@ test "calculateStoreContentHash excludes .mere directory" {
     // Create .mere directory with manifest.v1
     const mere_dir = try std.fs.path.join(std.testing.allocator, &.{ test_env.path, ".mere" });
     defer std.testing.allocator.free(mere_dir);
-    try std.fs.cwd().makePath(mere_dir);
+    try path.ensureDirExists(mere_dir);
 
     const manifest_path = try std.fs.path.join(std.testing.allocator, &.{ mere_dir, "manifest.v1" });
     defer std.testing.allocator.free(manifest_path);
     {
-        const f = try std.fs.createFileAbsolute(manifest_path, .{});
-        try f.writeAll("MEREMFST" ++ [_]u8{0} ** 100);
-        f.close();
+        var f = try std.Io.Dir.createFileAbsolute(path.currentIo(), manifest_path, .{});
+        try f.writeStreamingAll(path.currentIo(), "MEREMFST" ++ [_]u8{0} ** 100);
+        f.close(path.currentIo());
     }
 
     // Compute hash with .mere/manifest.v1 present
@@ -400,18 +403,18 @@ test "calculateStoreContentHash excludes .mere directory" {
     const sig_path = try std.fs.path.join(std.testing.allocator, &.{ mere_dir, "manifest.v1.sig" });
     defer std.testing.allocator.free(sig_path);
     {
-        const f = try std.fs.createFileAbsolute(sig_path, .{});
-        try f.writeAll(&[_]u8{0} ** 64);
-        f.close();
+        var f = try std.Io.Dir.createFileAbsolute(path.currentIo(), sig_path, .{});
+        try f.writeStreamingAll(path.currentIo(), &[_]u8{0} ** 64);
+        f.close(path.currentIo());
     }
 
     // Add meta.kdl to .mere directory
     const meta_path = try std.fs.path.join(std.testing.allocator, &.{ mere_dir, "meta.kdl" });
     defer std.testing.allocator.free(meta_path);
     {
-        const f = try std.fs.createFileAbsolute(meta_path, .{});
-        try f.writeAll("dependencies { }\nprovisions { }\n");
-        f.close();
+        var f = try std.Io.Dir.createFileAbsolute(path.currentIo(), meta_path, .{});
+        try f.writeStreamingAll(path.currentIo(), "dependencies { }\nprovisions { }\n");
+        f.close(path.currentIo());
     }
 
     // Compute hash with all .mere files present
@@ -436,9 +439,9 @@ test "calculateStoreContentHash includes executable bit" {
     defer std.testing.allocator.free(file_path);
 
     {
-        const f = try std.fs.createFileAbsolute(file_path, .{});
-        try f.writeAll("#!/bin/sh\necho hello");
-        f.close();
+        var f = try std.Io.Dir.createFileAbsolute(path.currentIo(), file_path, .{});
+        try f.writeStreamingAll(path.currentIo(), "#!/bin/sh\necho hello");
+        f.close(path.currentIo());
     }
 
     // Hash with non-executable file
@@ -447,9 +450,9 @@ test "calculateStoreContentHash includes executable bit" {
 
     // Make file executable
     {
-        const f = try std.fs.openFileAbsolute(file_path, .{});
-        defer f.close();
-        try f.setPermissions(.{ .inner = .{ .mode = 0o755 } });
+        var f = try path.openExistingFile(file_path);
+        defer f.close(path.currentIo());
+        try f.setPermissions(path.currentIo(), .fromMode(0o755));
     }
 
     // Hash with executable file
@@ -473,29 +476,29 @@ test "calculateStoreContentHash hashes symlink targets" {
     const target_path = try std.fs.path.join(std.testing.allocator, &.{ test_env.path, "target.txt" });
     defer std.testing.allocator.free(target_path);
     {
-        const f = try std.fs.createFileAbsolute(target_path, .{});
-        try f.writeAll("data");
-        f.close();
+        var f = try std.Io.Dir.createFileAbsolute(path.currentIo(), target_path, .{});
+        try f.writeStreamingAll(path.currentIo(), "data");
+        f.close(path.currentIo());
     }
 
     const link_path = try std.fs.path.join(std.testing.allocator, &.{ test_env.path, "link.txt" });
     defer std.testing.allocator.free(link_path);
-    try std.fs.cwd().symLink(target_path, link_path, .{});
+    try std.Io.Dir.cwd().symLink(path.currentIo(), target_path, link_path, .{});
 
     const hash1 = try calculateStoreContentHash(test_env.ctx.allocator, test_env.path, null);
     defer test_env.ctx.allocator.free(hash1);
 
     // Change the symlink target and verify hash changes.
-    try std.fs.deleteFileAbsolute(link_path);
+    try std.Io.Dir.deleteFileAbsolute(path.currentIo(), link_path);
 
     const alt_path = try std.fs.path.join(std.testing.allocator, &.{ test_env.path, "alt.txt" });
     defer std.testing.allocator.free(alt_path);
     {
-        const f = try std.fs.createFileAbsolute(alt_path, .{});
-        try f.writeAll("data");
-        f.close();
+        var f = try std.Io.Dir.createFileAbsolute(path.currentIo(), alt_path, .{});
+        try f.writeStreamingAll(path.currentIo(), "data");
+        f.close(path.currentIo());
     }
-    try std.fs.cwd().symLink(alt_path, link_path, .{});
+    try std.Io.Dir.cwd().symLink(path.currentIo(), alt_path, link_path, .{});
 
     const hash2 = try calculateStoreContentHash(test_env.ctx.allocator, test_env.path, null);
     defer test_env.ctx.allocator.free(hash2);
@@ -518,9 +521,9 @@ test "calculateFileHash" {
     const test_file_path = try std.fs.path.join(std.testing.allocator, &.{ test_env.path, "test-file" });
     defer std.testing.allocator.free(test_file_path);
 
-    const test_file = try std.fs.createFileAbsolute(test_file_path, .{});
-    try test_file.writeAll(test_content);
-    test_file.close();
+    var test_file = try std.Io.Dir.createFileAbsolute(path.currentIo(), test_file_path, .{});
+    try test_file.writeStreamingAll(path.currentIo(), test_content);
+    test_file.close(path.currentIo());
 
     // Calculate hash
     const hash = try calculateFileHash(test_env.ctx.allocator, test_file_path);
@@ -559,19 +562,20 @@ test "calculateFileHash with relative path" {
     const test_file_path = try std.fs.path.join(std.testing.allocator, &.{ test_env.path, test_file_name });
     defer std.testing.allocator.free(test_file_path);
 
-    const test_file = try std.fs.createFileAbsolute(test_file_path, .{});
-    try test_file.writeAll(test_content);
-    test_file.close();
+    var test_file = try std.Io.Dir.createFileAbsolute(path.currentIo(), test_file_path, .{});
+    try test_file.writeStreamingAll(path.currentIo(), test_content);
+    test_file.close(path.currentIo());
 
     // Save current working directory before switching
     var buf: [std.fs.max_path_bytes]u8 = undefined;
-    const original_cwd = try std.fs.cwd().realpath(".", &buf);
-    defer std.posix.chdir(original_cwd) catch |err| {
+    const original_cwd_len = try std.process.currentPath(path.currentIo(), &buf);
+    const original_cwd = buf[0..original_cwd_len];
+    defer std.Io.Threaded.chdir(original_cwd) catch |err| {
         test_env.ctx.debug("Failed to restore cwd: {}\n", .{err});
     };
 
     // Change directories to the test environment path
-    try std.posix.chdir(test_env.path);
+    try std.Io.Threaded.chdir(test_env.path);
 
     // Calculate hash using relative path
     const hash_relative = try calculateFileHash(test_env.ctx.allocator, test_file_name);
@@ -609,9 +613,9 @@ test "calculateStoreContentHash includes empty directories" {
     const file_path = try std.fs.path.join(std.testing.allocator, &.{ test_env.path, "a.txt" });
     defer std.testing.allocator.free(file_path);
     {
-        const f = try std.fs.createFileAbsolute(file_path, .{});
-        try f.writeAll("content");
-        f.close();
+        var f = try std.Io.Dir.createFileAbsolute(path.currentIo(), file_path, .{});
+        try f.writeStreamingAll(path.currentIo(), "content");
+        f.close(path.currentIo());
     }
 
     // Hash without empty directory
@@ -621,7 +625,7 @@ test "calculateStoreContentHash includes empty directories" {
     // Create an empty subdirectory
     const empty_dir = try std.fs.path.join(std.testing.allocator, &.{ test_env.path, "emptydir" });
     defer std.testing.allocator.free(empty_dir);
-    try std.fs.cwd().makePath(empty_dir);
+    try path.ensureDirExists(empty_dir);
 
     // Hash with empty directory present
     const hash2 = try calculateStoreContentHash(test_env.ctx.allocator, test_env.path, null);
@@ -644,9 +648,9 @@ test "calculateStoreContentHash ignores non-executable permission bits" {
     const file_path = try std.fs.path.join(std.testing.allocator, &.{ test_env.path, "data.txt" });
     defer std.testing.allocator.free(file_path);
     {
-        const f = try std.fs.createFileAbsolute(file_path, .{});
-        try f.writeAll("some data");
-        f.close();
+        var f = try std.Io.Dir.createFileAbsolute(path.currentIo(), file_path, .{});
+        try f.writeStreamingAll(path.currentIo(), "some data");
+        f.close(path.currentIo());
     }
 
     // Hash with default permissions (typically 0o644)
@@ -655,9 +659,9 @@ test "calculateStoreContentHash ignores non-executable permission bits" {
 
     // Change to read-only (0o444) — only non-exec bits differ
     {
-        const f = try std.fs.openFileAbsolute(file_path, .{});
-        defer f.close();
-        try f.setPermissions(.{ .inner = .{ .mode = 0o444 } });
+        var f = try path.openExistingFile(file_path);
+        defer f.close(path.currentIo());
+        try f.setPermissions(path.currentIo(), .fromMode(0o444));
     }
 
     // Hash after permission change
@@ -681,9 +685,9 @@ test "calculateStoreContentHash ignores ownership and timestamps" {
     const file_path = try std.fs.path.join(std.testing.allocator, &.{ test_env.path, "file.txt" });
     defer std.testing.allocator.free(file_path);
     {
-        const f = try std.fs.createFileAbsolute(file_path, .{});
-        try f.writeAll("test content");
-        f.close();
+        var f = try std.Io.Dir.createFileAbsolute(path.currentIo(), file_path, .{});
+        try f.writeStreamingAll(path.currentIo(), "test content");
+        f.close(path.currentIo());
     }
 
     // Compute initial hash
@@ -695,10 +699,9 @@ test "calculateStoreContentHash ignores ownership and timestamps" {
     // Note: We cannot easily change ownership without root privileges, but the implementation
     // demonstrates that uid/gid are never read from stat - only mode is accessed for exec bit
     {
-        const f = try std.fs.openFileAbsolute(file_path, .{ .mode = .read_write });
-        defer f.close();
-        // Force a metadata update by seeking (this updates atime/mtime on many systems)
-        try f.seekTo(0);
+        var f = try std.Io.Dir.openFileAbsolute(path.currentIo(), file_path, .{ .mode = .read_write });
+        defer f.close(path.currentIo());
+        try f.setTimestampsNow(path.currentIo());
     }
 
     // Compute hash after timestamp modification
@@ -722,9 +725,9 @@ test "calculateBuildSnapshotHash includes timestamps" {
     const file_path = try std.fs.path.join(std.testing.allocator, &.{ test_env.path, "file.txt" });
     defer std.testing.allocator.free(file_path);
     {
-        const f = try std.fs.createFileAbsolute(file_path, .{});
-        try f.writeAll("test content");
-        f.close();
+        var f = try std.Io.Dir.createFileAbsolute(path.currentIo(), file_path, .{});
+        try f.writeStreamingAll(path.currentIo(), "test content");
+        f.close(path.currentIo());
     }
 
     const store_hash_before = try calculateStoreContentHash(test_env.ctx.allocator, test_env.path, null);
@@ -733,9 +736,12 @@ test "calculateBuildSnapshotHash includes timestamps" {
     defer test_env.ctx.allocator.free(snapshot_hash_before);
 
     {
-        var f = try std.fs.openFileAbsolute(file_path, .{});
-        defer f.close();
-        try f.updateTimes(1_700_000_000_000_000_000, 1_700_000_123_000_000_000);
+        var f = try path.openExistingFile(file_path);
+        defer f.close(path.currentIo());
+        try f.setTimestamps(path.currentIo(), .{
+            .access_timestamp = .{ .new = std.Io.Timestamp.fromNanoseconds(1_700_000_000_000_000_000) },
+            .modify_timestamp = .{ .new = std.Io.Timestamp.fromNanoseconds(1_700_000_123_000_000_000) },
+        });
     }
 
     const store_hash_after = try calculateStoreContentHash(test_env.ctx.allocator, test_env.path, null);
@@ -767,46 +773,46 @@ test "calculateStoreContentHash is order-independent" {
     {
         const a = try std.fs.path.join(std.testing.allocator, &.{ test_env1.path, "a.txt" });
         defer std.testing.allocator.free(a);
-        const f = try std.fs.createFileAbsolute(a, .{});
-        try f.writeAll("alpha");
-        f.close();
+        var f = try std.Io.Dir.createFileAbsolute(path.currentIo(), a, .{});
+        try f.writeStreamingAll(path.currentIo(), "alpha");
+        f.close(path.currentIo());
     }
     {
         const b = try std.fs.path.join(std.testing.allocator, &.{ test_env1.path, "b.txt" });
         defer std.testing.allocator.free(b);
-        const f = try std.fs.createFileAbsolute(b, .{});
-        try f.writeAll("bravo");
-        f.close();
+        var f = try std.Io.Dir.createFileAbsolute(path.currentIo(), b, .{});
+        try f.writeStreamingAll(path.currentIo(), "bravo");
+        f.close(path.currentIo());
     }
     {
         const c = try std.fs.path.join(std.testing.allocator, &.{ test_env1.path, "c.txt" });
         defer std.testing.allocator.free(c);
-        const f = try std.fs.createFileAbsolute(c, .{});
-        try f.writeAll("charlie");
-        f.close();
+        var f = try std.Io.Dir.createFileAbsolute(path.currentIo(), c, .{});
+        try f.writeStreamingAll(path.currentIo(), "charlie");
+        f.close(path.currentIo());
     }
 
     // Environment 2: create same files in reverse order c, b, a
     {
         const c = try std.fs.path.join(std.testing.allocator, &.{ test_env2.path, "c.txt" });
         defer std.testing.allocator.free(c);
-        const f = try std.fs.createFileAbsolute(c, .{});
-        try f.writeAll("charlie");
-        f.close();
+        var f = try std.Io.Dir.createFileAbsolute(path.currentIo(), c, .{});
+        try f.writeStreamingAll(path.currentIo(), "charlie");
+        f.close(path.currentIo());
     }
     {
         const b = try std.fs.path.join(std.testing.allocator, &.{ test_env2.path, "b.txt" });
         defer std.testing.allocator.free(b);
-        const f = try std.fs.createFileAbsolute(b, .{});
-        try f.writeAll("bravo");
-        f.close();
+        var f = try std.Io.Dir.createFileAbsolute(path.currentIo(), b, .{});
+        try f.writeStreamingAll(path.currentIo(), "bravo");
+        f.close(path.currentIo());
     }
     {
         const a = try std.fs.path.join(std.testing.allocator, &.{ test_env2.path, "a.txt" });
         defer std.testing.allocator.free(a);
-        const f = try std.fs.createFileAbsolute(a, .{});
-        try f.writeAll("alpha");
-        f.close();
+        var f = try std.Io.Dir.createFileAbsolute(path.currentIo(), a, .{});
+        try f.writeStreamingAll(path.currentIo(), "alpha");
+        f.close(path.currentIo());
     }
 
     const hash1 = try calculateStoreContentHash(test_env1.ctx.allocator, test_env1.path, null);
@@ -832,9 +838,9 @@ test "calculateStoreContentHash output is all lowercase hex" {
     const file_path = try std.fs.path.join(std.testing.allocator, &.{ test_env.path, "data.bin" });
     defer std.testing.allocator.free(file_path);
     {
-        const f = try std.fs.createFileAbsolute(file_path, .{});
-        try f.writeAll("some binary \x00\x01\x02 data");
-        f.close();
+        var f = try std.Io.Dir.createFileAbsolute(path.currentIo(), file_path, .{});
+        try f.writeStreamingAll(path.currentIo(), "some binary \x00\x01\x02 data");
+        f.close(path.currentIo());
     }
 
     const hash_str = try calculateStoreContentHash(test_env.ctx.allocator, test_env.path, null);

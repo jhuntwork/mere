@@ -142,7 +142,7 @@ fn collectSelectedPackages(
     selectors: []const []const u8,
     keep_count: u32,
 ) !std.ArrayList(package_mod.Package) {
-    var selected: std.ArrayList(package_mod.Package) = .{};
+    var selected: std.ArrayList(package_mod.Package) = .empty;
     errdefer {
         for (selected.items) |*pkg| pkg.deinit();
         selected.deinit(ctx.allocator);
@@ -276,7 +276,7 @@ fn makeTestPkg(ctx: *mere.Context, name: []const u8, version: []const u8, releas
 fn createPoolArchive(ctx: *mere.Context, name: []const u8, version: []const u8, release: u32, arch: []const u8, hash: []const u8) !void {
     const pool_dir = try std.fs.path.join(ctx.allocator, &.{ ctx.root_path, "mere", "cache", "packages" });
     defer ctx.allocator.free(pool_dir);
-    try std.fs.cwd().makePath(pool_dir);
+    try path.ensureDirExists(pool_dir);
 
     const archive_name = try std.fmt.allocPrint(ctx.allocator, "{s}-{s}-{d}-{s}-{s}.pkg.tar.zst", .{ name, version, release, arch, hash });
     defer ctx.allocator.free(archive_name);
@@ -284,8 +284,8 @@ fn createPoolArchive(ctx: *mere.Context, name: []const u8, version: []const u8, 
     defer ctx.allocator.free(archive_path);
 
     var file = try path.makePathAndOpenFile(archive_path);
-    defer file.close();
-    try file.writeAll("archive");
+    defer file.close(path.currentIo());
+    try file.writeStreamingAll(path.currentIo(), "archive");
 }
 
 fn countPublishedPackages(ctx: *mere.Context, output_dir: []const u8) !u32 {
@@ -350,11 +350,11 @@ test "publish with keep count selects latest local versions on initial publish" 
 
     const pkg5_path = try std.fs.path.join(ctx.allocator, &.{ output_dir, "packages", "llvm-21.1.8-5-x86_64-" ++ ("5" ** 64) ++ ".pkg.tar.zst" });
     defer ctx.allocator.free(pkg5_path);
-    try std.fs.accessAbsolute(pkg5_path, .{});
+    try std.Io.Dir.accessAbsolute(path.currentIo(), pkg5_path, .{});
 
     const pkg6_path = try std.fs.path.join(ctx.allocator, &.{ output_dir, "packages", "llvm-21.1.8-6-x86_64-" ++ ("6" ** 64) ++ ".pkg.tar.zst" });
     defer ctx.allocator.free(pkg6_path);
-    try std.fs.accessAbsolute(pkg6_path, .{});
+    try std.Io.Dir.accessAbsolute(path.currentIo(), pkg6_path, .{});
 }
 
 test "publish with keep count retains published baseline lineage" {
@@ -382,7 +382,7 @@ test "publish with keep count retains published baseline lineage" {
 
     const output_dir = try std.fs.path.join(ctx.allocator, &.{ test_env.path, "published-out-existing" });
     defer ctx.allocator.free(output_dir);
-    try std.fs.cwd().makePath(output_dir);
+    try path.ensureDirExists(output_dir);
 
     const output_db = try std.fs.path.join(ctx.allocator, &.{ output_dir, "repo.db" });
     defer ctx.allocator.free(output_db);
@@ -402,9 +402,9 @@ test "publish with keep count retains published baseline lineage" {
 
     const pkg5_path = try std.fs.path.join(ctx.allocator, &.{ output_dir, "packages", "llvm-21.1.8-5-x86_64-" ++ ("5" ** 64) ++ ".pkg.tar.zst" });
     defer ctx.allocator.free(pkg5_path);
-    try std.fs.accessAbsolute(pkg5_path, .{});
+    try std.Io.Dir.accessAbsolute(path.currentIo(), pkg5_path, .{});
 
     const pkg6_path = try std.fs.path.join(ctx.allocator, &.{ output_dir, "packages", "llvm-21.1.8-6-x86_64-" ++ ("6" ** 64) ++ ".pkg.tar.zst" });
     defer ctx.allocator.free(pkg6_path);
-    try std.fs.accessAbsolute(pkg6_path, .{});
+    try std.Io.Dir.accessAbsolute(path.currentIo(), pkg6_path, .{});
 }

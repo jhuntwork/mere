@@ -76,7 +76,7 @@ pub const Renderer = struct {
         if (phase_label == null) return;
 
         const allocator = self.allocator;
-        var line = std.ArrayList(u8){};
+        var line: std.ArrayList(u8) = .empty;
         defer line.deinit(allocator);
 
         try appendLabelCode(allocator, &line, phase_label.?, self.options.use_color, palette.code(.phase));
@@ -101,7 +101,7 @@ pub const Renderer = struct {
         if (data.status_ok) return;
 
         const allocator = self.allocator;
-        var line = std.ArrayList(u8){};
+        var line: std.ArrayList(u8) = .empty;
         defer line.deinit(allocator);
 
         try appendLabelCode(allocator, &line, "error", self.options.use_color, palette.code(.err));
@@ -121,7 +121,7 @@ pub const Renderer = struct {
         // A new step means any queued child line is followed by at least one sibling.
         try self.flushPendingChild(false);
         const allocator = self.allocator;
-        var line = std.ArrayList(u8){};
+        var line: std.ArrayList(u8) = .empty;
         defer line.deinit(allocator);
 
         try appendStepPrefix(allocator, &line, self.step_depth, self.options);
@@ -159,7 +159,7 @@ pub const Renderer = struct {
         const segments = event.data.log_segments;
         if (segments.len == 0) return;
         const allocator = self.allocator;
-        var line = std.ArrayList(u8){};
+        var line: std.ArrayList(u8) = .empty;
         defer line.deinit(allocator);
         for (segments) |segment| {
             if (segment.text.len == 0) continue;
@@ -172,7 +172,7 @@ pub const Renderer = struct {
         const url = if (event.subject) |subject| subject.url else null;
         const label = url orelse event.message orelse return;
         const allocator = self.allocator;
-        var line = std.ArrayList(u8){};
+        var line: std.ArrayList(u8) = .empty;
         defer line.deinit(allocator);
         try line.appendSlice(allocator, "downloading ");
         try line.appendSlice(allocator, label);
@@ -197,7 +197,7 @@ pub const Renderer = struct {
         const url = if (event.subject) |subject| subject.url else null;
         const label = url orelse event.message orelse "download";
         const allocator = self.allocator;
-        var line = std.ArrayList(u8){};
+        var line: std.ArrayList(u8) = .empty;
         defer line.deinit(allocator);
         try appendLabelCode(allocator, &line, "error", self.options.use_color, palette.code(.err));
         try line.append(allocator, ' ');
@@ -208,7 +208,7 @@ pub const Renderer = struct {
     fn renderInstallStart(self: *Renderer, event: ui.Event) !void {
         const label = event.message orelse return;
         const allocator = self.allocator;
-        var line = std.ArrayList(u8){};
+        var line: std.ArrayList(u8) = .empty;
         defer line.deinit(allocator);
         try line.appendSlice(allocator, "installing ");
         try line.appendSlice(allocator, label);
@@ -232,7 +232,7 @@ pub const Renderer = struct {
     fn renderInstallError(self: *Renderer, event: ui.Event) !void {
         const label = event.message orelse "package";
         const allocator = self.allocator;
-        var line = std.ArrayList(u8){};
+        var line: std.ArrayList(u8) = .empty;
         defer line.deinit(allocator);
         try appendLabelCode(allocator, &line, "error", self.options.use_color, palette.code(.err));
         try line.appendSlice(allocator, " installing ");
@@ -244,7 +244,7 @@ pub const Renderer = struct {
         try self.flushPendingChild(true);
         const diag = event.data.diagnostic;
         const allocator = self.allocator;
-        var line = std.ArrayList(u8){};
+        var line: std.ArrayList(u8) = .empty;
         defer line.deinit(allocator);
 
         try appendLabelCode(allocator, &line, "error", self.options.use_color, palette.code(.err));
@@ -260,7 +260,7 @@ pub const Renderer = struct {
 
         if (event.subject) |subject| {
             if (subject.name != null or subject.path != null or subject.url != null) {
-                var subject_buf = std.ArrayList(u8){};
+                var subject_buf: std.ArrayList(u8) = .empty;
                 defer subject_buf.deinit(allocator);
                 _ = appendSubject(allocator, &subject_buf, event.subject, false);
                 try writeLabelLine(self.allocator, &self.err, self.options.indent, "subject", subject_buf.items, self.options.use_color);
@@ -304,7 +304,7 @@ pub const Renderer = struct {
 
     fn writeChildLine(self: *Renderer, writer_kind: WriterKind, msg: []const u8, child_is_last: bool) !void {
         const allocator = self.allocator;
-        var line = std.ArrayList(u8){};
+        var line: std.ArrayList(u8) = .empty;
         defer line.deinit(allocator);
         try appendContentPrefix(allocator, &line, self.step_depth, self.options, child_is_last);
         try line.appendSlice(allocator, msg);
@@ -451,7 +451,7 @@ fn appendContentPrefix(
 }
 
 fn writeLabelLine(allocator: std.mem.Allocator, writer: *Writer, indent: []const u8, label: []const u8, value: []const u8, use_color: bool) !void {
-    var line = std.ArrayList(u8){};
+    var line: std.ArrayList(u8) = .empty;
     defer line.deinit(allocator);
     try line.appendSlice(allocator, indent);
     try appendLabelCode(allocator, &line, label, use_color, palette.code(.meta_label));
@@ -461,7 +461,7 @@ fn writeLabelLine(allocator: std.mem.Allocator, writer: *Writer, indent: []const
 }
 
 fn writeDetailsLine(allocator: std.mem.Allocator, writer: *Writer, indent: []const u8, details: []const u8, use_color: bool) !void {
-    var line = std.ArrayList(u8){};
+    var line: std.ArrayList(u8) = .empty;
     defer line.deinit(allocator);
     try line.appendSlice(allocator, indent);
     try appendLabelCode(allocator, &line, "details", use_color, palette.code(.meta_label));

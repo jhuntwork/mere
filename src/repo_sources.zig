@@ -8,11 +8,12 @@ const RepoCache = @import("repocache.zig").RepoCache;
 const repo_history = @import("repo_history.zig");
 const sign = @import("sign.zig");
 const kdl = @import("kdl.zig");
+const path_mod = @import("path.zig");
 
 const default_sync_timeout_seconds: u32 = 30;
 
 pub fn createCaches(ctx: *Context, cfg: *const Config) !std.ArrayList(*RepoCache) {
-    var repocaches = std.ArrayList(*RepoCache){};
+    var repocaches: std.ArrayList(*RepoCache) = .empty;
     errdefer {
         for (repocaches.items) |rc| {
             rc.*.deinit();
@@ -54,11 +55,15 @@ fn resolveUserTrustedKdlPath(
 }
 
 fn userTrustedKdlPath(ctx: *Context) ![]const u8 {
-    return resolveUserTrustedKdlPath(ctx.allocator, ctx.home_dir orelse std.posix.getenv("HOME"));
+    const home_env = if (ctx.home_dir == null)
+        if (std.c.getenv("HOME")) |value| std.mem.span(value) else null
+    else
+        null;
+    return resolveUserTrustedKdlPath(ctx.allocator, ctx.home_dir orelse home_env);
 }
 
 pub fn loadTrustedFingerprints(ctx: *Context) !std.ArrayList([]const u8) {
-    var fingerprints = std.ArrayList([]const u8){};
+    var fingerprints: std.ArrayList([]const u8) = .empty;
     errdefer {
         for (fingerprints.items) |fp| ctx.allocator.free(fp);
         fingerprints.deinit(ctx.allocator);
@@ -90,16 +95,36 @@ pub fn loadTrustedFingerprints(ctx: *Context) !std.ArrayList([]const u8) {
     };
     defer ctx.allocator.free(trusted_path);
 
-    const file = std.fs.openFileAbsolute(trusted_path, .{}) catch |err| {
+    const io = path_mod.currentIo();
+    const file = std.Io.Dir.openFileAbsolute(io, trusted_path, .{}) catch |err| {
         ctx.debug("trusted.kdl not found or inaccessible: {}", .{err});
         return fingerprints;
     };
-    defer file.close();
+    defer file.close(io);
 
-    const content = file.readToEndAlloc(ctx.allocator, 1024 * 1024) catch |err| {
+    const stat = file.stat(io) catch |err| {
+        ctx.debug("failed to stat trusted.kdl: {}", .{err});
+        return fingerprints;
+    };
+    if (stat.size > 1024 * 1024) {
+        ctx.debug("trusted.kdl too large: {d}", .{stat.size});
+        return fingerprints;
+    }
+
+    const content = ctx.allocator.alloc(u8, @intCast(stat.size)) catch |err| {
+        ctx.debug("failed to allocate trusted.kdl buffer: {}", .{err});
+        return fingerprints;
+    };
+    errdefer ctx.allocator.free(content);
+
+    const bytes_read = file.readPositionalAll(io, content, 0) catch |err| {
         ctx.debug("failed to read trusted.kdl: {}", .{err});
         return fingerprints;
     };
+    if (bytes_read != stat.size) {
+        ctx.debug("failed to read complete trusted.kdl content", .{});
+        return fingerprints;
+    }
     defer ctx.allocator.free(content);
 
     var nodes = kdl.parseDocument(ctx.allocator, content) catch |err| {
@@ -145,14 +170,14 @@ fn appendDiscoveredLocalRepos(ctx: *Context, cfg: *Config) !void {
     const repos_dir_path = try std.fs.path.join(ctx.allocator, &.{ ctx.root_path, "mere", "dev", "repo" });
     defer ctx.allocator.free(repos_dir_path);
 
-    var repos_dir = std.fs.openDirAbsolute(repos_dir_path, .{ .iterate = true }) catch |err| {
+    var repos_dir = std.Io.Dir.openDirAbsolute(path_mod.currentIo(), repos_dir_path, .{ .iterate = true }) catch |err| {
         ctx.debug("local repos directory not found: {s} ({s})", .{ repos_dir_path, @errorName(err) });
         return;
     };
-    defer repos_dir.close();
+    defer repos_dir.close(path_mod.currentIo());
 
     var iter = repos_dir.iterate();
-    while (try iter.next()) |entry| {
+    while (try iter.next(path_mod.currentIo())) |entry| {
         if (entry.kind != .directory) continue;
 
         const repo_name = entry.name;
@@ -177,11 +202,11 @@ fn appendDiscoveredLocalRepos(ctx: *Context, cfg: *Config) !void {
         };
         defer ctx.allocator.free(active_sig_path);
 
-        std.fs.accessAbsolute(active_db_path, .{}) catch {
+        std.Io.Dir.accessAbsolute(path_mod.currentIo(), active_db_path, .{}) catch {
             ctx.debug("skipping {s}: current state missing db", .{repo_name});
             continue;
         };
-        std.fs.accessAbsolute(active_sig_path, .{}) catch {
+        std.Io.Dir.accessAbsolute(path_mod.currentIo(), active_sig_path, .{}) catch {
             ctx.debug("skipping {s}: current state missing db signature", .{repo_name});
             continue;
         };
@@ -209,7 +234,7 @@ fn appendDiscoveredLocalRepos(ctx: *Context, cfg: *Config) !void {
         const name_copy = try ctx.allocator.dupe(u8, repo_name);
         errdefer ctx.allocator.free(name_copy);
 
-        var repo_fps = std.ArrayList([]const u8){};
+        var repo_fps: std.ArrayList([]const u8) = .empty;
         errdefer {
             for (repo_fps.items) |fp| ctx.allocator.free(fp);
             repo_fps.deinit(ctx.allocator);
@@ -251,11 +276,11 @@ test "loadTrustedFingerprints loads fingerprints from trusted.kdl" {
 
     const auto_pub_path = try std.fs.path.join(test_env.ctx.allocator, &.{ test_env.path, ".mere", "keys", "mere.pub" });
     defer test_env.ctx.allocator.free(auto_pub_path);
-    std.fs.deleteFileAbsolute(auto_pub_path) catch {};
+    std.Io.Dir.deleteFileAbsolute(path_mod.currentIo(), auto_pub_path) catch {};
 
     const mere_dir = try std.fs.path.join(test_env.ctx.allocator, &.{ test_env.path, ".mere" });
     defer test_env.ctx.allocator.free(mere_dir);
-    try std.fs.cwd().makePath(mere_dir);
+    try path_mod.ensureDirExists(mere_dir);
 
     const trusted_path = try std.fs.path.join(test_env.ctx.allocator, &.{ mere_dir, "trusted.kdl" });
     defer test_env.ctx.allocator.free(trusted_path);
@@ -265,9 +290,9 @@ test "loadTrustedFingerprints loads fingerprints from trusted.kdl" {
         \\trusted-fingerprint "fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210"
     ;
 
-    const file = try std.fs.createFileAbsolute(trusted_path, .{});
-    try file.writeAll(trusted_content);
-    file.close();
+    const file = try std.Io.Dir.createFileAbsolute(path_mod.currentIo(), trusted_path, .{});
+    try file.writeStreamingAll(path_mod.currentIo(), trusted_content);
+    file.close(path_mod.currentIo());
 
     var fingerprints = try loadTrustedFingerprints(&test_env.ctx);
     defer {
@@ -289,7 +314,7 @@ test "loadTrustedFingerprints returns empty list when file missing" {
 
     const auto_pub_path = try std.fs.path.join(test_env.ctx.allocator, &.{ test_env.path, ".mere", "keys", "mere.pub" });
     defer test_env.ctx.allocator.free(auto_pub_path);
-    std.fs.deleteFileAbsolute(auto_pub_path) catch {};
+    std.Io.Dir.deleteFileAbsolute(path_mod.currentIo(), auto_pub_path) catch {};
 
     var fingerprints = try loadTrustedFingerprints(&test_env.ctx);
     defer fingerprints.deinit(test_env.ctx.allocator);
@@ -319,14 +344,14 @@ test "appendDiscoveredLocalRepos finds valid repositories" {
     defer test_env.ctx.allocator.free(repo_root);
     const current_dir = try std.fs.path.join(test_env.ctx.allocator, &.{ repo_root, "current" });
     defer test_env.ctx.allocator.free(current_dir);
-    try std.fs.cwd().makePath(repo_root);
-    try std.fs.cwd().makePath(current_dir);
+    try path_mod.ensureDirExists(repo_root);
+    try path_mod.ensureDirExists(current_dir);
 
     const db_path = try std.fs.path.join(test_env.ctx.allocator, &.{ current_dir, "repo.db" });
     defer test_env.ctx.allocator.free(db_path);
-    const db_file = try std.fs.createFileAbsolute(db_path, .{});
-    try db_file.writeAll("dummy db content");
-    db_file.close();
+    const db_file = try std.Io.Dir.createFileAbsolute(path_mod.currentIo(), db_path, .{});
+    try db_file.writeStreamingAll(path_mod.currentIo(), "dummy db content");
+    db_file.close(path_mod.currentIo());
 
     const keypair = try sign.generateKeyPair();
     const secret_key_path = try std.fs.path.join(test_env.ctx.allocator, &.{ test_env.path, "testrepo.key" });
@@ -335,7 +360,7 @@ test "appendDiscoveredLocalRepos finds valid repositories" {
 
     const user_keys_dir = try std.fs.path.join(test_env.ctx.allocator, &.{ test_env.path, ".mere", "keys" });
     defer test_env.ctx.allocator.free(user_keys_dir);
-    try std.fs.cwd().makePath(user_keys_dir);
+    try path_mod.ensureDirExists(user_keys_dir);
     const pubkey_path = try std.fs.path.join(test_env.ctx.allocator, &.{ user_keys_dir, "testrepo.pub" });
     defer test_env.ctx.allocator.free(pubkey_path);
     try keypair.public_key.saveToFile(pubkey_path);
@@ -345,11 +370,11 @@ test "appendDiscoveredLocalRepos finds valid repositories" {
     const trusted_path = try std.fs.path.join(test_env.ctx.allocator, &.{ test_env.path, ".mere", "trusted.kdl" });
     defer test_env.ctx.allocator.free(trusted_path);
     {
-        const trusted_file = try std.fs.createFileAbsolute(trusted_path, .{});
+        const trusted_file = try std.Io.Dir.createFileAbsolute(path_mod.currentIo(), trusted_path, .{});
         const line = try std.fmt.allocPrint(test_env.ctx.allocator, "trusted-fingerprint \"{s}\"\n", .{fingerprint});
         defer test_env.ctx.allocator.free(line);
-        try trusted_file.writeAll(line);
-        trusted_file.close();
+        try trusted_file.writeStreamingAll(path_mod.currentIo(), line);
+        trusted_file.close(path_mod.currentIo());
     }
 
     const sig_path = try std.fs.path.join(test_env.ctx.allocator, &.{ current_dir, "repo.db.sig" });
@@ -376,7 +401,7 @@ test "appendDiscoveredLocalRepos skips directories without db" {
 
     const repos_dir = try std.fs.path.join(test_env.ctx.allocator, &.{ test_env.path, "mere", "dev", "repo", "invalid" });
     defer test_env.ctx.allocator.free(repos_dir);
-    try std.fs.cwd().makePath(repos_dir);
+    try path_mod.ensureDirExists(repos_dir);
 
     var cfg = Config.init(&test_env.ctx, test_env.ctx.allocator);
     defer cfg.deinit();

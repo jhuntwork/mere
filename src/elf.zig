@@ -4,6 +4,7 @@ const pkg = @import("package.zig");
 const Dependency = pkg.Dependency;
 const Provision = pkg.Provision;
 const errors = @import("errors.zig");
+const path_mod = @import("path.zig");
 const native_endian = @import("builtin").target.cpu.arch.endian();
 
 /// ELF operations error set
@@ -55,14 +56,12 @@ const TargetElfInfo = struct {
 };
 
 pub fn readElfHeaderInfo(file_path: []const u8) !ElfHeaderInfo {
-    var file = if (std.fs.path.isAbsolute(file_path))
-        std.fs.openFileAbsolute(file_path, .{}) catch return error.FileSystem
-    else
-        std.fs.cwd().openFile(file_path, .{}) catch return error.FileSystem;
-    defer file.close();
+    const io = path_mod.currentIo();
+    var file = path_mod.openExistingFile(file_path) catch return error.FileSystem;
+    defer file.close(io);
 
     var header_bytes: [20]u8 = undefined;
-    const bytes_read = file.readAll(&header_bytes) catch return error.FileSystem;
+    const bytes_read = file.readPositionalAll(io, &header_bytes, 0) catch return error.FileSystem;
     if (bytes_read < header_bytes.len) return error.InvalidInput;
     if (!std.mem.eql(u8, header_bytes[0..4], "\x7fELF")) return error.InvalidInput;
 
@@ -123,14 +122,12 @@ fn targetElfInfoForArch(arch: []const u8) ?TargetElfInfo {
 /// Read ELF object type (`e_type`) from file header.
 /// Returns null for non-ELF files, unsupported endianness, or unreadable inputs.
 pub fn readElfType(file_path: []const u8) ?std.elf.ET {
-    var file = if (std.fs.path.isAbsolute(file_path))
-        std.fs.openFileAbsolute(file_path, .{}) catch return null
-    else
-        std.fs.cwd().openFile(file_path, .{}) catch return null;
-    defer file.close();
+    const io = path_mod.currentIo();
+    var file = path_mod.openExistingFile(file_path) catch return null;
+    defer file.close(io);
 
     var ident: [16]u8 = undefined;
-    const ident_read = file.readAll(&ident) catch return null;
+    const ident_read = file.readPositionalAll(io, &ident, 0) catch return null;
     if (ident_read < 16) return null;
     if (!std.mem.eql(u8, ident[0..4], "\x7fELF")) return null;
 
@@ -142,7 +139,7 @@ pub fn readElfType(file_path: []const u8) ?std.elf.ET {
     };
 
     var e_type_bytes: [2]u8 = undefined;
-    const e_type_read = file.readAll(&e_type_bytes) catch return null;
+    const e_type_read = file.readPositionalAll(io, &e_type_bytes, 16) catch return null;
     if (e_type_read < 2) return null;
     return @enumFromInt(std.mem.readInt(u16, &e_type_bytes, endian));
 }
@@ -150,21 +147,22 @@ pub fn readElfType(file_path: []const u8) ?std.elf.ET {
 /// Scan an ELF file for dependencies, SONAME provisions, and interpreter metadata.
 pub fn scanElfMetadata(ctx: *Context, path: []const u8) !ElfScanResult {
     const allocator = ctx.allocator;
-    var file = std.fs.cwd().openFile(path, .{}) catch |err| {
+    const io = path_mod.currentIo();
+    var file = path_mod.openExistingFile(path) catch |err| {
         return ctx.fail(err, path, "failed to open ELF file");
     };
-    defer file.close();
+    defer file.close(io);
 
-    const file_size = file.getEndPos() catch |err| {
+    const file_size = (file.stat(io) catch |err| {
         return ctx.fail(err, path, "failed to read ELF file size");
-    };
+    }).size;
     if (file_size < @sizeOf(std.elf.Elf64_Ehdr)) {
         ctx.debug("file too small to be a valid elf file: {d} bytes", .{file_size});
         return ctx.fail(ElfError.InvalidInput, path, "file too small to be a valid ELF");
     }
 
     var elf_header: std.elf.Elf64_Ehdr = undefined;
-    _ = file.readAll(std.mem.asBytes(&elf_header)) catch |err| {
+    _ = file.readPositionalAll(io, std.mem.asBytes(&elf_header), 0) catch |err| {
         return ctx.fail(err, path, "failed to read ELF header");
     };
 
@@ -198,9 +196,8 @@ pub fn scanElfMetadata(ctx: *Context, path: []const u8) !ElfScanResult {
             return ctx.fail(ElfError.SectionHeaderOverflow, path, "section header offset exceeds file size");
         }
 
-        try file.seekTo(final_shstr_offset);
         var shstr_header: std.elf.Elf64_Shdr = undefined;
-        _ = try file.readAll(std.mem.asBytes(&shstr_header));
+        _ = try file.readPositionalAll(io, std.mem.asBytes(&shstr_header), final_shstr_offset);
 
         var i: usize = 0;
         while (i < shnum) : (i += 1) {
@@ -209,9 +206,8 @@ pub fn scanElfMetadata(ctx: *Context, path: []const u8) !ElfScanResult {
 
             if (total_offset + @sizeOf(std.elf.Elf64_Shdr) > file_size) break;
 
-            try file.seekTo(total_offset);
             var section_header: std.elf.Elf64_Shdr = undefined;
-            _ = try file.readAll(std.mem.asBytes(&section_header));
+            _ = try file.readPositionalAll(io, std.mem.asBytes(&section_header), total_offset);
 
             const section_name = readSectionName(&file, file_size, shstr_header.sh_offset, section_header.sh_name) catch |err| switch (err) {
                 ElfError.SectionHeaderOverflow, ElfError.CorruptData => continue,
@@ -317,10 +313,8 @@ pub fn scanElfMetadata(ctx: *Context, path: []const u8) !ElfScanResult {
         try provisions.append(.{ .resource = resource, .prov_type = .elf_soname });
     }
 
-    try file.seekTo(0);
-
     var elf_header_for_phdr: std.elf.Elf64_Ehdr = undefined;
-    _ = file.readAll(std.mem.asBytes(&elf_header_for_phdr)) catch |err| {
+    _ = file.readPositionalAll(io, std.mem.asBytes(&elf_header_for_phdr), 0) catch |err| {
         return ctx.fail(err, path, "failed to read ELF header for program headers");
     };
 
@@ -335,17 +329,15 @@ pub fn scanElfMetadata(ctx: *Context, path: []const u8) !ElfScanResult {
 
         if (total_ph_offset + @sizeOf(std.elf.Elf64_Phdr) > file_size) continue;
 
-        try file.seekTo(total_ph_offset);
         var phdr: std.elf.Elf64_Phdr = undefined;
-        _ = try file.readAll(std.mem.asBytes(&phdr));
+        _ = try file.readPositionalAll(io, std.mem.asBytes(&phdr), total_ph_offset);
 
         if (phdr.p_type == std.elf.PT_INTERP) {
             ctx.debug("pt_interp section at offset {d} size {d}", .{ phdr.p_offset, phdr.p_filesz });
 
             if (phdr.p_filesz > 0 and phdr.p_filesz < 256) { // Reasonable size limit
-                try file.seekTo(phdr.p_offset);
                 var interp_buf: [256]u8 = undefined;
-                const bytes_read = file.readAll(interp_buf[0..@intCast(phdr.p_filesz)]) catch |err| {
+                const bytes_read = file.readPositionalAll(io, interp_buf[0..@intCast(phdr.p_filesz)], phdr.p_offset) catch |err| {
                     return ctx.fail(err, path, "failed to read ELF interpreter");
                 };
 
@@ -373,7 +365,7 @@ fn isSharedObjectBasename(name: []const u8) bool {
     return std.mem.indexOf(u8, name, ".so.") != null;
 }
 
-fn readSectionName(file: *std.fs.File, file_size: u64, shstr_offset: u64, name_offset: u32) ![]const u8 {
+fn readSectionName(file: *const std.Io.File, file_size: u64, shstr_offset: u64, name_offset: u32) ![]const u8 {
     if (shstr_offset >= file_size or name_offset >= file_size) {
         return ElfError.SectionHeaderOverflow;
     }
@@ -383,10 +375,8 @@ fn readSectionName(file: *std.fs.File, file_size: u64, shstr_offset: u64, name_o
         return ElfError.SectionHeaderOverflow;
     }
 
-    try file.seekTo(total_offset);
-
     var name_buf: [256]u8 = undefined;
-    const bytes_read = try file.readAll(&name_buf);
+    const bytes_read = try file.readPositionalAll(path_mod.currentIo(), &name_buf, total_offset);
     if (bytes_read == 0) return ElfError.FileSystem;
 
     var end: usize = 0;
@@ -398,7 +388,7 @@ fn readSectionName(file: *std.fs.File, file_size: u64, shstr_offset: u64, name_o
 }
 
 /// Load an ELF string table safely from file
-fn loadElfStringTable(file: *std.fs.File, allocator: std.mem.Allocator, offset: u64, size: u64, file_size: u64) ![]u8 {
+fn loadElfStringTable(file: *const std.Io.File, allocator: std.mem.Allocator, offset: u64, size: u64, file_size: u64) ![]u8 {
     if (offset > file_size) {
         return ElfError.SectionHeaderOverflow;
     }
@@ -409,8 +399,7 @@ fn loadElfStringTable(file: *std.fs.File, allocator: std.mem.Allocator, offset: 
     const buf = try allocator.alloc(u8, @intCast(size));
     const read_size = @min(size, file_size - offset);
     if (read_size < size) @memset(buf, 0);
-    try file.seekTo(offset);
-    _ = try file.readAll(buf[0..@intCast(read_size)]);
+    _ = try file.readPositionalAll(path_mod.currentIo(), buf[0..@intCast(read_size)], offset);
     return buf;
 }
 
@@ -517,11 +506,11 @@ test "scanElfMetadata returns ElfError.FileTooSmall for tiny file" {
     }
 
     // Create a tiny file in the test environment
-    const tiny_file = try test_env.tmp.dir.createFile("tiny", .{});
-    defer tiny_file.close();
-    try tiny_file.writeAll(&[_]u8{ 0x7f, 0x45 }); // Not enough for ELF header
+    const tiny_file = try test_env.tmp.dir.createFile(path_mod.currentIo(), "tiny", .{});
+    defer tiny_file.close(path_mod.currentIo());
+    try tiny_file.writeStreamingAll(path_mod.currentIo(), &[_]u8{ 0x7f, 0x45 }); // Not enough for ELF header
 
-    const real_path = try test_env.tmp.dir.realpathAlloc(std.testing.allocator, "tiny");
+    const real_path = try test_env.tmp.dir.realPathFileAlloc(path_mod.currentIo(), "tiny", std.testing.allocator);
     defer std.testing.allocator.free(real_path);
     const result = scanElfMetadata(&test_env.ctx, real_path);
     try std.testing.expectError(ElfError.InvalidInput, result);
@@ -535,8 +524,8 @@ test "readElfType handles little-endian ELF headers" {
         std.testing.allocator.destroy(test_env);
     }
 
-    const elf_file = try test_env.tmp.dir.createFile("tiny-le.elf", .{});
-    defer elf_file.close();
+    const elf_file = try test_env.tmp.dir.createFile(path_mod.currentIo(), "tiny-le.elf", .{});
+    defer elf_file.close(path_mod.currentIo());
 
     var header: [18]u8 = [_]u8{0} ** 18;
     header[0] = 0x7f;
@@ -547,9 +536,9 @@ test "readElfType handles little-endian ELF headers" {
     header[std.elf.EI_DATA] = std.elf.ELFDATA2LSB;
     header[16] = 0x02; // ET_EXEC, little-endian
     header[17] = 0x00;
-    try elf_file.writeAll(&header);
+    try elf_file.writeStreamingAll(path_mod.currentIo(), &header);
 
-    const real_path = try test_env.tmp.dir.realpathAlloc(std.testing.allocator, "tiny-le.elf");
+    const real_path = try test_env.tmp.dir.realPathFileAlloc(path_mod.currentIo(), "tiny-le.elf", std.testing.allocator);
     defer std.testing.allocator.free(real_path);
 
     try std.testing.expectEqual(std.elf.ET.EXEC, readElfType(real_path).?);
@@ -563,8 +552,8 @@ test "readElfType handles big-endian ELF headers" {
         std.testing.allocator.destroy(test_env);
     }
 
-    const elf_file = try test_env.tmp.dir.createFile("tiny-be.elf", .{});
-    defer elf_file.close();
+    const elf_file = try test_env.tmp.dir.createFile(path_mod.currentIo(), "tiny-be.elf", .{});
+    defer elf_file.close(path_mod.currentIo());
 
     var header: [18]u8 = [_]u8{0} ** 18;
     header[0] = 0x7f;
@@ -575,9 +564,9 @@ test "readElfType handles big-endian ELF headers" {
     header[std.elf.EI_DATA] = std.elf.ELFDATA2MSB;
     header[16] = 0x00;
     header[17] = 0x03; // ET_DYN, big-endian
-    try elf_file.writeAll(&header);
+    try elf_file.writeStreamingAll(path_mod.currentIo(), &header);
 
-    const real_path = try test_env.tmp.dir.realpathAlloc(std.testing.allocator, "tiny-be.elf");
+    const real_path = try test_env.tmp.dir.realPathFileAlloc(path_mod.currentIo(), "tiny-be.elf", std.testing.allocator);
     defer std.testing.allocator.free(real_path);
 
     try std.testing.expectEqual(std.elf.ET.DYN, readElfType(real_path).?);
@@ -592,13 +581,13 @@ test "scanElfMetadata returns ElfError.InvalidMagic for non-ELF file" {
     }
 
     // Create a file with enough size but invalid magic in the test environment
-    const bad_file = try test_env.tmp.dir.createFile("bad", .{});
-    defer bad_file.close();
+    const bad_file = try test_env.tmp.dir.createFile(path_mod.currentIo(), "bad", .{});
+    defer bad_file.close(path_mod.currentIo());
     var buf: [64]u8 = undefined;
     @memset(&buf, 0);
-    try bad_file.writeAll(&buf);
+    try bad_file.writeStreamingAll(path_mod.currentIo(), &buf);
 
-    const real_path = try test_env.tmp.dir.realpathAlloc(std.testing.allocator, "bad");
+    const real_path = try test_env.tmp.dir.realPathFileAlloc(path_mod.currentIo(), "bad", std.testing.allocator);
     defer std.testing.allocator.free(real_path);
     const result = scanElfMetadata(&test_env.ctx, real_path);
     try std.testing.expectError(ElfError.InvalidInput, result);

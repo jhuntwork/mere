@@ -3,6 +3,7 @@
 const std = @import("std");
 const Context = @import("../mere.zig").Context;
 const errors = @import("../errors.zig");
+const path_mod = @import("../path.zig");
 const ui = @import("../ui/mod.zig");
 
 const Std = errors.StandardErrors;
@@ -25,13 +26,14 @@ pub const BuildProfile = struct {
 
         ctx.debug("creating build profile at: {s}", .{profile_path});
 
-        std.fs.cwd().makePath(profile_path) catch |err| {
+        var profile_dir = path_mod.makePathAndOpenDir(profile_path) catch |err| {
             ctx.setDiagnosticContext(profile_path, "failed to create build profile directory");
             return switch (err) {
                 error.AccessDenied => BuildProfileError.PermissionDenied,
                 else => BuildProfileError.ProfileCreationFailed,
             };
         };
+        profile_dir.close(path_mod.currentIo());
 
         ctx.debug("created build profile at: {s}", .{profile_path});
 
@@ -49,10 +51,19 @@ pub const BuildProfile = struct {
     pub fn cleanup(self: *BuildProfile) void {
         self.ctx.debug("cleaning up build profile: {s}", .{self.profile_path});
 
-        std.fs.deleteTreeAbsolute(self.profile_path) catch |err| {
+        const parent_path = std.fs.path.dirname(self.profile_path) orelse "/";
+        const basename = std.fs.path.basename(self.profile_path);
+        if (path_mod.openExistingDir(parent_path)) |parent_dir| {
+            var dir = parent_dir;
+            defer dir.close(path_mod.currentIo());
+            dir.deleteTree(path_mod.currentIo(), basename) catch |err| {
+                self.ctx.setDiagnosticContext(self.profile_path, "failed to cleanup build profile");
+                self.ctx.debug("failed to cleanup build profile {s}: {}", .{ self.profile_path, err });
+            };
+        } else |err| {
             self.ctx.setDiagnosticContext(self.profile_path, "failed to cleanup build profile");
-            self.ctx.debug("failed to cleanup build profile {s}: {}", .{ self.profile_path, err });
-        };
+            self.ctx.debug("failed to open build profile parent {s}: {}", .{ self.profile_path, err });
+        }
 
         self.allocator.free(self.profile_path);
     }
@@ -82,12 +93,12 @@ test "BuildProfile.create creates profile root" {
     var build_profile = try BuildProfile.create(ctx, profile_dir);
     defer build_profile.cleanup();
 
-    var profile_dir_handle = std.fs.openDirAbsolute(build_profile.profile_path, .{}) catch |err| {
+    var profile_dir_handle = std.Io.Dir.openDirAbsolute(path_mod.currentIo(), build_profile.profile_path, .{}) catch |err| {
         ctx.setDiagnosticContext(build_profile.profile_path, "failed to open profile directory in test");
         std.debug.print("failed to open profile directory: {}\n", .{err});
         return err;
     };
-    profile_dir_handle.close();
+    profile_dir_handle.close(path_mod.currentIo());
 }
 
 test "BuildProfile.root returns correct path" {
@@ -133,7 +144,7 @@ test "BuildProfile.cleanup removes profile directory" {
     build_profile.cleanup();
 
     // Verify directory no longer exists
-    const result = std.fs.openDirAbsolute(profile_path, .{});
+    const result = std.Io.Dir.openDirAbsolute(path_mod.currentIo(), profile_path, .{});
     try std.testing.expectError(error.FileNotFound, result);
 }
 
@@ -160,11 +171,17 @@ test "BuildProfile.preserve keeps profile directory" {
     build_profile.preserve();
 
     // Verify directory still exists
-    var dir = try std.fs.openDirAbsolute(profile_path, .{});
-    dir.close();
+    var dir = try std.Io.Dir.openDirAbsolute(path_mod.currentIo(), profile_path, .{});
+    dir.close(path_mod.currentIo());
 
     // Manual cleanup for test
-    std.fs.deleteTreeAbsolute(profile_path) catch {};
+    const parent_path = std.fs.path.dirname(profile_path) orelse "/";
+    const basename = std.fs.path.basename(profile_path);
+    if (path_mod.openExistingDir(parent_path)) |parent_dir| {
+        var cleanup_dir = parent_dir;
+        defer cleanup_dir.close(path_mod.currentIo());
+        cleanup_dir.deleteTree(path_mod.currentIo(), basename) catch {};
+    } else |_| {}
 }
 
 test "BuildProfile.create uses provided workspace path" {

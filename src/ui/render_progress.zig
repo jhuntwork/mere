@@ -34,7 +34,7 @@ pub const ProgressEmitter = struct {
             }),
             .allocator = allocator,
             .options = options,
-            .downloads = std.ArrayList(DownloadEntry){},
+            .downloads = .empty,
         };
         self.emitter = .{ .emitFn = emit };
         return self;
@@ -136,7 +136,7 @@ pub const ProgressEmitter = struct {
         if (percent < entry.last_percent + 5 and percent != 100) return;
         entry.last_percent = percent;
 
-        var line = std.ArrayList(u8){};
+        var line: std.ArrayList(u8) = .empty;
         defer line.deinit(self.allocator);
         try appendTreeBranchToLine(self.allocator, &line, &self.renderer, self.options, false);
         try line.appendSlice(self.allocator, "downloading ");
@@ -227,7 +227,7 @@ pub const ProgressEmitter = struct {
         if (self.active_line) {
             try clearLine(&self.renderer.out);
         }
-        var line = std.ArrayList(u8){};
+        var line: std.ArrayList(u8) = .empty;
         defer line.deinit(self.allocator);
         try appendTreeBranchToLine(self.allocator, &line, &self.renderer, self.options, false);
         try line.appendSlice(self.allocator, "installing ");
@@ -263,7 +263,7 @@ pub const ProgressEmitter = struct {
             self.active_line = false;
             self.active_install_id = null;
         }
-        var line = std.ArrayList(u8){};
+        var line: std.ArrayList(u8) = .empty;
         defer line.deinit(self.allocator);
         try appendTreeBranchToLine(self.allocator, &line, &self.renderer, self.options, false);
         try line.appendSlice(self.allocator, "error installing ");
@@ -321,7 +321,7 @@ pub const ProgressEmitter = struct {
     }
 
     fn renderBlockThrottled(self: *ProgressEmitter) !void {
-        const now = std.time.milliTimestamp();
+        const now = std.Io.Clock.real.now(std.Options.debug_io).toMilliseconds();
         if (now - self.last_render_ms < 150) return;
         self.last_render_ms = now;
         try self.renderBlock();
@@ -397,7 +397,7 @@ pub const ProgressEmitter = struct {
     }
 
     fn printErrorLine(self: *ProgressEmitter, label: []const u8) !void {
-        var line = std.ArrayList(u8){};
+        var line: std.ArrayList(u8) = .empty;
         defer line.deinit(self.allocator);
         try appendTreeBranchToLine(self.allocator, &line, &self.renderer, self.options, false);
         try line.appendSlice(self.allocator, "error downloading ");

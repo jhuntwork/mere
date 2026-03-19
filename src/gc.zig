@@ -19,6 +19,7 @@ const gcroots = @import("gcroots.zig");
 const mere = @import("mere.zig");
 const errors = @import("errors.zig");
 const package_mod = @import("package.zig");
+const path_mod = @import("path.zig");
 const repodb = @import("repodb.zig");
 const repo_history = @import("repo_history.zig");
 
@@ -45,7 +46,7 @@ pub const GCResult = struct {
 
     pub fn init(allocator: std.mem.Allocator) GCResult {
         return GCResult{
-            .deleted_paths = .{},
+            .deleted_paths = .empty,
             .allocator = allocator,
         };
     }
@@ -152,18 +153,19 @@ fn collectGarbageAtPathsWithPackagePool(
     }
 
     // Step 2: Enumerate store candidates
-    var store_handle_opt: ?std.fs.Dir = null;
-    store_handle_opt = std.fs.openDirAbsolute(store_dir, .{ .iterate = true }) catch |err| switch (err) {
+    const io = path_mod.currentIo();
+    var store_handle_opt: ?std.Io.Dir = null;
+    store_handle_opt = std.Io.Dir.openDirAbsolute(io, store_dir, .{ .iterate = true }) catch |err| switch (err) {
         error.FileNotFound => null,
         error.AccessDenied => return ctx.fail(GCError.PermissionDenied, store_dir, "permission denied opening store directory"),
         else => return ctx.fail(GCError.FileSystem, store_dir, "failed to open store directory"),
     };
     if (store_handle_opt) |*store_handle| {
-        defer store_handle.close();
+        defer store_handle.close(io);
 
         var iter = store_handle.iterate();
         while (true) {
-            const entry = iter.next() catch |err| {
+            const entry = iter.next(io) catch |err| {
                 return ctx.fail(mapGcFsError(err), store_dir, "failed to iterate store directory");
             };
             if (entry == null) break;
@@ -195,7 +197,7 @@ fn collectGarbageAtPathsWithPackagePool(
                 // Make directory writable before deletion (store paths are read-only)
                 makeWritable(store_path);
                 // Actually delete
-                std.fs.deleteTreeAbsolute(store_path) catch |err| {
+                std.Io.Dir.cwd().deleteTree(io, store_path) catch |err| {
                     switch (err) {
                         error.AccessDenied => return ctx.fail(GCError.PermissionDenied, store_path, "permission denied deleting store path"),
                         else => return ctx.fail(GCError.FileSystem, store_path, "failed to delete store path"),
@@ -232,18 +234,19 @@ fn prunePackagePool(
         referenced.deinit();
     }
 
-    var pool_dir_opt: ?std.fs.Dir = null;
-    pool_dir_opt = std.fs.openDirAbsolute(package_pool_dir, .{ .iterate = true }) catch |err| switch (err) {
+    const io = path_mod.currentIo();
+    var pool_dir_opt: ?std.Io.Dir = null;
+    pool_dir_opt = std.Io.Dir.openDirAbsolute(io, package_pool_dir, .{ .iterate = true }) catch |err| switch (err) {
         error.FileNotFound => null,
         error.AccessDenied => return ctx.fail(GCError.PermissionDenied, package_pool_dir, "permission denied opening package pool"),
         else => return ctx.fail(GCError.FileSystem, package_pool_dir, "failed to open package pool"),
     };
     if (pool_dir_opt) |*pool_dir| {
-        defer pool_dir.close();
+        defer pool_dir.close(io);
 
         var iter = pool_dir.iterate();
         while (true) {
-            const entry = iter.next() catch |err| {
+            const entry = iter.next(io) catch |err| {
                 return ctx.fail(mapGcFsError(err), package_pool_dir, "failed to iterate package pool");
             };
             if (entry == null) break;
@@ -263,7 +266,7 @@ fn prunePackagePool(
             };
 
             if (!options.dry_run) {
-                std.fs.deleteFileAbsolute(archive_path) catch |err| switch (err) {
+                std.Io.Dir.deleteFileAbsolute(io, archive_path) catch |err| switch (err) {
                     error.FileNotFound => {},
                     error.AccessDenied => return ctx.fail(GCError.PermissionDenied, archive_path, "permission denied deleting package archive"),
                     else => return ctx.fail(GCError.FileSystem, archive_path, "failed to delete package archive"),
@@ -285,18 +288,19 @@ fn collectReferencedPackageArchives(
         referenced.deinit();
     }
 
-    var repo_root_opt: ?std.fs.Dir = null;
-    repo_root_opt = std.fs.openDirAbsolute(repo_root_dir, .{ .iterate = true }) catch |err| switch (err) {
+    const io = path_mod.currentIo();
+    var repo_root_opt: ?std.Io.Dir = null;
+    repo_root_opt = std.Io.Dir.openDirAbsolute(io, repo_root_dir, .{ .iterate = true }) catch |err| switch (err) {
         error.FileNotFound => null,
         error.AccessDenied => return ctx.fail(GCError.PermissionDenied, repo_root_dir, "permission denied opening repo root"),
         else => return ctx.fail(GCError.FileSystem, repo_root_dir, "failed to open repo root"),
     };
     if (repo_root_opt) |*repo_root| {
-        defer repo_root.close();
+        defer repo_root.close(io);
 
         var iter = repo_root.iterate();
         while (true) {
-            const entry = iter.next() catch |err| {
+            const entry = iter.next(io) catch |err| {
                 return ctx.fail(mapGcFsError(err), repo_root_dir, "failed to iterate repo root");
             };
             if (entry == null) break;
@@ -331,7 +335,7 @@ fn collectReferencedPackageArchivesFromDb(
     db_path: []const u8,
     referenced: *std.StringHashMap(void),
 ) GCError!void {
-    std.fs.accessAbsolute(db_path, .{}) catch |err| switch (err) {
+    std.Io.Dir.accessAbsolute(path_mod.currentIo(), db_path, .{}) catch |err| switch (err) {
         error.FileNotFound => return,
         error.AccessDenied => return ctx.fail(GCError.PermissionDenied, db_path, "permission denied accessing repository database"),
         else => return ctx.fail(GCError.FileSystem, db_path, "failed to access repository database"),
@@ -469,7 +473,7 @@ fn pruneGenerations(
         };
 
         if (!options.dry_run) {
-            std.fs.deleteTreeAbsolute(gen_path) catch |err| {
+            std.Io.Dir.cwd().deleteTree(path_mod.currentIo(), gen_path) catch |err| {
                 return switch (err) {
                     error.AccessDenied => ctx.fail(GCError.PermissionDenied, gen_path, "permission denied deleting generation"),
                     else => ctx.fail(GCError.FileSystem, gen_path, "failed to delete generation"),
@@ -485,18 +489,19 @@ fn collectNamedProfileReachable(
     reachable: *std.StringHashMap(void),
 ) GCError!void {
     const allocator = ctx.allocator;
-    var profiles_handle = std.fs.openDirAbsolute(profiles_dir, .{ .iterate = true }) catch |err| {
+    const io = path_mod.currentIo();
+    var profiles_handle = std.Io.Dir.openDirAbsolute(io, profiles_dir, .{ .iterate = true }) catch |err| {
         return switch (err) {
             error.FileNotFound => return, // No profiles directory = nothing to prune
             error.AccessDenied => ctx.fail(GCError.PermissionDenied, profiles_dir, "permission denied opening profiles directory"),
             else => ctx.fail(GCError.FileSystem, profiles_dir, "failed to open profiles directory"),
         };
     };
-    defer profiles_handle.close();
+    defer profiles_handle.close(io);
 
     var iter = profiles_handle.iterate();
     while (true) {
-        const entry = iter.next() catch |err| {
+        const entry = iter.next(io) catch |err| {
             return ctx.fail(mapGcFsError(err), profiles_dir, "failed to iterate profiles directory");
         };
         if (entry == null) break;
@@ -515,7 +520,7 @@ fn collectNamedProfileReachable(
         };
         defer allocator.free(root_dir);
 
-        std.fs.accessAbsolute(root_dir, .{}) catch |err| switch (err) {
+        std.Io.Dir.accessAbsolute(io, root_dir, .{}) catch |err| switch (err) {
             error.FileNotFound => continue,
             error.AccessDenied => return ctx.fail(GCError.PermissionDenied, root_dir, "permission denied accessing profile root"),
             else => return ctx.fail(GCError.FileSystem, root_dir, "failed to access profile root"),
@@ -542,7 +547,7 @@ fn readCurrentGeneration(ctx: *mere.Context, profile_dir: []const u8) GCError!?u
     };
 
     var target_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const target = std.fs.readLinkAbsolute(current_path, &target_buf) catch |err| {
+    const target_len = std.Io.Dir.readLinkAbsolute(path_mod.currentIo(), current_path, &target_buf) catch |err| {
         return switch (err) {
             error.FileNotFound => null,
             error.AccessDenied => ctx.fail(GCError.PermissionDenied, current_path, "permission denied reading current symlink"),
@@ -550,35 +555,40 @@ fn readCurrentGeneration(ctx: *mere.Context, profile_dir: []const u8) GCError!?u
         };
     };
 
-    return generation.parseGenerationNumber(target);
+    return generation.parseGenerationNumber(target_buf[0..target_len]);
 }
 
 /// Make a directory and its contents writable (to allow deletion).
 /// Best-effort: silently ignores failures since we'll try to delete anyway.
 fn makeWritable(dir_path: []const u8) void {
-    var dir = std.fs.openDirAbsolute(dir_path, .{ .iterate = true }) catch return;
-    defer dir.close();
+    const io = path_mod.currentIo();
+    var dir = std.Io.Dir.openDirAbsolute(io, dir_path, .{ .iterate = true }) catch return;
+    defer dir.close(io);
 
     var walker = dir.walk(std.heap.page_allocator) catch return;
     defer walker.deinit();
 
-    while (walker.next() catch null) |entry| {
-        if (entry.kind == .directory) {
-            var subdir = dir.openDir(entry.path, .{}) catch continue;
-            defer subdir.close();
-            const stat = subdir.stat() catch continue;
-            subdir.chmod(stat.mode | 0o200) catch {}; // Add write bit for owner
-        } else {
-            var file = dir.openFile(entry.path, .{ .mode = .read_write }) catch continue;
-            defer file.close();
-            const stat = file.stat() catch continue;
-            file.chmod(stat.mode | 0o200) catch {}; // Add write bit for owner
+    while (walker.next(io) catch null) |entry| {
+        switch (entry.kind) {
+            .directory => {
+                var subdir = dir.openDir(io, entry.path, .{}) catch continue;
+                defer subdir.close(io);
+                const stat = subdir.stat(io) catch continue;
+                subdir.setPermissions(io, .fromMode(stat.permissions.toMode() | 0o200)) catch {};
+            },
+            .file => {
+                var file = dir.openFile(io, entry.path, .{}) catch continue;
+                defer file.close(io);
+                const stat = file.stat(io) catch continue;
+                file.setPermissions(io, .fromMode(stat.permissions.toMode() | 0o200)) catch {};
+            },
+            else => {},
         }
     }
 
     // Also chmod the directory itself
-    const stat = dir.stat() catch return;
-    dir.chmod(stat.mode | 0o200) catch {};
+    const stat = dir.stat(io) catch return;
+    dir.setPermissions(io, .fromMode(stat.permissions.toMode() | 0o200)) catch {};
 }
 
 /// Collect all reachable store paths from GC roots.
@@ -600,14 +610,15 @@ fn collectReachable(
     }
 
     // Open gc-roots directory
-    var dir = std.fs.openDirAbsolute(gc_roots_dir, .{ .iterate = true }) catch |err| {
+    const io = path_mod.currentIo();
+    var dir = std.Io.Dir.openDirAbsolute(io, gc_roots_dir, .{ .iterate = true }) catch |err| {
         return switch (err) {
             error.FileNotFound => reachable, // No roots dir = no roots
             error.AccessDenied => ctx.fail(GCError.PermissionDenied, gc_roots_dir, "permission denied opening gc-roots"),
             else => ctx.fail(GCError.FileSystem, gc_roots_dir, "failed to open gc-roots"),
         };
     };
-    defer dir.close();
+    defer dir.close(io);
 
     // Walk the gc-roots directory recursively to find all symlinks
     var walker = dir.walk(allocator) catch |err| {
@@ -615,7 +626,7 @@ fn collectReachable(
     };
     defer walker.deinit();
 
-    while (walker.next() catch |err| {
+    while (walker.next(io) catch |err| {
         return ctx.fail(mapGcFsError(err), gc_roots_dir, "failed to iterate gc-roots");
     }) |entry| {
         // Only process symlinks (skip .note files, directories, etc)
@@ -629,13 +640,14 @@ fn collectReachable(
 
         // Read symlink target
         var target_buf: [std.fs.max_path_bytes]u8 = undefined;
-        const target = std.fs.readLinkAbsolute(root_path, &target_buf) catch |err| {
+        const target_len = std.Io.Dir.readLinkAbsolute(io, root_path, &target_buf) catch |err| {
             switch (err) {
                 error.FileNotFound => continue,
                 error.AccessDenied => return ctx.fail(GCError.PermissionDenied, root_path, "permission denied reading gc-root"),
                 else => return ctx.fail(GCError.FileSystem, root_path, "failed to read gc-root"),
             }
         };
+        const target = target_buf[0..target_len];
 
         var resolved_target: []const u8 = target;
         var resolved_owned: ?[]const u8 = null;
@@ -672,7 +684,7 @@ fn collectFromRoot(
     defer allocator.free(manifest_path);
 
     // Try to read as a generation manifest
-    if (std.fs.accessAbsolute(manifest_path, .{})) |_| {
+    if (std.Io.Dir.accessAbsolute(path_mod.currentIo(), manifest_path, .{})) |_| {
         // This is a generation - read manifest and extract store paths
         var manifest = generation.readManifest(allocator, root_target) catch |err| {
             return switch (err) {
@@ -708,9 +720,9 @@ fn collectFromRoot(
         // Also handle symlinks to symlinks (e.g., gc-roots/profiles/system/current -> profiles/system/current -> gen-N)
         // Try to resolve further
         var resolve_buf: [std.fs.max_path_bytes]u8 = undefined;
-        if (std.fs.readLinkAbsolute(root_target, &resolve_buf)) |resolved| {
+        if (std.Io.Dir.readLinkAbsolute(path_mod.currentIo(), root_target, &resolve_buf)) |resolved_len| {
             // Recursively collect from the resolved target
-            try collectFromRoot(ctx, resolved, reachable);
+            try collectFromRoot(ctx, resolve_buf[0..resolved_len], reachable);
         } else |_| {
             // Not a symlink, that's fine
         }
@@ -745,18 +757,18 @@ fn addReachable(
 
 /// Check if any GC roots exist.
 fn hasRootsAt(gc_roots_dir: []const u8) GCError!bool {
-    var dir = std.fs.openDirAbsolute(gc_roots_dir, .{ .iterate = true }) catch |err| {
+    var dir = std.Io.Dir.openDirAbsolute(path_mod.currentIo(), gc_roots_dir, .{ .iterate = true }) catch |err| {
         return switch (err) {
             error.FileNotFound => false,
             error.AccessDenied => GCError.PermissionDenied,
             else => GCError.FileSystem,
         };
     };
-    defer dir.close();
+    defer dir.close(path_mod.currentIo());
 
     var iter = dir.iterate();
     while (true) {
-        const entry = iter.next() catch |err| {
+        const entry = iter.next(path_mod.currentIo()) catch |err| {
             return mapGcFsError(err);
         };
         if (entry == null) break;
@@ -797,7 +809,8 @@ fn writeRepoStateDb(
     state_dir: []const u8,
     pkgs: []const TestRepoPackage,
 ) !void {
-    try std.fs.cwd().makePath(state_dir);
+    var state_dir_handle = try path_mod.makePathAndOpenDir(state_dir);
+    state_dir_handle.close(path_mod.currentIo());
 
     const db_path = try std.fs.path.join(ctx.allocator, &.{ state_dir, repo_history.REPO_DB_FILENAME });
     defer ctx.allocator.free(db_path);
@@ -823,9 +836,9 @@ fn createPackagePoolArchive(
     const archive_path = try std.fs.path.join(allocator, &.{ package_pool_dir, archive_name });
     errdefer allocator.free(archive_path);
 
-    var file = try std.fs.createFileAbsolute(archive_path, .{});
-    defer file.close();
-    try file.writeAll("archive");
+    var file = try std.Io.Dir.createFileAbsolute(path_mod.currentIo(), archive_path, .{});
+    defer file.close(path_mod.currentIo());
+    try file.writeStreamingAll(path_mod.currentIo(), "archive");
 
     return archive_path;
 }
@@ -843,20 +856,20 @@ test "collectGarbage with no roots fails" {
 
     const gc_roots_dir = try std.fs.path.join(allocator, &.{ test_env.path, "gc-roots" });
     defer allocator.free(gc_roots_dir);
-    try std.fs.cwd().makePath(gc_roots_dir);
+    try path_mod.ensureDirExists(gc_roots_dir);
 
     const store_dir = try std.fs.path.join(allocator, &.{ test_env.path, "store" });
     defer allocator.free(store_dir);
-    try std.fs.cwd().makePath(store_dir);
+    try path_mod.ensureDirExists(store_dir);
 
     const profiles_dir = try std.fs.path.join(allocator, &.{ test_env.path, "profiles" });
     defer allocator.free(profiles_dir);
-    try std.fs.cwd().makePath(profiles_dir);
+    try path_mod.ensureDirExists(profiles_dir);
 
     // Create a store object
     const store_obj = try std.fs.path.join(allocator, &.{ store_dir, "abc123-test-1.0" });
     defer allocator.free(store_obj);
-    try std.fs.cwd().makePath(store_obj);
+    try path_mod.ensureDirExists(store_obj);
 
     // GC should fail with NoRoots
     const result = collectGarbageAtPaths(&test_env.ctx, gc_roots_dir, store_dir, profiles_dir, .{});
@@ -876,32 +889,32 @@ test "collectGarbage keeps rooted store paths" {
 
     const gc_roots_dir = try std.fs.path.join(allocator, &.{ test_env.path, "gc-roots" });
     defer allocator.free(gc_roots_dir);
-    try std.fs.cwd().makePath(gc_roots_dir);
+    try path_mod.ensureDirExists(gc_roots_dir);
 
     const store_dir = try std.fs.path.join(allocator, &.{ test_env.path, "store" });
     defer allocator.free(store_dir);
-    try std.fs.cwd().makePath(store_dir);
+    try path_mod.ensureDirExists(store_dir);
 
     const profiles_dir = try std.fs.path.join(allocator, &.{ test_env.path, "profiles" });
     defer allocator.free(profiles_dir);
-    try std.fs.cwd().makePath(profiles_dir);
+    try path_mod.ensureDirExists(profiles_dir);
 
     // Create two store objects
     const kept_obj = try std.fs.path.join(allocator, &.{ store_dir, "abc123-kept-1.0" });
     defer allocator.free(kept_obj);
-    try std.fs.cwd().makePath(kept_obj);
+    try path_mod.ensureDirExists(kept_obj);
 
     const unreachable_obj = try std.fs.path.join(allocator, &.{ store_dir, "def456-unreachable-2.0" });
     defer allocator.free(unreachable_obj);
-    try std.fs.cwd().makePath(unreachable_obj);
+    try path_mod.ensureDirExists(unreachable_obj);
 
     // Create a pin pointing to the kept object
     const pin_path = try std.fs.path.join(allocator, &.{ gc_roots_dir, "my-pin" });
     defer allocator.free(pin_path);
 
-    var gc_roots_handle = try std.fs.openDirAbsolute(gc_roots_dir, .{});
-    defer gc_roots_handle.close();
-    gc_roots_handle.symLink(kept_obj, "my-pin", .{}) catch {};
+    var gc_roots_handle = try std.Io.Dir.openDirAbsolute(path_mod.currentIo(), gc_roots_dir, .{});
+    defer gc_roots_handle.close(path_mod.currentIo());
+    gc_roots_handle.symLink(path_mod.currentIo(), kept_obj, "my-pin", .{}) catch {};
 
     // GC should only want to delete unreachable
     var gc_result = try collectGarbageAtPaths(&test_env.ctx, gc_roots_dir, store_dir, profiles_dir, .{ .dry_run = true });
@@ -924,37 +937,37 @@ test "collectGarbage collects from generation manifest" {
 
     const gc_roots_dir = try std.fs.path.join(allocator, &.{ test_env.path, "gc-roots" });
     defer allocator.free(gc_roots_dir);
-    try std.fs.cwd().makePath(gc_roots_dir);
+    try path_mod.ensureDirExists(gc_roots_dir);
 
     const store_dir = try std.fs.path.join(allocator, &.{ test_env.path, "store" });
     defer allocator.free(store_dir);
-    try std.fs.cwd().makePath(store_dir);
+    try path_mod.ensureDirExists(store_dir);
 
     const profiles_dir = try std.fs.path.join(allocator, &.{ test_env.path, "profiles" });
     defer allocator.free(profiles_dir);
-    try std.fs.cwd().makePath(profiles_dir);
+    try path_mod.ensureDirExists(profiles_dir);
 
     const profile_dir = try std.fs.path.join(allocator, &.{ test_env.path, "profiles", "system" });
     defer allocator.free(profile_dir);
-    try std.fs.cwd().makePath(profile_dir);
+    try path_mod.ensureDirExists(profile_dir);
 
     // Create store objects
     const pkg1_path = try std.fs.path.join(allocator, &.{ store_dir, "abc123-pkg1-1.0" });
     defer allocator.free(pkg1_path);
-    try std.fs.cwd().makePath(pkg1_path);
+    try path_mod.ensureDirExists(pkg1_path);
 
     const pkg2_path = try std.fs.path.join(allocator, &.{ store_dir, "def456-pkg2-2.0" });
     defer allocator.free(pkg2_path);
-    try std.fs.cwd().makePath(pkg2_path);
+    try path_mod.ensureDirExists(pkg2_path);
 
     const unreachable_path = try std.fs.path.join(allocator, &.{ store_dir, "xyz789-old-0.1" });
     defer allocator.free(unreachable_path);
-    try std.fs.cwd().makePath(unreachable_path);
+    try path_mod.ensureDirExists(unreachable_path);
 
     // Create a generation with pkg1 and pkg2
     const gen_dir = try std.fs.path.join(allocator, &.{ profile_dir, "gen-1" });
     defer allocator.free(gen_dir);
-    try std.fs.cwd().makePath(gen_dir);
+    try path_mod.ensureDirExists(gen_dir);
 
     var manifest = generation.GenerationManifest.init(allocator, 1);
     defer manifest.deinit();
@@ -979,9 +992,9 @@ test "collectGarbage collects from generation manifest" {
     try generation.writeManifest(allocator, gen_dir, &manifest);
 
     // Create gc-root pointing to generation
-    var gc_roots_handle = try std.fs.openDirAbsolute(gc_roots_dir, .{});
-    defer gc_roots_handle.close();
-    gc_roots_handle.symLink(gen_dir, "gen-1", .{}) catch {};
+    var gc_roots_handle = try std.Io.Dir.openDirAbsolute(path_mod.currentIo(), gc_roots_dir, .{});
+    defer gc_roots_handle.close(path_mod.currentIo());
+    gc_roots_handle.symLink(path_mod.currentIo(), gen_dir, "gen-1", .{}) catch {};
 
     // GC should only want to delete unreachable (old-0.1)
     var gc_result = try collectGarbageAtPaths(&test_env.ctx, gc_roots_dir, store_dir, profiles_dir, .{ .dry_run = true });
@@ -1004,35 +1017,35 @@ test "collectGarbage actual deletion" {
 
     const gc_roots_dir = try std.fs.path.join(allocator, &.{ test_env.path, "gc-roots" });
     defer allocator.free(gc_roots_dir);
-    try std.fs.cwd().makePath(gc_roots_dir);
+    try path_mod.ensureDirExists(gc_roots_dir);
 
     const store_dir = try std.fs.path.join(allocator, &.{ test_env.path, "store" });
     defer allocator.free(store_dir);
-    try std.fs.cwd().makePath(store_dir);
+    try path_mod.ensureDirExists(store_dir);
 
     const profiles_dir = try std.fs.path.join(allocator, &.{ test_env.path, "profiles" });
     defer allocator.free(profiles_dir);
-    try std.fs.cwd().makePath(profiles_dir);
+    try path_mod.ensureDirExists(profiles_dir);
 
     // Create a store object to delete
     const to_delete = try std.fs.path.join(allocator, &.{ store_dir, "abc123-delete-me-1.0" });
     defer allocator.free(to_delete);
-    try std.fs.cwd().makePath(to_delete);
+    try path_mod.ensureDirExists(to_delete);
 
     // Put a file inside it
     const inner_file = try std.fs.path.join(allocator, &.{ to_delete, "somefile" });
     defer allocator.free(inner_file);
-    var file = try std.fs.createFileAbsolute(inner_file, .{});
-    file.close();
+    var file = try std.Io.Dir.createFileAbsolute(path_mod.currentIo(), inner_file, .{});
+    file.close(path_mod.currentIo());
 
     // Create a kept object with a root
     const kept = try std.fs.path.join(allocator, &.{ store_dir, "def456-kept-2.0" });
     defer allocator.free(kept);
-    try std.fs.cwd().makePath(kept);
+    try path_mod.ensureDirExists(kept);
 
-    var gc_roots_handle = try std.fs.openDirAbsolute(gc_roots_dir, .{});
-    defer gc_roots_handle.close();
-    gc_roots_handle.symLink(kept, "my-pin", .{}) catch {};
+    var gc_roots_handle = try std.Io.Dir.openDirAbsolute(path_mod.currentIo(), gc_roots_dir, .{});
+    defer gc_roots_handle.close(path_mod.currentIo());
+    gc_roots_handle.symLink(path_mod.currentIo(), kept, "my-pin", .{}) catch {};
 
     // Actually run GC (not dry-run)
     var gc_result = try collectGarbageAtPaths(&test_env.ctx, gc_roots_dir, store_dir, profiles_dir, .{ .dry_run = false });
@@ -1041,7 +1054,7 @@ test "collectGarbage actual deletion" {
     try std.testing.expectEqual(@as(usize, 1), gc_result.deleted_paths.items.len);
 
     // Verify delete-me is gone
-    std.fs.accessAbsolute(to_delete, .{}) catch |err| {
+    std.Io.Dir.accessAbsolute(path_mod.currentIo(), to_delete, .{}) catch |err| {
         try std.testing.expectEqual(error.FileNotFound, err);
         return;
     };
@@ -1061,34 +1074,34 @@ test "collectGarbage prunes unkept generations" {
 
     const gc_roots_dir = try std.fs.path.join(allocator, &.{ test_env.path, "gc-roots" });
     defer allocator.free(gc_roots_dir);
-    try std.fs.cwd().makePath(gc_roots_dir);
+    try path_mod.ensureDirExists(gc_roots_dir);
 
     const store_dir = try std.fs.path.join(allocator, &.{ test_env.path, "store" });
     defer allocator.free(store_dir);
-    try std.fs.cwd().makePath(store_dir);
+    try path_mod.ensureDirExists(store_dir);
 
     const profiles_dir = try std.fs.path.join(allocator, &.{ test_env.path, "profiles" });
     defer allocator.free(profiles_dir);
-    try std.fs.cwd().makePath(profiles_dir);
+    try path_mod.ensureDirExists(profiles_dir);
 
     const profile_dir = try std.fs.path.join(allocator, &.{ profiles_dir, "system" });
     defer allocator.free(profile_dir);
-    try std.fs.cwd().makePath(profile_dir);
+    try path_mod.ensureDirExists(profile_dir);
 
     // Create a reachable store object and pin it so GC has roots.
     const kept_obj = try std.fs.path.join(allocator, &.{ store_dir, "abc123-kept-1.0" });
     defer allocator.free(kept_obj);
-    try std.fs.cwd().makePath(kept_obj);
+    try path_mod.ensureDirExists(kept_obj);
 
-    var gc_roots_handle = try std.fs.openDirAbsolute(gc_roots_dir, .{});
-    defer gc_roots_handle.close();
-    gc_roots_handle.symLink(kept_obj, "my-pin", .{}) catch {};
+    var gc_roots_handle = try std.Io.Dir.openDirAbsolute(path_mod.currentIo(), gc_roots_dir, .{});
+    defer gc_roots_handle.close(path_mod.currentIo());
+    gc_roots_handle.symLink(path_mod.currentIo(), kept_obj, "my-pin", .{}) catch {};
 
     // Create generations 1-4 with valid manifests.
     for ([_]u32{ 1, 2, 3, 4 }) |gen| {
         const gen_dir = try generation.getGenerationPath(allocator, profile_dir, gen);
         defer allocator.free(gen_dir);
-        try std.fs.cwd().makePath(gen_dir);
+        try path_mod.ensureDirExists(gen_dir);
 
         var manifest = generation.GenerationManifest.init(allocator, gen);
         defer manifest.deinit();
@@ -1104,9 +1117,9 @@ test "collectGarbage prunes unkept generations" {
     }
 
     // Point current to gen-1 so it stays kept even though it's not recent.
-    var profile_handle = try std.fs.openDirAbsolute(profile_dir, .{});
-    defer profile_handle.close();
-    profile_handle.symLink("gen-1", "current", .{}) catch {};
+    var profile_handle = try std.Io.Dir.openDirAbsolute(path_mod.currentIo(), profile_dir, .{});
+    defer profile_handle.close(path_mod.currentIo());
+    profile_handle.symLink(path_mod.currentIo(), "gen-1", "current", .{}) catch {};
 
     var gc_result = try collectGarbageAtPaths(&test_env.ctx, gc_roots_dir, store_dir, profiles_dir, .{ .dry_run = true });
     defer gc_result.deinit();
@@ -1127,15 +1140,15 @@ test "hasRootsAt" {
 
     const gc_roots_dir = try std.fs.path.join(allocator, &.{ test_env.path, "gc-roots" });
     defer allocator.free(gc_roots_dir);
-    try std.fs.cwd().makePath(gc_roots_dir);
+    try path_mod.ensureDirExists(gc_roots_dir);
 
     // Initially no roots
     try std.testing.expect(!try hasRootsAt(gc_roots_dir));
 
     // Add a symlink
-    var handle = try std.fs.openDirAbsolute(gc_roots_dir, .{});
-    defer handle.close();
-    handle.symLink("/some/target", "my-root", .{}) catch {};
+    var handle = try std.Io.Dir.openDirAbsolute(path_mod.currentIo(), gc_roots_dir, .{});
+    defer handle.close(path_mod.currentIo());
+    handle.symLink(path_mod.currentIo(), "/some/target", "my-root", .{}) catch {};
 
     // Now has roots
     try std.testing.expect(try hasRootsAt(gc_roots_dir));
@@ -1183,42 +1196,42 @@ test "collectGarbage preserves store paths from both pins and generation manifes
 
     const gc_roots_dir = try std.fs.path.join(allocator, &.{ test_env.path, "gc-roots" });
     defer allocator.free(gc_roots_dir);
-    try std.fs.cwd().makePath(gc_roots_dir);
+    try path_mod.ensureDirExists(gc_roots_dir);
 
     const store_dir = try std.fs.path.join(allocator, &.{ test_env.path, "store" });
     defer allocator.free(store_dir);
-    try std.fs.cwd().makePath(store_dir);
+    try path_mod.ensureDirExists(store_dir);
 
     const profiles_dir = try std.fs.path.join(allocator, &.{ test_env.path, "profiles" });
     defer allocator.free(profiles_dir);
-    try std.fs.cwd().makePath(profiles_dir);
+    try path_mod.ensureDirExists(profiles_dir);
 
     const profile_dir = try std.fs.path.join(allocator, &.{ profiles_dir, "system" });
     defer allocator.free(profile_dir);
-    try std.fs.cwd().makePath(profile_dir);
+    try path_mod.ensureDirExists(profile_dir);
 
     // Create three store objects: two reachable (one via pin, one via generation), one unreachable
     const pinned_obj = try std.fs.path.join(allocator, &.{ store_dir, "aaa111-pinned-1.0" });
     defer allocator.free(pinned_obj);
-    try std.fs.cwd().makePath(pinned_obj);
+    try path_mod.ensureDirExists(pinned_obj);
 
     const gen_obj = try std.fs.path.join(allocator, &.{ store_dir, "bbb222-gen-pkg-2.0" });
     defer allocator.free(gen_obj);
-    try std.fs.cwd().makePath(gen_obj);
+    try path_mod.ensureDirExists(gen_obj);
 
     const unreachable_obj = try std.fs.path.join(allocator, &.{ store_dir, "ccc333-orphan-3.0" });
     defer allocator.free(unreachable_obj);
-    try std.fs.cwd().makePath(unreachable_obj);
+    try path_mod.ensureDirExists(unreachable_obj);
 
     // Create a pin root pointing to pinned_obj
-    var gc_roots_handle = try std.fs.openDirAbsolute(gc_roots_dir, .{});
-    defer gc_roots_handle.close();
-    gc_roots_handle.symLink(pinned_obj, "my-pin", .{}) catch {};
+    var gc_roots_handle = try std.Io.Dir.openDirAbsolute(path_mod.currentIo(), gc_roots_dir, .{});
+    defer gc_roots_handle.close(path_mod.currentIo());
+    gc_roots_handle.symLink(path_mod.currentIo(), pinned_obj, "my-pin", .{}) catch {};
 
     // Create a generation with gen_obj referenced in its manifest
     const gen_dir = try std.fs.path.join(allocator, &.{ profile_dir, "gen-1" });
     defer allocator.free(gen_dir);
-    try std.fs.cwd().makePath(gen_dir);
+    try path_mod.ensureDirExists(gen_dir);
 
     var manifest = generation.GenerationManifest.init(allocator, 1);
     defer manifest.deinit();
@@ -1233,7 +1246,7 @@ test "collectGarbage preserves store paths from both pins and generation manifes
     try generation.writeManifest(allocator, gen_dir, &manifest);
 
     // Create gc-root symlink pointing to the generation directory
-    gc_roots_handle.symLink(gen_dir, "gen-root", .{}) catch {};
+    gc_roots_handle.symLink(path_mod.currentIo(), gen_dir, "gen-root", .{}) catch {};
 
     // Run GC in dry-run mode
     var gc_result = try collectGarbageAtPaths(&test_env.ctx, gc_roots_dir, store_dir, profiles_dir, .{ .dry_run = true });
@@ -1244,8 +1257,8 @@ test "collectGarbage preserves store paths from both pins and generation manifes
     try std.testing.expect(std.mem.endsWith(u8, gc_result.deleted_paths.items[0], "ccc333-orphan-3.0"));
 
     // Verify both reachable objects still exist
-    std.fs.accessAbsolute(pinned_obj, .{}) catch return error.TestUnexpectedResult;
-    std.fs.accessAbsolute(gen_obj, .{}) catch return error.TestUnexpectedResult;
+    std.Io.Dir.accessAbsolute(path_mod.currentIo(), pinned_obj, .{}) catch return error.TestUnexpectedResult;
+    std.Io.Dir.accessAbsolute(path_mod.currentIo(), gen_obj, .{}) catch return error.TestUnexpectedResult;
 }
 
 // Spec #12: GC deletes unreachable store paths
@@ -1261,44 +1274,44 @@ test "collectGarbage deletes multiple unreachable store paths" {
 
     const gc_roots_dir = try std.fs.path.join(allocator, &.{ test_env.path, "gc-roots" });
     defer allocator.free(gc_roots_dir);
-    try std.fs.cwd().makePath(gc_roots_dir);
+    try path_mod.ensureDirExists(gc_roots_dir);
 
     const store_dir = try std.fs.path.join(allocator, &.{ test_env.path, "store" });
     defer allocator.free(store_dir);
-    try std.fs.cwd().makePath(store_dir);
+    try path_mod.ensureDirExists(store_dir);
 
     const profiles_dir = try std.fs.path.join(allocator, &.{ test_env.path, "profiles" });
     defer allocator.free(profiles_dir);
-    try std.fs.cwd().makePath(profiles_dir);
+    try path_mod.ensureDirExists(profiles_dir);
 
     // Create one rooted store object
     const kept_obj = try std.fs.path.join(allocator, &.{ store_dir, "aaa111-kept-1.0" });
     defer allocator.free(kept_obj);
-    try std.fs.cwd().makePath(kept_obj);
+    try path_mod.ensureDirExists(kept_obj);
 
-    var gc_roots_handle = try std.fs.openDirAbsolute(gc_roots_dir, .{});
-    defer gc_roots_handle.close();
-    gc_roots_handle.symLink(kept_obj, "keep-pin", .{}) catch {};
+    var gc_roots_handle = try std.Io.Dir.openDirAbsolute(path_mod.currentIo(), gc_roots_dir, .{});
+    defer gc_roots_handle.close(path_mod.currentIo());
+    gc_roots_handle.symLink(path_mod.currentIo(), kept_obj, "keep-pin", .{}) catch {};
 
     // Create two unreachable store objects with files inside
     const orphan1 = try std.fs.path.join(allocator, &.{ store_dir, "bbb222-orphan1-1.0" });
     defer allocator.free(orphan1);
-    try std.fs.cwd().makePath(orphan1);
+    try path_mod.ensureDirExists(orphan1);
     {
         const f_path = try std.fs.path.join(allocator, &.{ orphan1, "file.txt" });
         defer allocator.free(f_path);
-        var f = try std.fs.createFileAbsolute(f_path, .{});
-        f.close();
+        var f = try std.Io.Dir.createFileAbsolute(path_mod.currentIo(), f_path, .{});
+        f.close(path_mod.currentIo());
     }
 
     const orphan2 = try std.fs.path.join(allocator, &.{ store_dir, "ccc333-orphan2-2.0" });
     defer allocator.free(orphan2);
-    try std.fs.cwd().makePath(orphan2);
+    try path_mod.ensureDirExists(orphan2);
     {
         const f_path = try std.fs.path.join(allocator, &.{ orphan2, "data.bin" });
         defer allocator.free(f_path);
-        var f = try std.fs.createFileAbsolute(f_path, .{});
-        f.close();
+        var f = try std.Io.Dir.createFileAbsolute(path_mod.currentIo(), f_path, .{});
+        f.close(path_mod.currentIo());
     }
 
     // Actually run GC (not dry-run)
@@ -1309,12 +1322,12 @@ test "collectGarbage deletes multiple unreachable store paths" {
     try std.testing.expectEqual(@as(usize, 2), gc_result.deleted_paths.items.len);
 
     // Verify orphans are gone
-    std.fs.accessAbsolute(orphan1, .{}) catch |err| {
+    std.Io.Dir.accessAbsolute(path_mod.currentIo(), orphan1, .{}) catch |err| {
         try std.testing.expectEqual(error.FileNotFound, err);
-        std.fs.accessAbsolute(orphan2, .{}) catch |err2| {
+        std.Io.Dir.accessAbsolute(path_mod.currentIo(), orphan2, .{}) catch |err2| {
             try std.testing.expectEqual(error.FileNotFound, err2);
             // Verify kept object still exists
-            std.fs.accessAbsolute(kept_obj, .{}) catch return error.TestUnexpectedResult;
+            std.Io.Dir.accessAbsolute(path_mod.currentIo(), kept_obj, .{}) catch return error.TestUnexpectedResult;
             return;
         };
         return error.TestUnexpectedResult;
@@ -1335,43 +1348,43 @@ test "collectGarbage only deletes directories in store" {
 
     const gc_roots_dir = try std.fs.path.join(allocator, &.{ test_env.path, "gc-roots" });
     defer allocator.free(gc_roots_dir);
-    try std.fs.cwd().makePath(gc_roots_dir);
+    try path_mod.ensureDirExists(gc_roots_dir);
 
     const store_dir = try std.fs.path.join(allocator, &.{ test_env.path, "store" });
     defer allocator.free(store_dir);
-    try std.fs.cwd().makePath(store_dir);
+    try path_mod.ensureDirExists(store_dir);
 
     const profiles_dir = try std.fs.path.join(allocator, &.{ test_env.path, "profiles" });
     defer allocator.free(profiles_dir);
-    try std.fs.cwd().makePath(profiles_dir);
+    try path_mod.ensureDirExists(profiles_dir);
 
     // Create a rooted store object so GC has roots and will run
     const kept_obj = try std.fs.path.join(allocator, &.{ store_dir, "aaa111-kept-1.0" });
     defer allocator.free(kept_obj);
-    try std.fs.cwd().makePath(kept_obj);
+    try path_mod.ensureDirExists(kept_obj);
 
-    var gc_roots_handle = try std.fs.openDirAbsolute(gc_roots_dir, .{});
-    defer gc_roots_handle.close();
-    gc_roots_handle.symLink(kept_obj, "keep-pin", .{}) catch {};
+    var gc_roots_handle = try std.Io.Dir.openDirAbsolute(path_mod.currentIo(), gc_roots_dir, .{});
+    defer gc_roots_handle.close(path_mod.currentIo());
+    gc_roots_handle.symLink(path_mod.currentIo(), kept_obj, "keep-pin", .{}) catch {};
 
     // Create an unreachable directory (should be deleted)
     const unreachable_dir = try std.fs.path.join(allocator, &.{ store_dir, "bbb222-orphan-1.0" });
     defer allocator.free(unreachable_dir);
-    try std.fs.cwd().makePath(unreachable_dir);
+    try path_mod.ensureDirExists(unreachable_dir);
 
     // Create a plain file in the store (should NOT be deleted by GC)
     const store_file = try std.fs.path.join(allocator, &.{ store_dir, "stray-file.txt" });
     defer allocator.free(store_file);
     {
-        var f = try std.fs.createFileAbsolute(store_file, .{});
-        try f.writeAll("stray file");
-        f.close();
+        var f = try std.Io.Dir.createFileAbsolute(path_mod.currentIo(), store_file, .{});
+        try f.writeStreamingAll(path_mod.currentIo(), "stray file");
+        f.close(path_mod.currentIo());
     }
 
     // Create a symlink in the store (should NOT be deleted by GC)
-    var store_handle = try std.fs.openDirAbsolute(store_dir, .{});
-    defer store_handle.close();
-    store_handle.symLink("/some/target", "stray-symlink", .{}) catch {};
+    var store_handle = try std.Io.Dir.openDirAbsolute(path_mod.currentIo(), store_dir, .{});
+    defer store_handle.close(path_mod.currentIo());
+    store_handle.symLink(path_mod.currentIo(), "/some/target", "stray-symlink", .{}) catch {};
 
     const store_symlink = try std.fs.path.join(allocator, &.{ store_dir, "stray-symlink" });
     defer allocator.free(store_symlink);
@@ -1385,15 +1398,15 @@ test "collectGarbage only deletes directories in store" {
     try std.testing.expect(std.mem.endsWith(u8, gc_result.deleted_paths.items[0], "bbb222-orphan-1.0"));
 
     // Verify the directory is gone
-    std.fs.accessAbsolute(unreachable_dir, .{}) catch |err| {
+    std.Io.Dir.accessAbsolute(path_mod.currentIo(), unreachable_dir, .{}) catch |err| {
         try std.testing.expectEqual(error.FileNotFound, err);
 
         // Verify the plain file still exists
-        std.fs.accessAbsolute(store_file, .{}) catch return error.TestUnexpectedResult;
+        std.Io.Dir.accessAbsolute(path_mod.currentIo(), store_file, .{}) catch return error.TestUnexpectedResult;
 
         // Verify the symlink still exists (check via readLink)
         var link_buf: [std.fs.max_path_bytes]u8 = undefined;
-        _ = std.fs.readLinkAbsolute(store_symlink, &link_buf) catch return error.TestUnexpectedResult;
+        _ = std.Io.Dir.readLinkAbsolute(path_mod.currentIo(), store_symlink, &link_buf) catch return error.TestUnexpectedResult;
 
         return;
     };
@@ -1413,35 +1426,35 @@ test "collectGarbage preserves explicitly kept generations" {
 
     const gc_roots_dir = try std.fs.path.join(allocator, &.{ test_env.path, "gc-roots" });
     defer allocator.free(gc_roots_dir);
-    try std.fs.cwd().makePath(gc_roots_dir);
+    try path_mod.ensureDirExists(gc_roots_dir);
 
     const store_dir = try std.fs.path.join(allocator, &.{ test_env.path, "store" });
     defer allocator.free(store_dir);
-    try std.fs.cwd().makePath(store_dir);
+    try path_mod.ensureDirExists(store_dir);
 
     const profiles_dir = try std.fs.path.join(allocator, &.{ test_env.path, "profiles" });
     defer allocator.free(profiles_dir);
-    try std.fs.cwd().makePath(profiles_dir);
+    try path_mod.ensureDirExists(profiles_dir);
 
     const profile_dir = try std.fs.path.join(allocator, &.{ profiles_dir, "system" });
     defer allocator.free(profile_dir);
-    try std.fs.cwd().makePath(profile_dir);
+    try path_mod.ensureDirExists(profile_dir);
 
     // Create a store object referenced by all generations
     const pkg_obj = try std.fs.path.join(allocator, &.{ store_dir, "aaa111-pkg-1.0" });
     defer allocator.free(pkg_obj);
-    try std.fs.cwd().makePath(pkg_obj);
+    try path_mod.ensureDirExists(pkg_obj);
 
     // Create a pin so GC has roots and will run
-    var gc_roots_handle = try std.fs.openDirAbsolute(gc_roots_dir, .{});
-    defer gc_roots_handle.close();
-    gc_roots_handle.symLink(pkg_obj, "keep-pin", .{}) catch {};
+    var gc_roots_handle = try std.Io.Dir.openDirAbsolute(path_mod.currentIo(), gc_roots_dir, .{});
+    defer gc_roots_handle.close(path_mod.currentIo());
+    gc_roots_handle.symLink(path_mod.currentIo(), pkg_obj, "keep-pin", .{}) catch {};
 
     // Create generations 1-5 with valid manifests
     for ([_]u32{ 1, 2, 3, 4, 5 }) |gen| {
         const gen_dir = try generation.getGenerationPath(allocator, profile_dir, gen);
         defer allocator.free(gen_dir);
-        try std.fs.cwd().makePath(gen_dir);
+        try path_mod.ensureDirExists(gen_dir);
 
         var manifest = generation.GenerationManifest.init(allocator, gen);
         defer manifest.deinit();
@@ -1457,9 +1470,9 @@ test "collectGarbage preserves explicitly kept generations" {
     }
 
     // Point current to gen-5
-    var profile_handle = try std.fs.openDirAbsolute(profile_dir, .{});
-    defer profile_handle.close();
-    profile_handle.symLink("gen-5", "current", .{}) catch {};
+    var profile_handle = try std.Io.Dir.openDirAbsolute(path_mod.currentIo(), profile_dir, .{});
+    defer profile_handle.close(path_mod.currentIo());
+    profile_handle.symLink(path_mod.currentIo(), "gen-5", "current", .{}) catch {};
 
     // Explicitly keep gen-1 with a .keep marker
     try gcroots.keepGeneration(allocator, profile_dir, 1, "important baseline");
@@ -1498,35 +1511,35 @@ test "collectGarbage prunes unreferenced package pool archives" {
 
     const gc_roots_dir = try std.fs.path.join(allocator, &.{ test_env.path, "gc-roots" });
     defer allocator.free(gc_roots_dir);
-    try std.fs.cwd().makePath(gc_roots_dir);
+    try path_mod.ensureDirExists(gc_roots_dir);
 
     const store_dir = try std.fs.path.join(allocator, &.{ test_env.path, "store" });
     defer allocator.free(store_dir);
-    try std.fs.cwd().makePath(store_dir);
+    try path_mod.ensureDirExists(store_dir);
 
     const profiles_dir = try std.fs.path.join(allocator, &.{ test_env.path, "profiles" });
     defer allocator.free(profiles_dir);
-    try std.fs.cwd().makePath(profiles_dir);
+    try path_mod.ensureDirExists(profiles_dir);
 
     const package_pool_dir = try std.fs.path.join(allocator, &.{ test_env.path, "mere", "cache", "packages" });
     defer allocator.free(package_pool_dir);
-    try std.fs.cwd().makePath(package_pool_dir);
+    try path_mod.ensureDirExists(package_pool_dir);
 
     const repo_root_dir = try std.fs.path.join(allocator, &.{ test_env.path, "mere", "dev", "repo" });
     defer allocator.free(repo_root_dir);
-    try std.fs.cwd().makePath(repo_root_dir);
+    try path_mod.ensureDirExists(repo_root_dir);
 
     const kept_obj = try std.fs.path.join(allocator, &.{ store_dir, "aaa111-kept-1.0" });
     defer allocator.free(kept_obj);
-    try std.fs.cwd().makePath(kept_obj);
+    try path_mod.ensureDirExists(kept_obj);
 
-    var gc_roots_handle = try std.fs.openDirAbsolute(gc_roots_dir, .{});
-    defer gc_roots_handle.close();
-    gc_roots_handle.symLink(kept_obj, "keep-pin", .{}) catch {};
+    var gc_roots_handle = try std.Io.Dir.openDirAbsolute(path_mod.currentIo(), gc_roots_dir, .{});
+    defer gc_roots_handle.close(path_mod.currentIo());
+    gc_roots_handle.symLink(path_mod.currentIo(), kept_obj, "keep-pin", .{}) catch {};
 
     const repo_dir = try std.fs.path.join(allocator, &.{ repo_root_dir, "local" });
     defer allocator.free(repo_dir);
-    try std.fs.cwd().makePath(repo_dir);
+    try path_mod.ensureDirExists(repo_dir);
 
     const current_state_dir = try std.fs.path.join(allocator, &.{ repo_dir, repo_history.CURRENT_STATE_DIR });
     defer allocator.free(current_state_dir);
@@ -1579,9 +1592,9 @@ test "collectGarbage prunes unreferenced package pool archives" {
     try std.testing.expectEqual(@as(usize, 1), gc_result.deleted_paths.items.len);
     try std.testing.expect(std.mem.endsWith(u8, gc_result.deleted_paths.items[0], orphan_name));
 
-    std.fs.accessAbsolute(orphan_path, .{}) catch |err| {
+    std.Io.Dir.accessAbsolute(path_mod.currentIo(), orphan_path, .{}) catch |err| {
         try std.testing.expectEqual(error.FileNotFound, err);
     };
-    std.fs.accessAbsolute(kept_current_path, .{}) catch return error.TestUnexpectedResult;
-    std.fs.accessAbsolute(kept_previous_path, .{}) catch return error.TestUnexpectedResult;
+    std.Io.Dir.accessAbsolute(path_mod.currentIo(), kept_current_path, .{}) catch return error.TestUnexpectedResult;
+    std.Io.Dir.accessAbsolute(path_mod.currentIo(), kept_previous_path, .{}) catch return error.TestUnexpectedResult;
 }

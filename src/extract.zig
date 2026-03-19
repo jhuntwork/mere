@@ -22,7 +22,7 @@ const PendingModeKind = enum {
 
 const PendingSpecialBits = struct {
     kind: PendingModeKind,
-    special_bits: std.fs.File.Mode,
+    special_bits: std.Io.File.Permissions,
 };
 
 const PendingSpecialBitMap = std.StringHashMap(PendingSpecialBits);
@@ -52,8 +52,8 @@ fn recordArchivedSpecialBits(
         AE_IFDIR => .directory,
         else => return,
     };
-    const special_bits: std.fs.File.Mode = @intCast(c.archive_entry_perm(entry) & 0o7000);
-    if (special_bits == 0) return;
+    const special_bits = std.Io.File.Permissions.fromMode(@intCast(c.archive_entry_perm(entry) & 0o7000));
+    if (special_bits.toMode() == 0) return;
 
     if (pending_special_bits.fetchRemove(rel_path)) |removed| ctx.allocator.free(removed.key);
 
@@ -75,7 +75,7 @@ fn applyArchivedSpecialBits(
     target_dir: []const u8,
     pending_special_bits: *const PendingSpecialBitMap,
 ) ExtractError!void {
-    var directory_paths: std.ArrayList([]const u8) = .{};
+    var directory_paths: std.ArrayList([]const u8) = .empty;
     defer directory_paths.deinit(ctx.allocator);
 
     var iter = pending_special_bits.iterator();
@@ -123,30 +123,30 @@ fn applyArchivedSpecialBitsAtPath(
 
     switch (restore.kind) {
         .directory => {
-            var dir = std.fs.openDirAbsolute(full_path, .{}) catch |err| {
+            var dir = std.Io.Dir.openDirAbsolute(p.currentIo(), full_path, .{}) catch |err| {
                 return ctx.fail(mapFsError(err), full_path, "failed to open directory for special-bit restore");
             };
-            defer dir.close();
+            defer dir.close(p.currentIo());
 
-            const stat = dir.stat() catch |err| {
+            const stat = dir.stat(p.currentIo()) catch |err| {
                 return ctx.fail(mapFsError(err), full_path, "failed to stat directory for special-bit restore");
             };
-            const new_mode = (stat.mode & ~@as(std.fs.File.Mode, 0o7000)) | restore.special_bits;
-            dir.chmod(new_mode) catch |err| {
+            const new_mode = (stat.permissions.toMode() & ~@as(std.posix.mode_t, 0o7000)) | restore.special_bits.toMode();
+            dir.setPermissions(p.currentIo(), std.Io.File.Permissions.fromMode(new_mode)) catch |err| {
                 return ctx.fail(mapFsError(err), full_path, "failed to restore directory special bits");
             };
         },
         .file => {
-            var file = std.fs.openFileAbsolute(full_path, .{}) catch |err| {
+            var file = std.Io.Dir.openFileAbsolute(p.currentIo(), full_path, .{}) catch |err| {
                 return ctx.fail(mapFsError(err), full_path, "failed to open file for special-bit restore");
             };
-            defer file.close();
+            defer file.close(p.currentIo());
 
-            const stat = file.stat() catch |err| {
+            const stat = file.stat(p.currentIo()) catch |err| {
                 return ctx.fail(mapFsError(err), full_path, "failed to stat file for special-bit restore");
             };
-            const new_mode = (stat.mode & ~@as(std.fs.File.Mode, 0o7000)) | restore.special_bits;
-            file.chmod(new_mode) catch |err| {
+            const new_mode = (stat.permissions.toMode() & ~@as(std.posix.mode_t, 0o7000)) | restore.special_bits.toMode();
+            file.setPermissions(p.currentIo(), std.Io.File.Permissions.fromMode(new_mode)) catch |err| {
                 return ctx.fail(mapFsError(err), full_path, "failed to restore file special bits");
             };
         },
@@ -304,7 +304,7 @@ fn createExtractionStageDir(ctx: *Context, target_abs: []const u8) ![]const u8 {
     const base = std.fs.path.basename(target_abs);
 
     var rand_bytes: [8]u8 = undefined;
-    std.crypto.random.bytes(&rand_bytes);
+    p.currentIo().random(&rand_bytes);
     const suffix = std.fmt.bytesToHex(rand_bytes, .lower);
 
     return std.fmt.allocPrint(ctx.allocator, "{s}/.{s}.extract-stage-{s}", .{ parent, base, suffix[0..] }) catch {
@@ -313,10 +313,10 @@ fn createExtractionStageDir(ctx: *Context, target_abs: []const u8) ![]const u8 {
 }
 
 fn mergeStagedTree(ctx: *Context, staged_dir: []const u8, target_abs: []const u8) ExtractError!void {
-    var stage_root = std.fs.openDirAbsolute(staged_dir, .{ .iterate = true }) catch |err| {
+    var stage_root = std.Io.Dir.openDirAbsolute(p.currentIo(), staged_dir, .{ .iterate = true }) catch |err| {
         return ctx.fail(mapFsError(err), staged_dir, "failed to open staged extraction directory");
     };
-    defer stage_root.close();
+    defer stage_root.close(p.currentIo());
 
     var walker = stage_root.walk(ctx.allocator) catch |err| {
         return ctx.fail(mapFsError(err), staged_dir, "failed to initialize staged extraction walker");
@@ -325,20 +325,20 @@ fn mergeStagedTree(ctx: *Context, staged_dir: []const u8, target_abs: []const u8
 
     const StagedEntry = struct {
         path: []const u8,
-        kind: std.fs.Dir.Entry.Kind,
+        kind: std.Io.File.Kind,
     };
 
-    var entries: std.ArrayList(StagedEntry) = .{};
+    var entries: std.ArrayList(StagedEntry) = .empty;
     defer {
         for (entries.items) |entry| ctx.allocator.free(entry.path);
         entries.deinit(ctx.allocator);
     }
 
-    var directories: std.ArrayList([]const u8) = .{};
+    var directories: std.ArrayList([]const u8) = .empty;
     defer directories.deinit(ctx.allocator);
 
     while (true) {
-        const entry = walker.next() catch |err| {
+        const entry = walker.next(p.currentIo()) catch |err| {
             return ctx.fail(mapFsError(err), staged_dir, "failed to iterate staged extraction directory");
         };
         if (entry == null) break;
@@ -370,28 +370,30 @@ fn mergeStagedTree(ctx: *Context, staged_dir: []const u8, target_abs: []const u8
 
         switch (entry.kind) {
             .directory => {
-                std.fs.cwd().makePath(dst_path) catch |err| {
+                var dir = p.makePathAndOpenDir(dst_path) catch |err| {
                     return ctx.fail(mapFsError(err), dst_path, "failed to create destination directory");
                 };
+                dir.close(p.currentIo());
             },
             .file, .sym_link => {
                 if (std.fs.path.dirname(dst_path)) |dst_parent| {
-                    std.fs.cwd().makePath(dst_parent) catch |err| {
+                    var dir = p.makePathAndOpenDir(dst_parent) catch |err| {
                         return ctx.fail(mapFsError(err), dst_parent, "failed to create destination parent directory");
                     };
+                    dir.close(p.currentIo());
                 }
 
-                std.fs.deleteFileAbsolute(dst_path) catch |err| switch (err) {
+                std.Io.Dir.deleteFileAbsolute(p.currentIo(), dst_path) catch |err| switch (err) {
                     error.FileNotFound => {},
                     error.IsDir => {
-                        std.fs.deleteTreeAbsolute(dst_path) catch |del_err| {
+                        std.Io.Dir.cwd().deleteTree(p.currentIo(), dst_path) catch |del_err| {
                             return ctx.fail(mapFsError(del_err), dst_path, "failed to replace destination directory");
                         };
                     },
                     else => return ctx.fail(mapFsError(err), dst_path, "failed to replace destination entry"),
                 };
 
-                std.fs.renameAbsolute(src_path, dst_path) catch |err| {
+                std.Io.Dir.renameAbsolute(src_path, dst_path, p.currentIo()) catch |err| {
                     return ctx.fail(mapFsError(err), dst_path, "failed to move staged entry into destination");
                 };
             },
@@ -416,11 +418,11 @@ fn mergeStagedTree(ctx: *Context, staged_dir: []const u8, target_abs: []const u8
 }
 
 fn copyDirectoryTimes(ctx: *Context, src_path: []const u8, dst_path: []const u8) ExtractError!void {
-    var src_dir = std.fs.openDirAbsolute(src_path, .{}) catch |err| {
+    var src_dir = std.Io.Dir.openDirAbsolute(p.currentIo(), src_path, .{}) catch |err| {
         return ctx.fail(mapFsError(err), src_path, "failed to open staged directory for timestamp copy");
     };
-    defer src_dir.close();
-    const stat = src_dir.stat() catch |err| {
+    defer src_dir.close(p.currentIo());
+    const stat = src_dir.stat(p.currentIo()) catch |err| {
         return ctx.fail(mapFsError(err), src_path, "failed to stat staged directory for timestamp copy");
     };
 
@@ -430,8 +432,8 @@ fn copyDirectoryTimes(ctx: *Context, src_path: []const u8, dst_path: []const u8)
     defer ctx.allocator.free(dst_path_z);
 
     const times = [2]std.posix.timespec{
-        nsToTimespec(stat.atime),
-        nsToTimespec(stat.mtime),
+        nsToTimespec((stat.atime orelse stat.mtime).nanoseconds),
+        nsToTimespec(stat.mtime.nanoseconds),
     };
     switch (std.posix.errno(std.c.utimensat(std.posix.AT.FDCWD, dst_path_z, @constCast(&times), 0))) {
         .SUCCESS => {},
@@ -492,7 +494,7 @@ fn extractWithPolicy(
             else => ExtractError.FileSystem,
         };
     };
-    target_dir_handle.close();
+    target_dir_handle.close(p.currentIo());
 
     var pending_special_bits = PendingSpecialBitMap.init(ctx.allocator);
     defer deinitPendingSpecialBits(&pending_special_bits, ctx.allocator);
@@ -510,12 +512,12 @@ fn extractWithPolicy(
 
     const stage_dir = try createExtractionStageDir(ctx, target_abs);
     defer ctx.allocator.free(stage_dir);
-    defer std.fs.deleteTreeAbsolute(stage_dir) catch {};
+    defer std.Io.Dir.cwd().deleteTree(p.currentIo(), stage_dir) catch {};
 
     var stage_handle = p.makePathAndOpenDir(stage_dir) catch |err| {
         return ctx.fail(mapFsError(err), stage_dir, "failed to create extraction stage directory");
     };
-    stage_handle.close();
+    stage_handle.close(p.currentIo());
 
     try extractWithLibarchive(ctx, archive_path, stage_dir, null, special_bit_policy, &pending_special_bits);
     try mergeStagedTree(ctx, stage_dir, target_abs);
@@ -541,7 +543,7 @@ fn writeTarWithOwnedFile(
     tar_path: []const u8,
     entry_path: []const u8,
     file_contents: []const u8,
-    mode: std.fs.File.Mode,
+    mode: std.Io.File.Permissions,
     uid: i64,
     gid: i64,
 ) !void {
@@ -563,7 +565,7 @@ fn writeTarWithOwnedFile(
     defer allocator.free(entry_path_z);
     c.archive_entry_set_pathname(entry, entry_path_z.ptr);
     c.archive_entry_set_filetype(entry, AE_IFREG);
-    c.archive_entry_set_perm(entry, @intCast(mode));
+    c.archive_entry_set_perm(entry, @intCast(mode.toMode()));
     c.archive_entry_set_uid(entry, uid);
     c.archive_entry_set_gid(entry, gid);
     c.archive_entry_set_size(entry, @intCast(file_contents.len));
@@ -643,9 +645,9 @@ test "Error when extracting a tar archive with relative path traversal" {
 
         const tar_contents = try th.createMaliciousTarContents("../etc/passwd");
         defer std.testing.allocator.free(tar_contents);
-        const file = try std.fs.cwd().createFile(abs_target, .{});
-        defer file.close();
-        try file.writeAll(tar_contents);
+        var file = try std.Io.Dir.createFileAbsolute(p.currentIo(), abs_target, .{});
+        defer file.close(p.currentIo());
+        try file.writeStreamingAll(p.currentIo(), tar_contents);
 
         try std.testing.expectError(error.InvalidInput, into(&test_env.ctx, abs_target, test_env.path));
     }
@@ -674,18 +676,16 @@ test "Extract a sample tar.zst archive" {
         defer std.testing.allocator.free(zst_path);
 
         // Compress using libzstd helper
-        const f = try std.fs.openFileAbsolute(tar_path, .{});
-        defer f.close();
-        const uncompressed = try f.readToEndAlloc(std.testing.allocator, 64 * 1024);
+        const uncompressed = try std.Io.Dir.readFileAlloc(std.Io.Dir.cwd(), p.currentIo(), tar_path, std.testing.allocator, .limited(64 * 1024));
         defer std.testing.allocator.free(uncompressed);
         const compressed_buf = @import("zstd_c.zig").compressOneShot(std.testing.allocator, uncompressed) catch |err| {
             test_env.ctx.debug("zstd compression failed: {s}\n", .{@errorName(err)});
             return ExtractError.FileSystem;
         };
         defer std.testing.allocator.free(compressed_buf);
-        const out_file = try p.makePathAndOpenFile(zst_path);
-        defer out_file.close();
-        try out_file.writeAll(compressed_buf);
+        var out_file = try p.makePathAndOpenFile(zst_path);
+        defer out_file.close(p.currentIo());
+        try out_file.writeStreamingAll(p.currentIo(), compressed_buf);
 
         // Now test the extraction
         try into(&test_env.ctx, zst_path, test_env.path);
@@ -694,11 +694,11 @@ test "Extract a sample tar.zst archive" {
         const extracted_file_path = try std.fs.path.join(std.testing.allocator, &.{ test_env.path, "some/random/file" });
         defer std.testing.allocator.free(extracted_file_path);
 
-        const extracted_file = try std.fs.openFileAbsolute(extracted_file_path, .{});
-        defer extracted_file.close();
+        var extracted_file = try std.Io.Dir.openFileAbsolute(p.currentIo(), extracted_file_path, .{});
+        defer extracted_file.close(p.currentIo());
 
         var content_buffer: [12]u8 = undefined; // "test content" is 12 bytes
-        const bytes_read = try extracted_file.readAll(&content_buffer);
+        const bytes_read = try extracted_file.readPositionalAll(p.currentIo(), &content_buffer, 0);
         try std.testing.expectEqual(@as(usize, 12), bytes_read);
         try std.testing.expectEqualStrings("test content", content_buffer[0..bytes_read]);
     }
@@ -722,7 +722,8 @@ test "Extract a single file from a tar archive" {
         // Create a staging directory for the archive content
         const staging_dir = try std.fs.path.join(std.testing.allocator, &.{ test_env.path, "staging" });
         defer std.testing.allocator.free(staging_dir);
-        try std.fs.cwd().makePath(staging_dir);
+        var staging_dir_handle = try p.makePathAndOpenDir(staging_dir);
+        staging_dir_handle.close(p.currentIo());
 
         // Define the content for each file
         const file1_content = "content of file 1";
@@ -733,20 +734,20 @@ test "Extract a single file from a tar archive" {
         const file1_path = try std.fs.path.join(std.testing.allocator, &.{ staging_dir, "file1.txt" });
         defer std.testing.allocator.free(file1_path);
         var f1 = try p.makePathAndOpenFile(file1_path);
-        try f1.writeAll(file1_content);
-        f1.close();
+        try f1.writeStreamingAll(p.currentIo(), file1_content);
+        f1.close(p.currentIo());
 
         const file2_path = try std.fs.path.join(std.testing.allocator, &.{ staging_dir, "file2.txt" });
         defer std.testing.allocator.free(file2_path);
         var f2 = try p.makePathAndOpenFile(file2_path);
-        try f2.writeAll(file2_content);
-        f2.close();
+        try f2.writeStreamingAll(p.currentIo(), file2_content);
+        f2.close(p.currentIo());
 
         const file3_path = try std.fs.path.join(std.testing.allocator, &.{ staging_dir, "subdir", "file3.txt" });
         defer std.testing.allocator.free(file3_path);
         var f3 = try p.makePathAndOpenFile(file3_path);
-        try f3.writeAll(file3_content);
-        f3.close();
+        try f3.writeStreamingAll(p.currentIo(), file3_content);
+        f3.close(p.currentIo());
 
         // Use archive.createPackageArchive instead of std.tar.Writer
         try archive.createPackageArchive(&test_env.ctx, staging_dir, abs_target);
@@ -760,10 +761,10 @@ test "Extract a single file from a tar archive" {
         defer std.testing.allocator.free(file2_extracted);
 
         // Check that file2.txt exists and has the correct content
-        const file2 = try std.fs.openFileAbsolute(file2_extracted, .{});
-        defer file2.close();
+        var file2 = try std.Io.Dir.openFileAbsolute(p.currentIo(), file2_extracted, .{});
+        defer file2.close(p.currentIo());
         var content_buffer: [17]u8 = undefined; // "content of file 2" is 17 bytes
-        const bytes_read = try file2.readAll(&content_buffer);
+        const bytes_read = try file2.readPositionalAll(p.currentIo(), &content_buffer, 0);
         try std.testing.expectEqual(@as(usize, file2_content.len), bytes_read);
         try std.testing.expectEqualStrings(file2_content, content_buffer[0..bytes_read]);
 
@@ -772,7 +773,7 @@ test "Extract a single file from a tar archive" {
         defer std.testing.allocator.free(file1_extracted);
         // Check that file1.txt was NOT extracted
         const file1_exists = blk: {
-            std.fs.accessAbsolute(file1_extracted, .{}) catch |err| {
+            std.Io.Dir.accessAbsolute(p.currentIo(), file1_extracted, .{}) catch |err| {
                 try std.testing.expectEqual(error.FileNotFound, err);
                 break :blk false;
             };
@@ -784,7 +785,7 @@ test "Extract a single file from a tar archive" {
         const file3_extracted = try std.fs.path.join(std.testing.allocator, &.{ test_env.path, "subdir/file3.txt" });
         defer std.testing.allocator.free(file3_extracted);
         const file3_exists = blk: {
-            std.fs.accessAbsolute(file3_extracted, .{}) catch |err| {
+            std.Io.Dir.accessAbsolute(p.currentIo(), file3_extracted, .{}) catch |err| {
                 try std.testing.expectEqual(error.FileNotFound, err);
                 break :blk false;
             };
@@ -825,22 +826,22 @@ test "Error when extracting a tar archive with absolute path traversal" {
         // Write the tar contents to a file
         const tar_contents = try std.testing.allocator.dupe(u8, buffer.written());
         defer std.testing.allocator.free(tar_contents);
-        const file = try std.fs.cwd().createFile(tar_path, .{});
-        defer file.close();
-        try file.writeAll(tar_contents);
+        var file = try std.Io.Dir.createFileAbsolute(p.currentIo(), tar_path, .{});
+        defer file.close(p.currentIo());
+        try file.writeStreamingAll(p.currentIo(), tar_contents);
 
         // libarchive successfully blocks this attack, so extraction succeeds safely
         try into(&test_env.ctx, tar_path, test_env.path);
 
         // Verify that the malicious file was NOT extracted to /etc/passwd
-        std.fs.accessAbsolute("/etc/passwd.extracted", .{}) catch |err| {
+        std.Io.Dir.accessAbsolute(p.currentIo(), "/etc/passwd.extracted", .{}) catch |err| {
             try std.testing.expectEqual(error.FileNotFound, err);
         };
 
         // Verify no files were extracted outside the target directory
         const malicious_path = try std.fs.path.join(std.testing.allocator, &.{ test_env.path, "../etc/passwd" });
         defer std.testing.allocator.free(malicious_path);
-        std.fs.accessAbsolute(malicious_path, .{}) catch |err| {
+        std.Io.Dir.accessAbsolute(p.currentIo(), malicious_path, .{}) catch |err| {
             try std.testing.expectEqual(error.FileNotFound, err);
         };
     }
@@ -881,9 +882,9 @@ test "Error when extracting a tar archive with traversal via symlink" {
         // Write the tar contents to a file
         const tar_contents = try std.testing.allocator.dupe(u8, buffer.written());
         defer std.testing.allocator.free(tar_contents);
-        const file = try std.fs.cwd().createFile(tar_path, .{});
-        defer file.close();
-        try file.writeAll(tar_contents);
+        var file = try std.Io.Dir.createFileAbsolute(p.currentIo(), tar_path, .{});
+        defer file.close(p.currentIo());
+        try file.writeStreamingAll(p.currentIo(), tar_contents);
 
         // libarchive successfully blocks this attack, so extraction succeeds safely
         try into(&test_env.ctx, tar_path, test_env.path);
@@ -896,11 +897,12 @@ test "Error when extracting a tar archive with traversal via symlink" {
 
         // The symlink might exist but should not point outside the extraction directory
         var link_buf: [std.fs.max_path_bytes]u8 = undefined;
-        const target = std.fs.readLinkAbsolute(evil_link_path, &link_buf) catch |err| {
+        const target_len = std.Io.Dir.readLinkAbsolute(p.currentIo(), evil_link_path, &link_buf) catch |err| {
             // If symlink doesn't exist, that's also acceptable (libarchive blocked it)
             try std.testing.expect(err == error.FileNotFound or err == error.NotLink);
             return;
         };
+        const target = link_buf[0..target_len];
 
         // If symlink exists, verify it doesn't point outside the extraction directory
         try std.testing.expect(!std.mem.startsWith(u8, target, "/etc/"));
@@ -944,9 +946,9 @@ test "Error when extracting a tar archive with traversal via normalized symlink"
         // Write the tar contents to a file
         const tar_contents = try std.testing.allocator.dupe(u8, buffer.written());
         defer std.testing.allocator.free(tar_contents);
-        const file = try std.fs.cwd().createFile(tar_path, .{});
-        defer file.close();
-        try file.writeAll(tar_contents);
+        var file = try std.Io.Dir.createFileAbsolute(p.currentIo(), tar_path, .{});
+        defer file.close(p.currentIo());
+        try file.writeStreamingAll(p.currentIo(), tar_contents);
 
         // libarchive successfully blocks this attack, so extraction succeeds safely
         try into(&test_env.ctx, tar_path, test_env.path);
@@ -959,11 +961,12 @@ test "Error when extracting a tar archive with traversal via normalized symlink"
 
         // The symlink might exist but should not point outside the extraction directory
         var link_buf: [std.fs.max_path_bytes]u8 = undefined;
-        const target = std.fs.readLinkAbsolute(evil_link_path, &link_buf) catch |err| {
+        const target_len = std.Io.Dir.readLinkAbsolute(p.currentIo(), evil_link_path, &link_buf) catch |err| {
             // If symlink doesn't exist, that's also acceptable (libarchive blocked it)
             try std.testing.expect(err == error.FileNotFound or err == error.NotLink);
             return;
         };
+        const target = link_buf[0..target_len];
 
         // If symlink exists, verify it doesn't point outside the extraction directory
         try std.testing.expect(!std.mem.startsWith(u8, target, "/etc/"));
@@ -990,7 +993,8 @@ test "Extract preserves file permissions" {
         // Create a staging directory for the archive content
         const staging_dir = try std.fs.path.join(std.testing.allocator, &.{ test_env.path, "staging" });
         defer std.testing.allocator.free(staging_dir);
-        try std.fs.cwd().makePath(staging_dir);
+        var staging_dir_handle = try p.makePathAndOpenDir(staging_dir);
+        staging_dir_handle.close(p.currentIo());
 
         // Define the content for the executable file
         const exec_content = "#!/bin/sh\necho 'Hello, World!'\n";
@@ -999,10 +1003,10 @@ test "Extract preserves file permissions" {
         const exec_path = try std.fs.path.join(std.testing.allocator, &.{ staging_dir, "bin", "executable.sh" });
         defer std.testing.allocator.free(exec_path);
         var exec_file = try p.makePathAndOpenFile(exec_path);
-        try exec_file.writeAll(exec_content);
+        try exec_file.writeStreamingAll(p.currentIo(), exec_content);
         // Set executable permissions on the staged file before closing
-        try exec_file.chmod(0o755);
-        exec_file.close();
+        try exec_file.setPermissions(p.currentIo(), std.Io.File.Permissions.fromMode(0o755));
+        exec_file.close(p.currentIo());
 
         // Use archive.createPackageArchive instead of std.tar.Writer
         try archive.createPackageArchive(&test_env.ctx, staging_dir, tar_path);
@@ -1014,14 +1018,14 @@ test "Extract preserves file permissions" {
         const extracted_path = try std.fs.path.join(std.testing.allocator, &.{ test_env.path, "bin/executable.sh" });
         defer std.testing.allocator.free(extracted_path);
 
-        const result_file = try std.fs.openFileAbsolute(extracted_path, .{});
-        defer result_file.close();
+        var result_file = try std.Io.Dir.openFileAbsolute(p.currentIo(), extracted_path, .{});
+        defer result_file.close(p.currentIo());
 
-        const stat = try result_file.stat();
+        const stat = try result_file.stat(p.currentIo());
         // Check that the file has executable permissions
-        try std.testing.expect((stat.mode & 0o100) != 0); // Check owner executable bit
-        try std.testing.expect((stat.mode & 0o010) != 0); // Check group executable bit
-        try std.testing.expect((stat.mode & 0o001) != 0); // Check other executable bit
+        try std.testing.expect((stat.permissions.toMode() & 0o100) != 0); // Check owner executable bit
+        try std.testing.expect((stat.permissions.toMode() & 0o010) != 0); // Check group executable bit
+        try std.testing.expect((stat.permissions.toMode() & 0o001) != 0); // Check other executable bit
     }
 }
 
@@ -1041,7 +1045,7 @@ test "install extraction restores setuid bit when archive owner differs" {
             tar_path,
             "bin/suid-tool",
             "#!/bin/sh\nexit 0\n",
-            0o4755,
+            std.Io.File.Permissions.fromMode(0o4755),
             0,
             0,
         );
@@ -1053,11 +1057,11 @@ test "install extraction restores setuid bit when archive owner differs" {
         const extracted_path = try std.fs.path.join(std.testing.allocator, &.{ install_target, "bin", "suid-tool" });
         defer std.testing.allocator.free(extracted_path);
 
-        const extracted_file = try std.fs.openFileAbsolute(extracted_path, .{});
-        defer extracted_file.close();
+        var extracted_file = try std.Io.Dir.openFileAbsolute(p.currentIo(), extracted_path, .{});
+        defer extracted_file.close(p.currentIo());
 
-        const stat = try extracted_file.stat();
-        try std.testing.expectEqual(@as(std.fs.File.Mode, 0o4755), stat.mode & 0o7777);
+        const stat = try extracted_file.stat(p.currentIo());
+        try std.testing.expectEqual(@as(std.posix.mode_t, 0o4755), stat.permissions.toMode() & 0o7777);
     }
 }
 
@@ -1093,9 +1097,9 @@ test "musl absolute symlink should be rewritten to package-local target" {
 
         const tar_contents = try std.testing.allocator.dupe(u8, buffer.written());
         defer std.testing.allocator.free(tar_contents);
-        const file = try std.fs.cwd().createFile(tar_path, .{});
-        defer file.close();
-        try file.writeAll(tar_contents);
+        var file = try std.Io.Dir.createFileAbsolute(p.currentIo(), tar_path, .{});
+        defer file.close(p.currentIo());
+        try file.writeStreamingAll(p.currentIo(), tar_contents);
 
         try into(&test_env.ctx, tar_path, test_env.path);
 
@@ -1103,10 +1107,11 @@ test "musl absolute symlink should be rewritten to package-local target" {
         defer std.testing.allocator.free(link_path);
 
         var link_buf: [std.fs.max_path_bytes]u8 = undefined;
-        const target = std.fs.readLinkAbsolute(link_path, &link_buf) catch {
+        const target_len = std.Io.Dir.readLinkAbsolute(p.currentIo(), link_path, &link_buf) catch {
             test_env.ctx.debug("failed to read symlink target", .{});
             return;
         };
+        const target = link_buf[0..target_len];
 
         // New behavior: preserve symlinks as-is (no rewriting)
         try std.testing.expectEqualStrings("/lib/libc.so", target);
@@ -1130,13 +1135,13 @@ test "Extract archive with hard links scenario" {
     const file2_path = try std.fs.path.join(std.testing.allocator, &.{ test_env.path, "hardlink-test/hardlink.txt" });
     defer std.testing.allocator.free(file2_path);
 
-    const file1 = try std.fs.openFileAbsolute(file1_path, .{});
-    defer file1.close();
-    const file2 = try std.fs.openFileAbsolute(file2_path, .{});
-    defer file2.close();
+    var file1 = try std.Io.Dir.openFileAbsolute(p.currentIo(), file1_path, .{});
+    defer file1.close(p.currentIo());
+    var file2 = try std.Io.Dir.openFileAbsolute(p.currentIo(), file2_path, .{});
+    defer file2.close(p.currentIo());
 
-    const stat1 = try file1.stat();
-    const stat2 = try file2.stat();
+    const stat1 = try file1.stat(p.currentIo());
+    const stat2 = try file2.stat(p.currentIo());
 
     // Should have same inode (hard link relationship preserved)
     try std.testing.expectEqual(stat1.inode, stat2.inode);
@@ -1161,24 +1166,25 @@ test "Extract archive with mixed entry types scenario" {
     defer std.testing.allocator.free(hardlink_path);
 
     // Regular file should exist
-    const regular_file = try std.fs.openFileAbsolute(regular_path, .{});
-    regular_file.close();
+    var regular_file = try std.Io.Dir.openFileAbsolute(p.currentIo(), regular_path, .{});
+    regular_file.close(p.currentIo());
 
     // Symlink should exist
     var link_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const target = try std.fs.readLinkAbsolute(symlink_path, &link_buf);
+    const target_len = try std.Io.Dir.readLinkAbsolute(p.currentIo(), symlink_path, &link_buf);
+    const target = link_buf[0..target_len];
     try std.testing.expectEqualStrings("target.txt", target);
 
     // Hard link should exist and share inode with target
     const target_path_mixed = try std.fs.path.join(std.testing.allocator, &.{ test_env.path, "mixed-test/target.txt" });
     defer std.testing.allocator.free(target_path_mixed);
-    const target_file = try std.fs.openFileAbsolute(target_path_mixed, .{});
-    defer target_file.close();
-    const hardlink_file = try std.fs.openFileAbsolute(hardlink_path, .{});
-    defer hardlink_file.close();
+    var target_file = try std.Io.Dir.openFileAbsolute(p.currentIo(), target_path_mixed, .{});
+    defer target_file.close(p.currentIo());
+    var hardlink_file = try std.Io.Dir.openFileAbsolute(p.currentIo(), hardlink_path, .{});
+    defer hardlink_file.close(p.currentIo());
 
-    const target_stat = try target_file.stat();
-    const hardlink_stat = try hardlink_file.stat();
+    const target_stat = try target_file.stat(p.currentIo());
+    const hardlink_stat = try hardlink_file.stat(p.currentIo());
     try std.testing.expectEqual(target_stat.inode, hardlink_stat.inode);
 }
 
@@ -1196,12 +1202,12 @@ test "Compressed archive extraction (.tar.zst) scenario" {
     const regular_path = try std.fs.path.join(std.testing.allocator, &.{ test_env.path, "mixed-test/regular.txt" });
     defer std.testing.allocator.free(regular_path);
 
-    const file = try std.fs.openFileAbsolute(regular_path, .{});
-    defer file.close();
+    var file = try std.Io.Dir.openFileAbsolute(p.currentIo(), regular_path, .{});
+    defer file.close(p.currentIo());
     var content_buffer: [50]u8 = undefined;
-    const bytes_read = try file.readAll(&content_buffer);
+    const bytes_read = try file.readPositionalAll(p.currentIo(), &content_buffer, 0);
     // The test file may have a trailing newline, so trim it
-    const content_str = std.mem.trimRight(u8, content_buffer[0..bytes_read], "\n\r");
+    const content_str = std.mem.trimEnd(u8, content_buffer[0..bytes_read], "\n\r");
     try std.testing.expectEqualStrings("regular file content", content_str);
 }
 
@@ -1223,11 +1229,11 @@ test "Single-file extraction with libarchive scenario" {
     defer std.testing.allocator.free(target_path);
 
     // Regular file should exist
-    const regular_file = try std.fs.openFileAbsolute(regular_path, .{});
-    regular_file.close();
+    var regular_file = try std.Io.Dir.openFileAbsolute(p.currentIo(), regular_path, .{});
+    regular_file.close(p.currentIo());
 
     // Target file should NOT exist (since it wasn't extracted)
-    std.fs.accessAbsolute(target_path, .{}) catch |err| {
+    std.Io.Dir.accessAbsolute(p.currentIo(), target_path, .{}) catch |err| {
         try std.testing.expectEqual(error.FileNotFound, err);
     };
 }
@@ -1249,9 +1255,9 @@ test "Path traversal attack prevention scenario" {
     // Create tar contents with path traversal
     const tar_contents = try th.createMaliciousTarContents("../../../etc/passwd");
     defer std.testing.allocator.free(tar_contents);
-    const file = try std.fs.cwd().createFile(tar_path, .{});
-    defer file.close();
-    try file.writeAll(tar_contents);
+    var file = try std.Io.Dir.createFileAbsolute(p.currentIo(), tar_path, .{});
+    defer file.close(p.currentIo());
+    try file.writeStreamingAll(p.currentIo(), tar_contents);
 
     // Should detect and reject path traversal
     try std.testing.expectError(error.InvalidInput, into(&test_env.ctx, tar_path, test_env.path));
@@ -1276,10 +1282,10 @@ test "Various tar implementations compatibility scenario" {
     defer std.testing.allocator.free(regular_path);
 
     // Both files should exist
-    const hardlink_file = try std.fs.openFileAbsolute(hardlink_path, .{});
-    hardlink_file.close();
-    const regular_file = try std.fs.openFileAbsolute(regular_path, .{});
-    regular_file.close();
+    var hardlink_file = try std.Io.Dir.openFileAbsolute(p.currentIo(), hardlink_path, .{});
+    hardlink_file.close(p.currentIo());
+    var regular_file = try std.Io.Dir.openFileAbsolute(p.currentIo(), regular_path, .{});
+    regular_file.close(p.currentIo());
 }
 
 // Spec #16: No partial extraction on failure
@@ -1319,14 +1325,15 @@ test "No partial extraction on failure" {
     // Write the tar contents to a file
     const tar_contents = try std.testing.allocator.dupe(u8, buffer.written());
     defer std.testing.allocator.free(tar_contents);
-    const file = try std.fs.cwd().createFile(tar_path, .{});
-    defer file.close();
-    try file.writeAll(tar_contents);
+    var file = try std.Io.Dir.createFileAbsolute(p.currentIo(), tar_path, .{});
+    defer file.close(p.currentIo());
+    try file.writeStreamingAll(p.currentIo(), tar_contents);
 
     // Create a dedicated extraction directory
     const extract_dir = try std.fs.path.join(std.testing.allocator, &.{ test_env.path, "extract_target" });
     defer std.testing.allocator.free(extract_dir);
-    try std.fs.cwd().makePath(extract_dir);
+    var extract_dir_handle = try p.makePathAndOpenDir(extract_dir);
+    extract_dir_handle.close(p.currentIo());
 
     // Attempt extraction - should fail due to path traversal
     const result = into(&test_env.ctx, tar_path, extract_dir);
@@ -1340,17 +1347,17 @@ test "No partial extraction on failure" {
     defer std.testing.allocator.free(file2_path);
 
     // Check that the valid files were NOT left behind after failure
-    std.fs.accessAbsolute(file1_path, .{}) catch |err| {
+    std.Io.Dir.accessAbsolute(p.currentIo(), file1_path, .{}) catch |err| {
         try std.testing.expectEqual(error.FileNotFound, err);
     };
-    std.fs.accessAbsolute(file2_path, .{}) catch |err| {
+    std.Io.Dir.accessAbsolute(p.currentIo(), file2_path, .{}) catch |err| {
         try std.testing.expectEqual(error.FileNotFound, err);
     };
 
     // Verify the directory itself is clean (no valid_dir should exist)
     const valid_dir_path = try std.fs.path.join(std.testing.allocator, &.{ extract_dir, "valid_dir" });
     defer std.testing.allocator.free(valid_dir_path);
-    std.fs.accessAbsolute(valid_dir_path, .{}) catch |err| {
+    std.Io.Dir.accessAbsolute(p.currentIo(), valid_dir_path, .{}) catch |err| {
         try std.testing.expectEqual(error.FileNotFound, err);
     };
 }
@@ -1377,36 +1384,37 @@ test "transactional extraction preserves preexisting target files on failure" {
     try tar_writer.writeFileBytes("../../../../etc/evil", "bad", .{});
 
     {
-        const out = try std.fs.cwd().createFile(tar_path, .{});
-        defer out.close();
-        try out.writeAll(buffer.written());
+        var out = try std.Io.Dir.createFileAbsolute(p.currentIo(), tar_path, .{});
+        defer out.close(p.currentIo());
+        try out.writeStreamingAll(p.currentIo(), buffer.written());
     }
 
     const extract_dir = try std.fs.path.join(std.testing.allocator, &.{ test_env.path, "extract_target_existing" });
     defer std.testing.allocator.free(extract_dir);
-    try std.fs.cwd().makePath(extract_dir);
+    var extract_dir_handle = try p.makePathAndOpenDir(extract_dir);
+    extract_dir_handle.close(p.currentIo());
 
     const keep_path = try std.fs.path.join(std.testing.allocator, &.{ extract_dir, "keep.txt" });
     defer std.testing.allocator.free(keep_path);
     {
         var keep_file = try p.makePathAndOpenFile(keep_path);
-        defer keep_file.close();
-        try keep_file.writeAll("keep");
+        defer keep_file.close(p.currentIo());
+        try keep_file.writeStreamingAll(p.currentIo(), "keep");
     }
 
     try std.testing.expectError(error.InvalidInput, into(&test_env.ctx, tar_path, extract_dir));
 
     {
-        const keep_file = try std.fs.openFileAbsolute(keep_path, .{});
-        defer keep_file.close();
+        var keep_file = try std.Io.Dir.openFileAbsolute(p.currentIo(), keep_path, .{});
+        defer keep_file.close(p.currentIo());
         var buf: [8]u8 = undefined;
-        const n = try keep_file.readAll(&buf);
+        const n = try keep_file.readPositionalAll(p.currentIo(), &buf, 0);
         try std.testing.expectEqualStrings("keep", buf[0..n]);
     }
 
     const new_path = try std.fs.path.join(std.testing.allocator, &.{ extract_dir, "new.txt" });
     defer std.testing.allocator.free(new_path);
-    std.fs.accessAbsolute(new_path, .{}) catch |err| {
+    std.Io.Dir.accessAbsolute(p.currentIo(), new_path, .{}) catch |err| {
         try std.testing.expectEqual(error.FileNotFound, err);
     };
 }

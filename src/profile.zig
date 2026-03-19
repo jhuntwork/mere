@@ -186,21 +186,23 @@ pub const PathConflictDetector = struct {
     pub fn formatAllConflicts(self: *const PathConflictDetector, allocator: std.mem.Allocator) ![]const u8 {
         var result = try std.ArrayList(u8).initCapacity(allocator, 0);
         defer result.deinit(allocator);
-        const writer = result.writer(allocator);
+        var out_buf: std.Io.Writer.Allocating = .fromArrayList(allocator, &result);
+        const out = &out_buf.writer;
 
-        try writer.print("{d} path conflict(s) detected:\n", .{self.conflicts.items.len});
+        try out.print("{d} path conflict(s) detected:\n", .{self.conflicts.items.len});
 
         for (self.conflicts.items, 0..) |conflict, i| {
             if (i > 0) {
-                try writer.writeAll("\n");
+                try out.writeAll("\n");
             }
-            try writer.writeAll("  - ");
-            try writer.print(
+            try out.writeAll("  - ");
+            try out.print(
                 "path conflict: '{s}' claimed by both '{s}' (-> {s}) and '{s}' (-> {s})",
                 .{ conflict.path, conflict.package_a, conflict.target_a, conflict.package_b, conflict.target_b },
             );
         }
 
+        result = out_buf.toArrayList();
         return try result.toOwnedSlice(allocator);
     }
 };
@@ -265,14 +267,14 @@ fn readPackageProjection(
     ctx: *Context,
     store_path: []const u8,
 ) ProfileError!projection_index.Data {
-    var store_dir = std.fs.openDirAbsolute(store_path, .{}) catch |err| {
+    var store_dir = path.openExistingDir(store_path) catch |err| {
         return ctx.fail(switch (err) {
             error.FileNotFound => ProfileError.StorePathNotFound,
             error.AccessDenied => ProfileError.PermissionDenied,
             else => ProfileError.FileSystem,
         }, store_path, "failed to open store path");
     };
-    store_dir.close();
+    store_dir.close(path.currentIo());
 
     return projection_index.readFile(allocator, store_path) catch |err| {
         return ctx.fail(switch (err) {
@@ -295,15 +297,21 @@ pub fn getRootPath(allocator: std.mem.Allocator, profile_dir: []const u8) Profil
 fn assertRootOwnedPackages(ctx: *Context, packages: []const generation.PackageEntry) ProfileError!void {
     for (packages) |pkg| {
         const store_path = pkg.store_path;
-        const stat_buf = std.posix.fstatat(std.posix.AT.FDCWD, store_path, 0) catch |err| {
-            return ctx.fail(switch (err) {
-                error.FileNotFound => ProfileError.StorePathNotFound,
-                error.AccessDenied => ProfileError.PermissionDenied,
-                else => ProfileError.FileSystem,
-            }, store_path, "failed to stat store path for ownership");
-        };
+        const store_path_z = try ctx.allocator.dupeZ(u8, store_path);
+        defer ctx.allocator.free(store_path_z);
 
-        if (stat_buf.uid != 0 or stat_buf.gid != 0) {
+        var statx = std.mem.zeroes(std.os.linux.Statx);
+        switch (std.os.linux.errno(std.os.linux.statx(std.posix.AT.FDCWD, store_path_z, 0, .{
+            .UID = true,
+            .GID = true,
+        }, &statx))) {
+            .SUCCESS => {},
+            .NOENT => return ctx.fail(ProfileError.StorePathNotFound, store_path, "failed to stat store path for ownership"),
+            .ACCES, .PERM => return ctx.fail(ProfileError.PermissionDenied, store_path, "failed to stat store path for ownership"),
+            else => return ctx.fail(ProfileError.FileSystem, store_path, "failed to stat store path for ownership"),
+        }
+
+        if (statx.uid != 0 or statx.gid != 0) {
             return ctx.fail(ProfileError.PermissionDenied, store_path, "store path is not root-owned");
         }
     }
@@ -319,7 +327,7 @@ pub fn buildProfile(
     if (profile_root.len == 0 or store_root.len == 0) {
         return ProfileError.InvalidInput;
     }
-    const started_at = std.time.nanoTimestamp();
+    const started_at = std.Io.Clock.Timestamp.now(path.currentIo(), .awake).raw.toNanoseconds();
 
     var result = try planProfileRealization(allocator, ctx, profile_root, store_root, packages, null);
     errdefer result.deinit();
@@ -338,7 +346,7 @@ pub fn buildProfile(
     );
     result.stats.materialized_entries = apply_stats.materialized_entries;
     result.stats.reused_entries = apply_stats.reused_entries;
-    result.stats.duration_ns = @intCast(std.time.nanoTimestamp() - started_at);
+    result.stats.duration_ns = @intCast(std.Io.Clock.Timestamp.now(path.currentIo(), .awake).raw.toNanoseconds() - started_at);
     return result;
 }
 
@@ -627,7 +635,7 @@ fn applyRealization(
 ) ProfileError!ProjectionStats {
     var materialized_entries: usize = 0;
     var reused_entries: usize = 0;
-    var last_parent = std.ArrayList(u8){};
+    var last_parent: std.ArrayList(u8) = .empty;
     defer last_parent.deinit(allocator);
 
     for (realization.entries.items) |entry| {
@@ -686,7 +694,7 @@ fn ensureProfileParent(
 ) ProfileError!void {
     if (std.mem.eql(u8, last_parent.items, parent)) return;
 
-    std.fs.cwd().makePath(parent) catch |err| {
+    path.ensureDirExists(parent) catch |err| {
         return ctx.fail(switch (err) {
             error.AccessDenied => ProfileError.PermissionDenied,
             else => ProfileError.FileSystem,
@@ -700,13 +708,13 @@ fn ensureProfileParent(
 }
 
 fn linkExistingEntry(ctx: *Context, source_path: []const u8, dest_path: []const u8) ProfileError!void {
-    std.fs.deleteFileAbsolute(dest_path) catch |err| switch (err) {
+    std.Io.Dir.deleteFileAbsolute(path.currentIo(), dest_path) catch |err| switch (err) {
         error.FileNotFound => {},
         error.AccessDenied => return ctx.fail(ProfileError.PermissionDenied, dest_path, "failed to remove existing destination before reuse"),
         else => return ctx.fail(ProfileError.FileSystem, dest_path, "failed to remove existing destination before reuse"),
     };
 
-    std.posix.link(source_path, dest_path) catch |err| {
+    std.Io.Dir.cwd().hardLink(source_path, std.Io.Dir.cwd(), dest_path, path.currentIo(), .{}) catch |err| {
         return ctx.fail(switch (err) {
             error.FileNotFound => ProfileError.FileSystem,
             error.AccessDenied, error.PermissionDenied => ProfileError.PermissionDenied,
@@ -724,16 +732,17 @@ fn replaceSymlinkAtomically(
     const parent = std.fs.path.dirname(profile_path) orelse "/";
     const basename = std.fs.path.basename(profile_path);
 
-    var parent_dir = std.fs.openDirAbsolute(parent, .{}) catch |err| {
+    const io = path.currentIo();
+    var parent_dir = path.openExistingDir(parent) catch |err| {
         return ctx.fail(switch (err) {
             error.AccessDenied => ProfileError.PermissionDenied,
             else => ProfileError.FileSystem,
         }, parent, "failed to open parent directory for symlink replacement");
     };
-    defer parent_dir.close();
+    defer parent_dir.close(io);
 
     var random_bytes: [6]u8 = undefined;
-    std.crypto.random.bytes(&random_bytes);
+    io.random(&random_bytes);
     const suffix = std.fmt.bytesToHex(random_bytes, .lower);
 
     const tmp_name = std.fmt.allocPrint(allocator, ".{s}.tmp-{s}", .{ basename, suffix }) catch {
@@ -741,15 +750,15 @@ fn replaceSymlinkAtomically(
     };
     defer allocator.free(tmp_name);
 
-    parent_dir.symLink(store_target, tmp_name, .{}) catch |err| {
+    parent_dir.symLink(io, store_target, tmp_name, .{}) catch |err| {
         return ctx.fail(switch (err) {
             error.AccessDenied => ProfileError.PermissionDenied,
             else => ProfileError.FileSystem,
         }, profile_path, "failed to create temporary symlink");
     };
-    errdefer parent_dir.deleteFile(tmp_name) catch {};
+    errdefer parent_dir.deleteFile(io, tmp_name) catch {};
 
-    parent_dir.rename(tmp_name, basename) catch |err| {
+    parent_dir.rename(tmp_name, parent_dir, basename, io) catch |err| {
         return ctx.fail(switch (err) {
             error.AccessDenied => ProfileError.PermissionDenied,
             else => ProfileError.FileSystem,
@@ -794,7 +803,7 @@ fn loadParentRealizationState(
 }
 
 fn exchangePaths(left_path: []const u8, right_path: []const u8) ProfileError!void {
-    const rename_exchange: u32 = 1 << 1;
+    const rename_exchange = std.os.linux.RENAME{ .EXCHANGE = true };
     const left_z = std.heap.page_allocator.dupeZ(u8, left_path) catch return ProfileError.OutOfMemory;
     defer std.heap.page_allocator.free(left_z);
     const right_z = std.heap.page_allocator.dupeZ(u8, right_path) catch return ProfileError.OutOfMemory;
@@ -855,20 +864,20 @@ pub fn publishProfileRoot(
     }
 
     var random_bytes: [6]u8 = undefined;
-    std.crypto.random.bytes(&random_bytes);
+    path.currentIo().random(&random_bytes);
     const suffix = std.fmt.bytesToHex(random_bytes, .lower);
     const stage_dir = std.fmt.allocPrint(ctx.allocator, "{s}/.root-new-{s}", .{ profile_dir, suffix }) catch {
         return ctx.fail(ProfileError.OutOfMemory, profile_dir, "failed to allocate staged root path");
     };
     defer ctx.allocator.free(stage_dir);
 
-    std.fs.cwd().makePath(stage_dir) catch |err| {
+    path.ensureDirExists(stage_dir) catch |err| {
         return ctx.fail(switch (err) {
             error.AccessDenied => ProfileError.PermissionDenied,
             else => ProfileError.FileSystem,
         }, stage_dir, "failed to create staged profile root");
     };
-    errdefer std.fs.deleteTreeAbsolute(stage_dir) catch {};
+    errdefer path.deleteTreeAbsolute(stage_dir) catch {};
 
     const root_path = try getRootPath(ctx.allocator, profile_dir);
     defer ctx.allocator.free(root_path);
@@ -877,7 +886,7 @@ pub fn publishProfileRoot(
     defer if (parent_state) |*state| state.deinit();
 
     const root_exists = blk: {
-        std.fs.accessAbsolute(root_path, .{}) catch |err| switch (err) {
+        std.Io.Dir.accessAbsolute(path.currentIo(), root_path, .{}) catch |err| switch (err) {
             error.FileNotFound => break :blk false,
             else => return ctx.fail(switch (err) {
                 error.AccessDenied => ProfileError.PermissionDenied,
@@ -890,7 +899,7 @@ pub fn publishProfileRoot(
         parent_state = try loadParentRealizationState(ctx.allocator, ctx, root_path);
     }
 
-    const started_at = std.time.nanoTimestamp();
+    const started_at = std.Io.Clock.Timestamp.now(path.currentIo(), .awake).raw.toNanoseconds();
     var result = try planProfileRealization(
         ctx.allocator,
         ctx,
@@ -915,7 +924,7 @@ pub fn publishProfileRoot(
     );
     result.stats.materialized_entries = apply_stats.materialized_entries;
     result.stats.reused_entries = apply_stats.reused_entries;
-    result.stats.duration_ns = @intCast(std.time.nanoTimestamp() - started_at);
+    result.stats.duration_ns = @intCast(std.Io.Clock.Timestamp.now(path.currentIo(), .awake).raw.toNanoseconds() - started_at);
 
     var manifest = try buildProfileManifest(
         ctx.allocator,
@@ -948,11 +957,11 @@ pub fn publishProfileRoot(
         exchangePaths(stage_dir, root_path) catch |err| {
             return ctx.fail(err, root_path, "failed to atomically publish profile root");
         };
-        std.fs.deleteTreeAbsolute(stage_dir) catch |err| {
+        path.deleteTreeAbsolute(stage_dir) catch |err| {
             ctx.debug("failed to remove previous profile root after publish: {}", .{err});
         };
     } else {
-        std.posix.rename(stage_dir, root_path) catch |err| {
+        std.Io.Dir.renameAbsolute(stage_dir, root_path, path.currentIo()) catch |err| {
             return ctx.fail(switch (err) {
                 error.AccessDenied => ProfileError.PermissionDenied,
                 else => ProfileError.FileSystem,
@@ -970,7 +979,7 @@ pub fn createGeneration(
     packages: []const generation.PackageEntry,
     parent_generation: ?u32,
 ) ProfileError!u32 {
-    const started_at = std.time.nanoTimestamp();
+    const started_at = std.Io.Clock.Timestamp.now(path.currentIo(), .awake).raw.toNanoseconds();
     const gen_num = generation.getNextGenerationNumber(profile_dir) catch |err| {
         return ctx.fail(switch (err) {
             generation.GenerationError.ProfilesNotFound => ProfileError.FileSystem,
@@ -985,7 +994,7 @@ pub fn createGeneration(
     };
     defer ctx.allocator.free(gen_path);
 
-    std.fs.cwd().makePath(gen_path) catch |err| {
+    path.ensureDirExists(gen_path) catch |err| {
         return ctx.fail(switch (err) {
             error.AccessDenied => ProfileError.PermissionDenied,
             else => ProfileError.FileSystem,
@@ -1029,7 +1038,7 @@ pub fn createGeneration(
     );
     result.stats.materialized_entries = apply_stats.materialized_entries;
     result.stats.reused_entries = apply_stats.reused_entries;
-    result.stats.duration_ns = @intCast(std.time.nanoTimestamp() - started_at);
+    result.stats.duration_ns = @intCast(std.Io.Clock.Timestamp.now(path.currentIo(), .awake).raw.toNanoseconds() - started_at);
 
     var manifest = try buildProfileManifest(
         ctx.allocator,
@@ -1081,7 +1090,7 @@ pub fn createProfile(
     };
     errdefer ctx.allocator.free(profile_dir);
 
-    std.fs.cwd().makePath(profile_dir) catch |err| {
+    path.ensureDirExists(profile_dir) catch |err| {
         return ctx.fail(switch (err) {
             error.AccessDenied => ProfileError.PermissionDenied,
             else => ProfileError.FileSystem,
@@ -1130,15 +1139,15 @@ test "buildProfile creates symlinks for package files" {
 
     const bin_dir = try std.fs.path.join(allocator, &.{ pkg_path, "bin" });
     defer allocator.free(bin_dir);
-    try std.fs.cwd().makePath(bin_dir);
+    try path.ensureDirExists(bin_dir);
 
     // Create a file in the package
     const file_path = try std.fs.path.join(allocator, &.{ bin_dir, "hello" });
     defer allocator.free(file_path);
     {
-        var f = try std.fs.createFileAbsolute(file_path, .{});
-        try f.writeAll("#!/bin/sh\necho hello\n");
-        f.close();
+        var f = try std.Io.Dir.createFileAbsolute(path.currentIo(), file_path, .{});
+        try f.writeStreamingAll(path.currentIo(), "#!/bin/sh\necho hello\n");
+        f.close(path.currentIo());
     }
 
     try writeProjectionForTestPackage(allocator, pkg_path);
@@ -1146,7 +1155,7 @@ test "buildProfile creates symlinks for package files" {
     // Create profile directory
     const profile_root = try std.fs.path.join(allocator, &.{ test_env.path, "profiles", "system-1" });
     defer allocator.free(profile_root);
-    try std.fs.cwd().makePath(profile_root);
+    try path.ensureDirExists(profile_root);
 
     // Build profile
     var result = try buildProfile(allocator, &test_env.ctx, profile_root, store_root, &.{testPackageEntry("hello", pkg_path)});
@@ -1162,8 +1171,8 @@ test "buildProfile creates symlinks for package files" {
     defer allocator.free(expected_link);
 
     var buf: [std.fs.max_path_bytes]u8 = undefined;
-    const target = try std.fs.readLinkAbsolute(expected_link, &buf);
-    try std.testing.expectEqualStrings(file_path, target);
+    const target_len = try std.Io.Dir.readLinkAbsolute(path.currentIo(), expected_link, &buf);
+    try std.testing.expectEqualStrings(file_path, buf[0..target_len]);
 }
 
 // Spec #19: Path conflicts during profile build are hard errors
@@ -1185,29 +1194,29 @@ test "buildProfile detects path conflicts" {
     defer allocator.free(pkg1_path);
     const pkg1_bin = try std.fs.path.join(allocator, &.{ pkg1_path, "bin" });
     defer allocator.free(pkg1_bin);
-    try std.fs.cwd().makePath(pkg1_bin);
+    try path.ensureDirExists(pkg1_bin);
 
     const pkg2_path = try std.fs.path.join(allocator, &.{ store_root, "pkg2-1.0" });
     defer allocator.free(pkg2_path);
     const pkg2_bin = try std.fs.path.join(allocator, &.{ pkg2_path, "bin" });
     defer allocator.free(pkg2_bin);
-    try std.fs.cwd().makePath(pkg2_bin);
+    try path.ensureDirExists(pkg2_bin);
 
     // Both packages provide bin/foo
     const file1 = try std.fs.path.join(allocator, &.{ pkg1_bin, "foo" });
     defer allocator.free(file1);
     {
-        var f = try std.fs.createFileAbsolute(file1, .{});
-        try f.writeAll("pkg1");
-        f.close();
+        var f = try std.Io.Dir.createFileAbsolute(path.currentIo(), file1, .{});
+        try f.writeStreamingAll(path.currentIo(), "pkg1");
+        f.close(path.currentIo());
     }
 
     const file2 = try std.fs.path.join(allocator, &.{ pkg2_bin, "foo" });
     defer allocator.free(file2);
     {
-        var f = try std.fs.createFileAbsolute(file2, .{});
-        try f.writeAll("pkg2");
-        f.close();
+        var f = try std.Io.Dir.createFileAbsolute(path.currentIo(), file2, .{});
+        try f.writeStreamingAll(path.currentIo(), "pkg2");
+        f.close(path.currentIo());
     }
 
     try writeProjectionForTestPackage(allocator, pkg1_path);
@@ -1216,7 +1225,7 @@ test "buildProfile detects path conflicts" {
     // Create profile directory
     const profile_root = try std.fs.path.join(allocator, &.{ test_env.path, "profiles", "system-1" });
     defer allocator.free(profile_root);
-    try std.fs.cwd().makePath(profile_root);
+    try path.ensureDirExists(profile_root);
 
     // Build profile - should succeed but report conflicts
     var result = try buildProfile(
@@ -1254,33 +1263,33 @@ test "buildProfile skips package metadata files" {
 
     const pkg_path = try std.fs.path.join(allocator, &.{ store_root, "abc-test-1.0" });
     defer allocator.free(pkg_path);
-    try std.fs.cwd().makePath(pkg_path);
+    try path.ensureDirExists(pkg_path);
 
     // Create manifest files under .mere/ (should be skipped)
     const manifest_path = try std.fs.path.join(allocator, &.{ pkg_path, package_manifest.MANIFEST_FILENAME });
     defer allocator.free(manifest_path);
     {
-        try std.fs.cwd().makePath(std.fs.path.dirname(manifest_path).?);
-        var f = try std.fs.createFileAbsolute(manifest_path, .{});
-        try f.writeAll("manifest");
-        f.close();
+        try path.ensureDirExists(std.fs.path.dirname(manifest_path).?);
+        var f = try std.Io.Dir.createFileAbsolute(path.currentIo(), manifest_path, .{});
+        try f.writeStreamingAll(path.currentIo(), "manifest");
+        f.close(path.currentIo());
     }
 
     const sig_path = try std.fs.path.join(allocator, &.{ pkg_path, package_manifest.MANIFEST_SIG_FILENAME });
     defer allocator.free(sig_path);
     {
-        var f = try std.fs.createFileAbsolute(sig_path, .{});
-        try f.writeAll("sig");
-        f.close();
+        var f = try std.Io.Dir.createFileAbsolute(path.currentIo(), sig_path, .{});
+        try f.writeStreamingAll(path.currentIo(), "sig");
+        f.close(path.currentIo());
     }
 
     const meta_path = try std.fs.path.join(allocator, &.{ pkg_path, package_manifest.META_KDL_FILENAME });
     defer allocator.free(meta_path);
     {
-        try std.fs.cwd().makePath(std.fs.path.dirname(meta_path).?);
-        var f = try std.fs.createFileAbsolute(meta_path, .{});
-        try f.writeAll("metadata");
-        f.close();
+        try path.ensureDirExists(std.fs.path.dirname(meta_path).?);
+        var f = try std.Io.Dir.createFileAbsolute(path.currentIo(), meta_path, .{});
+        try f.writeStreamingAll(path.currentIo(), "metadata");
+        f.close(path.currentIo());
     }
 
     // Create a regular file that should be included
@@ -1288,10 +1297,10 @@ test "buildProfile skips package metadata files" {
     defer allocator.free(bin_path);
     {
         const parent = std.fs.path.dirname(bin_path) orelse pkg_path;
-        try std.fs.cwd().makePath(parent);
-        var f = try std.fs.createFileAbsolute(bin_path, .{});
-        try f.writeAll("tool");
-        f.close();
+        try path.ensureDirExists(parent);
+        var f = try std.Io.Dir.createFileAbsolute(path.currentIo(), bin_path, .{});
+        try f.writeStreamingAll(path.currentIo(), "tool");
+        f.close(path.currentIo());
     }
 
     try writeProjectionForTestPackage(allocator, pkg_path);
@@ -1299,7 +1308,7 @@ test "buildProfile skips package metadata files" {
     // Create profile directory
     const profile_root = try std.fs.path.join(allocator, &.{ test_env.path, "profiles", "system-1" });
     defer allocator.free(profile_root);
-    try std.fs.cwd().makePath(profile_root);
+    try path.ensureDirExists(profile_root);
 
     // Build profile
     var result = try buildProfile(allocator, &test_env.ctx, profile_root, store_root, &.{testPackageEntry("test", pkg_path)});
@@ -1320,9 +1329,9 @@ test "buildProfile skips package metadata files" {
     const mere_link = try std.fs.path.join(allocator, &.{ profile_root, ".mere" });
     defer allocator.free(mere_link);
     // Check directory doesn't exist
-    const maybe_dir = std.fs.openDirAbsolute(mere_link, .{});
+    const maybe_dir = std.Io.Dir.openDirAbsolute(path.currentIo(), mere_link, .{});
     if (maybe_dir) |dir| {
-        @constCast(&dir).close();
+        @constCast(&dir).close(path.currentIo());
         try std.testing.expect(false); // Should not exist
     } else |err| {
         try std.testing.expect(err == error.FileNotFound);
@@ -1348,14 +1357,14 @@ test "createGeneration creates full generation" {
 
     const bin_dir = try std.fs.path.join(allocator, &.{ pkg_path, "bin" });
     defer allocator.free(bin_dir);
-    try std.fs.cwd().makePath(bin_dir);
+    try path.ensureDirExists(bin_dir);
 
     const file_path = try std.fs.path.join(allocator, &.{ bin_dir, "test" });
     defer allocator.free(file_path);
     {
-        var f = try std.fs.createFileAbsolute(file_path, .{});
-        try f.writeAll("test");
-        f.close();
+        var f = try std.Io.Dir.createFileAbsolute(path.currentIo(), file_path, .{});
+        try f.writeStreamingAll(path.currentIo(), "test");
+        f.close(path.currentIo());
     }
 
     try writeProjectionForTestPackage(allocator, pkg_path);
@@ -1363,7 +1372,7 @@ test "createGeneration creates full generation" {
     // Create profile directory (new layout: profiles/<name>/)
     const profile_dir = try std.fs.path.join(allocator, &.{ test_env.path, "profiles", "dev" });
     defer allocator.free(profile_dir);
-    try std.fs.cwd().makePath(profile_dir);
+    try path.ensureDirExists(profile_dir);
 
     // Create package entry
     const packages = [_]generation.PackageEntry{
@@ -1396,8 +1405,8 @@ test "createGeneration creates full generation" {
     const link_path = try std.fs.path.join(allocator, &.{ gen_path, "bin", "test" });
     defer allocator.free(link_path);
     var buf: [std.fs.max_path_bytes]u8 = undefined;
-    const target = try std.fs.readLinkAbsolute(link_path, &buf);
-    try std.testing.expectEqualStrings(file_path, target);
+    const target_len = try std.Io.Dir.readLinkAbsolute(path.currentIo(), link_path, &buf);
+    try std.testing.expectEqualStrings(file_path, buf[0..target_len]);
 
     // Verify manifest was written
     var manifest = try generation.readManifest(allocator, gen_path);
@@ -1428,20 +1437,20 @@ test "createGeneration reuses unchanged entries from parent generation" {
     defer allocator.free(pkg_path);
     const bin_dir = try std.fs.path.join(allocator, &.{ pkg_path, "bin" });
     defer allocator.free(bin_dir);
-    try std.fs.cwd().makePath(bin_dir);
+    try path.ensureDirExists(bin_dir);
 
     const file_path = try std.fs.path.join(allocator, &.{ bin_dir, "test" });
     defer allocator.free(file_path);
     {
-        var f = try std.fs.createFileAbsolute(file_path, .{});
-        defer f.close();
-        try f.writeAll("test");
+        var f = try std.Io.Dir.createFileAbsolute(path.currentIo(), file_path, .{});
+        defer f.close(path.currentIo());
+        try f.writeStreamingAll(path.currentIo(), "test");
     }
     try writeProjectionForTestPackage(allocator, pkg_path);
 
     const profile_dir = try std.fs.path.join(allocator, &.{ test_env.path, "profiles", "dev" });
     defer allocator.free(profile_dir);
-    try std.fs.cwd().makePath(profile_dir);
+    try path.ensureDirExists(profile_dir);
 
     const packages = [_]generation.PackageEntry{testPackageEntry("test", pkg_path)};
 
@@ -1455,9 +1464,26 @@ test "createGeneration reuses unchanged entries from parent generation" {
     const gen2_link = try std.fs.path.join(allocator, &.{ profile_dir, "gen-2", "bin", "test" });
     defer allocator.free(gen2_link);
 
-    const stat1 = try std.posix.fstatat(std.posix.AT.FDCWD, gen1_link, std.posix.AT.SYMLINK_NOFOLLOW);
-    const stat2 = try std.posix.fstatat(std.posix.AT.FDCWD, gen2_link, std.posix.AT.SYMLINK_NOFOLLOW);
-    try std.testing.expectEqual(stat1.ino, stat2.ino);
+    const gen1_link_z = try allocator.dupeZ(u8, gen1_link);
+    defer allocator.free(gen1_link_z);
+    const gen2_link_z = try allocator.dupeZ(u8, gen2_link);
+    defer allocator.free(gen2_link_z);
+
+    var statx1 = std.mem.zeroes(std.os.linux.Statx);
+    var statx2 = std.mem.zeroes(std.os.linux.Statx);
+    switch (std.os.linux.errno(std.os.linux.statx(std.posix.AT.FDCWD, gen1_link_z, std.posix.AT.SYMLINK_NOFOLLOW, .{
+        .INO = true,
+    }, &statx1))) {
+        .SUCCESS => {},
+        else => return error.FileSystem,
+    }
+    switch (std.os.linux.errno(std.os.linux.statx(std.posix.AT.FDCWD, gen2_link_z, std.posix.AT.SYMLINK_NOFOLLOW, .{
+        .INO = true,
+    }, &statx2))) {
+        .SUCCESS => {},
+        else => return error.FileSystem,
+    }
+    try std.testing.expectEqual(statx1.ino, statx2.ino);
 }
 
 test "createGeneration does not reread projection.v1 for unchanged parent package" {
@@ -1476,13 +1502,13 @@ test "createGeneration does not reread projection.v1 for unchanged parent packag
     defer allocator.free(pkg_a_path);
     const pkg_a_bin = try std.fs.path.join(allocator, &.{ pkg_a_path, "bin" });
     defer allocator.free(pkg_a_bin);
-    try std.fs.cwd().makePath(pkg_a_bin);
+    try path.ensureDirExists(pkg_a_bin);
     const pkg_a_file = try std.fs.path.join(allocator, &.{ pkg_a_bin, "a" });
     defer allocator.free(pkg_a_file);
     {
-        var f = try std.fs.createFileAbsolute(pkg_a_file, .{});
-        defer f.close();
-        try f.writeAll("a");
+        var f = try std.Io.Dir.createFileAbsolute(path.currentIo(), pkg_a_file, .{});
+        defer f.close(path.currentIo());
+        try f.writeStreamingAll(path.currentIo(), "a");
     }
     try writeProjectionForTestPackage(allocator, pkg_a_path);
 
@@ -1490,19 +1516,19 @@ test "createGeneration does not reread projection.v1 for unchanged parent packag
     defer allocator.free(pkg_b_path);
     const pkg_b_bin = try std.fs.path.join(allocator, &.{ pkg_b_path, "bin" });
     defer allocator.free(pkg_b_bin);
-    try std.fs.cwd().makePath(pkg_b_bin);
+    try path.ensureDirExists(pkg_b_bin);
     const pkg_b_file = try std.fs.path.join(allocator, &.{ pkg_b_bin, "b" });
     defer allocator.free(pkg_b_file);
     {
-        var f = try std.fs.createFileAbsolute(pkg_b_file, .{});
-        defer f.close();
-        try f.writeAll("b");
+        var f = try std.Io.Dir.createFileAbsolute(path.currentIo(), pkg_b_file, .{});
+        defer f.close(path.currentIo());
+        try f.writeStreamingAll(path.currentIo(), "b");
     }
     try writeProjectionForTestPackage(allocator, pkg_b_path);
 
     const profile_dir = try std.fs.path.join(allocator, &.{ test_env.path, "profiles", "dev" });
     defer allocator.free(profile_dir);
-    try std.fs.cwd().makePath(profile_dir);
+    try path.ensureDirExists(profile_dir);
 
     const gen1_packages = [_]generation.PackageEntry{
         testPackageEntry("pkg-a", pkg_a_path),
@@ -1512,7 +1538,7 @@ test "createGeneration does not reread projection.v1 for unchanged parent packag
 
     const projection_path = try std.fs.path.join(allocator, &.{ pkg_a_path, package_manifest.PROJECTION_FILENAME });
     defer allocator.free(projection_path);
-    try std.fs.deleteFileAbsolute(projection_path);
+    try std.Io.Dir.deleteFileAbsolute(path.currentIo(), projection_path);
 
     const gen2_packages = [_]generation.PackageEntry{
         testPackageEntry("pkg-a", pkg_a_path),
@@ -1546,13 +1572,13 @@ test "createGeneration detects conflicts against retained parent paths" {
     defer allocator.free(pkg_a_path);
     const pkg_a_bin = try std.fs.path.join(allocator, &.{ pkg_a_path, "bin" });
     defer allocator.free(pkg_a_bin);
-    try std.fs.cwd().makePath(pkg_a_bin);
+    try path.ensureDirExists(pkg_a_bin);
     const pkg_a_file = try std.fs.path.join(allocator, &.{ pkg_a_bin, "tool" });
     defer allocator.free(pkg_a_file);
     {
-        var f = try std.fs.createFileAbsolute(pkg_a_file, .{});
-        defer f.close();
-        try f.writeAll("a");
+        var f = try std.Io.Dir.createFileAbsolute(path.currentIo(), pkg_a_file, .{});
+        defer f.close(path.currentIo());
+        try f.writeStreamingAll(path.currentIo(), "a");
     }
     try writeProjectionForTestPackage(allocator, pkg_a_path);
 
@@ -1560,19 +1586,19 @@ test "createGeneration detects conflicts against retained parent paths" {
     defer allocator.free(pkg_b_path);
     const pkg_b_bin = try std.fs.path.join(allocator, &.{ pkg_b_path, "bin" });
     defer allocator.free(pkg_b_bin);
-    try std.fs.cwd().makePath(pkg_b_bin);
+    try path.ensureDirExists(pkg_b_bin);
     const pkg_b_file = try std.fs.path.join(allocator, &.{ pkg_b_bin, "tool" });
     defer allocator.free(pkg_b_file);
     {
-        var f = try std.fs.createFileAbsolute(pkg_b_file, .{});
-        defer f.close();
-        try f.writeAll("b");
+        var f = try std.Io.Dir.createFileAbsolute(path.currentIo(), pkg_b_file, .{});
+        defer f.close(path.currentIo());
+        try f.writeStreamingAll(path.currentIo(), "b");
     }
     try writeProjectionForTestPackage(allocator, pkg_b_path);
 
     const profile_dir = try std.fs.path.join(allocator, &.{ test_env.path, "profiles", "dev" });
     defer allocator.free(profile_dir);
-    try std.fs.cwd().makePath(profile_dir);
+    try path.ensureDirExists(profile_dir);
 
     const gen1_packages = [_]generation.PackageEntry{
         testPackageEntry("pkg-a", pkg_a_path),
@@ -1603,15 +1629,15 @@ test "createProfile creates profile directory" {
     // Create base profiles directory
     const profiles_dir = try std.fs.path.join(allocator, &.{ test_env.path, "profiles" });
     defer allocator.free(profiles_dir);
-    try std.fs.cwd().makePath(profiles_dir);
+    try path.ensureDirExists(profiles_dir);
 
     // Create a profile
     const profile_dir = try createProfile(&test_env.ctx, profiles_dir, "dev");
     defer allocator.free(profile_dir);
 
     // Verify it was created by opening it
-    var dir = try std.fs.openDirAbsolute(profile_dir, .{});
-    dir.close();
+    var dir = try path.openExistingDir(profile_dir);
+    dir.close(path.currentIo());
 
     // Verify path is correct
     const expected = try std.fs.path.join(allocator, &.{ profiles_dir, "dev" });
@@ -1636,45 +1662,45 @@ test "buildProfile skips etc/ paths" {
 
     const pkg_path = try std.fs.path.join(allocator, &.{ store_root, "abc-test-1.0" });
     defer allocator.free(pkg_path);
-    try std.fs.cwd().makePath(pkg_path);
+    try path.ensureDirExists(pkg_path);
 
     // Create etc/ directory with a config file (should be skipped)
     const etc_dir = try std.fs.path.join(allocator, &.{ pkg_path, "etc" });
     defer allocator.free(etc_dir);
-    try std.fs.cwd().makePath(etc_dir);
+    try path.ensureDirExists(etc_dir);
 
     const etc_file = try std.fs.path.join(allocator, &.{ etc_dir, "config.conf" });
     defer allocator.free(etc_file);
     {
-        var f = try std.fs.createFileAbsolute(etc_file, .{});
-        try f.writeAll("config");
-        f.close();
+        var f = try std.Io.Dir.createFileAbsolute(path.currentIo(), etc_file, .{});
+        try f.writeStreamingAll(path.currentIo(), "config");
+        f.close(path.currentIo());
     }
 
     // Create etc-defaults/ directory with a template (should be included)
     const etc_defaults_dir = try std.fs.path.join(allocator, &.{ pkg_path, "etc-defaults" });
     defer allocator.free(etc_defaults_dir);
-    try std.fs.cwd().makePath(etc_defaults_dir);
+    try path.ensureDirExists(etc_defaults_dir);
 
     const etc_defaults_file = try std.fs.path.join(allocator, &.{ etc_defaults_dir, "template.conf" });
     defer allocator.free(etc_defaults_file);
     {
-        var f = try std.fs.createFileAbsolute(etc_defaults_file, .{});
-        try f.writeAll("template");
-        f.close();
+        var f = try std.Io.Dir.createFileAbsolute(path.currentIo(), etc_defaults_file, .{});
+        try f.writeStreamingAll(path.currentIo(), "template");
+        f.close(path.currentIo());
     }
 
     // Create a regular file that should be included
     const bin_dir = try std.fs.path.join(allocator, &.{ pkg_path, "bin" });
     defer allocator.free(bin_dir);
-    try std.fs.cwd().makePath(bin_dir);
+    try path.ensureDirExists(bin_dir);
 
     const bin_file = try std.fs.path.join(allocator, &.{ bin_dir, "tool" });
     defer allocator.free(bin_file);
     {
-        var f = try std.fs.createFileAbsolute(bin_file, .{});
-        try f.writeAll("tool");
-        f.close();
+        var f = try std.Io.Dir.createFileAbsolute(path.currentIo(), bin_file, .{});
+        try f.writeStreamingAll(path.currentIo(), "tool");
+        f.close(path.currentIo());
     }
 
     try writeProjectionForTestPackage(allocator, pkg_path);
@@ -1682,7 +1708,7 @@ test "buildProfile skips etc/ paths" {
     // Create profile directory
     const profile_root = try std.fs.path.join(allocator, &.{ test_env.path, "profiles", "system-1" });
     defer allocator.free(profile_root);
-    try std.fs.cwd().makePath(profile_root);
+    try path.ensureDirExists(profile_root);
 
     // Build profile
     var result = try buildProfile(allocator, &test_env.ctx, profile_root, store_root, &.{testPackageEntry("test", pkg_path)});
@@ -1726,31 +1752,31 @@ test "buildProfile rejects packages missing projection.v1" {
 
     const pkg_path = try std.fs.path.join(allocator, &.{ store_root, "abc-badpkg-1.0" });
     defer allocator.free(pkg_path);
-    try std.fs.cwd().makePath(pkg_path);
+    try path.ensureDirExists(pkg_path);
 
     const bin_dir = try std.fs.path.join(allocator, &.{ pkg_path, "bin" });
     defer allocator.free(bin_dir);
-    try std.fs.cwd().makePath(bin_dir);
+    try path.ensureDirExists(bin_dir);
 
     const tool_path = try std.fs.path.join(allocator, &.{ bin_dir, "tool" });
     defer allocator.free(tool_path);
     {
-        var f = try std.fs.createFileAbsolute(tool_path, .{});
-        try f.writeAll("tool");
-        f.close();
+        var f = try std.Io.Dir.createFileAbsolute(path.currentIo(), tool_path, .{});
+        try f.writeStreamingAll(path.currentIo(), "tool");
+        f.close(path.currentIo());
     }
 
     // Create profile directory
     const profile_root = try std.fs.path.join(allocator, &.{ test_env.path, "profiles", "system-1" });
     defer allocator.free(profile_root);
-    try std.fs.cwd().makePath(profile_root);
+    try path.ensureDirExists(profile_root);
 
     const result = buildProfile(allocator, &test_env.ctx, profile_root, store_root, &.{testPackageEntry("badpkg", pkg_path)});
     try std.testing.expectError(ProfileError.InvalidStoreLayout, result);
 }
 
 test "buildProfile preserves existing symlink when atomic replacement cannot start" {
-    if (std.posix.geteuid() == 0) return error.SkipZigTest;
+    if (std.os.linux.geteuid() == 0) return error.SkipZigTest;
 
     const th = @import("test_helpers.zig");
     var test_env = try th.createTestEnv();
@@ -1767,14 +1793,14 @@ test "buildProfile preserves existing symlink when atomic replacement cannot sta
     defer allocator.free(pkg_path);
     const bin_dir = try std.fs.path.join(allocator, &.{ pkg_path, "bin" });
     defer allocator.free(bin_dir);
-    try std.fs.cwd().makePath(bin_dir);
+    try path.ensureDirExists(bin_dir);
 
     const file_path = try std.fs.path.join(allocator, &.{ bin_dir, "tool" });
     defer allocator.free(file_path);
     {
-        var f = try std.fs.createFileAbsolute(file_path, .{});
-        defer f.close();
-        try f.writeAll("tool");
+        var f = try std.Io.Dir.createFileAbsolute(path.currentIo(), file_path, .{});
+        defer f.close(path.currentIo());
+        try f.writeStreamingAll(path.currentIo(), "tool");
     }
 
     try writeProjectionForTestPackage(allocator, pkg_path);
@@ -1783,17 +1809,21 @@ test "buildProfile preserves existing symlink when atomic replacement cannot sta
     defer allocator.free(profile_root);
     const profile_bin = try std.fs.path.join(allocator, &.{ profile_root, "bin" });
     defer allocator.free(profile_bin);
-    try std.fs.cwd().makePath(profile_bin);
+    try path.ensureDirExists(profile_bin);
 
     const link_path = try std.fs.path.join(allocator, &.{ profile_bin, "tool" });
     defer allocator.free(link_path);
-    try std.posix.symlinkat("/existing/target", std.fs.cwd().fd, link_path);
+    {
+        var dir = try path.openExistingDir(profile_bin);
+        defer dir.close(path.currentIo());
+        try dir.symLink(path.currentIo(), "/existing/target", "tool", .{});
+    }
 
     // Deny write in parent dir to force temp-symlink creation failure.
-    var profile_bin_dir = try std.fs.openDirAbsolute(profile_bin, .{});
-    defer profile_bin_dir.close();
-    try profile_bin_dir.chmod(0o555);
-    defer profile_bin_dir.chmod(0o755) catch {};
+    var profile_bin_dir = try path.openExistingDir(profile_bin);
+    defer profile_bin_dir.close(path.currentIo());
+    try profile_bin_dir.setPermissions(path.currentIo(), .fromMode(0o555));
+    defer profile_bin_dir.setPermissions(path.currentIo(), .fromMode(0o755)) catch {};
 
     const result = buildProfile(allocator, &test_env.ctx, profile_root, store_root, &.{testPackageEntry("test", pkg_path)});
     if (result) |success| {
@@ -1805,8 +1835,8 @@ test "buildProfile preserves existing symlink when atomic replacement cannot sta
     }
 
     var buf: [std.fs.max_path_bytes]u8 = undefined;
-    const target = try std.fs.readLinkAbsolute(link_path, &buf);
-    try std.testing.expectEqualStrings("/existing/target", target);
+    const target_len = try std.Io.Dir.readLinkAbsolute(path.currentIo(), link_path, &buf);
+    try std.testing.expectEqualStrings("/existing/target", buf[0..target_len]);
 }
 
 test "PathConflictDetector detects conflicts" {

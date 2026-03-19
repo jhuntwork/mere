@@ -6,6 +6,7 @@ const std = @import("std");
 const elf = @import("elf.zig");
 const mere = @import("mere.zig");
 const errors = @import("errors.zig");
+const path = @import("path.zig");
 const test_helpers = @import("test_helpers.zig");
 
 /// Strip error set
@@ -69,8 +70,7 @@ pub const CommandResult = struct {
 pub const CommandRunnerFn = fn (allocator: std.mem.Allocator, argv: []const []const u8) anyerror!CommandResult;
 
 fn defaultCommandRunner(allocator: std.mem.Allocator, argv: []const []const u8) anyerror!CommandResult {
-    const result = try std.process.Child.run(.{
-        .allocator = allocator,
+    const result = try std.process.run(allocator, path.currentIo(), .{
         .argv = argv,
     });
     return .{
@@ -95,10 +95,10 @@ pub fn stripDirectory(
     const allocator = ctx.allocator;
     const runner = injected_runner orelse &defaultCommandRunner;
 
-    var dir = std.fs.openDirAbsolute(staging_dir, .{ .iterate = true }) catch {
+    var dir = path.openExistingDir(staging_dir) catch {
         return ctx.fail(StripError.FileSystem, staging_dir, "failed to open staging directory for stripping");
     };
-    defer dir.close();
+    defer dir.close(path.currentIo());
 
     var walker = dir.walk(allocator) catch {
         return ctx.fail(StripError.OutOfMemory, staging_dir, "failed to walk staging directory for stripping");
@@ -110,7 +110,7 @@ pub fn stripDirectory(
     var files_failed: usize = 0;
 
     while (true) {
-        const entry = walker.next() catch {
+        const entry = walker.next(path.currentIo()) catch {
             return ctx.fail(StripError.FileSystem, staging_dir, "failed to read directory entry during stripping");
         };
         if (entry == null) break;
@@ -160,7 +160,7 @@ pub fn stripDirectory(
         defer result.deinit(allocator);
 
         switch (result.term) {
-            .Exited => |code| {
+            .exited => |code| {
                 if (code != 0) {
                     ctx.debug("strip exited {d} for {s}: {s}", .{ code, e.path, result.stderr });
                     files_failed += 1;
@@ -200,9 +200,9 @@ test "classifyElf returns null for non-ELF file" {
     defer std.testing.allocator.free(txt_path);
 
     {
-        const f = try std.fs.createFileAbsolute(txt_path, .{});
-        defer f.close();
-        try f.writeAll("not an elf");
+        var f = try path.makePathAndOpenFile(txt_path);
+        defer f.close(path.currentIo());
+        try f.writeStreamingAll(path.currentIo(), "not an elf");
     }
 
     try std.testing.expect(classifyElf(txt_path) == null);
@@ -238,15 +238,15 @@ test "stripDirectory skips non-ELF files" {
 
     const staging = try std.fs.path.join(std.testing.allocator, &.{ test_env.path, "staging" });
     defer std.testing.allocator.free(staging);
-    try std.fs.cwd().makePath(staging);
+    try path.ensureDirExists(staging);
 
     // Create a plain text file — should be skipped
     const txt_path = try std.fs.path.join(std.testing.allocator, &.{ staging, "readme.txt" });
     defer std.testing.allocator.free(txt_path);
     {
-        const f = try std.fs.createFileAbsolute(txt_path, .{});
-        defer f.close();
-        try f.writeAll("hello");
+        var f = try path.makePathAndOpenFile(txt_path);
+        defer f.close(path.currentIo());
+        try f.writeStreamingAll(path.currentIo(), "hello");
     }
 
     const result = try stripDirectory(&test_env.ctx, staging, null);
@@ -264,7 +264,7 @@ test "stripDirectory handles empty directory" {
 
     const staging = try std.fs.path.join(std.testing.allocator, &.{ test_env.path, "empty" });
     defer std.testing.allocator.free(staging);
-    try std.fs.cwd().makePath(staging);
+    try path.ensureDirExists(staging);
 
     const result = try stripDirectory(&test_env.ctx, staging, null);
     try std.testing.expectEqual(@as(usize, 0), result.files_stripped);
@@ -281,14 +281,14 @@ test "stripDirectory reports runner spawn failures without failing the directory
 
     const staging = try std.fs.path.join(std.testing.allocator, &.{ test_env.path, "spawn-fail" });
     defer std.testing.allocator.free(staging);
-    try std.fs.cwd().makePath(staging);
+    try path.ensureDirExists(staging);
 
     const archive_path = try std.fs.path.join(std.testing.allocator, &.{ staging, "libfoo.a" });
     defer std.testing.allocator.free(archive_path);
     {
-        const f = try std.fs.createFileAbsolute(archive_path, .{});
-        defer f.close();
-        try f.writeAll("fake archive");
+        var f = try path.makePathAndOpenFile(archive_path);
+        defer f.close(path.currentIo());
+        try f.writeStreamingAll(path.currentIo(), "fake archive");
     }
 
     const FailingRunner = struct {
@@ -312,20 +312,20 @@ test "stripDirectory reports non-zero runner exits without failing the directory
 
     const staging = try std.fs.path.join(std.testing.allocator, &.{ test_env.path, "exit-fail" });
     defer std.testing.allocator.free(staging);
-    try std.fs.cwd().makePath(staging);
+    try path.ensureDirExists(staging);
 
     const archive_path = try std.fs.path.join(std.testing.allocator, &.{ staging, "libfoo.a" });
     defer std.testing.allocator.free(archive_path);
     {
-        const f = try std.fs.createFileAbsolute(archive_path, .{});
-        defer f.close();
-        try f.writeAll("fake archive");
+        var f = try path.makePathAndOpenFile(archive_path);
+        defer f.close(path.currentIo());
+        try f.writeStreamingAll(path.currentIo(), "fake archive");
     }
 
     const ExitFailRunner = struct {
         fn run(allocator: std.mem.Allocator, _: []const []const u8) anyerror!CommandResult {
             return .{
-                .term = .{ .Exited = 1 },
+                .term = .{ .exited = 1 },
                 .stdout = try allocator.dupe(u8, ""),
                 .stderr = try allocator.dupe(u8, "strip failed"),
             };

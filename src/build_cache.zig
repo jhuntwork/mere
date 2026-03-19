@@ -2,6 +2,7 @@ const std = @import("std");
 const mere = @import("mere.zig");
 const split_staging = @import("build_orchestrator/split_staging.zig");
 const packaging = @import("packaging.zig");
+const path_mod = @import("path.zig");
 const recipe = @import("recipe.zig");
 const hash = @import("hash.zig");
 const test_helpers = @import("test_helpers.zig");
@@ -103,25 +104,23 @@ pub fn clear(
 ) CacheError!usize {
     const cache_root = try buildCacheRoot(allocator, ctx);
     defer allocator.free(cache_root);
+    const io = path_mod.currentIo();
 
-    var dir = std.fs.openDirAbsolute(cache_root, .{ .iterate = true }) catch |err| {
+    var dir = path_mod.openExistingDir(cache_root) catch |err| {
         return switch (err) {
             error.FileNotFound => 0,
             else => mapFsError(err),
         };
     };
-    defer dir.close();
+    defer dir.close(io);
 
     var iter = dir.iterate();
     var removed_count: usize = 0;
 
-    while (iter.next() catch |err| return mapFsError(err)) |entry| {
-        const entry_path = try std.fs.path.join(allocator, &.{ cache_root, entry.name });
-        defer allocator.free(entry_path);
-
+    while (iter.next(io) catch |err| return mapFsError(err)) |entry| {
         switch (entry.kind) {
-            .directory => std.fs.deleteTreeAbsolute(entry_path) catch |err| return mapFsError(err),
-            else => std.fs.deleteFileAbsolute(entry_path) catch |err| return mapFsError(err),
+            .directory => dir.deleteTree(io, entry.name) catch |err| return mapFsError(err),
+            else => dir.deleteFile(io, entry.name) catch |err| return mapFsError(err),
         }
 
         removed_count += 1;
@@ -145,15 +144,17 @@ pub fn computeSourceFetchKey(
     recipe_dir: []const u8,
     parsed_recipe: *const recipe.Recipe,
 ) CacheError![]const u8 {
-    var buf: std.ArrayList(u8) = .{};
+    var buf: std.ArrayList(u8) = .empty;
     defer buf.deinit(allocator);
-    const writer = buf.writer(allocator);
+    var out_buf: std.Io.Writer.Allocating = .fromArrayList(allocator, &buf);
+    const out = &out_buf.writer;
 
-    try writer.writeAll("source-fetch-v1\n");
-    try appendRecipeVars(writer, parsed_recipe);
-    try appendSourceInputs(allocator, ctx, writer, recipe_dir, parsed_recipe);
-    try appendRecipeCompanionInputs(allocator, writer, recipe_dir);
+    out.writeAll("source-fetch-v1\n") catch return error.OutOfMemory;
+    try appendRecipeVars(out, parsed_recipe);
+    try appendSourceInputs(allocator, ctx, out, recipe_dir, parsed_recipe);
+    try appendRecipeCompanionInputs(allocator, out, recipe_dir);
 
+    buf = out_buf.toArrayList();
     return hash.calculateBytesHash(allocator, buf.items) catch |err| mapHashError(err);
 }
 
@@ -170,15 +171,16 @@ pub fn computeProfileRealizeKey(
     parsed_recipe: *const recipe.Recipe,
     config: *const @import("config.zig").Config,
 ) CacheError![]const u8 {
-    var buf: std.ArrayList(u8) = .{};
+    var buf: std.ArrayList(u8) = .empty;
     defer buf.deinit(allocator);
-    const writer = buf.writer(allocator);
+    var out_buf: std.Io.Writer.Allocating = .fromArrayList(allocator, &buf);
+    const out = &out_buf.writer;
 
-    try writer.writeAll("profile-realize-v1\n");
-    try writer.print("root={s}\n", .{ctx.root()});
-    try writer.print("arch={s}\n", .{parsed_recipe.arch orelse ""});
+    out.writeAll("profile-realize-v1\n") catch return error.OutOfMemory;
+    out.print("root={s}\n", .{ctx.root()}) catch return error.OutOfMemory;
+    out.print("arch={s}\n", .{parsed_recipe.arch orelse ""}) catch return error.OutOfMemory;
     for (parsed_recipe.depends.items) |dep| {
-        try writer.print("dep={s}\n", .{dep});
+        out.print("dep={s}\n", .{dep}) catch return error.OutOfMemory;
     }
 
     const config_kdl = config.toKdl() catch |err| {
@@ -187,8 +189,9 @@ pub fn computeProfileRealizeKey(
         };
     };
     defer config.alloc.free(config_kdl);
-    try writer.writeAll(config_kdl);
+    out.writeAll(config_kdl) catch return error.OutOfMemory;
 
+    buf = out_buf.toArrayList();
     return hash.calculateBytesHash(allocator, buf.items) catch |err| {
         return mapHashError(err);
     };
@@ -204,19 +207,21 @@ pub fn computePhaseStepKey(
     profile_tree_hash: []const u8,
     ns_working_dir: []const u8,
 ) CacheError![]const u8 {
-    var buf: std.ArrayList(u8) = .{};
+    var buf: std.ArrayList(u8) = .empty;
     defer buf.deinit(allocator);
-    const writer = buf.writer(allocator);
+    var out_buf: std.Io.Writer.Allocating = .fromArrayList(allocator, &buf);
+    const out = &out_buf.writer;
 
-    try writer.writeAll("phase-step-v1\n");
-    try writer.print("phase={s}\n", .{phase_name});
-    try writer.print("script={s}\n", .{script});
-    try writer.print("source_tree={s}\n", .{source_tree_hash});
-    try writer.print("profile_tree={s}\n", .{profile_tree_hash});
-    try writer.print("working_dir={s}\n", .{ns_working_dir});
-    try appendKvList(writer, "recipe_env", recipe_env);
-    try appendKvList(writer, "phase_env", phase_env);
+    out.writeAll("phase-step-v1\n") catch return error.OutOfMemory;
+    out.print("phase={s}\n", .{phase_name}) catch return error.OutOfMemory;
+    out.print("script={s}\n", .{script}) catch return error.OutOfMemory;
+    out.print("source_tree={s}\n", .{source_tree_hash}) catch return error.OutOfMemory;
+    out.print("profile_tree={s}\n", .{profile_tree_hash}) catch return error.OutOfMemory;
+    out.print("working_dir={s}\n", .{ns_working_dir}) catch return error.OutOfMemory;
+    try appendKvList(out, "recipe_env", recipe_env);
+    try appendKvList(out, "phase_env", phase_env);
 
+    buf = out_buf.toArrayList();
     return hash.calculateBytesHash(allocator, buf.items) catch |err| {
         return mapHashError(err);
     };
@@ -227,19 +232,21 @@ pub fn computeSplitStageKey(
     parsed_recipe: *const recipe.Recipe,
     destdir_tree_hash: []const u8,
 ) CacheError![]const u8 {
-    var buf: std.ArrayList(u8) = .{};
+    var buf: std.ArrayList(u8) = .empty;
     defer buf.deinit(allocator);
-    const writer = buf.writer(allocator);
+    var out_buf: std.Io.Writer.Allocating = .fromArrayList(allocator, &buf);
+    const out = &out_buf.writer;
 
-    try writer.writeAll("split-stage-v1\n");
-    try writer.print("destdir={s}\n", .{destdir_tree_hash});
+    out.writeAll("split-stage-v1\n") catch return error.OutOfMemory;
+    out.print("destdir={s}\n", .{destdir_tree_hash}) catch return error.OutOfMemory;
     for (parsed_recipe.packages.items, 0..) |pkg, idx| {
-        try writer.print("package[{d}].name={s}\n", .{ idx, pkg.name });
+        out.print("package[{d}].name={s}\n", .{ idx, pkg.name }) catch return error.OutOfMemory;
         for (pkg.pkgfiles.items) |pattern| {
-            try writer.print("package[{d}].pattern={s}\n", .{ idx, pattern });
+            out.print("package[{d}].pattern={s}\n", .{ idx, pattern }) catch return error.OutOfMemory;
         }
     }
 
+    buf = out_buf.toArrayList();
     return hash.calculateBytesHash(allocator, buf.items) catch |err| {
         return mapHashError(err);
     };
@@ -253,26 +260,28 @@ pub fn computePackageArchiveKey(
     staging_tree_hash: []const u8,
     injected_dependencies: []const packaging.InjectedDependency,
 ) CacheError![]const u8 {
-    var buf: std.ArrayList(u8) = .{};
+    var buf: std.ArrayList(u8) = .empty;
     defer buf.deinit(allocator);
-    const writer = buf.writer(allocator);
+    var out_buf: std.Io.Writer.Allocating = .fromArrayList(allocator, &buf);
+    const out = &out_buf.writer;
 
-    try writer.writeAll("package-archive-v1\n");
-    try writer.print("staging={s}\n", .{staging_tree_hash});
-    try writer.print("name={s}\n", .{if (artifact.name.len > 0) artifact.name else parsed_recipe.name});
-    try writer.print("version={s}\n", .{parsed_recipe.version});
-    try writer.print("release={d}\n", .{parsed_recipe.release});
-    try writer.print("arch={s}\n", .{parsed_recipe.arch orelse "any"});
+    out.writeAll("package-archive-v1\n") catch return error.OutOfMemory;
+    out.print("staging={s}\n", .{staging_tree_hash}) catch return error.OutOfMemory;
+    out.print("name={s}\n", .{if (artifact.name.len > 0) artifact.name else parsed_recipe.name}) catch return error.OutOfMemory;
+    out.print("version={s}\n", .{parsed_recipe.version}) catch return error.OutOfMemory;
+    out.print("release={d}\n", .{parsed_recipe.release}) catch return error.OutOfMemory;
+    out.print("arch={s}\n", .{parsed_recipe.arch orelse "any"}) catch return error.OutOfMemory;
 
     const signing_key_hash = try computeSigningKeyHash(allocator, ctx);
     defer allocator.free(signing_key_hash);
-    try writer.print("signing_key={s}\n", .{signing_key_hash});
+    out.print("signing_key={s}\n", .{signing_key_hash}) catch return error.OutOfMemory;
 
     for (injected_dependencies) |dep| {
-        try writer.print("dep.{s}={s}\n", .{ dep.dep_type.toNodeName(), dep.value });
-        try writer.print("dep-constraint={s}\n", .{dep.version_constraint orelse ""});
+        out.print("dep.{s}={s}\n", .{ dep.dep_type.toNodeName(), dep.value }) catch return error.OutOfMemory;
+        out.print("dep-constraint={s}\n", .{dep.version_constraint orelse ""}) catch return error.OutOfMemory;
     }
 
+    buf = out_buf.toArrayList();
     return hash.calculateBytesHash(allocator, buf.items) catch |err| {
         return mapHashError(err);
     };
@@ -495,6 +504,7 @@ pub fn gc(
 ) CacheError!GcResult {
     const cache_root = try buildCacheRoot(allocator, ctx);
     defer allocator.free(cache_root);
+    const io = path_mod.currentIo();
     if (!dirExists(cache_root)) return .{};
 
     const keys_root = try std.fs.path.join(allocator, &.{ cache_root, "keys" });
@@ -524,17 +534,17 @@ pub fn gc(
         defer allocator.free(kind_keys_dir);
         if (!dirExists(kind_keys_dir)) continue;
 
-        var dir = std.fs.openDirAbsolute(kind_keys_dir, .{ .iterate = true }) catch |err| {
+        var dir = path_mod.openExistingDir(kind_keys_dir) catch |err| {
             return mapFsError(err);
         };
-        defer dir.close();
+        defer dir.close(io);
 
         var walker = dir.walk(allocator) catch |err| {
             return mapFsError(err);
         };
         defer walker.deinit();
 
-        while (walker.next() catch |err| return mapFsError(err)) |entry| {
+        while (walker.next(io) catch |err| return mapFsError(err)) |entry| {
             if (entry.kind != .file) continue;
 
             const key_path = try std.fs.path.join(allocator, &.{ kind_keys_dir, entry.path });
@@ -542,7 +552,7 @@ pub fn gc(
 
             var record = readKeyRecord(allocator, kind, key_path) catch |err| {
                 if (fileExists(key_path)) {
-                    std.fs.deleteFileAbsolute(key_path) catch |delete_err| return mapFsError(delete_err);
+                    std.Io.Dir.deleteFileAbsolute(io, key_path) catch |delete_err| return mapFsError(delete_err);
                     result.removed_key_records += 1;
                 }
                 switch (err) {
@@ -555,7 +565,7 @@ pub fn gc(
             const artifact_dir = try std.fs.path.join(allocator, &.{ artifacts_root, record.artifact_digest_hex });
             defer allocator.free(artifact_dir);
             if (!artifactPayloadExists(allocator, kind, artifact_dir)) {
-                std.fs.deleteFileAbsolute(key_path) catch |err| return mapFsError(err);
+                std.Io.Dir.deleteFileAbsolute(io, key_path) catch |err| return mapFsError(err);
                 result.removed_key_records += 1;
                 continue;
             }
@@ -573,24 +583,21 @@ pub fn gc(
 
     if (!dirExists(artifacts_root)) return result;
 
-    var artifacts_dir = std.fs.openDirAbsolute(artifacts_root, .{ .iterate = true }) catch |err| {
+    var artifacts_dir = path_mod.openExistingDir(artifacts_root) catch |err| {
         return mapFsError(err);
     };
-    defer artifacts_dir.close();
+    defer artifacts_dir.close(io);
 
     var artifact_iter = artifacts_dir.iterate();
-    while (artifact_iter.next() catch |err| return mapFsError(err)) |entry| {
+    while (artifact_iter.next(io) catch |err| return mapFsError(err)) |entry| {
         if (entry.kind != .directory) continue;
-
-        const artifact_dir = try std.fs.path.join(allocator, &.{ artifacts_root, entry.name });
-        defer allocator.free(artifact_dir);
 
         if (referenced_artifacts.contains(entry.name)) {
             result.retained_artifacts += 1;
             continue;
         }
 
-        std.fs.deleteTreeAbsolute(artifact_dir) catch |err| return mapFsError(err);
+        artifacts_dir.deleteTree(io, entry.name) catch |err| return mapFsError(err);
         result.removed_artifacts += 1;
     }
 
@@ -797,29 +804,29 @@ fn keyHexFilename(key_hex: []const u8) []const u8 {
 }
 
 fn appendRecipeVars(
-    writer: anytype,
+    writer: *std.Io.Writer,
     parsed_recipe: *const recipe.Recipe,
-) !void {
-    try writer.writeAll("vars\n");
+) CacheError!void {
+    writer.writeAll("vars\n") catch return error.OutOfMemory;
     for (parsed_recipe.vars.items) |kv| {
-        try writer.print("{s}={s}\n", .{ kv.key, kv.value });
+        writer.print("{s}={s}\n", .{ kv.key, kv.value }) catch return error.OutOfMemory;
     }
 }
 
 fn appendKvList(
-    writer: anytype,
+    writer: *std.Io.Writer,
     prefix: []const u8,
     kvs: []const recipe.KV,
-) !void {
+) CacheError!void {
     for (kvs) |kv| {
-        try writer.print("{s}.{s}={s}\n", .{ prefix, kv.key, kv.value });
+        writer.print("{s}.{s}={s}\n", .{ prefix, kv.key, kv.value }) catch return error.OutOfMemory;
     }
 }
 
 fn appendSourceInputs(
     allocator: std.mem.Allocator,
     ctx: *mere.Context,
-    writer: anytype,
+    writer: *std.Io.Writer,
     recipe_dir: []const u8,
     parsed_recipe: *const recipe.Recipe,
 ) CacheError!void {
@@ -833,9 +840,9 @@ fn appendSourceInputs(
         };
         defer allocator.free(expanded);
 
-        try writer.print("source[{d}].url={s}\n", .{ idx, expanded });
-        try writer.print("source[{d}].blake3={s}\n", .{ idx, src.blake3 orelse "" });
-        try writer.print("source[{d}].save_as={s}\n", .{ idx, src.save_as orelse "" });
+        writer.print("source[{d}].url={s}\n", .{ idx, expanded }) catch return error.OutOfMemory;
+        writer.print("source[{d}].blake3={s}\n", .{ idx, src.blake3 orelse "" }) catch return error.OutOfMemory;
+        writer.print("source[{d}].save_as={s}\n", .{ idx, src.save_as orelse "" }) catch return error.OutOfMemory;
 
         if (std.mem.indexOf(u8, expanded, "://") == null and recipe_dir.len > 0) {
             const local_path = try std.fs.path.join(allocator, &.{ recipe_dir, expanded });
@@ -844,27 +851,28 @@ fn appendSourceInputs(
                 return mapHashError(err);
             };
             defer allocator.free(file_hash);
-            try writer.print("source[{d}].local_hash={s}\n", .{ idx, file_hash });
+            writer.print("source[{d}].local_hash={s}\n", .{ idx, file_hash }) catch return error.OutOfMemory;
         }
     }
 }
 
 fn appendRecipeCompanionInputs(
     allocator: std.mem.Allocator,
-    writer: anytype,
+    writer: *std.Io.Writer,
     recipe_dir: []const u8,
 ) CacheError!void {
     if (recipe_dir.len == 0) {
-        try writer.writeAll("companions=none\n");
+        writer.writeAll("companions=none\n") catch return error.OutOfMemory;
         return;
     }
 
-    var dir = std.fs.openDirAbsolute(recipe_dir, .{ .iterate = true }) catch |err| {
+    const io = path_mod.currentIo();
+    var dir = path_mod.openExistingDir(recipe_dir) catch |err| {
         return mapFsError(err);
     };
-    defer dir.close();
+    defer dir.close(io);
 
-    var names: std.ArrayList([]const u8) = .{};
+    var names: std.ArrayList([]const u8) = .empty;
     defer {
         for (names.items) |name| allocator.free(name);
         names.deinit(allocator);
@@ -872,7 +880,7 @@ fn appendRecipeCompanionInputs(
 
     var iter = dir.iterate();
     while (true) {
-        const entry = iter.next() catch |err| {
+        const entry = iter.next(io) catch |err| {
             return mapFsError(err);
         } orelse break;
 
@@ -891,8 +899,8 @@ fn appendRecipeCompanionInputs(
         const abs_path = try std.fs.path.join(allocator, &.{ recipe_dir, name });
         defer allocator.free(abs_path);
 
-        if (std.fs.readLinkAbsolute(abs_path, &target_buf)) |target| {
-            try writer.print("companion.symlink.{s}={s}\n", .{ name, target });
+        if (std.Io.Dir.readLinkAbsolute(io, abs_path, &target_buf)) |target_len| {
+            writer.print("companion.symlink.{s}={s}\n", .{ name, target_buf[0..target_len] }) catch return error.OutOfMemory;
             continue;
         } else |_| {}
 
@@ -900,7 +908,7 @@ fn appendRecipeCompanionInputs(
             return mapHashError(err);
         };
         defer allocator.free(file_hash);
-        try writer.print("companion.file.{s}={s}\n", .{ name, file_hash });
+        writer.print("companion.file.{s}={s}\n", .{ name, file_hash }) catch return error.OutOfMemory;
     }
 }
 
@@ -917,18 +925,17 @@ fn computeActualSubpath(
 }
 
 fn ensurePath(path: []const u8) CacheError!void {
-    std.fs.cwd().makePath(path) catch |err| {
-        return mapFsError(err);
-    };
+    var dir = path_mod.makePathAndOpenDir(path) catch |err| return mapFsError(err);
+    dir.close(path_mod.currentIo());
 }
 
 fn dirExists(path: []const u8) bool {
-    std.fs.accessAbsolute(path, .{}) catch return false;
+    std.Io.Dir.accessAbsolute(path_mod.currentIo(), path, .{}) catch return false;
     return true;
 }
 
 fn fileExists(path: []const u8) bool {
-    std.fs.accessAbsolute(path, .{}) catch return false;
+    std.Io.Dir.accessAbsolute(path_mod.currentIo(), path, .{}) catch return false;
     return true;
 }
 
@@ -937,20 +944,21 @@ fn writeArtifactMetadata(
     kind: ArtifactKind,
     artifact_digest_hex: []const u8,
 ) CacheError!void {
-    var file = std.fs.createFileAbsolute(metadata_path, .{ .truncate = true }) catch |err| {
+    const io = path_mod.currentIo();
+    var file = std.Io.Dir.createFileAbsolute(io, metadata_path, .{ .truncate = true }) catch |err| {
         return mapFsError(err);
     };
-    defer file.close();
+    defer file.close(io);
 
     var buf: [384]u8 = undefined;
     const content = std.fmt.bufPrint(&buf, "kind \"{s}\"\nartifact_digest \"{s}\"\ncreated_at_unix {d}\n", .{
         kind.asString(),
         artifact_digest_hex,
-        std.time.timestamp(),
+        std.Io.Clock.real.now(io).toSeconds(),
     }) catch {
         return error.OutOfMemory;
     };
-    file.writeAll(content) catch |err| {
+    file.writeStreamingAll(io, content) catch |err| {
         return mapFsError(err);
     };
 }
@@ -960,23 +968,26 @@ fn writeSplitStageMetadata(
     metadata_path: []const u8,
     staged_packages: []const split_staging.StagedPackage,
 ) CacheError!void {
-    var file = std.fs.createFileAbsolute(metadata_path, .{ .truncate = true }) catch |err| {
+    const io = path_mod.currentIo();
+    var file = std.Io.Dir.createFileAbsolute(io, metadata_path, .{ .truncate = true }) catch |err| {
         return mapFsError(err);
     };
-    defer file.close();
+    defer file.close(io);
 
-    var buf: std.ArrayList(u8) = .{};
+    var buf: std.ArrayList(u8) = .empty;
     defer buf.deinit(allocator);
-    const writer = buf.writer(allocator);
+    var out_buf: std.Io.Writer.Allocating = .fromArrayList(allocator, &buf);
+    const out = &out_buf.writer;
 
     for (staged_packages) |staged| {
-        try writer.print("package {d}\n", .{staged.pkg_index});
+        out.print("package {d}\n", .{staged.pkg_index}) catch return error.OutOfMemory;
         for (staged.copied_files) |rel_path| {
-            try writer.print("file \"{s}\"\n", .{rel_path});
+            out.print("file \"{s}\"\n", .{rel_path}) catch return error.OutOfMemory;
         }
     }
 
-    file.writeAll(buf.items) catch |err| {
+    buf = out_buf.toArrayList();
+    file.writeStreamingAll(io, buf.items) catch |err| {
         return mapFsError(err);
     };
 }
@@ -989,25 +1000,28 @@ fn writePackageArchiveMetadata(
     archive_hash: []const u8,
     signature: []const u8,
 ) CacheError!void {
-    var file = std.fs.createFileAbsolute(metadata_path, .{ .truncate = true }) catch |err| {
+    const io = path_mod.currentIo();
+    var file = std.Io.Dir.createFileAbsolute(io, metadata_path, .{ .truncate = true }) catch |err| {
         return mapFsError(err);
     };
-    defer file.close();
+    defer file.close(io);
 
-    var buf: std.ArrayList(u8) = .{};
+    var buf: std.ArrayList(u8) = .empty;
     defer buf.deinit(allocator);
-    const writer = buf.writer(allocator);
+    var out_buf: std.Io.Writer.Allocating = .fromArrayList(allocator, &buf);
+    const out = &out_buf.writer;
     const signature_hex = std.fmt.allocPrint(allocator, "{x}", .{signature}) catch {
         return error.OutOfMemory;
     };
     defer allocator.free(signature_hex);
-    try writer.print("archive \"{s}\"\n", .{archive_basename});
-    try writer.print("content_hash \"{s}\"\n", .{content_hash});
-    try writer.print("archive_hash \"{s}\"\n", .{archive_hash});
-    try writer.print("signature_hex \"{s}\"\n", .{signature_hex});
-    try writer.print("created_at_unix {d}\n", .{std.time.timestamp()});
+    out.print("archive \"{s}\"\n", .{archive_basename}) catch return error.OutOfMemory;
+    out.print("content_hash \"{s}\"\n", .{content_hash}) catch return error.OutOfMemory;
+    out.print("archive_hash \"{s}\"\n", .{archive_hash}) catch return error.OutOfMemory;
+    out.print("signature_hex \"{s}\"\n", .{signature_hex}) catch return error.OutOfMemory;
+    out.print("created_at_unix {d}\n", .{std.Io.Clock.real.now(io).toSeconds()}) catch return error.OutOfMemory;
 
-    file.writeAll(buf.items) catch |err| {
+    buf = out_buf.toArrayList();
+    file.writeStreamingAll(io, buf.items) catch |err| {
         return mapFsError(err);
     };
 }
@@ -1020,22 +1034,25 @@ fn writeKeyRecord(
     artifact_digest_hex: []const u8,
     actual_subpath: ?[]const u8,
 ) CacheError!void {
-    var file = std.fs.createFileAbsolute(key_path, .{ .truncate = true }) catch |err| {
+    const io = path_mod.currentIo();
+    var file = std.Io.Dir.createFileAbsolute(io, key_path, .{ .truncate = true }) catch |err| {
         return mapFsError(err);
     };
-    defer file.close();
+    defer file.close(io);
 
-    var buf: std.ArrayList(u8) = .{};
+    var buf: std.ArrayList(u8) = .empty;
     defer buf.deinit(allocator);
-    const writer = buf.writer(allocator);
-    try writer.print("kind \"{s}\"\n", .{kind.asString()});
-    try writer.print("key \"{s}\"\n", .{key_hex});
-    try writer.print("artifact_digest \"{s}\"\n", .{artifact_digest_hex});
-    try writer.print("recorded_at_unix {d}\n", .{std.time.timestamp()});
+    var out_buf: std.Io.Writer.Allocating = .fromArrayList(allocator, &buf);
+    const out = &out_buf.writer;
+    out.print("kind \"{s}\"\n", .{kind.asString()}) catch return error.OutOfMemory;
+    out.print("key \"{s}\"\n", .{key_hex}) catch return error.OutOfMemory;
+    out.print("artifact_digest \"{s}\"\n", .{artifact_digest_hex}) catch return error.OutOfMemory;
+    out.print("recorded_at_unix {d}\n", .{std.Io.Clock.real.now(io).toSeconds()}) catch return error.OutOfMemory;
     if (actual_subpath) |subpath| {
-        try writer.print("actual_subpath \"{s}\"\n", .{subpath});
+        out.print("actual_subpath \"{s}\"\n", .{subpath}) catch return error.OutOfMemory;
     }
-    file.writeAll(buf.items) catch |err| {
+    buf = out_buf.toArrayList();
+    file.writeStreamingAll(io, buf.items) catch |err| {
         return mapFsError(err);
     };
 }
@@ -1045,9 +1062,11 @@ fn readKeyRecord(
     kind: ArtifactKind,
     key_path: []const u8,
 ) CacheError!CacheRecord {
-    const content = std.fs.cwd().readFileAlloc(allocator, key_path, 4096) catch |err| {
-        return mapFsError(err);
-    };
+    const io = path_mod.currentIo();
+    var file = path_mod.openExistingFile(key_path) catch |err| return mapFsError(err);
+    defer file.close(io);
+    var reader = file.reader(io, &.{});
+    const content = reader.interface.allocRemaining(allocator, .limited(4096)) catch |err| return mapFsError(err);
     defer allocator.free(content);
 
     var file_kind: ?[]const u8 = null;
@@ -1096,17 +1115,18 @@ fn readSplitStageMetadata(
     packages: []const recipe.BuildArtifact,
     staged_packages: *std.ArrayList(split_staging.StagedPackage),
 ) CacheError!void {
-    var file = std.fs.openFileAbsolute(metadata_path, .{}) catch |err| {
+    const io = path_mod.currentIo();
+    var file = std.Io.Dir.openFileAbsolute(io, metadata_path, .{}) catch |err| {
         ctx.setDiagnosticContextFmt(metadata_path, "failed to read split-stage metadata ({s})", .{@errorName(err)});
         return mapFsError(err);
     };
-    defer file.close();
+    defer file.close(io);
 
     var read_buffer: [1024 * 1024]u8 = undefined;
-    var reader = file.reader(&read_buffer);
+    var reader = file.reader(io, &read_buffer);
 
     var current_pkg_index: ?usize = null;
-    var current_copied: std.ArrayList([]const u8) = .{};
+    var current_copied: std.ArrayList([]const u8) = .empty;
     defer {
         for (current_copied.items) |item| allocator.free(item);
         current_copied.deinit(allocator);
@@ -1118,7 +1138,7 @@ fn readSplitStageMetadata(
             return mapFsError(err);
         };
         if (line == null) break;
-        const trimmed = std.mem.trimRight(u8, line.?, "\r");
+        const trimmed = std.mem.trimEnd(u8, line.?, "\r");
         if (trimmed.len == 0) continue;
         if (std.mem.startsWith(u8, trimmed, "package ")) {
             if (current_pkg_index) |pkg_index| {
@@ -1165,9 +1185,11 @@ fn readPackageArchiveMetadata(
     allocator: std.mem.Allocator,
     metadata_path: []const u8,
 ) CacheError!PackageArchiveMetadata {
-    const content = std.fs.cwd().readFileAlloc(allocator, metadata_path, 16 * 1024) catch |err| {
-        return mapFsError(err);
-    };
+    const io = path_mod.currentIo();
+    var file = path_mod.openExistingFile(metadata_path) catch |err| return mapFsError(err);
+    defer file.close(io);
+    var reader = file.reader(io, &.{});
+    const content = reader.interface.allocRemaining(allocator, .limited(16 * 1024)) catch |err| return mapFsError(err);
     defer allocator.free(content);
 
     var archive_basename: ?[]const u8 = null;
@@ -1282,12 +1304,13 @@ fn computeSigningKeyHash(allocator: std.mem.Allocator, ctx: *mere.Context) Cache
 
 fn copyFileReplace(src_path: []const u8, dest_path: []const u8) CacheError!void {
     const dest_parent = std.fs.path.dirname(dest_path) orelse return error.InvalidInput;
+    const io = path_mod.currentIo();
     try ensurePath(dest_parent);
-    std.fs.deleteFileAbsolute(dest_path) catch |err| switch (err) {
+    std.Io.Dir.deleteFileAbsolute(io, dest_path) catch |err| switch (err) {
         error.FileNotFound => {},
         else => return mapFsError(err),
     };
-    std.fs.copyFileAbsolute(src_path, dest_path, .{}) catch |err| {
+    std.Io.Dir.copyFileAbsolute(src_path, dest_path, io, .{}) catch |err| {
         return mapFsError(err);
     };
     try copyFileTimes(src_path, dest_path);
@@ -1306,33 +1329,53 @@ fn replaceTreeFromCache(
     dest_dir: []const u8,
 ) CacheError!void {
     const parent_dir = std.fs.path.dirname(dest_dir) orelse return error.InvalidInput;
+    const io = path_mod.currentIo();
     try ensurePath(parent_dir);
 
     var rand_bytes: [8]u8 = undefined;
-    std.crypto.random.bytes(&rand_bytes);
+    io.random(&rand_bytes);
     const rand_hex = std.fmt.bytesToHex(rand_bytes[0..], .lower);
     const tmp_dir = try std.fmt.allocPrint(allocator, "{s}.tmp-{s}", .{ dest_dir, rand_hex });
     defer allocator.free(tmp_dir);
-    errdefer std.fs.deleteTreeAbsolute(tmp_dir) catch {};
+    errdefer {
+        if (std.fs.path.dirname(tmp_dir)) |tmp_parent| {
+            const tmp_base = std.fs.path.basename(tmp_dir);
+            if (path_mod.openExistingDir(tmp_parent)) |parent| {
+                var owned = parent;
+                defer owned.close(io);
+                owned.deleteTree(io, tmp_base) catch {};
+            } else |_| {}
+        }
+    }
 
-    std.fs.deleteTreeAbsolute(tmp_dir) catch |err| switch (err) {
-        error.FileNotFound => {},
-        else => return mapFsError(err),
-    };
+    if (dirExists(tmp_dir)) {
+        const tmp_parent = std.fs.path.dirname(tmp_dir) orelse return error.InvalidInput;
+        const tmp_base = std.fs.path.basename(tmp_dir);
+        var parent = path_mod.openExistingDir(tmp_parent) catch |err| switch (err) {
+            error.FileNotFound => return error.InvalidInput,
+            else => return mapFsError(err),
+        };
+        defer parent.close(io);
+        parent.deleteTree(io, tmp_base) catch |err| return mapFsError(err);
+    }
     try ensurePath(tmp_dir);
     try copyTreeContents(allocator, src_dir, tmp_dir);
 
     if (!dirExists(dest_dir)) {
-        std.posix.rename(tmp_dir, dest_dir) catch |err| {
+        std.Io.Dir.renameAbsolute(tmp_dir, dest_dir, io) catch |err| {
             return mapFsError(err);
         };
         return;
     }
 
     try exchangePaths(allocator, dest_dir, tmp_dir);
-    std.fs.deleteTreeAbsolute(tmp_dir) catch |err| {
-        return mapFsError(err);
-    };
+    {
+        const tmp_parent = std.fs.path.dirname(tmp_dir) orelse return error.InvalidInput;
+        const tmp_base = std.fs.path.basename(tmp_dir);
+        var parent = path_mod.openExistingDir(tmp_parent) catch |err| return mapFsError(err);
+        defer parent.close(io);
+        parent.deleteTree(io, tmp_base) catch |err| return mapFsError(err);
+    }
 }
 
 fn copyTreeAtomic(
@@ -1341,22 +1384,38 @@ fn copyTreeAtomic(
     dest_dir: []const u8,
 ) CacheError!void {
     const parent_dir = std.fs.path.dirname(dest_dir) orelse return error.InvalidInput;
+    const io = path_mod.currentIo();
     try ensurePath(parent_dir);
 
     var rand_bytes: [8]u8 = undefined;
-    std.crypto.random.bytes(&rand_bytes);
+    io.random(&rand_bytes);
     const rand_hex = std.fmt.bytesToHex(rand_bytes[0..], .lower);
     const tmp_dir = try std.fmt.allocPrint(allocator, "{s}.tmp-{s}", .{ dest_dir, rand_hex });
     defer allocator.free(tmp_dir);
-    errdefer std.fs.deleteTreeAbsolute(tmp_dir) catch {};
+    errdefer {
+        if (std.fs.path.dirname(tmp_dir)) |tmp_parent| {
+            const tmp_base = std.fs.path.basename(tmp_dir);
+            if (path_mod.openExistingDir(tmp_parent)) |parent| {
+                var owned = parent;
+                defer owned.close(io);
+                owned.deleteTree(io, tmp_base) catch {};
+            } else |_| {}
+        }
+    }
 
-    std.fs.deleteTreeAbsolute(tmp_dir) catch |err| switch (err) {
-        error.FileNotFound => {},
-        else => return mapFsError(err),
-    };
+    if (dirExists(tmp_dir)) {
+        const tmp_parent = std.fs.path.dirname(tmp_dir) orelse return error.InvalidInput;
+        const tmp_base = std.fs.path.basename(tmp_dir);
+        var parent = path_mod.openExistingDir(tmp_parent) catch |err| switch (err) {
+            error.FileNotFound => return error.InvalidInput,
+            else => return mapFsError(err),
+        };
+        defer parent.close(io);
+        parent.deleteTree(io, tmp_base) catch |err| return mapFsError(err);
+    }
     try ensurePath(tmp_dir);
     try copyTreeContents(allocator, src_dir, tmp_dir);
-    std.posix.rename(tmp_dir, dest_dir) catch |err| {
+    std.Io.Dir.renameAbsolute(tmp_dir, dest_dir, io) catch |err| {
         return mapFsError(err);
     };
 }
@@ -1371,8 +1430,7 @@ fn copyTreeContents(
     const src_contents = try std.fs.path.join(allocator, &.{ src_dir, "." });
     defer allocator.free(src_contents);
 
-    const result = std.process.Child.run(.{
-        .allocator = allocator,
+    const result = std.process.run(allocator, path_mod.currentIo(), .{
         .argv = &.{ "/bin/cp", "-a", src_contents, dest_dir },
     }) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
@@ -1384,7 +1442,7 @@ fn copyTreeContents(
     }
 
     switch (result.term) {
-        .Exited => |code| {
+        .exited => |code| {
             if (code != 0) return error.FileSystem;
         },
         else => return error.FileSystem,
@@ -1392,19 +1450,23 @@ fn copyTreeContents(
 }
 
 fn copyFileTimes(src_path: []const u8, dest_path: []const u8) CacheError!void {
-    var src_file = std.fs.openFileAbsolute(src_path, .{}) catch |err| {
+    const io = path_mod.currentIo();
+    var src_file = std.Io.Dir.openFileAbsolute(io, src_path, .{}) catch |err| {
         return mapFsError(err);
     };
-    defer src_file.close();
-    const stat = src_file.stat() catch |err| {
+    defer src_file.close(io);
+    const stat = src_file.stat(io) catch |err| {
         return mapFsError(err);
     };
 
-    var dest_file = std.fs.openFileAbsolute(dest_path, .{}) catch |err| {
+    var dest_file = std.Io.Dir.openFileAbsolute(io, dest_path, .{ .mode = .read_write }) catch |err| {
         return mapFsError(err);
     };
-    defer dest_file.close();
-    dest_file.updateTimes(stat.atime, stat.mtime) catch |err| {
+    defer dest_file.close(io);
+    dest_file.setTimestamps(io, .{
+        .access_timestamp = .init(stat.atime),
+        .modify_timestamp = .init(stat.mtime),
+    }) catch |err| {
         return mapFsError(err);
     };
 }
@@ -1415,13 +1477,12 @@ fn exchangePaths(allocator: std.mem.Allocator, left_path: []const u8, right_path
     const right_z = allocator.dupeZ(u8, right_path) catch return error.OutOfMemory;
     defer allocator.free(right_z);
 
-    const rename_exchange: u32 = 1 << 1;
     switch (std.posix.errno(std.os.linux.renameat2(
         std.os.linux.AT.FDCWD,
         left_z,
         std.os.linux.AT.FDCWD,
         right_z,
-        rename_exchange,
+        .{ .EXCHANGE = true },
     ))) {
         .SUCCESS => {},
         .ACCES => return error.PermissionDenied,
@@ -1478,16 +1539,20 @@ test "build_cache stores and restores a source tree" {
         test_env.cleanup();
         std.testing.allocator.destroy(test_env);
     }
+    const io = path_mod.currentIo();
 
     const src_dir = try std.fs.path.join(test_env.ctx.allocator, &.{ test_env.path, "src-tree" });
     defer test_env.ctx.allocator.free(src_dir);
-    try std.fs.cwd().makePath(src_dir);
+    {
+        var dir = try path_mod.makePathAndOpenDir(src_dir);
+        dir.close(io);
+    }
 
     const src_file = try std.fs.path.join(test_env.ctx.allocator, &.{ src_dir, "hello.txt" });
     defer test_env.ctx.allocator.free(src_file);
-    var file = try std.fs.createFileAbsolute(src_file, .{});
-    defer file.close();
-    try file.writeAll("hello");
+    var file = try std.Io.Dir.createFileAbsolute(io, src_file, .{});
+    defer file.close(io);
+    try file.writeStreamingAll(io, "hello");
 
     var record = try storeDirectoryForKey(test_env.ctx.allocator, &test_env.ctx, .source_fetch, "fetch-key", src_dir, null);
     defer record.deinit();
@@ -1500,7 +1565,7 @@ test "build_cache stores and restores a source tree" {
 
     const restored_file = try std.fs.path.join(test_env.ctx.allocator, &.{ restore_dir, "hello.txt" });
     defer test_env.ctx.allocator.free(restored_file);
-    const content = try std.fs.cwd().readFileAlloc(test_env.ctx.allocator, restored_file, 64);
+    const content = try std.Io.Dir.readFileAlloc(std.Io.Dir.cwd(), io, restored_file, test_env.ctx.allocator, .limited(64));
     defer test_env.ctx.allocator.free(content);
     try std.testing.expectEqualStrings("hello", content);
 }
@@ -1511,18 +1576,22 @@ test "build_cache restores unpacked actual source subpath" {
         test_env.cleanup();
         std.testing.allocator.destroy(test_env);
     }
+    const io = path_mod.currentIo();
 
     const src_dir = try std.fs.path.join(test_env.ctx.allocator, &.{ test_env.path, "unpacked-tree" });
     defer test_env.ctx.allocator.free(src_dir);
     const nested_dir = try std.fs.path.join(test_env.ctx.allocator, &.{ src_dir, "pkg-1.0" });
     defer test_env.ctx.allocator.free(nested_dir);
-    try std.fs.cwd().makePath(nested_dir);
+    {
+        var dir = try path_mod.makePathAndOpenDir(nested_dir);
+        dir.close(io);
+    }
 
     const src_file = try std.fs.path.join(test_env.ctx.allocator, &.{ nested_dir, "hello.txt" });
     defer test_env.ctx.allocator.free(src_file);
-    var file = try std.fs.createFileAbsolute(src_file, .{});
-    defer file.close();
-    try file.writeAll("nested");
+    var file = try std.Io.Dir.createFileAbsolute(io, src_file, .{});
+    defer file.close(io);
+    try file.writeStreamingAll(io, "nested");
 
     var record = try storeDirectoryForKey(test_env.ctx.allocator, &test_env.ctx, .source_unpack, "unpack-key", src_dir, nested_dir);
     defer record.deinit();
@@ -1545,40 +1614,47 @@ test "build_cache restore replaces existing destination tree" {
         test_env.cleanup();
         std.testing.allocator.destroy(test_env);
     }
+    const io = path_mod.currentIo();
 
     const src_dir = try std.fs.path.join(test_env.ctx.allocator, &.{ test_env.path, "replace-src-tree" });
     defer test_env.ctx.allocator.free(src_dir);
-    try std.fs.cwd().makePath(src_dir);
+    {
+        var dir = try path_mod.makePathAndOpenDir(src_dir);
+        dir.close(io);
+    }
 
     const src_file = try std.fs.path.join(test_env.ctx.allocator, &.{ src_dir, "fresh.txt" });
     defer test_env.ctx.allocator.free(src_file);
-    var src_handle = try std.fs.createFileAbsolute(src_file, .{});
-    defer src_handle.close();
-    try src_handle.writeAll("fresh");
+    var src_handle = try std.Io.Dir.createFileAbsolute(io, src_file, .{});
+    defer src_handle.close(io);
+    try src_handle.writeStreamingAll(io, "fresh");
 
     var record = try storeDirectoryForKey(test_env.ctx.allocator, &test_env.ctx, .source_fetch, "replace-key", src_dir, null);
     defer record.deinit();
 
     const restore_dir = try std.fs.path.join(test_env.ctx.allocator, &.{ test_env.path, "replace-dest-tree" });
     defer test_env.ctx.allocator.free(restore_dir);
-    try std.fs.cwd().makePath(restore_dir);
+    {
+        var dir = try path_mod.makePathAndOpenDir(restore_dir);
+        dir.close(io);
+    }
 
     const stale_file = try std.fs.path.join(test_env.ctx.allocator, &.{ restore_dir, "stale.txt" });
     defer test_env.ctx.allocator.free(stale_file);
-    var stale_handle = try std.fs.createFileAbsolute(stale_file, .{});
-    defer stale_handle.close();
-    try stale_handle.writeAll("stale");
+    var stale_handle = try std.Io.Dir.createFileAbsolute(io, stale_file, .{});
+    defer stale_handle.close(io);
+    try stale_handle.writeStreamingAll(io, "stale");
 
     var restored = (try restoreDirectoryForKey(test_env.ctx.allocator, &test_env.ctx, .source_fetch, "replace-key", restore_dir)).?;
     defer restored.deinit();
 
     const restored_file = try std.fs.path.join(test_env.ctx.allocator, &.{ restore_dir, "fresh.txt" });
     defer test_env.ctx.allocator.free(restored_file);
-    const content = try std.fs.cwd().readFileAlloc(test_env.ctx.allocator, restored_file, 64);
+    const content = try std.Io.Dir.readFileAlloc(std.Io.Dir.cwd(), io, restored_file, test_env.ctx.allocator, .limited(64));
     defer test_env.ctx.allocator.free(content);
     try std.testing.expectEqualStrings("fresh", content);
 
-    try std.testing.expectError(error.FileNotFound, std.fs.accessAbsolute(stale_file, .{}));
+    try std.testing.expectError(error.FileNotFound, std.Io.Dir.accessAbsolute(io, stale_file, .{}));
 }
 
 test "build_cache restores split-stage metadata larger than 64 KiB" {
@@ -1601,18 +1677,22 @@ test "build_cache restores split-stage metadata larger than 64 KiB" {
 
     var parsed = try recipe.parse(&test_env.ctx, kdl_text);
     defer parsed.deinit();
+    const io = path_mod.currentIo();
 
     const workspace_root = try std.fs.path.join(test_env.ctx.allocator, &.{ test_env.path, "workspace-large-split" });
     defer test_env.ctx.allocator.free(workspace_root);
     const staging_dir = try std.fs.path.join(test_env.ctx.allocator, &.{ workspace_root, "pkg", "large-split" });
     defer test_env.ctx.allocator.free(staging_dir);
-    try std.fs.cwd().makePath(staging_dir);
+    {
+        var dir = try path_mod.makePathAndOpenDir(staging_dir);
+        dir.close(io);
+    }
 
     const staged_file = try std.fs.path.join(test_env.ctx.allocator, &.{ staging_dir, "payload.txt" });
     defer test_env.ctx.allocator.free(staged_file);
-    var file = try std.fs.createFileAbsolute(staged_file, .{});
-    defer file.close();
-    try file.writeAll("payload");
+    var file = try std.Io.Dir.createFileAbsolute(io, staged_file, .{});
+    defer file.close(io);
+    try file.writeStreamingAll(io, "payload");
 
     const copied_count: usize = 6000;
     var copied_files = try test_env.ctx.allocator.alloc([]const u8, copied_count);
@@ -1624,7 +1704,7 @@ test "build_cache restores split-stage metadata larger than 64 KiB" {
         copied_files[i] = try std.fmt.allocPrint(test_env.ctx.allocator, "usr/share/path-{d}-with-extra-padding-to-grow-metadata.txt", .{i});
     }
 
-    var staged_packages = std.ArrayList(split_staging.StagedPackage){};
+    var staged_packages: std.ArrayList(split_staging.StagedPackage) = .empty;
     defer {
         split_staging.clearStagedPackages(test_env.ctx.allocator, &staged_packages);
         staged_packages.deinit(test_env.ctx.allocator);
@@ -1646,7 +1726,7 @@ test "build_cache restores split-stage metadata larger than 64 KiB" {
 
     split_staging.clearStagedPackages(test_env.ctx.allocator, &staged_packages);
 
-    var restored_packages = std.ArrayList(split_staging.StagedPackage){};
+    var restored_packages: std.ArrayList(split_staging.StagedPackage) = .empty;
     defer {
         split_staging.clearStagedPackages(test_env.ctx.allocator, &restored_packages);
         restored_packages.deinit(test_env.ctx.allocator);
@@ -1681,16 +1761,20 @@ test "build_cache gc removes stale key records for missing artifacts" {
         test_env.cleanup();
         std.testing.allocator.destroy(test_env);
     }
+    const io = path_mod.currentIo();
 
     const src_dir = try std.fs.path.join(test_env.ctx.allocator, &.{ test_env.path, "gc-src" });
     defer test_env.ctx.allocator.free(src_dir);
-    try std.fs.cwd().makePath(src_dir);
+    {
+        var dir = try path_mod.makePathAndOpenDir(src_dir);
+        dir.close(io);
+    }
 
     const src_file = try std.fs.path.join(test_env.ctx.allocator, &.{ src_dir, "hello.txt" });
     defer test_env.ctx.allocator.free(src_file);
-    var file = try std.fs.createFileAbsolute(src_file, .{});
-    defer file.close();
-    try file.writeAll("hello");
+    var file = try std.Io.Dir.createFileAbsolute(io, src_file, .{});
+    defer file.close(io);
+    try file.writeStreamingAll(io, "hello");
 
     var record = try storeDirectoryForKey(test_env.ctx.allocator, &test_env.ctx, .source_fetch, "gc-stale-key", src_dir, null);
     defer record.deinit();
@@ -1699,15 +1783,21 @@ test "build_cache gc removes stale key records for missing artifacts" {
     defer test_env.ctx.allocator.free(cache_root);
     const artifact_dir = try std.fs.path.join(test_env.ctx.allocator, &.{ cache_root, "artifacts", record.artifact_digest_hex });
     defer test_env.ctx.allocator.free(artifact_dir);
-    try std.fs.deleteTreeAbsolute(artifact_dir);
+    {
+        const artifact_parent = std.fs.path.dirname(artifact_dir) orelse unreachable;
+        const artifact_base = std.fs.path.basename(artifact_dir);
+        var dir = try path_mod.openExistingDir(artifact_parent);
+        defer dir.close(io);
+        try dir.deleteTree(io, artifact_base);
+    }
 
     const key_path = try std.fs.path.join(test_env.ctx.allocator, &.{ cache_root, "keys", ArtifactKind.source_fetch.asString(), keyHexFilename("gc-stale-key") });
     defer test_env.ctx.allocator.free(key_path);
-    try std.fs.accessAbsolute(key_path, .{});
+    try std.Io.Dir.accessAbsolute(io, key_path, .{});
 
     const result = try gc(test_env.ctx.allocator, &test_env.ctx);
     try std.testing.expectEqual(@as(usize, 1), result.removed_key_records);
-    std.fs.accessAbsolute(key_path, .{}) catch |err| {
+    std.Io.Dir.accessAbsolute(io, key_path, .{}) catch |err| {
         try std.testing.expectEqual(error.FileNotFound, err);
         return;
     };
@@ -1720,16 +1810,20 @@ test "build_cache gc removes unreferenced artifacts" {
         test_env.cleanup();
         std.testing.allocator.destroy(test_env);
     }
+    const io = path_mod.currentIo();
 
     const src_dir = try std.fs.path.join(test_env.ctx.allocator, &.{ test_env.path, "gc-orphan-src" });
     defer test_env.ctx.allocator.free(src_dir);
-    try std.fs.cwd().makePath(src_dir);
+    {
+        var dir = try path_mod.makePathAndOpenDir(src_dir);
+        dir.close(io);
+    }
 
     const src_file = try std.fs.path.join(test_env.ctx.allocator, &.{ src_dir, "hello.txt" });
     defer test_env.ctx.allocator.free(src_file);
-    var file = try std.fs.createFileAbsolute(src_file, .{});
-    defer file.close();
-    try file.writeAll("hello");
+    var file = try std.Io.Dir.createFileAbsolute(io, src_file, .{});
+    defer file.close(io);
+    try file.writeStreamingAll(io, "hello");
 
     var record = try storeDirectoryForKey(test_env.ctx.allocator, &test_env.ctx, .source_fetch, "gc-orphan-key", src_dir, null);
     defer record.deinit();
@@ -1738,15 +1832,15 @@ test "build_cache gc removes unreferenced artifacts" {
     defer test_env.ctx.allocator.free(cache_root);
     const key_path = try std.fs.path.join(test_env.ctx.allocator, &.{ cache_root, "keys", ArtifactKind.source_fetch.asString(), keyHexFilename("gc-orphan-key") });
     defer test_env.ctx.allocator.free(key_path);
-    try std.fs.deleteFileAbsolute(key_path);
+    try std.Io.Dir.deleteFileAbsolute(io, key_path);
 
     const artifact_dir = try std.fs.path.join(test_env.ctx.allocator, &.{ cache_root, "artifacts", record.artifact_digest_hex });
     defer test_env.ctx.allocator.free(artifact_dir);
-    try std.fs.accessAbsolute(artifact_dir, .{});
+    try std.Io.Dir.accessAbsolute(io, artifact_dir, .{});
 
     const result = try gc(test_env.ctx.allocator, &test_env.ctx);
     try std.testing.expectEqual(@as(usize, 1), result.removed_artifacts);
-    std.fs.accessAbsolute(artifact_dir, .{}) catch |err| {
+    std.Io.Dir.accessAbsolute(io, artifact_dir, .{}) catch |err| {
         try std.testing.expectEqual(error.FileNotFound, err);
         return;
     };
@@ -1759,28 +1853,35 @@ test "build_cache clear removes all cache entries" {
         test_env.cleanup();
         std.testing.allocator.destroy(test_env);
     }
+    const io = path_mod.currentIo();
 
     const cache_root = try buildCacheRoot(test_env.ctx.allocator, &test_env.ctx);
     defer test_env.ctx.allocator.free(cache_root);
-    try std.fs.cwd().makePath(cache_root);
+    {
+        var dir = try path_mod.makePathAndOpenDir(cache_root);
+        dir.close(io);
+    }
 
     const keys_dir = try std.fs.path.join(test_env.ctx.allocator, &.{ cache_root, "keys" });
     defer test_env.ctx.allocator.free(keys_dir);
-    try std.fs.makeDirAbsolute(keys_dir);
+    {
+        var dir = try path_mod.makePathAndOpenDir(keys_dir);
+        dir.close(io);
+    }
 
     const stamp_path = try std.fs.path.join(test_env.ctx.allocator, &.{ cache_root, "stamp.txt" });
     defer test_env.ctx.allocator.free(stamp_path);
     {
-        var file = try std.fs.createFileAbsolute(stamp_path, .{});
-        defer file.close();
-        try file.writeAll("ok");
+        var file = try std.Io.Dir.createFileAbsolute(io, stamp_path, .{});
+        defer file.close(io);
+        try file.writeStreamingAll(io, "ok");
     }
 
     const removed = try clear(test_env.ctx.allocator, &test_env.ctx);
     try std.testing.expectEqual(@as(usize, 2), removed);
 
-    var dir = try std.fs.openDirAbsolute(cache_root, .{ .iterate = true });
-    defer dir.close();
+    var dir = try path_mod.openExistingDir(cache_root);
+    defer dir.close(io);
     var iter = dir.iterate();
-    try std.testing.expect((try iter.next()) == null);
+    try std.testing.expect((try iter.next(io)) == null);
 }

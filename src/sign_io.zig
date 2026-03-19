@@ -37,15 +37,16 @@ fn mapReadOrWriteError(err: anyerror) SignIOError {
 }
 
 fn readFixedSizeFile(comptime N: usize, file_path: []const u8) SignIOError![N]u8 {
+    const io = path.currentIo();
     const file = path.openExistingFile(file_path) catch |err| {
         return mapOpenOrCreateError(err);
     };
-    defer file.close();
+    defer file.close(io);
     var data: [N]u8 = undefined;
-    const n = file.readAll(&data) catch |err| return mapReadOrWriteError(err);
+    const n = file.readPositionalAll(io, &data, 0) catch |err| return mapReadOrWriteError(err);
     if (n != N) return SignIOError.InvalidSize;
     var extra: [1]u8 = undefined;
-    const extra_n = file.readAll(&extra) catch |err| return mapReadOrWriteError(err);
+    const extra_n = file.readPositionalAll(io, &extra, N) catch |err| return mapReadOrWriteError(err);
     if (extra_n != 0) return SignIOError.InvalidSize;
     return data;
 }
@@ -55,13 +56,14 @@ fn readKeyFile(
     comptime N: usize,
     file_path: []const u8,
 ) SignIOError![N]u8 {
+    const io = path.currentIo();
     const file = path.openExistingFile(file_path) catch |err| {
         return mapOpenOrCreateError(err);
     };
-    defer file.close();
+    defer file.close(io);
 
     var header: [key_header_size]u8 = undefined;
-    const header_n = file.readAll(&header) catch |err| return mapReadOrWriteError(err);
+    const header_n = file.readPositionalAll(io, &header, 0) catch |err| return mapReadOrWriteError(err);
     if (header_n != header.len) return SignIOError.InvalidSize;
     if (!std.mem.eql(u8, header[0..key_magic.len], key_magic[0..])) return SignIOError.InvalidSize;
     if (header[8] != key_version) return SignIOError.InvalidSize;
@@ -72,11 +74,11 @@ fn readKeyFile(
     if (payload_len != N) return SignIOError.InvalidSize;
 
     var data: [N]u8 = undefined;
-    const n = file.readAll(&data) catch |err| return mapReadOrWriteError(err);
+    const n = file.readPositionalAll(io, &data, key_header_size) catch |err| return mapReadOrWriteError(err);
     if (n != N) return SignIOError.InvalidSize;
 
     var extra: [1]u8 = undefined;
-    const extra_n = file.readAll(&extra) catch |err| return mapReadOrWriteError(err);
+    const extra_n = file.readPositionalAll(io, &extra, key_header_size + N) catch |err| return mapReadOrWriteError(err);
     if (extra_n != 0) return SignIOError.InvalidSize;
     return data;
 }
@@ -85,8 +87,9 @@ fn writeKeyFile(
     comptime kind: KeyKind,
     file_path: []const u8,
     data: []const u8,
-    create_flags: std.fs.File.CreateFlags,
+    create_flags: std.Io.File.CreateFlags,
 ) SignIOError!void {
+    const io = path.currentIo();
     var header: [key_header_size]u8 = undefined;
     @memcpy(header[0..key_magic.len], key_magic[0..]);
     header[8] = key_version;
@@ -96,13 +99,13 @@ fn writeKeyFile(
     std.mem.writeInt(u32, header[12..16], @intCast(data.len), .little);
 
     const out = if (std.fs.path.isAbsolute(file_path))
-        std.fs.createFileAbsolute(file_path, create_flags) catch |err| return mapOpenOrCreateError(err)
+        std.Io.Dir.createFileAbsolute(io, file_path, create_flags) catch |err| return mapOpenOrCreateError(err)
     else
-        std.fs.cwd().createFile(file_path, create_flags) catch |err| return mapOpenOrCreateError(err);
-    defer out.close();
+        std.Io.Dir.cwd().createFile(io, file_path, create_flags) catch |err| return mapOpenOrCreateError(err);
+    defer out.close(io);
 
-    out.writeAll(&header) catch |err| return mapReadOrWriteError(err);
-    out.writeAll(data) catch |err| return mapReadOrWriteError(err);
+    out.writeStreamingAll(io, &header) catch |err| return mapReadOrWriteError(err);
+    out.writeStreamingAll(io, data) catch |err| return mapReadOrWriteError(err);
 }
 
 pub fn readPublicKeyFile(file_path: []const u8) SignIOError![sign_crypto.c.crypto_sign_PUBLICKEYBYTES]u8 {
@@ -118,19 +121,20 @@ pub fn readSignatureFile(file_path: []const u8) SignIOError![sign_crypto.c.crypt
 }
 
 pub fn readRawFile(file_path: []const u8) SignIOError![]u8 {
+    const io = path.currentIo();
     const file = path.openExistingFile(file_path) catch |err| {
         return mapOpenOrCreateError(err);
     };
-    defer file.close();
+    defer file.close(io);
 
-    const stat = file.stat() catch |err| return mapReadOrWriteError(err);
+    const stat = file.stat(io) catch |err| return mapReadOrWriteError(err);
     const size = stat.size;
     if (size > 1024 * 1024) return SignIOError.InvalidSize;
 
     const buffer = std.heap.page_allocator.alloc(u8, size) catch return SignIOError.OutOfMemory;
     errdefer std.heap.page_allocator.free(buffer);
 
-    const n = file.readAll(buffer) catch |err| return mapReadOrWriteError(err);
+    const n = file.readPositionalAll(io, buffer, 0) catch |err| return mapReadOrWriteError(err);
     if (n != size) return SignIOError.FileSystem;
 
     return buffer;
@@ -138,13 +142,14 @@ pub fn readRawFile(file_path: []const u8) SignIOError![]u8 {
 
 pub fn writeSignatureFileRaw(file_path: []const u8, data: []const u8) SignIOError!void {
     if (data.len != sign_crypto.c.crypto_sign_BYTES) return SignIOError.InvalidSize;
+    const io = path.currentIo();
     path.ensureParent(file_path) catch |err| return mapOpenOrCreateError(err);
     const out = if (std.fs.path.isAbsolute(file_path))
-        std.fs.createFileAbsolute(file_path, .{ .truncate = true }) catch |err| return mapOpenOrCreateError(err)
+        std.Io.Dir.createFileAbsolute(io, file_path, .{ .truncate = true }) catch |err| return mapOpenOrCreateError(err)
     else
-        std.fs.cwd().createFile(file_path, .{ .truncate = true }) catch |err| return mapOpenOrCreateError(err);
-    defer out.close();
-    out.writeAll(data) catch |err| return mapReadOrWriteError(err);
+        std.Io.Dir.cwd().createFile(io, file_path, .{ .truncate = true }) catch |err| return mapOpenOrCreateError(err);
+    defer out.close(io);
+    out.writeStreamingAll(io, data) catch |err| return mapReadOrWriteError(err);
     return;
 }
 
@@ -168,19 +173,21 @@ pub fn writeSecretKeyFile(file_path: []const u8, data: []const u8) SignIOError!v
     const tmp_path = std.fs.path.join(std.heap.page_allocator, &.{ dirname, tmp_name }) catch return SignIOError.OutOfMemory;
     defer std.heap.page_allocator.free(tmp_path);
 
-    writeKeyFile(.secret, tmp_path, data, .{ .exclusive = true, .mode = 0o600 }) catch |err| return err;
+    writeKeyFile(.secret, tmp_path, data, .{ .exclusive = true, .permissions = .fromMode(0o600) }) catch |err| return err;
     errdefer {
+        const io = path.currentIo();
         if (std.fs.path.isAbsolute(tmp_path)) {
-            std.fs.deleteFileAbsolute(tmp_path) catch {};
+            std.Io.Dir.deleteFileAbsolute(io, tmp_path) catch {};
         } else {
-            std.fs.cwd().deleteFile(tmp_path) catch {};
+            std.Io.Dir.cwd().deleteFile(io, tmp_path) catch {};
         }
     }
 
+    const io = path.currentIo();
     if (std.fs.path.isAbsolute(file_path)) {
-        std.fs.renameAbsolute(tmp_path, file_path) catch |err| return mapOpenOrCreateError(err);
+        std.Io.Dir.renameAbsolute(tmp_path, file_path, io) catch |err| return mapOpenOrCreateError(err);
     } else {
-        std.fs.cwd().rename(tmp_path, file_path) catch |err| return mapOpenOrCreateError(err);
+        std.Io.Dir.cwd().rename(tmp_path, std.Io.Dir.cwd(), file_path, io) catch |err| return mapOpenOrCreateError(err);
     }
     return;
 }
@@ -192,7 +199,8 @@ test "sign_io: writeSignatureFileRaw and readSignatureFile roundtrip" {
     defer tmp.cleanup();
 
     var buf: [std.fs.max_path_bytes]u8 = undefined;
-    const dir = try tmp.dir.realpath(".", &buf);
+    const dir_len = try tmp.dir.realPath(path.currentIo(), &buf);
+    const dir = buf[0..dir_len];
 
     const sig_path = try std.fs.path.join(testing.allocator, &.{ dir, "test.sig" });
     defer testing.allocator.free(sig_path);
@@ -225,7 +233,8 @@ test "sign_io: writePublicKeyFile and readPublicKeyFile roundtrip" {
     defer tmp.cleanup();
 
     var buf: [std.fs.max_path_bytes]u8 = undefined;
-    const dir = try tmp.dir.realpath(".", &buf);
+    const dir_len = try tmp.dir.realPath(path.currentIo(), &buf);
+    const dir = buf[0..dir_len];
 
     const pub_path = try std.fs.path.join(testing.allocator, &.{ dir, "test.pub" });
     defer testing.allocator.free(pub_path);
@@ -253,15 +262,16 @@ test "sign_io: readSecretKeyFile rejects invalid sizes" {
     defer tmp.cleanup();
 
     var buf: [std.fs.max_path_bytes]u8 = undefined;
-    const dir = try tmp.dir.realpath(".", &buf);
+    const dir_len = try tmp.dir.realPath(path.currentIo(), &buf);
+    const dir = buf[0..dir_len];
 
     const sec_path = try std.fs.path.join(testing.allocator, &.{ dir, "short.key" });
     defer testing.allocator.free(sec_path);
 
     // Create a too-short file
-    const f = try tmp.dir.createFile("short.key", .{});
-    try f.writeAll("short");
-    f.close();
+    const f = try tmp.dir.createFile(path.currentIo(), "short.key", .{});
+    try f.writeStreamingAll(path.currentIo(), "short");
+    f.close(path.currentIo());
 
     try testing.expectError(SignIOError.InvalidSize, readSecretKeyFile(sec_path));
 }
@@ -273,17 +283,18 @@ test "sign_io: oversized fixed-size files are rejected" {
     defer tmp.cleanup();
 
     var buf: [std.fs.max_path_bytes]u8 = undefined;
-    const dir = try tmp.dir.realpath(".", &buf);
+    const dir_len = try tmp.dir.realPath(path.currentIo(), &buf);
+    const dir = buf[0..dir_len];
 
     const pub_path = try std.fs.path.join(testing.allocator, &.{ dir, "oversized.pub" });
     defer testing.allocator.free(pub_path);
 
-    const pub_file = try std.fs.createFileAbsolute(pub_path, .{});
-    defer pub_file.close();
+    const pub_file = try std.Io.Dir.createFileAbsolute(path.currentIo(), pub_path, .{});
+    defer pub_file.close(path.currentIo());
 
     var oversized: [sign_crypto.c.crypto_sign_PUBLICKEYBYTES + 1]u8 = undefined;
     @memset(&oversized, 0x33);
-    try pub_file.writeAll(&oversized);
+    try pub_file.writeStreamingAll(path.currentIo(), &oversized);
 
     try testing.expectError(SignIOError.InvalidSize, readPublicKeyFile(pub_path));
 }
@@ -295,7 +306,8 @@ test "sign_io: missing files return FileNotFound" {
     defer tmp.cleanup();
 
     var buf: [std.fs.max_path_bytes]u8 = undefined;
-    const dir = try tmp.dir.realpath(".", &buf);
+    const dir_len = try tmp.dir.realPath(path.currentIo(), &buf);
+    const dir = buf[0..dir_len];
 
     const missing_pub = try std.fs.path.join(testing.allocator, &.{ dir, "does-not-exist.pub" });
     defer testing.allocator.free(missing_pub);
@@ -306,14 +318,15 @@ test "sign_io: missing files return FileNotFound" {
 }
 
 test "sign_io: readPublicKeyFile reports permission denied" {
-    if (std.posix.geteuid() == 0) return error.SkipZigTest;
+    if (std.os.linux.geteuid() == 0) return error.SkipZigTest;
 
     const testing = std.testing;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     var buf: [std.fs.max_path_bytes]u8 = undefined;
-    const dir = try tmp.dir.realpath(".", &buf);
+    const dir_len = try tmp.dir.realPath(path.currentIo(), &buf);
+    const dir = buf[0..dir_len];
 
     const pub_path = try std.fs.path.join(testing.allocator, &.{ dir, "restricted.pub" });
     defer testing.allocator.free(pub_path);
@@ -321,28 +334,29 @@ test "sign_io: readPublicKeyFile reports permission denied" {
     var pub_key: [sign_crypto.c.crypto_sign_PUBLICKEYBYTES]u8 = undefined;
     @memset(pub_key[0..], 0x11);
 
-    const file = try std.fs.createFileAbsolute(pub_path, .{});
-    defer file.close();
-    try file.writeAll(pub_key[0..]);
-    try file.chmod(0o000);
+    const file = try std.Io.Dir.createFileAbsolute(path.currentIo(), pub_path, .{});
+    defer file.close(path.currentIo());
+    try file.writeStreamingAll(path.currentIo(), pub_key[0..]);
+    try file.setPermissions(path.currentIo(), .fromMode(0o000));
 
     try testing.expectError(SignIOError.PermissionDenied, readPublicKeyFile(pub_path));
 }
 
 test "sign_io: writePublicKeyFile reports permission denied" {
-    if (std.posix.geteuid() == 0) return error.SkipZigTest;
+    if (std.os.linux.geteuid() == 0) return error.SkipZigTest;
 
     const testing = std.testing;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    try tmp.dir.makePath("ro");
-    var ro = try tmp.dir.openDir("ro", .{});
-    defer ro.close();
-    try ro.chmod(0o555);
+    try tmp.dir.createDirPath(path.currentIo(), "ro");
+    var ro = try tmp.dir.openDir(path.currentIo(), "ro", .{});
+    defer ro.close(path.currentIo());
+    try ro.setPermissions(path.currentIo(), .fromMode(0o555));
 
     var buf: [std.fs.max_path_bytes]u8 = undefined;
-    const dir = try tmp.dir.realpath(".", &buf);
+    const dir_len = try tmp.dir.realPath(path.currentIo(), &buf);
+    const dir = buf[0..dir_len];
     const pub_path = try std.fs.path.join(testing.allocator, &.{ dir, "ro", "blocked.pub" });
     defer testing.allocator.free(pub_path);
 
@@ -353,19 +367,20 @@ test "sign_io: writePublicKeyFile reports permission denied" {
 }
 
 test "sign_io: writeSecretKeyFile reports permission denied" {
-    if (std.posix.geteuid() == 0) return error.SkipZigTest;
+    if (std.os.linux.geteuid() == 0) return error.SkipZigTest;
 
     const testing = std.testing;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    try tmp.dir.makePath("ro");
-    var ro = try tmp.dir.openDir("ro", .{});
-    defer ro.close();
-    try ro.chmod(0o555);
+    try tmp.dir.createDirPath(path.currentIo(), "ro");
+    var ro = try tmp.dir.openDir(path.currentIo(), "ro", .{});
+    defer ro.close(path.currentIo());
+    try ro.setPermissions(path.currentIo(), .fromMode(0o555));
 
     var buf: [std.fs.max_path_bytes]u8 = undefined;
-    const dir = try tmp.dir.realpath(".", &buf);
+    const dir_len = try tmp.dir.realPath(path.currentIo(), &buf);
+    const dir = buf[0..dir_len];
     const sec_path = try std.fs.path.join(testing.allocator, &.{ dir, "ro", "blocked.key" });
     defer testing.allocator.free(sec_path);
 
@@ -376,19 +391,20 @@ test "sign_io: writeSecretKeyFile reports permission denied" {
 }
 
 test "sign_io: writeSecretKeyFile leaves no partial target on failure" {
-    if (std.posix.geteuid() == 0) return error.SkipZigTest;
+    if (std.os.linux.geteuid() == 0) return error.SkipZigTest;
 
     const testing = std.testing;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    try tmp.dir.makePath("ro");
-    var ro = try tmp.dir.openDir("ro", .{});
-    defer ro.close();
-    try ro.chmod(0o555);
+    try tmp.dir.createDirPath(path.currentIo(), "ro");
+    var ro = try tmp.dir.openDir(path.currentIo(), "ro", .{});
+    defer ro.close(path.currentIo());
+    try ro.setPermissions(path.currentIo(), .fromMode(0o555));
 
     var buf: [std.fs.max_path_bytes]u8 = undefined;
-    const dir = try tmp.dir.realpath(".", &buf);
+    const dir_len = try tmp.dir.realPath(path.currentIo(), &buf);
+    const dir = buf[0..dir_len];
     const sec_path = try std.fs.path.join(testing.allocator, &.{ dir, "ro", "blocked.key" });
     defer testing.allocator.free(sec_path);
 
@@ -406,7 +422,8 @@ test "sign_io: writeSecretKeyFile creates file with owner-only permissions" {
     defer tmp.cleanup();
 
     var buf: [std.fs.max_path_bytes]u8 = undefined;
-    const dir = try tmp.dir.realpath(".", &buf);
+    const dir_len = try tmp.dir.realPath(path.currentIo(), &buf);
+    const dir = buf[0..dir_len];
     const sec_path = try std.fs.path.join(testing.allocator, &.{ dir, "secure.key" });
     defer testing.allocator.free(sec_path);
 
@@ -415,11 +432,11 @@ test "sign_io: writeSecretKeyFile creates file with owner-only permissions" {
 
     try writeSecretKeyFile(sec_path, sec_key[0..]);
 
-    const file = try std.fs.openFileAbsolute(sec_path, .{});
-    defer file.close();
-    const stat = try file.stat();
+    const file = try std.Io.Dir.openFileAbsolute(path.currentIo(), sec_path, .{});
+    defer file.close(path.currentIo());
+    const stat = try file.stat(path.currentIo());
 
-    try testing.expectEqual(@as(u32, 0o600), stat.mode & 0o777);
+    try testing.expectEqual(@as(u32, 0o600), stat.permissions.toMode() & 0o777);
 }
 
 test "sign_io: wrapped key files reject raw payloads" {
@@ -429,17 +446,18 @@ test "sign_io: wrapped key files reject raw payloads" {
     defer tmp.cleanup();
 
     var buf: [std.fs.max_path_bytes]u8 = undefined;
-    const dir = try tmp.dir.realpath(".", &buf);
+    const dir_len = try tmp.dir.realPath(path.currentIo(), &buf);
+    const dir = buf[0..dir_len];
 
     const pub_path = try std.fs.path.join(testing.allocator, &.{ dir, "raw.pub" });
     defer testing.allocator.free(pub_path);
 
-    const file = try std.fs.createFileAbsolute(pub_path, .{});
-    defer file.close();
+    const file = try std.Io.Dir.createFileAbsolute(path.currentIo(), pub_path, .{});
+    defer file.close(path.currentIo());
 
     var pub_key: [sign_crypto.c.crypto_sign_PUBLICKEYBYTES]u8 = undefined;
     @memset(pub_key[0..], 0x12);
-    try file.writeAll(pub_key[0..]);
+    try file.writeStreamingAll(path.currentIo(), pub_key[0..]);
 
     try testing.expectError(SignIOError.InvalidSize, readPublicKeyFile(pub_path));
 }

@@ -114,7 +114,7 @@ const DependencyGraph = struct {
             .pkg_key = key_copy,
             .pkg = pkg,
             .repocache = repocache,
-            .dependencies = std.ArrayList([]const u8){},
+            .dependencies = .empty,
         };
 
         self.nodes.put(key_copy, node) catch {
@@ -151,8 +151,8 @@ const TarjanState = struct {
 
     fn init(allocator: std.mem.Allocator) TarjanState {
         return .{
-            .stack = std.ArrayList([]const u8){},
-            .sccs = std.ArrayList(std.ArrayList([]const u8)){},
+            .stack = .empty,
+            .sccs = .empty,
             .allocator = allocator,
         };
     }
@@ -198,7 +198,7 @@ fn tarjanStrongConnect(
 
     const current_node = graph.nodes.getPtr(pkg_key) orelse unreachable;
     if (current_node.low_link == current_node.index) {
-        var scc = std.ArrayList([]const u8){};
+        var scc: std.ArrayList([]const u8) = .empty;
 
         while (true) {
             const w = state.stack.pop() orelse unreachable; // Stack should never be empty here
@@ -281,7 +281,7 @@ fn topologicalSort(
         allocator.free(scc_adj);
     }
     for (scc_adj) |*neighbors| {
-        neighbors.* = .{};
+        neighbors.* = .empty;
     }
 
     var seen_edges = std.AutoHashMap(u128, void).init(allocator);
@@ -308,7 +308,7 @@ fn topologicalSort(
         }
     }
 
-    var queue = std.ArrayList(usize){};
+    var queue: std.ArrayList(usize) = .empty;
     defer queue.deinit(allocator);
 
     for (scc_in_degree, 0..) |degree, scc_idx| {
@@ -319,7 +319,7 @@ fn topologicalSort(
         }
     }
 
-    var scc_order = std.ArrayList(usize){};
+    var scc_order: std.ArrayList(usize) = .empty;
     defer scc_order.deinit(allocator);
 
     var queue_head: usize = 0;
@@ -390,9 +390,9 @@ const GraphTxn = struct {
     fn init(allocator: std.mem.Allocator) GraphTxn {
         return .{
             .allocator = allocator,
-            .added_nodes = .{},
-            .added_edges = .{},
-            .added_requirement_keys = .{},
+            .added_nodes = .empty,
+            .added_edges = .empty,
+            .added_requirement_keys = .empty,
         };
     }
 
@@ -627,17 +627,19 @@ fn formatResolutionFailure(
     requirement: []const u8,
     decisions: []const CandidateDecision,
 ) ResolverError!void {
-    var buf = std.ArrayList(u8){};
+    var buf: std.ArrayList(u8) = .empty;
     defer buf.deinit(ctx.allocator);
 
-    const writer = buf.writer(ctx.allocator);
-    try writer.print("resolution failed for '{s}': ", .{requirement});
+    var out_buf: std.Io.Writer.Allocating = .fromArrayList(ctx.allocator, &buf);
+    const out = &out_buf.writer;
+    out.print("resolution failed for '{s}': ", .{requirement}) catch return ResolverError.OutOfMemory;
 
     for (decisions, 0..) |decision, idx| {
-        if (idx > 0) try writer.writeAll("; ");
-        try writer.print("{s} rejected: {s}", .{ decision.label, decision.reason });
+        if (idx > 0) out.writeAll("; ") catch return ResolverError.OutOfMemory;
+        out.print("{s} rejected: {s}", .{ decision.label, decision.reason }) catch return ResolverError.OutOfMemory;
     }
 
+    buf = out_buf.toArrayList();
     const msg = try buf.toOwnedSlice(ctx.allocator);
     errdefer ctx.allocator.free(msg);
     ctx.setDiagnosticContext(requirement, msg);
@@ -649,18 +651,20 @@ fn formatAmbiguity(
     requirement: []const u8,
     candidates: []const Candidate,
 ) ResolverError!void {
-    var buf = std.ArrayList(u8){};
+    var buf: std.ArrayList(u8) = .empty;
     defer buf.deinit(ctx.allocator);
 
-    const writer = buf.writer(ctx.allocator);
-    try writer.print("ambiguous providers for '{s}' (same version/release/priority): ", .{requirement});
+    var out_buf: std.Io.Writer.Allocating = .fromArrayList(ctx.allocator, &buf);
+    const out = &out_buf.writer;
+    out.print("ambiguous providers for '{s}' (same version/release/priority): ", .{requirement}) catch return ResolverError.OutOfMemory;
     for (candidates, 0..) |candidate, idx| {
         const label = try formatCandidateLabel(ctx.allocator, candidate);
         defer ctx.allocator.free(label);
-        if (idx > 0) try writer.writeAll("; ");
-        try writer.print("{s}", .{label});
+        if (idx > 0) out.writeAll("; ") catch return ResolverError.OutOfMemory;
+        out.print("{s}", .{label}) catch return ResolverError.OutOfMemory;
     }
 
+    buf = out_buf.toArrayList();
     const msg = try buf.toOwnedSlice(ctx.allocator);
     errdefer ctx.allocator.free(msg);
     ctx.setDiagnosticContext(requirement, msg);
@@ -723,7 +727,7 @@ fn collectCandidates(
     repocaches: []*RepoCache,
     allocator: std.mem.Allocator,
 ) !std.ArrayList(Candidate) {
-    var candidates = std.ArrayList(Candidate){};
+    var candidates: std.ArrayList(Candidate) = .empty;
     errdefer {
         for (candidates.items) |*c| {
             c.deinit();
@@ -928,7 +932,7 @@ fn collectPreferredCandidates(
     preferred_selections: []const PreferredSelection,
     allocator: std.mem.Allocator,
 ) ResolverError!std.ArrayList(Candidate) {
-    var candidates = std.ArrayList(Candidate){};
+    var candidates: std.ArrayList(Candidate) = .empty;
     errdefer {
         for (candidates.items) |*candidate| candidate.deinit();
         candidates.deinit(allocator);
@@ -1193,7 +1197,7 @@ fn resolveRequirement(
         ctx.debug("found pin for {s}: {s}", .{ requirement.name, pin_info.store_path });
     }
 
-    var decisions = std.ArrayList(CandidateDecision){};
+    var decisions: std.ArrayList(CandidateDecision) = .empty;
     defer {
         for (decisions.items) |*decision| {
             decision.deinit(allocator);
@@ -1404,7 +1408,7 @@ pub fn withRequirements(
     errdefer allocator.free(result_sccs);
 
     for (sccs, 0..) |_, scc_idx| {
-        var scc_indices = std.ArrayList(usize){};
+        var scc_indices: std.ArrayList(usize) = .empty;
         defer scc_indices.deinit(allocator);
 
         for (packages, 0..) |resolved, pkg_idx| {
@@ -1433,7 +1437,7 @@ pub fn resolve(
     repocaches: []*RepoCache,
     allocator: std.mem.Allocator,
 ) ResolverError!ResolutionResult {
-    var requirements = std.ArrayList(Requirement){};
+    var requirements: std.ArrayList(Requirement) = .empty;
     defer requirements.deinit(allocator);
 
     for (pkg_names) |pkg_name| {
@@ -2106,7 +2110,7 @@ test "resolve fails cleanly when dependency recursion depth exceeds limit" {
     defer repocache.deinit();
     try initTestRepository(&repocache);
 
-    var names = std.ArrayList([]u8){};
+    var names: std.ArrayList([]u8) = .empty;
     defer {
         for (names.items) |name| allocator.free(name);
         names.deinit(allocator);
@@ -2153,7 +2157,7 @@ test "resolve handles larger dependency chain deterministically" {
     defer repocache.deinit();
     try initTestRepository(&repocache);
 
-    var names = std.ArrayList([]u8){};
+    var names: std.ArrayList([]u8) = .empty;
     defer {
         for (names.items) |name| allocator.free(name);
         names.deinit(allocator);
@@ -2188,7 +2192,7 @@ test "resolve handles larger dependency chain deterministically" {
 }
 
 test "resolve fails when pin directory is unreadable" {
-    if (std.posix.geteuid() == 0) return error.SkipZigTest;
+    if (std.os.linux.geteuid() == 0) return error.SkipZigTest;
 
     const th = @import("test_helpers.zig");
     var test_env = try th.createTestEnv();
@@ -2209,10 +2213,15 @@ test "resolve fails when pin directory is unreadable" {
 
     const gc_roots = try std.fs.path.join(allocator, &.{ ctx.root_path, "mere", "gc-roots" });
     defer allocator.free(gc_roots);
-    try std.fs.cwd().makePath(gc_roots);
+    try @import("path.zig").ensureDirExists(gc_roots);
 
-    try std.posix.fchmodat(std.posix.AT.FDCWD, gc_roots, 0, 0);
-    defer std.posix.fchmodat(std.posix.AT.FDCWD, gc_roots, 0o755, 0) catch {};
+    const gc_roots_z = try allocator.dupeZ(u8, gc_roots);
+    defer allocator.free(gc_roots_z);
+    switch (std.posix.errno(std.c.chmod(gc_roots_z, 0))) {
+        .SUCCESS => {},
+        else => return error.FileSystem,
+    }
+    defer _ = std.c.chmod(gc_roots_z, 0o755);
 
     var repocaches = [_]*RepoCache{&repocache};
     const result = resolve(ctx, &.{"A"}, repocaches[0..], allocator);
@@ -2242,7 +2251,7 @@ test "resolve handles larger SCC cycle" {
     defer repocache.deinit();
     try initTestRepository(&repocache);
 
-    var names = std.ArrayList([]u8){};
+    var names: std.ArrayList([]u8) = .empty;
     defer {
         for (names.items) |name| allocator.free(name);
         names.deinit(allocator);

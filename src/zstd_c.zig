@@ -16,17 +16,17 @@ const Std = errors.StandardErrors;
 pub const ZstdError = Std.OutOfMemory || Std.FileSystem || Std.Internal || Std.CorruptData;
 
 pub const ZstdReader = struct {
-    reader: std.io.Reader,
-    src: *std.io.Reader,
+    reader: std.Io.Reader,
+    src: *std.Io.Reader,
     allocator: std.mem.Allocator,
     zds: ?*c.ZSTD_DStream = null,
     in_buf: []u8 = undefined,
     in_pos: usize = 0,
     in_size: usize = 0,
     frame_complete: bool = false,
-    vtable_storage: std.io.Reader.VTable = undefined,
+    vtable_storage: std.Io.Reader.VTable = undefined,
 
-    pub fn init(allocator: std.mem.Allocator, src: *std.io.Reader) !*ZstdReader {
+    pub fn init(allocator: std.mem.Allocator, src: *std.Io.Reader) !*ZstdReader {
         var zr = try allocator.create(ZstdReader);
         zr.allocator = allocator;
         zr.src = src;
@@ -55,16 +55,16 @@ pub const ZstdReader = struct {
 
         zr.vtable_storage = .{
             .stream = ZstdReader.stream,
-            .discard = std.io.Reader.defaultDiscard,
-            .readVec = std.io.Reader.defaultReadVec,
-            .rebase = std.io.Reader.defaultRebase,
+            .discard = std.Io.Reader.defaultDiscard,
+            .readVec = std.Io.Reader.defaultReadVec,
+            .rebase = std.Io.Reader.defaultRebase,
         };
-        zr.reader = std.io.Reader{ .vtable = &zr.vtable_storage, .buffer = &[_]u8{}, .seek = 0, .end = 0 };
+        zr.reader = std.Io.Reader{ .vtable = &zr.vtable_storage, .buffer = &[_]u8{}, .seek = 0, .end = 0 };
 
         return zr;
     }
 
-    pub fn stream(r: *std.io.Reader, w: *std.io.Writer, limit: std.io.Limit) std.io.Reader.StreamError!usize {
+    pub fn stream(r: *std.Io.Reader, w: *std.Io.Writer, limit: std.Io.Limit) std.Io.Reader.StreamError!usize {
         const self: *ZstdReader = @alignCast(@fieldParentPtr("reader", r));
         var total: usize = 0;
         var remaining: usize = 0;
@@ -77,16 +77,16 @@ pub const ZstdReader = struct {
         while (unlimited or (remaining != 0)) {
             const to_read = if (unlimited) tmp.len else if (remaining < tmp.len) remaining else tmp.len;
             const n = self.read(tmp[0..to_read]) catch |err| switch (err) {
-                ZstdError.FileSystem, ZstdError.CorruptData => return std.io.Reader.StreamError.ReadFailed,
-                else => return std.io.Reader.StreamError.ReadFailed,
+                ZstdError.FileSystem, ZstdError.CorruptData => return std.Io.Reader.StreamError.ReadFailed,
+                else => return std.Io.Reader.StreamError.ReadFailed,
             };
             if (n == 0) {
-                if (total == 0) return std.io.Reader.StreamError.EndOfStream;
+                if (total == 0) return std.Io.Reader.StreamError.EndOfStream;
                 return total;
             }
             var written_total: usize = 0;
             while (written_total < n) {
-                const wn = w.write(tmp[written_total..n]) catch return std.io.Reader.StreamError.WriteFailed;
+                const wn = w.write(tmp[written_total..n]) catch return std.Io.Reader.StreamError.WriteFailed;
                 written_total += wn;
             }
             total += n;
@@ -119,7 +119,7 @@ pub const ZstdReader = struct {
         while (true) {
             // If we need input, fill the input buffer
             if (self.in_pos == self.in_size) {
-                const n = std.io.Reader.readSliceShort(self.src, self.in_buf) catch {
+                const n = std.Io.Reader.readSliceShort(self.src, self.in_buf) catch {
                     return ZstdError.FileSystem;
                 };
                 if (n == 0) {
@@ -170,12 +170,12 @@ pub const ZstdReader = struct {
 
 pub const StreamCompressor = struct {
     allocator: std.mem.Allocator,
-    out_w: *std.io.Writer,
+    out_w: *std.Io.Writer,
     zcs: *c.ZSTD_CStream,
     out_buf: []u8,
     finished: bool = false,
 
-    pub fn init(allocator: std.mem.Allocator, out_w: *std.io.Writer) !StreamCompressor {
+    pub fn init(allocator: std.mem.Allocator, out_w: *std.Io.Writer) !StreamCompressor {
         const zcs = c.ZSTD_createCStream() orelse return ZstdError.Internal;
         errdefer _ = c.ZSTD_freeCStream(zcs);
 
@@ -276,18 +276,19 @@ pub fn compressOneShot(allocator: std.mem.Allocator, input: []const u8) ![]u8 {
     return final_buf;
 }
 
-pub fn compressStream(allocator: std.mem.Allocator, reader: *std.io.Reader) ![]u8 {
-    var buf_writer: std.Io.Writer.Allocating = .init(allocator);
-    defer buf_writer.deinit();
+pub fn compressStream(allocator: std.mem.Allocator, reader: *std.Io.Reader) ![]u8 {
+    var out_buf: std.Io.Writer.Allocating = .init(allocator);
+    defer out_buf.deinit();
+    const out = &out_buf.writer;
 
-    try compressStreamToWriterInternal(allocator, reader, &buf_writer.writer);
-    return try allocator.dupe(u8, buf_writer.written());
+    try compressStreamToWriterInternal(allocator, reader, out);
+    return try allocator.dupe(u8, out_buf.written());
 }
 
 fn compressStreamToWriterInternal(
     allocator: std.mem.Allocator,
-    reader: *std.io.Reader,
-    out_w: *std.io.Writer,
+    reader: *std.Io.Reader,
+    out_w: *std.Io.Writer,
 ) !void {
     const zs = c.ZSTD_createCStream();
     if (zs == null) return ZstdError.Internal;
@@ -316,7 +317,7 @@ fn compressStreamToWriterInternal(
     };
 
     while (true) {
-        const n = std.io.Reader.readSliceShort(reader, in_buf) catch {
+        const n = std.Io.Reader.readSliceShort(reader, in_buf) catch {
             return ZstdError.FileSystem;
         };
         if (n == 0) break;
@@ -347,7 +348,7 @@ fn compressStreamToWriterInternal(
     return;
 }
 
-pub fn compressStreamToWriter(allocator: std.mem.Allocator, reader: *std.io.Reader, out_w: *std.io.Writer) !void {
+pub fn compressStreamToWriter(allocator: std.mem.Allocator, reader: *std.Io.Reader, out_w: *std.Io.Writer) !void {
     return compressStreamToWriterInternal(allocator, reader, out_w);
 }
 
@@ -403,7 +404,7 @@ test "zstd: compressStream basic functionality" {
     const original: []const u8 = "Hello, world! " ** 20 ++ "This is a test string for streaming compression that should compress nicely due to repetition.";
 
     // Create a reader from the original data
-    var fixed_reader = std.io.Reader.fixed(original);
+    var fixed_reader = std.Io.Reader.fixed(original);
 
     // Compress using streaming compression
     const compressed = try compressStream(allocator, &fixed_reader);
@@ -414,7 +415,7 @@ test "zstd: compressStream basic functionality" {
     try std.testing.expect(compressed.len < original.len); // Should compress due to repetition
 
     // Round-trip: decompress with ZstdReader
-    var compressed_reader = std.io.Reader.fixed(compressed);
+    var compressed_reader = std.Io.Reader.fixed(compressed);
     var zst = try ZstdReader.init(allocator, &compressed_reader);
     defer zst.deinit();
 
@@ -438,31 +439,27 @@ test "zstd: compressStream error handling" {
 
     // Test Io error from reader
     const FailingReader = struct {
-        reader: std.io.Reader,
-        vtable: std.io.Reader.VTable,
+        reader: std.Io.Reader,
 
         const Self = @This();
+        const vtable: std.Io.Reader.VTable = .{
+            .stream = stream,
+            .discard = std.Io.Reader.defaultDiscard,
+            .readVec = std.Io.Reader.defaultReadVec,
+            .rebase = std.Io.Reader.defaultRebase,
+        };
 
         fn init() Self {
-            var self = Self{
-                .reader = undefined,
-                .vtable = undefined,
+            return .{
+                .reader = std.Io.Reader{ .vtable = &vtable, .buffer = &[_]u8{}, .seek = 0, .end = 0 },
             };
-            self.vtable = .{
-                .stream = stream,
-                .discard = std.io.Reader.defaultDiscard,
-                .readVec = std.io.Reader.defaultReadVec,
-                .rebase = std.io.Reader.defaultRebase,
-            };
-            self.reader = std.io.Reader{ .vtable = &self.vtable, .buffer = &[_]u8{}, .seek = 0, .end = 0 };
-            return self;
         }
 
-        fn stream(r: *std.io.Reader, w: *std.io.Writer, limit: std.io.Limit) std.io.Reader.StreamError!usize {
+        fn stream(r: *std.Io.Reader, w: *std.Io.Writer, limit: std.Io.Limit) std.Io.Reader.StreamError!usize {
             _ = r;
             _ = w;
             _ = limit;
-            return std.io.Reader.StreamError.ReadFailed;
+            return std.Io.Reader.StreamError.ReadFailed;
         }
     };
 
@@ -488,29 +485,29 @@ test "zstd: ZstdReader.stream method" {
 
     // Test unlimited streaming using a fixed buffer writer
     {
-        var compressed_reader = std.io.Reader.fixed(compressed);
+        var compressed_reader = std.Io.Reader.fixed(compressed);
         var zst = try ZstdReader.init(allocator, &compressed_reader);
         defer zst.deinit();
 
         var output_buf: [1024]u8 = undefined;
-        var fixed_writer = std.io.Writer.fixed(&output_buf);
+        var fixed_writer = std.Io.Writer.fixed(&output_buf);
 
-        const bytes_streamed = try zst.reader.stream(&fixed_writer, std.io.Limit.unlimited);
+        const bytes_streamed = try zst.reader.stream(&fixed_writer, std.Io.Limit.unlimited);
         try std.testing.expectEqual(original.len, bytes_streamed);
         try std.testing.expectEqualSlices(u8, original, output_buf[0..bytes_streamed]);
     }
 
     // Test limited streaming
     {
-        var compressed_reader = std.io.Reader.fixed(compressed);
+        var compressed_reader = std.Io.Reader.fixed(compressed);
         var zst = try ZstdReader.init(allocator, &compressed_reader);
         defer zst.deinit();
 
         var output_buf: [1024]u8 = undefined;
-        var fixed_writer = std.io.Writer.fixed(&output_buf);
+        var fixed_writer = std.Io.Writer.fixed(&output_buf);
 
         const limit = 50; // Less than full original length
-        const bytes_streamed = try zst.reader.stream(&fixed_writer, std.io.Limit.limited(limit));
+        const bytes_streamed = try zst.reader.stream(&fixed_writer, std.Io.Limit.limited(limit));
         try std.testing.expectEqual(limit, bytes_streamed);
         try std.testing.expectEqualSlices(u8, original[0..limit], output_buf[0..bytes_streamed]);
     }
@@ -563,7 +560,7 @@ test "zstd: ZstdReader initialization error paths" {
 
     const failing_allocator = FailingAllocator.init();
     var empty_data: [0]u8 = undefined;
-    var fixed_reader = std.io.Reader.fixed(&empty_data);
+    var fixed_reader = std.Io.Reader.fixed(&empty_data);
 
     // Test memory allocation failure during ZstdReader creation
     const result = ZstdReader.init(failing_allocator.allocator, &fixed_reader);
@@ -582,31 +579,27 @@ test "zstd: ZstdReader read error handling" {
 
     // Test Io error from underlying reader
     const FailingReader = struct {
-        reader: std.io.Reader,
-        vtable: std.io.Reader.VTable,
+        reader: std.Io.Reader,
 
         const Self = @This();
+        const vtable: std.Io.Reader.VTable = .{
+            .stream = stream,
+            .discard = std.Io.Reader.defaultDiscard,
+            .readVec = std.Io.Reader.defaultReadVec,
+            .rebase = std.Io.Reader.defaultRebase,
+        };
 
         fn init() Self {
-            var self = Self{
-                .reader = undefined,
-                .vtable = undefined,
+            return .{
+                .reader = std.Io.Reader{ .vtable = &vtable, .buffer = &[_]u8{}, .seek = 0, .end = 0 },
             };
-            self.vtable = .{
-                .stream = stream,
-                .discard = std.io.Reader.defaultDiscard,
-                .readVec = std.io.Reader.defaultReadVec,
-                .rebase = std.io.Reader.defaultRebase,
-            };
-            self.reader = std.io.Reader{ .vtable = &self.vtable, .buffer = &[_]u8{}, .seek = 0, .end = 0 };
-            return self;
         }
 
-        fn stream(r: *std.io.Reader, w: *std.io.Writer, limit: std.io.Limit) std.io.Reader.StreamError!usize {
+        fn stream(r: *std.Io.Reader, w: *std.Io.Writer, limit: std.Io.Limit) std.Io.Reader.StreamError!usize {
             _ = r;
             _ = w;
             _ = limit;
-            return std.io.Reader.StreamError.ReadFailed;
+            return std.Io.Reader.StreamError.ReadFailed;
         }
     };
 
@@ -620,7 +613,7 @@ test "zstd: ZstdReader read error handling" {
 
     // Test DecompressFailed with invalid compressed data
     const invalid_data = [_]u8{ 0xFF, 0xFF, 0xFF, 0xFF }; // Invalid zstd data
-    var invalid_reader = std.io.Reader.fixed(&invalid_data);
+    var invalid_reader = std.Io.Reader.fixed(&invalid_data);
     var zst2 = try ZstdReader.init(allocator, &invalid_reader);
     defer zst2.deinit();
 
@@ -630,7 +623,7 @@ test "zstd: ZstdReader read error handling" {
     const truncated = try compressOneShot(allocator, "truncated stream payload");
     defer allocator.free(truncated);
     try std.testing.expect(truncated.len > 1);
-    var truncated_reader = std.io.Reader.fixed(truncated[0 .. truncated.len - 1]);
+    var truncated_reader = std.Io.Reader.fixed(truncated[0 .. truncated.len - 1]);
     var zst3 = try ZstdReader.init(allocator, &truncated_reader);
     defer zst3.deinit();
 
@@ -662,7 +655,7 @@ test "zstd: ZstdReader read edge cases" {
 
     // Test very small output buffer requiring multiple reads
     {
-        var compressed_reader = std.io.Reader.fixed(compressed);
+        var compressed_reader = std.Io.Reader.fixed(compressed);
         var zst = try ZstdReader.init(allocator, &compressed_reader);
         defer zst.deinit();
 
@@ -685,7 +678,7 @@ test "zstd: ZstdReader read edge cases" {
         const empty_compressed = try compressOneShot(allocator, "");
         defer allocator.free(empty_compressed);
 
-        var empty_reader = std.io.Reader.fixed(empty_compressed);
+        var empty_reader = std.Io.Reader.fixed(empty_compressed);
         var zst = try ZstdReader.init(allocator, &empty_reader);
         defer zst.deinit();
 
@@ -696,7 +689,7 @@ test "zstd: ZstdReader read edge cases" {
 
     // Test multiple read calls on the same reader
     {
-        var compressed_reader = std.io.Reader.fixed(compressed);
+        var compressed_reader = std.Io.Reader.fixed(compressed);
         var zst = try ZstdReader.init(allocator, &compressed_reader);
         defer zst.deinit();
 
@@ -783,7 +776,7 @@ test "zstd: round-trip with compressStream" {
     const original: []const u8 = "Round-trip test data for compressStream functionality! " ** 5;
 
     // Create a reader from the original data
-    var input_reader = std.io.Reader.fixed(original);
+    var input_reader = std.Io.Reader.fixed(original);
 
     // Compress using streaming compression
     const compressed = try compressStream(allocator, &input_reader);
@@ -794,7 +787,7 @@ test "zstd: round-trip with compressStream" {
     try std.testing.expect(compressed.len < original.len); // Should compress due to repetition
 
     // Round-trip: decompress with ZstdReader
-    var compressed_reader = std.io.Reader.fixed(compressed);
+    var compressed_reader = std.Io.Reader.fixed(compressed);
     var zst = try ZstdReader.init(allocator, &compressed_reader);
     defer zst.deinit();
 
@@ -844,7 +837,7 @@ test "zstd: large data round-trip" {
     try std.testing.expect(compressed.len < large_data.len / 4); // Should compress well
 
     // Round-trip: decompress with ZstdReader using multiple reads
-    var compressed_reader = std.io.Reader.fixed(compressed);
+    var compressed_reader = std.Io.Reader.fixed(compressed);
     var zst = try ZstdReader.init(allocator, &compressed_reader);
     defer zst.deinit();
 
@@ -884,7 +877,7 @@ test "zstd: empty input handling" {
         try std.testing.expect(compressed.len > 0);
 
         // Round-trip: decompress with ZstdReader
-        var compressed_reader = std.io.Reader.fixed(compressed);
+        var compressed_reader = std.Io.Reader.fixed(compressed);
         var zst = try ZstdReader.init(allocator, &compressed_reader);
         defer zst.deinit();
 
@@ -897,7 +890,7 @@ test "zstd: empty input handling" {
 
     // Test compressStream with empty data
     {
-        var empty_reader = std.io.Reader.fixed(empty_data);
+        var empty_reader = std.Io.Reader.fixed(empty_data);
         const compressed = try compressStream(allocator, &empty_reader);
         defer allocator.free(compressed);
 
@@ -905,7 +898,7 @@ test "zstd: empty input handling" {
         try std.testing.expect(compressed.len > 0);
 
         // Round-trip: decompress with ZstdReader
-        var compressed_reader = std.io.Reader.fixed(compressed);
+        var compressed_reader = std.Io.Reader.fixed(compressed);
         var zst = try ZstdReader.init(allocator, &compressed_reader);
         defer zst.deinit();
 
@@ -925,7 +918,7 @@ test "zstd: empty input handling" {
         // This tests what happens if we somehow get an empty buffer as compressed data
         // We expect initialization or the first read to reject the stream (or return no bytes)
         var truly_empty: [0]u8 = undefined;
-        var empty_reader = std.io.Reader.fixed(&truly_empty);
+        var empty_reader = std.Io.Reader.fixed(&truly_empty);
 
         // This might fail at init or at first read, depending on implementation
         var zst = ZstdReader.init(allocator, &empty_reader);
@@ -970,7 +963,7 @@ test "zstd: binary data round-trip" {
         try std.testing.expect(compressed.len > 0);
 
         // Round-trip: decompress with ZstdReader
-        var compressed_reader = std.io.Reader.fixed(compressed);
+        var compressed_reader = std.Io.Reader.fixed(compressed);
         var zst = try ZstdReader.init(allocator, &compressed_reader);
         defer zst.deinit();
 
@@ -999,7 +992,7 @@ test "zstd: binary data round-trip" {
         try std.testing.expect(compressed.len > 0);
 
         // Round-trip: decompress with ZstdReader
-        var compressed_reader = std.io.Reader.fixed(compressed);
+        var compressed_reader = std.Io.Reader.fixed(compressed);
         var zst = try ZstdReader.init(allocator, &compressed_reader);
         defer zst.deinit();
 
@@ -1023,7 +1016,7 @@ test "zstd: binary data round-trip" {
         try std.testing.expect(compressed.len < null_heavy_data.len);
 
         // Round-trip: decompress with ZstdReader
-        var compressed_reader = std.io.Reader.fixed(compressed);
+        var compressed_reader = std.Io.Reader.fixed(compressed);
         var zst = try ZstdReader.init(allocator, &compressed_reader);
         defer zst.deinit();
 
@@ -1054,7 +1047,7 @@ test "zstd: boundary condition reads" {
     const buffer_sizes = [_]usize{ 7, 13, 23, 37, 67 };
 
     for (buffer_sizes) |buf_size| {
-        var compressed_reader = std.io.Reader.fixed(compressed);
+        var compressed_reader = std.Io.Reader.fixed(compressed);
         var zst = try ZstdReader.init(allocator, &compressed_reader);
         defer zst.deinit();
 
@@ -1086,26 +1079,27 @@ test "zstd: compressStreamToWriter basic functionality" {
     const original: []const u8 = "Streaming test data for compressStreamToWriter " ** 10;
 
     // Create reader
-    var reader = std.io.Reader.fixed(original);
+    var reader = std.Io.Reader.fixed(original);
 
     // Create an allocating writer to capture output
-    var buf_writer: std.Io.Writer.Allocating = .init(allocator);
-    defer buf_writer.deinit();
+    var out_buf: std.Io.Writer.Allocating = .init(allocator);
+    defer out_buf.deinit();
+    const out = &out_buf.writer;
 
-    try compressStreamToWriter(allocator, &reader, &buf_writer.writer);
+    try compressStreamToWriter(allocator, &reader, out);
 
-    const compressed = try allocator.dupe(u8, buf_writer.written());
+    const compressed = try allocator.dupe(u8, out_buf.written());
     defer allocator.free(compressed);
 
     // Decompress and verify
-    var compressed_reader = std.io.Reader.fixed(compressed);
+    var compressed_reader = std.Io.Reader.fixed(compressed);
     var zst = try ZstdReader.init(allocator, &compressed_reader);
     defer zst.deinit();
 
-    var out_buf: [1024]u8 = undefined;
-    const decompressed_len = try zst.read(out_buf[0..]);
+    var decompressed_buf: [1024]u8 = undefined;
+    const decompressed_len = try zst.read(decompressed_buf[0..]);
     try std.testing.expectEqual(original.len, decompressed_len);
-    try std.testing.expectEqualSlices(u8, original, out_buf[0..decompressed_len]);
+    try std.testing.expectEqualSlices(u8, original, decompressed_buf[0..decompressed_len]);
 }
 
 test "zstd: compressStreamToWriter io error from reader" {
@@ -1119,39 +1113,36 @@ test "zstd: compressStreamToWriter io error from reader" {
     const allocator = env.ctx.allocator;
 
     const FailingReader = struct {
-        reader: std.io.Reader,
-        vtable: std.io.Reader.VTable,
+        reader: std.Io.Reader,
 
         const Self = @This();
+        const vtable: std.Io.Reader.VTable = .{
+            .stream = stream,
+            .discard = std.Io.Reader.defaultDiscard,
+            .readVec = std.Io.Reader.defaultReadVec,
+            .rebase = std.Io.Reader.defaultRebase,
+        };
 
         fn init() Self {
-            var self = Self{
-                .reader = undefined,
-                .vtable = undefined,
+            return .{
+                .reader = std.Io.Reader{ .vtable = &vtable, .buffer = &[_]u8{}, .seek = 0, .end = 0 },
             };
-            self.vtable = .{
-                .stream = stream,
-                .discard = std.io.Reader.defaultDiscard,
-                .readVec = std.io.Reader.defaultReadVec,
-                .rebase = std.io.Reader.defaultRebase,
-            };
-            self.reader = std.io.Reader{ .vtable = &self.vtable, .buffer = &[_]u8{}, .seek = 0, .end = 0 };
-            return self;
         }
 
-        fn stream(r: *std.io.Reader, w: *std.io.Writer, limit: std.io.Limit) std.io.Reader.StreamError!usize {
+        fn stream(r: *std.Io.Reader, w: *std.Io.Writer, limit: std.Io.Limit) std.Io.Reader.StreamError!usize {
             _ = r;
             _ = w;
             _ = limit;
-            return std.io.Reader.StreamError.ReadFailed;
+            return std.Io.Reader.StreamError.ReadFailed;
         }
     };
 
     var failing = FailingReader.init();
 
-    var buf_writer: std.Io.Writer.Allocating = .init(allocator);
-    defer buf_writer.deinit();
+    var out_buf: std.Io.Writer.Allocating = .init(allocator);
+    defer out_buf.deinit();
+    const out = &out_buf.writer;
 
-    const res = compressStreamToWriter(allocator, &failing.reader, &buf_writer.writer);
+    const res = compressStreamToWriter(allocator, &failing.reader, out);
     try std.testing.expectError(ZstdError.FileSystem, res);
 }

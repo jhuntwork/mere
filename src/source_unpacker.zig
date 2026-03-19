@@ -4,6 +4,7 @@ const recipe = @import("recipe.zig");
 const extract = @import("extract.zig");
 const test_helpers = @import("test_helpers.zig");
 const errors = @import("errors.zig");
+const path_mod = @import("path.zig");
 const DiagnosticContext = errors.DiagnosticContext;
 
 /// Source unpacking error set
@@ -107,12 +108,12 @@ pub fn unpackFirstSource(
         };
 
         // Check existence
-        var f = std.fs.openFileAbsolute(ws_path, .{}) catch |err| {
+        var f = path_mod.openExistingFile(ws_path) catch |err| {
             ctx.debug("source unpack: workspace source not present: {s} ({s})", .{ ws_path, @errorName(err) });
             allocator.free(ws_path);
             continue;
         };
-        f.close();
+        f.close(path_mod.currentIo());
 
         selected_path = ws_path;
         break;
@@ -149,51 +150,26 @@ pub fn unpackFirstSource(
         };
         defer allocator.free(dest_path);
 
-        var src_file = std.fs.openFileAbsolute(source_path, .{}) catch |err| {
+        path_mod.copyFile(source_path, dest_path) catch |err| {
             return switch (err) {
                 error.AccessDenied => UnpackError.PermissionDenied,
                 else => UnpackError.FileSystem,
             };
         };
-        defer src_file.close();
-        var dest_file = std.fs.createFileAbsolute(dest_path, .{}) catch |err| {
-            return switch (err) {
-                error.AccessDenied => UnpackError.PermissionDenied,
-                else => UnpackError.FileSystem,
-            };
-        };
-        defer dest_file.close();
-
-        var buf: [8192]u8 = undefined;
-        while (true) {
-            const n = src_file.read(&buf) catch |err| {
-                return switch (err) {
-                    error.AccessDenied => UnpackError.PermissionDenied,
-                    else => UnpackError.FileSystem,
-                };
-            };
-            if (n == 0) break;
-            dest_file.writeAll(buf[0..n]) catch |err| {
-                return switch (err) {
-                    error.AccessDenied => UnpackError.PermissionDenied,
-                    else => UnpackError.FileSystem,
-                };
-            };
-        }
     }
 
     // After extraction, detect single top-level directory inside dest_dir
-    var src_dir_handle = std.fs.openDirAbsolute(dest_dir, .{ .iterate = true }) catch |err| {
+    var src_dir_handle = path_mod.openExistingDir(dest_dir) catch |err| {
         ctx.debug("failed to open dest dir for post-extract inspection {s}: {s}", .{ dest_dir, @errorName(err) });
         return UnpackError.FileSystem;
     };
-    defer src_dir_handle.close();
+    defer src_dir_handle.close(path_mod.currentIo());
 
     var iter = src_dir_handle.iterate();
     var single_dir_name: ?[]const u8 = null;
     var entry_count: usize = 0;
     while (true) {
-        const entry = iter.next() catch |err| {
+        const entry = iter.next(path_mod.currentIo()) catch |err| {
             return switch (err) {
                 error.AccessDenied => UnpackError.PermissionDenied,
                 else => UnpackError.FileSystem,
@@ -237,7 +213,7 @@ test "SourceUnpacker extracts first source without mutating workspace state" {
     // Create sources dir and place a tar archive there
     const sources_dir = try std.fmt.allocPrint(test_env.ctx.allocator, "{s}/sources", .{test_env.path});
     defer test_env.ctx.allocator.free(sources_dir);
-    try std.fs.cwd().makePath(sources_dir);
+    try path_mod.ensureDirExists(sources_dir);
 
     const tar_name = "busybox-1.36.1.tar";
     const tar_path = try std.fmt.allocPrint(test_env.ctx.allocator, "{s}/{s}", .{ sources_dir, tar_name });
@@ -270,7 +246,7 @@ test "SourceUnpacker extracts first source without mutating workspace state" {
 
     const dest_dir = try std.fmt.allocPrint(test_env.ctx.allocator, "{s}/build-src", .{test_env.path});
     defer test_env.ctx.allocator.free(dest_dir);
-    try std.fs.cwd().makePath(dest_dir);
+    try path_mod.ensureDirExists(dest_dir);
 
     var res = try unpackFirstSource(test_env.ctx.allocator, &test_env.ctx, sources_dir, dest_dir, &parsed);
     defer res.deinit(test_env.ctx.allocator);
@@ -289,7 +265,7 @@ test "SourceUnpacker handles single-directory detection functionally" {
 
     const sources_dir = try std.fmt.allocPrint(test_env.ctx.allocator, "{s}/sources", .{test_env.path});
     defer test_env.ctx.allocator.free(sources_dir);
-    try std.fs.cwd().makePath(sources_dir);
+    try path_mod.ensureDirExists(sources_dir);
 
     const tar_name = "onlydir.tar";
     const tar_path = try std.fmt.allocPrint(test_env.ctx.allocator, "{s}/{s}", .{ sources_dir, tar_name });
@@ -321,7 +297,7 @@ test "SourceUnpacker handles single-directory detection functionally" {
 
     const dest_dir = try std.fmt.allocPrint(test_env.ctx.allocator, "{s}/build-src", .{test_env.path});
     defer test_env.ctx.allocator.free(dest_dir);
-    try std.fs.cwd().makePath(dest_dir);
+    try path_mod.ensureDirExists(dest_dir);
 
     var res = try unpackFirstSource(test_env.ctx.allocator, &test_env.ctx, sources_dir, dest_dir, &parsed);
     defer res.deinit(test_env.ctx.allocator);
@@ -369,11 +345,11 @@ test "SourceUnpacker returns NoSources when workspace has no matching source fil
 
     const sources_dir = try std.fmt.allocPrint(test_env.ctx.allocator, "{s}/sources", .{test_env.path});
     defer test_env.ctx.allocator.free(sources_dir);
-    try std.fs.cwd().makePath(sources_dir);
+    try path_mod.ensureDirExists(sources_dir);
 
     const dest_dir = try std.fmt.allocPrint(test_env.ctx.allocator, "{s}/build-src", .{test_env.path});
     defer test_env.ctx.allocator.free(dest_dir);
-    try std.fs.cwd().makePath(dest_dir);
+    try path_mod.ensureDirExists(dest_dir);
 
     const kdl_text =
         \\recipe {
@@ -412,19 +388,19 @@ test "SourceUnpacker reports malformed archive extraction failure" {
 
     const sources_dir = try std.fmt.allocPrint(test_env.ctx.allocator, "{s}/sources", .{test_env.path});
     defer test_env.ctx.allocator.free(sources_dir);
-    try std.fs.cwd().makePath(sources_dir);
+    try path_mod.ensureDirExists(sources_dir);
 
     const bad_tar_path = try std.fmt.allocPrint(test_env.ctx.allocator, "{s}/bad.tar", .{sources_dir});
     defer test_env.ctx.allocator.free(bad_tar_path);
     {
-        var bad_tar = try std.fs.createFileAbsolute(bad_tar_path, .{});
-        defer bad_tar.close();
-        try bad_tar.writeAll("not a tar archive");
+        var bad_tar = try path_mod.makePathAndOpenFile(bad_tar_path);
+        defer bad_tar.close(path_mod.currentIo());
+        try bad_tar.writeStreamingAll(path_mod.currentIo(), "not a tar archive");
     }
 
     const dest_dir = try std.fmt.allocPrint(test_env.ctx.allocator, "{s}/build-src", .{test_env.path});
     defer test_env.ctx.allocator.free(dest_dir);
-    try std.fs.cwd().makePath(dest_dir);
+    try path_mod.ensureDirExists(dest_dir);
 
     const kdl_text =
         \\recipe {

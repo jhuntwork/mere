@@ -2,6 +2,7 @@ const std = @import("std");
 const Context = @import("mere.zig").Context;
 const generation = @import("generation.zig");
 const errors = @import("errors.zig");
+const path = @import("path.zig");
 const version = @import("version.zig");
 
 /// Template handling error set
@@ -41,7 +42,7 @@ pub const TemplateStatus = struct {
             .missing = 0,
             .identical = 0,
             .differing = 0,
-            .entries = .{},
+            .entries = .empty,
             .allocator = allocator,
         };
     }
@@ -76,14 +77,14 @@ pub const TemplateResult = struct {
             .copied = 0,
             .skipped = 0,
             .differing = 0,
-            .created_paths = .{},
+            .created_paths = .empty,
             .allocator = allocator,
         };
     }
 
     pub fn deinit(self: *TemplateResult) void {
-        for (self.created_paths.items) |path| {
-            self.allocator.free(path);
+        for (self.created_paths.items) |created_path| {
+            self.allocator.free(created_path);
         }
         self.created_paths.deinit(self.allocator);
     }
@@ -167,12 +168,12 @@ pub fn rollbackCreatedFiles(ctx: *Context, result: *const TemplateResult) EtcErr
     var idx = result.created_paths.items.len;
     while (idx > 0) {
         idx -= 1;
-        const path = result.created_paths.items[idx];
-        std.fs.deleteFileAbsolute(path) catch |err| {
+        const created_path = result.created_paths.items[idx];
+        std.Io.Dir.deleteFileAbsolute(path.currentIo(), created_path) catch |err| {
             switch (err) {
                 error.FileNotFound => {},
-                error.AccessDenied => return ctx.fail(EtcError.PermissionDenied, path, "permission denied cleaning up /etc activation file"),
-                else => return ctx.fail(EtcError.FileSystem, path, "failed cleaning up /etc activation file"),
+                error.AccessDenied => return ctx.fail(EtcError.PermissionDenied, created_path, "permission denied cleaning up /etc activation file"),
+                else => return ctx.fail(EtcError.FileSystem, created_path, "failed cleaning up /etc activation file"),
             }
         };
     }
@@ -195,7 +196,7 @@ fn collectPackageTemplates(
     defer allocator.free(template_root);
 
     // Check if etc-defaults exists in this package
-    var template_dir = std.fs.openDirAbsolute(template_root, .{ .iterate = true }) catch |err| {
+    var template_dir = std.Io.Dir.openDirAbsolute(path.currentIo(), template_root, .{ .iterate = true }) catch |err| {
         return switch (err) {
             error.FileNotFound => {}, // No templates in this package, that's fine
             error.AccessDenied => {
@@ -206,7 +207,7 @@ fn collectPackageTemplates(
             },
         };
     };
-    defer template_dir.close();
+    defer template_dir.close(path.currentIo());
 
     // Walk the template directory recursively
     try walkTemplates(ctx, template_dir, template_root, "", package_name, etc_dir, seen_paths, status);
@@ -215,7 +216,7 @@ fn collectPackageTemplates(
 /// Recursively walk a template directory and process files.
 fn walkTemplates(
     ctx: *Context,
-    dir: std.fs.Dir,
+    dir: std.Io.Dir,
     template_root: []const u8,
     relative_path: []const u8,
     package_name: []const u8,
@@ -226,7 +227,7 @@ fn walkTemplates(
     const allocator = ctx.allocator;
     var iter = dir.iterate();
     while (true) {
-        const entry = iter.next() catch {
+        const entry = iter.next(path.currentIo()) catch {
             return EtcError.FileSystem;
         };
         if (entry == null) break;
@@ -241,7 +242,7 @@ fn walkTemplates(
 
         if (e.kind == .directory) {
             // Recurse into subdirectory
-            var subdir = dir.openDir(e.name, .{ .iterate = true }) catch |err| {
+            var subdir = dir.openDir(path.currentIo(), e.name, .{ .iterate = true }) catch |err| {
                 return switch (err) {
                     error.AccessDenied => {
                         return ctx.fail(EtcError.PermissionDenied, e.name, "permission denied opening template directory");
@@ -251,7 +252,7 @@ fn walkTemplates(
                     },
                 };
             };
-            defer subdir.close();
+            defer subdir.close(path.currentIo());
             try walkTemplates(ctx, subdir, template_root, entry_rel_path, package_name, etc_dir, seen_paths, status);
         } else if (e.kind == .file) {
             // Process this template file
@@ -305,7 +306,7 @@ fn processTemplateFile(
 
     // Check if destination exists
     const dest_exists = blk: {
-        std.fs.accessAbsolute(dest_path, .{}) catch |err| {
+        std.Io.Dir.accessAbsolute(path.currentIo(), dest_path, .{}) catch |err| {
             if (err == error.FileNotFound) break :blk false;
             if (err == error.AccessDenied) return EtcError.PermissionDenied;
             return EtcError.FileSystem;
@@ -342,8 +343,8 @@ pub fn applyTemplate(ctx: *Context, source_path: []const u8, dest_path: []const 
     };
     defer allocator.free(old_path);
 
-    if (std.fs.accessAbsolute(dest_path, .{})) |_| {
-        std.fs.renameAbsolute(dest_path, old_path) catch |err| {
+    if (std.Io.Dir.accessAbsolute(path.currentIo(), dest_path, .{})) |_| {
+        std.Io.Dir.renameAbsolute(dest_path, old_path, path.currentIo()) catch |err| {
             ctx.setDiagnosticContext(dest_path, "failed to back up existing /etc file");
             return switch (err) {
                 error.AccessDenied => EtcError.PermissionDenied,
@@ -403,17 +404,18 @@ fn lessThanTemplateEntry(_: void, a: TemplateEntry, b: TemplateEntry) bool {
 fn copyTemplate(ctx: *Context, src_path: []const u8, dest_path: []const u8) EtcError!void {
     // Ensure parent directory exists
     if (std.fs.path.dirnamePosix(dest_path)) |parent| {
-        std.fs.cwd().makePath(parent) catch |err| {
+        var dir = path.makePathAndOpenDir(parent) catch |err| {
             ctx.setDiagnosticContext(parent, "failed to create /etc parent directory");
             return switch (err) {
                 error.AccessDenied => EtcError.PermissionDenied,
                 else => EtcError.FileSystem,
             };
         };
+        dir.close(path.currentIo());
     }
 
     // Copy the file
-    std.fs.copyFileAbsolute(src_path, dest_path, .{}) catch |err| {
+    path.copyFile(src_path, dest_path) catch |err| {
         ctx.setDiagnosticContext(dest_path, "failed to copy /etc template");
         return switch (err) {
             error.FileNotFound => EtcError.FileSystem,
@@ -427,7 +429,7 @@ fn copyTemplate(ctx: *Context, src_path: []const u8, dest_path: []const u8) EtcE
 fn filesIdentical(ctx: *Context, path_a: []const u8, path_b: []const u8) EtcError!bool {
     const allocator = ctx.allocator;
     // Read both files
-    const content_a = std.fs.cwd().readFileAlloc(allocator, path_a, 10 * 1024 * 1024) catch |err| {
+    const content_a = std.Io.Dir.readFileAlloc(std.Io.Dir.cwd(), path.currentIo(), path_a, allocator, .limited(10 * 1024 * 1024)) catch |err| {
         ctx.setDiagnosticContext(path_a, "failed to read /etc template");
         return switch (err) {
             error.FileNotFound => EtcError.FileSystem,
@@ -438,7 +440,7 @@ fn filesIdentical(ctx: *Context, path_a: []const u8, path_b: []const u8) EtcErro
     };
     defer allocator.free(content_a);
 
-    const content_b = std.fs.cwd().readFileAlloc(allocator, path_b, 10 * 1024 * 1024) catch |err| {
+    const content_b = std.Io.Dir.readFileAlloc(std.Io.Dir.cwd(), path.currentIo(), path_b, allocator, .limited(10 * 1024 * 1024)) catch |err| {
         ctx.setDiagnosticContext(path_b, "failed to read /etc template");
         return switch (err) {
             error.FileNotFound => EtcError.FileSystem,
@@ -471,13 +473,13 @@ test "filesIdentical returns true for same content" {
     defer allocator.free(file_b);
 
     // Write same content to both
-    var fa = try std.fs.createFileAbsolute(file_a, .{});
-    try fa.writeAll("hello world");
-    fa.close();
+    var fa = try std.Io.Dir.createFileAbsolute(path.currentIo(), file_a, .{});
+    try fa.writeStreamingAll(path.currentIo(), "hello world");
+    fa.close(path.currentIo());
 
-    var fb = try std.fs.createFileAbsolute(file_b, .{});
-    try fb.writeAll("hello world");
-    fb.close();
+    var fb = try std.Io.Dir.createFileAbsolute(path.currentIo(), file_b, .{});
+    try fb.writeStreamingAll(path.currentIo(), "hello world");
+    fb.close(path.currentIo());
 
     try std.testing.expect(try filesIdentical(&test_env.ctx, file_a, file_b));
 }
@@ -498,13 +500,13 @@ test "filesIdentical returns false for different content" {
     const file_b = try std.fs.path.join(allocator, &.{ test_env.path, "b.txt" });
     defer allocator.free(file_b);
 
-    var fa = try std.fs.createFileAbsolute(file_a, .{});
-    try fa.writeAll("hello");
-    fa.close();
+    var fa = try std.Io.Dir.createFileAbsolute(path.currentIo(), file_a, .{});
+    try fa.writeStreamingAll(path.currentIo(), "hello");
+    fa.close(path.currentIo());
 
-    var fb = try std.fs.createFileAbsolute(file_b, .{});
-    try fb.writeAll("world");
-    fb.close();
+    var fb = try std.Io.Dir.createFileAbsolute(path.currentIo(), file_b, .{});
+    try fb.writeStreamingAll(path.currentIo(), "world");
+    fb.close(path.currentIo());
 
     try std.testing.expect(!try filesIdentical(&test_env.ctx, file_a, file_b));
 }
@@ -526,18 +528,20 @@ test "processTemplates copies missing file" {
 
     const template_dir = try std.fs.path.join(allocator, &.{ store_path, "etc-defaults", "myapp" });
     defer allocator.free(template_dir);
-    try std.fs.cwd().makePath(template_dir);
+    var template_dir_handle = try path.makePathAndOpenDir(template_dir);
+    template_dir_handle.close(path.currentIo());
 
     const template_file = try std.fs.path.join(allocator, &.{ template_dir, "config.conf" });
     defer allocator.free(template_file);
-    var tf = try std.fs.createFileAbsolute(template_file, .{});
-    try tf.writeAll("default config");
-    tf.close();
+    var tf = try std.Io.Dir.createFileAbsolute(path.currentIo(), template_file, .{});
+    try tf.writeStreamingAll(path.currentIo(), "default config");
+    tf.close(path.currentIo());
 
     // Create etc directory
     const etc_dir = try std.fs.path.join(allocator, &.{ test_env.path, "etc" });
     defer allocator.free(etc_dir);
-    try std.fs.cwd().makePath(etc_dir);
+    var etc_dir_handle = try path.makePathAndOpenDir(etc_dir);
+    etc_dir_handle.close(path.currentIo());
 
     // Create manifest with this package
     var manifest = generation.GenerationManifest.init(allocator, 1);
@@ -556,7 +560,7 @@ test "processTemplates copies missing file" {
     const dest_file = try std.fs.path.join(allocator, &.{ etc_dir, "myapp", "config.conf" });
     defer allocator.free(dest_file);
 
-    const content = try std.fs.cwd().readFileAlloc(allocator, dest_file, 1024);
+    const content = try std.Io.Dir.readFileAlloc(std.Io.Dir.cwd(), path.currentIo(), dest_file, allocator, .limited(1024));
     defer allocator.free(content);
     try std.testing.expectEqualStrings("default config", content);
 }
@@ -578,24 +582,26 @@ test "processTemplates skips identical file" {
 
     const template_dir = try std.fs.path.join(allocator, &.{ store_path, "etc-defaults" });
     defer allocator.free(template_dir);
-    try std.fs.cwd().makePath(template_dir);
+    var template_dir_handle = try path.makePathAndOpenDir(template_dir);
+    template_dir_handle.close(path.currentIo());
 
     const template_file = try std.fs.path.join(allocator, &.{ template_dir, "config.conf" });
     defer allocator.free(template_file);
-    var tf = try std.fs.createFileAbsolute(template_file, .{});
-    try tf.writeAll("same content");
-    tf.close();
+    var tf = try std.Io.Dir.createFileAbsolute(path.currentIo(), template_file, .{});
+    try tf.writeStreamingAll(path.currentIo(), "same content");
+    tf.close(path.currentIo());
 
     // Create etc with identical file
     const etc_dir = try std.fs.path.join(allocator, &.{ test_env.path, "etc" });
     defer allocator.free(etc_dir);
-    try std.fs.cwd().makePath(etc_dir);
+    var etc_dir_handle = try path.makePathAndOpenDir(etc_dir);
+    etc_dir_handle.close(path.currentIo());
 
     const etc_file = try std.fs.path.join(allocator, &.{ etc_dir, "config.conf" });
     defer allocator.free(etc_file);
-    var ef = try std.fs.createFileAbsolute(etc_file, .{});
-    try ef.writeAll("same content");
-    ef.close();
+    var ef = try std.Io.Dir.createFileAbsolute(path.currentIo(), etc_file, .{});
+    try ef.writeStreamingAll(path.currentIo(), "same content");
+    ef.close(path.currentIo());
 
     // Create manifest
     var manifest = generation.GenerationManifest.init(allocator, 1);
@@ -628,24 +634,26 @@ test "processTemplates reports differing file without writing .new" {
 
     const template_dir = try std.fs.path.join(allocator, &.{ store_path, "etc-defaults" });
     defer allocator.free(template_dir);
-    try std.fs.cwd().makePath(template_dir);
+    var template_dir_handle = try path.makePathAndOpenDir(template_dir);
+    template_dir_handle.close(path.currentIo());
 
     const template_file = try std.fs.path.join(allocator, &.{ template_dir, "config.conf" });
     defer allocator.free(template_file);
-    var tf = try std.fs.createFileAbsolute(template_file, .{});
-    try tf.writeAll("new default");
-    tf.close();
+    var tf = try std.Io.Dir.createFileAbsolute(path.currentIo(), template_file, .{});
+    try tf.writeStreamingAll(path.currentIo(), "new default");
+    tf.close(path.currentIo());
 
     // Create etc with different file
     const etc_dir = try std.fs.path.join(allocator, &.{ test_env.path, "etc" });
     defer allocator.free(etc_dir);
-    try std.fs.cwd().makePath(etc_dir);
+    var etc_dir_handle = try path.makePathAndOpenDir(etc_dir);
+    etc_dir_handle.close(path.currentIo());
 
     const etc_file = try std.fs.path.join(allocator, &.{ etc_dir, "config.conf" });
     defer allocator.free(etc_file);
-    var ef = try std.fs.createFileAbsolute(etc_file, .{});
-    try ef.writeAll("user customized");
-    ef.close();
+    var ef = try std.Io.Dir.createFileAbsolute(path.currentIo(), etc_file, .{});
+    try ef.writeStreamingAll(path.currentIo(), "user customized");
+    ef.close(path.currentIo());
 
     // Create manifest
     var manifest = generation.GenerationManifest.init(allocator, 1);
@@ -661,13 +669,13 @@ test "processTemplates reports differing file without writing .new" {
     try std.testing.expectEqual(@as(usize, 1), result.differing);
 
     // Verify original unchanged
-    const orig_content = try std.fs.cwd().readFileAlloc(allocator, etc_file, 1024);
+    const orig_content = try std.Io.Dir.readFileAlloc(std.Io.Dir.cwd(), path.currentIo(), etc_file, allocator, .limited(1024));
     defer allocator.free(orig_content);
     try std.testing.expectEqualStrings("user customized", orig_content);
 
     const new_file = try std.fs.path.join(allocator, &.{ etc_dir, "config.conf.new" });
     defer allocator.free(new_file);
-    try std.testing.expectError(error.FileNotFound, std.fs.accessAbsolute(new_file, .{}));
+    try std.testing.expectError(error.FileNotFound, std.Io.Dir.accessAbsolute(path.currentIo(), new_file, .{}));
 }
 
 // Spec #13: Duplicate template paths from two packages = hard error
@@ -686,28 +694,31 @@ test "processTemplates detects duplicate template paths" {
     defer allocator.free(store_path1);
     const template_dir1 = try std.fs.path.join(allocator, &.{ store_path1, "etc-defaults" });
     defer allocator.free(template_dir1);
-    try std.fs.cwd().makePath(template_dir1);
+    var template_dir1_handle = try path.makePathAndOpenDir(template_dir1);
+    template_dir1_handle.close(path.currentIo());
     const template_file1 = try std.fs.path.join(allocator, &.{ template_dir1, "shared.conf" });
     defer allocator.free(template_file1);
-    var tf1 = try std.fs.createFileAbsolute(template_file1, .{});
-    try tf1.writeAll("from pkg1");
-    tf1.close();
+    var tf1 = try std.Io.Dir.createFileAbsolute(path.currentIo(), template_file1, .{});
+    try tf1.writeStreamingAll(path.currentIo(), "from pkg1");
+    tf1.close(path.currentIo());
 
     const store_path2 = try std.fs.path.join(allocator, &.{ test_env.path, "store", "def-pkg2-1.0" });
     defer allocator.free(store_path2);
     const template_dir2 = try std.fs.path.join(allocator, &.{ store_path2, "etc-defaults" });
     defer allocator.free(template_dir2);
-    try std.fs.cwd().makePath(template_dir2);
+    var template_dir2_handle = try path.makePathAndOpenDir(template_dir2);
+    template_dir2_handle.close(path.currentIo());
     const template_file2 = try std.fs.path.join(allocator, &.{ template_dir2, "shared.conf" });
     defer allocator.free(template_file2);
-    var tf2 = try std.fs.createFileAbsolute(template_file2, .{});
-    try tf2.writeAll("from pkg2");
-    tf2.close();
+    var tf2 = try std.Io.Dir.createFileAbsolute(path.currentIo(), template_file2, .{});
+    try tf2.writeStreamingAll(path.currentIo(), "from pkg2");
+    tf2.close(path.currentIo());
 
     // Create etc directory
     const etc_dir = try std.fs.path.join(allocator, &.{ test_env.path, "etc" });
     defer allocator.free(etc_dir);
-    try std.fs.cwd().makePath(etc_dir);
+    var etc_dir_handle = try path.makePathAndOpenDir(etc_dir);
+    etc_dir_handle.close(path.currentIo());
 
     // Create manifest with both packages
     var manifest = generation.GenerationManifest.init(allocator, 1);
@@ -733,32 +744,32 @@ test "applyTemplate backs up and replaces" {
     // Create original and template files
     const original = try std.fs.path.join(allocator, &.{ test_env.path, "config.conf" });
     defer allocator.free(original);
-    var fo = try std.fs.createFileAbsolute(original, .{});
-    try fo.writeAll("original content");
-    fo.close();
+    var fo = try std.Io.Dir.createFileAbsolute(path.currentIo(), original, .{});
+    try fo.writeStreamingAll(path.currentIo(), "original content");
+    fo.close(path.currentIo());
 
     const new_file = try std.fs.path.join(allocator, &.{ test_env.path, "template.conf" });
     defer allocator.free(new_file);
-    var fn_ = try std.fs.createFileAbsolute(new_file, .{});
-    try fn_.writeAll("new content");
-    fn_.close();
+    var fn_ = try std.Io.Dir.createFileAbsolute(path.currentIo(), new_file, .{});
+    try fn_.writeStreamingAll(path.currentIo(), "new content");
+    fn_.close(path.currentIo());
 
     // Apply
     try applyTemplate(&test_env.ctx, new_file, original);
 
     // Verify original now has new content
-    const content = try std.fs.cwd().readFileAlloc(allocator, original, 1024);
+    const content = try std.Io.Dir.readFileAlloc(std.Io.Dir.cwd(), path.currentIo(), original, allocator, .limited(1024));
     defer allocator.free(content);
     try std.testing.expectEqualStrings("new content", content);
 
     // Verify .old has original content
     const old_file = try std.fs.path.join(allocator, &.{ test_env.path, "config.conf.old" });
     defer allocator.free(old_file);
-    const old_content = try std.fs.cwd().readFileAlloc(allocator, old_file, 1024);
+    const old_content = try std.Io.Dir.readFileAlloc(std.Io.Dir.cwd(), path.currentIo(), old_file, allocator, .limited(1024));
     defer allocator.free(old_content);
     try std.testing.expectEqualStrings("original content", old_content);
 
-    const template_content = try std.fs.cwd().readFileAlloc(allocator, new_file, 1024);
+    const template_content = try std.Io.Dir.readFileAlloc(std.Io.Dir.cwd(), path.currentIo(), new_file, allocator, .limited(1024));
     defer allocator.free(template_content);
     try std.testing.expectEqualStrings("new content", template_content);
 }
@@ -780,14 +791,15 @@ test "processTemplates never overwrites existing /etc files" {
 
     const template_dir = try std.fs.path.join(allocator, &.{ store_path, "etc-defaults", "myapp" });
     defer allocator.free(template_dir);
-    try std.fs.cwd().makePath(template_dir);
+    var template_dir_handle = try path.makePathAndOpenDir(template_dir);
+    template_dir_handle.close(path.currentIo());
 
     const template_file = try std.fs.path.join(allocator, &.{ template_dir, "app.conf" });
     defer allocator.free(template_file);
     {
-        var tf = try std.fs.createFileAbsolute(template_file, .{});
-        try tf.writeAll("# new upstream default\nport = 9090\n");
-        tf.close();
+        var tf = try std.Io.Dir.createFileAbsolute(path.currentIo(), template_file, .{});
+        try tf.writeStreamingAll(path.currentIo(), "# new upstream default\nport = 9090\n");
+        tf.close(path.currentIo());
     }
 
     // Create /etc with an existing user-customized file at the same relative path
@@ -796,14 +808,15 @@ test "processTemplates never overwrites existing /etc files" {
 
     const etc_app_dir = try std.fs.path.join(allocator, &.{ etc_dir, "myapp" });
     defer allocator.free(etc_app_dir);
-    try std.fs.cwd().makePath(etc_app_dir);
+    var etc_app_dir_handle = try path.makePathAndOpenDir(etc_app_dir);
+    etc_app_dir_handle.close(path.currentIo());
 
     const etc_file = try std.fs.path.join(allocator, &.{ etc_app_dir, "app.conf" });
     defer allocator.free(etc_file);
     {
-        var ef = try std.fs.createFileAbsolute(etc_file, .{});
-        try ef.writeAll("# user customized\nport = 8080\n");
-        ef.close();
+        var ef = try std.Io.Dir.createFileAbsolute(path.currentIo(), etc_file, .{});
+        try ef.writeStreamingAll(path.currentIo(), "# user customized\nport = 8080\n");
+        ef.close(path.currentIo());
     }
 
     // Build a generation manifest referencing this package
@@ -816,14 +829,14 @@ test "processTemplates never overwrites existing /etc files" {
     defer result.deinit();
 
     // Verify: existing /etc file was NOT overwritten
-    const etc_content = try std.fs.cwd().readFileAlloc(allocator, etc_file, 4096);
+    const etc_content = try std.Io.Dir.readFileAlloc(std.Io.Dir.cwd(), path.currentIo(), etc_file, allocator, .limited(4096));
     defer allocator.free(etc_content);
     try std.testing.expectEqualStrings("# user customized\nport = 8080\n", etc_content);
 
     // Verify no eager .new file was created
     const new_file = try std.fs.path.join(allocator, &.{ etc_app_dir, "app.conf.new" });
     defer allocator.free(new_file);
-    try std.testing.expectError(error.FileNotFound, std.fs.accessAbsolute(new_file, .{}));
+    try std.testing.expectError(error.FileNotFound, std.Io.Dir.accessAbsolute(path.currentIo(), new_file, .{}));
 
     // Verify counts: 0 copied, 0 skipped, 1 differing file
     try std.testing.expectEqual(@as(usize, 0), result.copied);
@@ -845,52 +858,54 @@ test "collectStatus reports differing and missing files" {
     defer allocator.free(store_path);
     const template_dir = try std.fs.path.join(allocator, &.{ store_path, "etc-defaults", "myapp" });
     defer allocator.free(template_dir);
-    try std.fs.cwd().makePath(template_dir);
+    var template_dir_handle = try path.makePathAndOpenDir(template_dir);
+    template_dir_handle.close(path.currentIo());
 
     const changed_file = try std.fs.path.join(allocator, &.{ template_dir, "changed.conf" });
     defer allocator.free(changed_file);
     {
-        var f = try std.fs.createFileAbsolute(changed_file, .{});
-        try f.writeAll("default changed");
-        f.close();
+        var f = try std.Io.Dir.createFileAbsolute(path.currentIo(), changed_file, .{});
+        try f.writeStreamingAll(path.currentIo(), "default changed");
+        f.close(path.currentIo());
     }
 
     const missing_file = try std.fs.path.join(allocator, &.{ template_dir, "missing.conf" });
     defer allocator.free(missing_file);
     {
-        var f = try std.fs.createFileAbsolute(missing_file, .{});
-        try f.writeAll("default missing");
-        f.close();
+        var f = try std.Io.Dir.createFileAbsolute(path.currentIo(), missing_file, .{});
+        try f.writeStreamingAll(path.currentIo(), "default missing");
+        f.close(path.currentIo());
     }
 
     const same_file = try std.fs.path.join(allocator, &.{ template_dir, "same.conf" });
     defer allocator.free(same_file);
     {
-        var f = try std.fs.createFileAbsolute(same_file, .{});
-        try f.writeAll("default same");
-        f.close();
+        var f = try std.Io.Dir.createFileAbsolute(path.currentIo(), same_file, .{});
+        try f.writeStreamingAll(path.currentIo(), "default same");
+        f.close(path.currentIo());
     }
 
     const etc_dir = try std.fs.path.join(allocator, &.{ test_env.path, "etc" });
     defer allocator.free(etc_dir);
     const etc_app_dir = try std.fs.path.join(allocator, &.{ etc_dir, "myapp" });
     defer allocator.free(etc_app_dir);
-    try std.fs.cwd().makePath(etc_app_dir);
+    var etc_app_dir_handle = try path.makePathAndOpenDir(etc_app_dir);
+    etc_app_dir_handle.close(path.currentIo());
 
     const etc_changed = try std.fs.path.join(allocator, &.{ etc_app_dir, "changed.conf" });
     defer allocator.free(etc_changed);
     {
-        var f = try std.fs.createFileAbsolute(etc_changed, .{});
-        try f.writeAll("user changed");
-        f.close();
+        var f = try std.Io.Dir.createFileAbsolute(path.currentIo(), etc_changed, .{});
+        try f.writeStreamingAll(path.currentIo(), "user changed");
+        f.close(path.currentIo());
     }
 
     const etc_same = try std.fs.path.join(allocator, &.{ etc_app_dir, "same.conf" });
     defer allocator.free(etc_same);
     {
-        var f = try std.fs.createFileAbsolute(etc_same, .{});
-        try f.writeAll("default same");
-        f.close();
+        var f = try std.Io.Dir.createFileAbsolute(path.currentIo(), etc_same, .{});
+        try f.writeStreamingAll(path.currentIo(), "default same");
+        f.close(path.currentIo());
     }
 
     var manifest = generation.GenerationManifest.init(allocator, 1);

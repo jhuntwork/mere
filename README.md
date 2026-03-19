@@ -54,7 +54,7 @@ mere gc
 
 ## Building from Source
 
-Requires [Zig](https://ziglang.org/) 0.15+. The build system automatically
+Requires [Zig](https://ziglang.org/) 0.16. The build system automatically
 fetches and builds all C library dependencies (libsodium, zstd, libarchive,
 libcurl, sqlite3). Host prerequisites: musl, LLVM, busybox (for sha256sum),
 curl, and cmake.

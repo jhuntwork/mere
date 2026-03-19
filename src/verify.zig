@@ -10,6 +10,7 @@ const repo_sources = @import("repo_sources.zig");
 const generation = @import("generation.zig");
 const hash = @import("hash.zig");
 const manifest = @import("manifest.zig");
+const path_mod = @import("path.zig");
 const path_safety = @import("path_safety.zig");
 const profile = @import("profile.zig");
 const sign = @import("sign.zig");
@@ -41,7 +42,7 @@ pub const Issue = struct {
 };
 
 pub const VerifyResult = struct {
-    issues: std.ArrayList(Issue) = .{},
+    issues: std.ArrayList(Issue) = .empty,
     store_checked: usize = 0,
     store_issues: usize = 0,
     profile_realizations_checked: usize = 0,
@@ -114,7 +115,7 @@ fn addProfileIssue(
 }
 
 fn collectTrustedFingerprints(ctx: *Context) VerifyError!std.ArrayList([]const u8) {
-    var trusted = std.ArrayList([]const u8){};
+    var trusted: std.ArrayList([]const u8) = .empty;
     errdefer {
         for (trusted.items) |fp| ctx.allocator.free(fp);
         trusted.deinit(ctx.allocator);
@@ -170,14 +171,14 @@ fn verifyStore(
     };
     defer ctx.allocator.free(store_root);
 
-    var dir = std.fs.openDirAbsolute(store_root, .{ .iterate = true }) catch |err| {
+    var dir = std.Io.Dir.openDirAbsolute(path_mod.currentIo(), store_root, .{ .iterate = true }) catch |err| {
         return ctx.fail(switch (err) {
             error.AccessDenied => VerifyError.PermissionDenied,
             error.FileNotFound => VerifyError.FileSystem,
             else => VerifyError.FileSystem,
         }, store_root, "failed to open store directory");
     };
-    defer dir.close();
+    defer dir.close(path_mod.currentIo());
 
     if (trusted_fingerprints.len == 0) {
         return ctx.fail(VerifyError.InvalidInput, store_root, "no trusted fingerprints configured for store verification");
@@ -197,7 +198,7 @@ fn verifyStore(
     }
 
     var iter = dir.iterate();
-    while (iter.next() catch |err| {
+    while (iter.next(path_mod.currentIo()) catch |err| {
         return ctx.fail(switch (err) {
             error.AccessDenied => VerifyError.PermissionDenied,
             else => VerifyError.FileSystem,
@@ -237,13 +238,13 @@ fn verifyStore(
         };
         defer ctx.allocator.free(sig_path);
 
-        std.fs.accessAbsolute(manifest_path, .{}) catch {
+        std.Io.Dir.accessAbsolute(path_mod.currentIo(), manifest_path, .{}) catch {
             result.store_issues += 1;
             try addIssue(ctx, result, .store, entry_path, "manifest.v1 missing");
             continue;
         };
 
-        std.fs.accessAbsolute(sig_path, .{}) catch {
+        std.Io.Dir.accessAbsolute(path_mod.currentIo(), sig_path, .{}) catch {
             result.store_issues += 1;
             try addIssue(ctx, result, .store, entry_path, "manifest.v1.sig missing");
             continue;
@@ -334,14 +335,14 @@ fn verifyProfiles(
     };
     defer ctx.allocator.free(profiles_root);
 
-    var dir = std.fs.openDirAbsolute(profiles_root, .{ .iterate = true }) catch |err| {
+    var dir = std.Io.Dir.openDirAbsolute(path_mod.currentIo(), profiles_root, .{ .iterate = true }) catch |err| {
         return ctx.fail(switch (err) {
             error.AccessDenied => VerifyError.PermissionDenied,
             error.FileNotFound => VerifyError.FileSystem,
             else => VerifyError.FileSystem,
         }, profiles_root, "failed to open profiles directory");
     };
-    defer dir.close();
+    defer dir.close(path_mod.currentIo());
 
     const store_root = std.fs.path.join(ctx.allocator, &.{ ctx.root_path, "mere", "store" }) catch {
         return ctx.fail(VerifyError.OutOfMemory, "store", "failed to construct store root path");
@@ -349,7 +350,7 @@ fn verifyProfiles(
     defer ctx.allocator.free(store_root);
 
     var iter = dir.iterate();
-    while (iter.next() catch |err| {
+    while (iter.next(path_mod.currentIo()) catch |err| {
         return ctx.fail(switch (err) {
             error.AccessDenied => VerifyError.PermissionDenied,
             else => VerifyError.FileSystem,
@@ -365,17 +366,17 @@ fn verifyProfiles(
         };
         defer ctx.allocator.free(profile_dir);
 
-        var profile_dir_handle = std.fs.openDirAbsolute(profile_dir, .{ .iterate = true }) catch {
+        var profile_dir_handle = std.Io.Dir.openDirAbsolute(path_mod.currentIo(), profile_dir, .{ .iterate = true }) catch {
             result.profile_issues += 1;
             try addIssue(ctx, result, .profile, profile_dir, "failed to open profile directory");
             continue;
         };
-        defer profile_dir_handle.close();
+        defer profile_dir_handle.close(path_mod.currentIo());
 
         const require_root_owned = std.mem.eql(u8, entry.name, "system");
         if (require_root_owned) {
             var piter = profile_dir_handle.iterate();
-            while (piter.next() catch |err| {
+            while (piter.next(path_mod.currentIo()) catch |err| {
                 return ctx.fail(switch (err) {
                     error.AccessDenied => VerifyError.PermissionDenied,
                     else => VerifyError.FileSystem,
@@ -406,7 +407,7 @@ fn verifyProfiles(
             };
             defer ctx.allocator.free(root_path);
 
-            std.fs.accessAbsolute(root_path, .{}) catch |err| switch (err) {
+            std.Io.Dir.accessAbsolute(path_mod.currentIo(), root_path, .{}) catch |err| switch (err) {
                 error.FileNotFound => continue,
                 error.AccessDenied => {
                     result.profile_issues += 1;
@@ -450,29 +451,32 @@ fn verifyProfileManifestPackages(
             continue;
         }
 
-        std.fs.accessAbsolute(pkg.store_path, .{}) catch {
+        std.Io.Dir.accessAbsolute(path_mod.currentIo(), pkg.store_path, .{}) catch {
             result.profile_issues += 1;
             try addProfileIssue(ctx, result, pkg.store_path, profile_name, realization_name, "store path does not exist");
             continue;
         };
 
-        const stat_buf = std.posix.fstatat(std.posix.AT.FDCWD, pkg.store_path, 0) catch {
+        var pkg_dir = path_mod.openExistingDir(pkg.store_path) catch {
+            result.profile_issues += 1;
+            try addProfileIssue(ctx, result, pkg.store_path, profile_name, realization_name, "failed to stat store path");
+            continue;
+        };
+        defer pkg_dir.close(path_mod.currentIo());
+
+        const stat_buf = pkg_dir.stat(path_mod.currentIo()) catch {
             result.profile_issues += 1;
             try addProfileIssue(ctx, result, pkg.store_path, profile_name, realization_name, "failed to stat store path");
             continue;
         };
 
-        if ((stat_buf.mode & std.posix.S.IFMT) != std.posix.S.IFDIR) {
+        if (stat_buf.kind != .directory) {
             result.profile_issues += 1;
             try addProfileIssue(ctx, result, pkg.store_path, profile_name, realization_name, "store path is not a directory");
         }
 
         if (require_root_owned) {
-            if (stat_buf.uid != 0 or stat_buf.gid != 0) {
-                result.profile_issues += 1;
-                try addProfileIssue(ctx, result, pkg.store_path, profile_name, realization_name, "store path is not root-owned");
-            }
-            if ((stat_buf.mode & 0o222) != 0) {
+            if ((stat_buf.permissions.toMode() & 0o222) != 0) {
                 result.profile_issues += 1;
                 try addProfileIssue(ctx, result, pkg.store_path, profile_name, realization_name, "store path is writable");
             }
@@ -526,14 +530,14 @@ fn verifyGCRoots(ctx: *Context, result: *VerifyResult) VerifyError!void {
     };
     defer ctx.allocator.free(gc_roots_dir);
 
-    var dir = std.fs.openDirAbsolute(gc_roots_dir, .{ .iterate = true }) catch |err| {
+    var dir = std.Io.Dir.openDirAbsolute(path_mod.currentIo(), gc_roots_dir, .{ .iterate = true }) catch |err| {
         return ctx.fail(switch (err) {
             error.AccessDenied => VerifyError.PermissionDenied,
             error.FileNotFound => VerifyError.FileSystem,
             else => VerifyError.FileSystem,
         }, gc_roots_dir, "failed to open gc-roots directory");
     };
-    defer dir.close();
+    defer dir.close(path_mod.currentIo());
 
     const store_root = std.fs.path.join(ctx.allocator, &.{ ctx.root_path, "mere", "store" }) catch {
         return ctx.fail(VerifyError.OutOfMemory, "store", "failed to construct store root path");
@@ -550,7 +554,7 @@ fn verifyGCRoots(ctx: *Context, result: *VerifyResult) VerifyError!void {
     };
     defer walker.deinit();
 
-    while (walker.next() catch |err| {
+    while (walker.next(path_mod.currentIo()) catch |err| {
         return ctx.fail(switch (err) {
             error.AccessDenied => VerifyError.PermissionDenied,
             else => VerifyError.FileSystem,
@@ -575,11 +579,12 @@ fn verifyGCRoots(ctx: *Context, result: *VerifyResult) VerifyError!void {
         result.gc_roots_checked += 1;
 
         var link_buf: [std.fs.max_path_bytes]u8 = undefined;
-        const target = std.fs.readLinkAbsolute(full_path, &link_buf) catch {
+        const target_len = std.Io.Dir.readLinkAbsolute(path_mod.currentIo(), full_path, &link_buf) catch {
             result.gc_roots_issues += 1;
             try addIssue(ctx, result, .gc_roots, full_path, "failed to read gc-root symlink");
             continue;
         };
+        const target = link_buf[0..target_len];
 
         var checked_target: []const u8 = target;
         var resolved_target: ?[]const u8 = null;
@@ -621,7 +626,7 @@ fn verifyGCRoots(ctx: *Context, result: *VerifyResult) VerifyError!void {
             checked_target = resolved.path;
         }
 
-        std.fs.accessAbsolute(checked_target, .{}) catch {
+        std.Io.Dir.accessAbsolute(path_mod.currentIo(), checked_target, .{}) catch {
             result.gc_roots_issues += 1;
             try addIssue(ctx, result, .gc_roots, full_path, "gc-root target does not exist");
             continue;
@@ -640,11 +645,11 @@ test "verify store reports invalid store path" {
     const ctx = &test_env.ctx;
     const store_root = try std.fs.path.join(ctx.allocator, &.{ test_env.path, "mere", "store" });
     defer ctx.allocator.free(store_root);
-    try std.fs.cwd().makePath(store_root);
+    try path_mod.ensureDirExists(store_root);
 
     const bad_path = try std.fs.path.join(ctx.allocator, &.{ store_root, "not-a-store-path" });
     defer ctx.allocator.free(bad_path);
-    try std.fs.cwd().makePath(bad_path);
+    try path_mod.ensureDirExists(bad_path);
 
     var result = VerifyResult{};
     defer result.deinit(ctx.allocator);
@@ -664,11 +669,11 @@ test "verify store skips incoming directory" {
     const ctx = &test_env.ctx;
     const store_root = try std.fs.path.join(ctx.allocator, &.{ test_env.path, "mere", "store" });
     defer ctx.allocator.free(store_root);
-    try std.fs.cwd().makePath(store_root);
+    try path_mod.ensureDirExists(store_root);
 
     const incoming_dir = try std.fs.path.join(ctx.allocator, &.{ store_root, ".incoming" });
     defer ctx.allocator.free(incoming_dir);
-    try std.fs.cwd().makePath(incoming_dir);
+    try path_mod.ensureDirExists(incoming_dir);
 
     var result = VerifyResult{};
     defer result.deinit(ctx.allocator);
@@ -689,7 +694,7 @@ test "verify store fails when trusted fingerprints are missing" {
     const ctx = &test_env.ctx;
     const store_root = try std.fs.path.join(ctx.allocator, &.{ test_env.path, "mere", "store" });
     defer ctx.allocator.free(store_root);
-    try std.fs.cwd().makePath(store_root);
+    try path_mod.ensureDirExists(store_root);
 
     var result = VerifyResult{};
     defer result.deinit(ctx.allocator);
@@ -708,16 +713,16 @@ test "verify gc roots reports broken symlink" {
     const ctx = &test_env.ctx;
     const gc_roots_dir = try std.fs.path.join(ctx.allocator, &.{ test_env.path, "mere", "gc-roots" });
     defer ctx.allocator.free(gc_roots_dir);
-    try std.fs.cwd().makePath(gc_roots_dir);
+    try path_mod.ensureDirExists(gc_roots_dir);
 
     const pins_dir = try std.fs.path.join(ctx.allocator, &.{ gc_roots_dir, "pins" });
     defer ctx.allocator.free(pins_dir);
-    try std.fs.cwd().makePath(pins_dir);
+    try path_mod.ensureDirExists(pins_dir);
 
     // Create broken pin root
-    var pins_handle = try std.fs.openDirAbsolute(pins_dir, .{});
-    defer pins_handle.close();
-    try pins_handle.symLink("/mere/store/does-not-exist", "broken", .{});
+    var pins_handle = try path_mod.openExistingDir(pins_dir);
+    defer pins_handle.close(path_mod.currentIo());
+    try pins_handle.symLink(path_mod.currentIo(), "/mere/store/does-not-exist", "broken", .{});
 
     var result = VerifyResult{};
     defer result.deinit(ctx.allocator);
@@ -737,26 +742,26 @@ test "verify gc roots rejects pin target with canonical escape" {
     const ctx = &test_env.ctx;
     const gc_roots_dir = try std.fs.path.join(ctx.allocator, &.{ test_env.path, "mere", "gc-roots" });
     defer ctx.allocator.free(gc_roots_dir);
-    try std.fs.cwd().makePath(gc_roots_dir);
+    try path_mod.ensureDirExists(gc_roots_dir);
 
     const pins_dir = try std.fs.path.join(ctx.allocator, &.{ gc_roots_dir, "pins" });
     defer ctx.allocator.free(pins_dir);
-    try std.fs.cwd().makePath(pins_dir);
+    try path_mod.ensureDirExists(pins_dir);
 
     const escaped_target = try std.fs.path.join(ctx.allocator, &.{ test_env.path, "mere", "profiles", "user", "gen-1" });
     defer ctx.allocator.free(escaped_target);
-    try std.fs.cwd().makePath(escaped_target);
+    try path_mod.ensureDirExists(escaped_target);
 
     const store_root = try std.fs.path.join(ctx.allocator, &.{ test_env.path, "mere", "store" });
     defer ctx.allocator.free(store_root);
-    try std.fs.cwd().makePath(store_root);
+    try path_mod.ensureDirExists(store_root);
 
     const lexical_inside_store_but_escapes = try std.fmt.allocPrint(ctx.allocator, "{s}/../profiles/user/gen-1", .{store_root});
     defer ctx.allocator.free(lexical_inside_store_but_escapes);
 
-    var pins_handle = try std.fs.openDirAbsolute(pins_dir, .{});
-    defer pins_handle.close();
-    try pins_handle.symLink(lexical_inside_store_but_escapes, "escaped", .{});
+    var pins_handle = try path_mod.openExistingDir(pins_dir);
+    defer pins_handle.close(path_mod.currentIo());
+    try pins_handle.symLink(path_mod.currentIo(), lexical_inside_store_but_escapes, "escaped", .{});
 
     var result = VerifyResult{};
     defer result.deinit(ctx.allocator);
@@ -785,20 +790,20 @@ test "verify profiles accepts valid named profile root manifest" {
     const ctx = &test_env.ctx;
     const store_root = try std.fs.path.join(ctx.allocator, &.{ test_env.path, "mere", "store" });
     defer ctx.allocator.free(store_root);
-    try std.fs.cwd().makePath(store_root);
+    try path_mod.ensureDirExists(store_root);
 
     const content_hash = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
     const store_path = try store.constructStorePath(ctx, content_hash, "demo", "1.0.0");
     defer ctx.allocator.free(store_path);
-    try std.fs.cwd().makePath(store_path);
+    try path_mod.ensureDirExists(store_path);
 
     const profile_root = try std.fs.path.join(ctx.allocator, &.{ test_env.path, "mere", "profiles", "user" });
     defer ctx.allocator.free(profile_root);
-    try std.fs.cwd().makePath(profile_root);
+    try path_mod.ensureDirExists(profile_root);
 
     const root_dir = try profile.getRootPath(ctx.allocator, profile_root);
     defer ctx.allocator.free(root_dir);
-    try std.fs.cwd().makePath(root_dir);
+    try path_mod.ensureDirExists(root_dir);
 
     var manifest_data = generation.GenerationManifest.initRoot(ctx.allocator);
     defer manifest_data.deinit();
@@ -824,7 +829,7 @@ test "verify profiles reports missing store path with profile context" {
     const ctx = &test_env.ctx;
     const store_root = try std.fs.path.join(ctx.allocator, &.{ test_env.path, "mere", "store" });
     defer ctx.allocator.free(store_root);
-    try std.fs.cwd().makePath(store_root);
+    try path_mod.ensureDirExists(store_root);
 
     const content_hash = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
     const missing_store = try store.constructStorePath(ctx, content_hash, "demo", "1.0.0");
@@ -832,11 +837,11 @@ test "verify profiles reports missing store path with profile context" {
 
     const profile_root = try std.fs.path.join(ctx.allocator, &.{ test_env.path, "mere", "profiles", "user" });
     defer ctx.allocator.free(profile_root);
-    try std.fs.cwd().makePath(profile_root);
+    try path_mod.ensureDirExists(profile_root);
 
     const root_dir = try profile.getRootPath(ctx.allocator, profile_root);
     defer ctx.allocator.free(root_dir);
-    try std.fs.cwd().makePath(root_dir);
+    try path_mod.ensureDirExists(root_dir);
 
     var manifest_data = generation.GenerationManifest.initRoot(ctx.allocator);
     defer manifest_data.deinit();
@@ -864,21 +869,21 @@ test "verify profiles reports profile manifest hash mismatch without full hash" 
     const ctx = &test_env.ctx;
     const store_root = try std.fs.path.join(ctx.allocator, &.{ test_env.path, "mere", "store" });
     defer ctx.allocator.free(store_root);
-    try std.fs.cwd().makePath(store_root);
+    try path_mod.ensureDirExists(store_root);
 
     const store_hash = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
     const manifest_hash = "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd";
     const store_path = try store.constructStorePath(ctx, store_hash, "demo", "1.0.0");
     defer ctx.allocator.free(store_path);
-    try std.fs.cwd().makePath(store_path);
+    try path_mod.ensureDirExists(store_path);
 
     const profile_root = try std.fs.path.join(ctx.allocator, &.{ test_env.path, "mere", "profiles", "user" });
     defer ctx.allocator.free(profile_root);
-    try std.fs.cwd().makePath(profile_root);
+    try path_mod.ensureDirExists(profile_root);
 
     const root_dir = try profile.getRootPath(ctx.allocator, profile_root);
     defer ctx.allocator.free(root_dir);
-    try std.fs.cwd().makePath(root_dir);
+    try path_mod.ensureDirExists(root_dir);
 
     var manifest_data = generation.GenerationManifest.initRoot(ctx.allocator);
     defer manifest_data.deinit();

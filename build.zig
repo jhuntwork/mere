@@ -338,9 +338,9 @@ pub fn build(b: *std.Build) void {
         }),
     });
     linkSystemLibraries(mere);
-    mere.linkLibrary(sqlite_lib);
-    mere.linkLibrary(ckdl_lib);
-    addVendoredObjectFiles(mere, b, vendored);
+    mere.root_module.linkLibrary(sqlite_lib);
+    mere.root_module.linkLibrary(ckdl_lib);
+    addVendoredObjectFiles(mere.root_module, b, vendored);
     mere.root_module.addImport("mere", mere_module);
 
     // Import build.zig.zon for version access
@@ -435,7 +435,7 @@ const TestModule = struct {
 };
 
 fn linkSystemLibraries(artifact: *std.Build.Step.Compile) void {
-    artifact.linkLibC();
+    artifact.root_module.linkSystemLibrary("c", .{});
 }
 
 fn createTestStep(
@@ -459,11 +459,11 @@ fn createTestStep(
             break :blk mod;
         },
     });
-    addVendoredIncludePaths(test_exe, b, deps);
+    addVendoredIncludePaths(test_exe.root_module, b, deps);
     linkSystemLibraries(test_exe);
-    test_exe.linkLibrary(sqlite_lib);
-    test_exe.linkLibrary(ckdl_lib);
-    addVendoredObjectFiles(test_exe, b, deps);
+    test_exe.root_module.linkLibrary(sqlite_lib);
+    test_exe.root_module.linkLibrary(ckdl_lib);
+    addVendoredObjectFiles(test_exe.root_module, b, deps);
 
     // Create run artifact
     const run_test = b.addRunArtifact(test_exe);
@@ -480,7 +480,7 @@ fn createTestStep(
     return run_test;
 }
 
-fn addVendoredIncludePaths(target: anytype, b: *std.Build, deps: VendoredDeps) void {
+fn addVendoredIncludePaths(target: *std.Build.Module, b: *std.Build, deps: VendoredDeps) void {
     target.addIncludePath(deps.zlib.include_dir);
     target.addIncludePath(deps.curl.include_dir);
     target.addIncludePath(deps.libsodium.include_dir);
@@ -494,7 +494,7 @@ fn addVendoredIncludePaths(target: anytype, b: *std.Build, deps: VendoredDeps) v
 }
 
 fn addVendoredObjectFiles(
-    artifact: *std.Build.Step.Compile,
+    artifact: *std.Build.Module,
     b: *std.Build,
     deps: VendoredDeps,
 ) void {
@@ -531,7 +531,7 @@ fn createSqliteLibrary(
         .root_module = sqlite_module,
         .linkage = .static,
     });
-    sqlite_lib.linkLibC();
+    sqlite_lib.root_module.linkSystemLibrary("c", .{});
     return sqlite_lib;
 }
 
@@ -559,7 +559,7 @@ fn createCkdlLibrary(
         .root_module = ckdl_module,
         .linkage = .static,
     });
-    ckdl_lib.linkLibC();
+    ckdl_lib.root_module.linkSystemLibrary("c", .{});
     return ckdl_lib;
 }
 
@@ -570,30 +570,32 @@ fn downloadVendorSource(b: *std.Build, source: VendorSource) std.Build.LazyPath 
         \\url="$1"
         \\expected="$2"
         \\out="$3"
+        \\log="$out.log"
         \\
-        \\if command -v curl >/dev/null 2>&1; then
-        \\  curl -L --fail --retry 3 -o "$out" "$url"
-        \\elif command -v wget >/dev/null 2>&1; then
-        \\  wget -O "$out" "$url"
-        \\else
-        \\  echo "need curl or wget to fetch vendor source: $url" >&2
-        \\  exit 1
-        \\fi
+        \\: > "$log"
+        \\curl -fsSL --retry 3 -o "$out" "$url" 2>>"$log" || {
+        \\  status="$?"
+        \\  echo "vendor fetch failed, see $log" >&2
+        \\  tail -n 50 "$log" >&2 || true
+        \\  exit "$status"
+        \\}
         \\
-        \\if command -v sha256sum >/dev/null 2>&1; then
-        \\  set -- $(sha256sum "$out")
-        \\elif command -v shasum >/dev/null 2>&1; then
-        \\  set -- $(shasum -a 256 "$out")
-        \\else
-        \\  echo "need sha256sum or shasum to verify vendor source: $out" >&2
-        \\  exit 1
-        \\fi
-        \\
+        \\checksum_line="$(sha256sum "$out" 2>>"$log")" || {
+        \\  status="$?"
+        \\  echo "vendor fetch failed, see $log" >&2
+        \\  tail -n 50 "$log" >&2 || true
+        \\  exit "$status"
+        \\}
+        \\set -- $checksum_line
         \\actual="$1"
         \\if [ "$actual" != "$expected" ]; then
-        \\  echo "sha256 mismatch for $out" >&2
-        \\  echo "expected: $expected" >&2
-        \\  echo "actual:   $actual" >&2
+        \\  {
+        \\    echo "sha256 mismatch for $out"
+        \\    echo "expected: $expected"
+        \\    echo "actual:   $actual"
+        \\  } >>"$log"
+        \\  echo "vendor fetch failed, see $log" >&2
+        \\  tail -n 50 "$log" >&2 || true
         \\  rm -f "$out"
         \\  exit 1
         \\fi
@@ -634,7 +636,7 @@ fn unpackVendorSourceTree(b: *std.Build, spec: SourceTreeBootstrap) SourceTree {
 }
 
 fn appendCMakeFlags(b: *std.Build, flags: []const []const u8) []const u8 {
-    var script = std.ArrayList(u8){};
+    var script: std.ArrayList(u8) = .empty;
     for (flags) |flag| {
         script.appendSlice(b.allocator, " \\\n  ") catch @panic("OOM");
         script.appendSlice(b.allocator, flag) catch @panic("OOM");
@@ -655,7 +657,7 @@ fn appendShellQuotedArg(list: *std.ArrayList(u8), allocator: std.mem.Allocator, 
 }
 
 fn appendShellSetArgs(b: *std.Build, args: []const []const u8) []const u8 {
-    var script = std.ArrayList(u8){};
+    var script: std.ArrayList(u8) = .empty;
     for (args) |arg| {
         script.appendSlice(b.allocator, "\nset -- \"$@\" ") catch @panic("OOM");
         appendShellQuotedArg(&script, b.allocator, arg);
@@ -679,14 +681,25 @@ fn bootstrapCMakePrefix(b: *std.Build, spec: CMakeBootstrap) BootstrappedPrefix 
         \\  rm -rf "$tmpdir"
         \\}}
         \\trap cleanup EXIT INT TERM
+        \\mkdir -p "$prefix"
+        \\log="$prefix/.mere-build.log"
+        \\: > "$log"
+        \\run_logged() {{
+        \\  "$@" >>"$log" 2>&1 || {{
+        \\    status="$?"
+        \\    echo "vendor bootstrap failed, see $log" >&2
+        \\    tail -n 50 "$log" >&2 || true
+        \\    exit "$status"
+        \\  }}
+        \\}}
         \\
-        \\tar {s} "$tarball" -C "$tmpdir"
+        \\run_logged tar {s} "$tarball" -C "$tmpdir"
         \\src="$tmpdir/{s}{s}"
         \\build="$tmpdir/build"
         \\
-        \\cmake -S "$src" -B "$build"{s}
-        \\cmake --build "$build"
-        \\cmake --install "$build" --prefix "$prefix"
+        \\run_logged cmake -Wno-dev -S "$src" -B "$build"{s}
+        \\run_logged cmake --build "$build"
+        \\run_logged cmake --install "$build" --prefix "$prefix"
     ,
         .{
             spec.source.archive_kind.tarExtractFlag(),
@@ -716,17 +729,28 @@ fn bootstrapAutotoolsPrefix(b: *std.Build, spec: AutotoolsBootstrap) Bootstrappe
         \\  rm -rf "$tmpdir"
         \\}}
         \\trap cleanup EXIT INT TERM
+        \\mkdir -p "$prefix"
+        \\log="$prefix/.mere-build.log"
+        \\: > "$log"
+        \\run_logged() {{
+        \\  "$@" >>"$log" 2>&1 || {{
+        \\    status="$?"
+        \\    echo "vendor bootstrap failed, see $log" >&2
+        \\    tail -n 50 "$log" >&2 || true
+        \\    exit "$status"
+        \\  }}
+        \\}}
         \\
-        \\tar {s} "$tarball" -C "$tmpdir"
+        \\run_logged tar {s} "$tarball" -C "$tmpdir"
         \\src="$tmpdir/{s}"
         \\build="$tmpdir/build"
         \\mkdir -p "$build"
         \\cd "$build"
         \\
         \\set -- "$src/configure" --prefix="$prefix" --libdir="$prefix/lib"{s}
-        \\"$@"
-        \\make -j"$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 1)"
-        \\make install
+        \\run_logged "$@"
+        \\run_logged make -j"$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 1)"
+        \\run_logged make install
     ,
         .{
             spec.source.archive_kind.tarExtractFlag(),
@@ -747,7 +771,7 @@ fn bootstrapAutotoolsPrefix(b: *std.Build, spec: AutotoolsBootstrap) Bootstrappe
 fn bootstrapZlib(b: *std.Build) BootstrappedPrefix {
     return bootstrapCMakePrefix(b, .{
         .step_name = "vendor-bootstrap-zlib",
-        .output_dirname = "zlib-ng-prefix",
+        .output_dirname = "zlib-ng",
         .source = vendorSource(.zlib),
         .cmake_flags = &.{
             "-DCMAKE_BUILD_TYPE=Release",
@@ -763,7 +787,7 @@ fn bootstrapZlib(b: *std.Build) BootstrappedPrefix {
 fn bootstrapMbedTls(b: *std.Build) BootstrappedPrefix {
     return bootstrapCMakePrefix(b, .{
         .step_name = "vendor-bootstrap-mbedtls",
-        .output_dirname = "mbedtls-prefix",
+        .output_dirname = "mbedtls",
         .source = vendorSource(.mbedtls),
         .cmake_flags = &.{
             "-DCMAKE_BUILD_TYPE=Release",
@@ -780,7 +804,7 @@ fn bootstrapMbedTls(b: *std.Build) BootstrappedPrefix {
 fn bootstrapLibsodium(b: *std.Build) BootstrappedPrefix {
     return bootstrapAutotoolsPrefix(b, .{
         .step_name = "vendor-bootstrap-libsodium",
-        .output_dirname = "libsodium-prefix",
+        .output_dirname = "libsodium",
         .source = vendorSource(.libsodium),
         .configure_args = &.{
             "--disable-shared",
@@ -793,7 +817,7 @@ fn bootstrapLibsodium(b: *std.Build) BootstrappedPrefix {
 fn bootstrapZstd(b: *std.Build) BootstrappedPrefix {
     return bootstrapCMakePrefix(b, .{
         .step_name = "vendor-bootstrap-zstd",
-        .output_dirname = "zstd-prefix",
+        .output_dirname = "zstd",
         .source = vendorSource(.zstd),
         .cmake_source_subdir = "build/cmake",
         .cmake_flags = &.{
@@ -810,7 +834,7 @@ fn bootstrapZstd(b: *std.Build) BootstrappedPrefix {
 fn bootstrapLzma(b: *std.Build) BootstrappedPrefix {
     return bootstrapAutotoolsPrefix(b, .{
         .step_name = "vendor-bootstrap-lzma",
-        .output_dirname = "lzma-prefix",
+        .output_dirname = "lzma",
         .source = vendorSource(.lzma),
         .configure_args = &.{
             "--disable-shared",
@@ -837,20 +861,31 @@ fn bootstrapBzip2(b: *std.Build) BootstrappedPrefix {
         \\  rm -rf "$tmpdir"
         \\}}
         \\trap cleanup EXIT INT TERM
+        \\mkdir -p "$prefix"
+        \\log="$prefix/.mere-build.log"
+        \\: > "$log"
+        \\run_logged() {{
+        \\  "$@" >>"$log" 2>&1 || {{
+        \\    status="$?"
+        \\    echo "vendor bootstrap failed, see $log" >&2
+        \\    tail -n 50 "$log" >&2 || true
+        \\    exit "$status"
+        \\  }}
+        \\}}
         \\
-        \\tar {s} "$tarball" -C "$tmpdir"
+        \\run_logged tar {s} "$tarball" -C "$tmpdir"
         \\src="$tmpdir/{s}"
         \\cd "$src"
-        \\make -f Makefile-libbz2_so clean >/dev/null 2>&1 || true
-        \\make \
+        \\make -f Makefile-libbz2_so clean >>"$log" 2>&1 || true
+        \\run_logged make \
         \\  CC=cc \
         \\  AR=ar \
         \\  RANLIB=ranlib \
         \\  CFLAGS=-O2\ -fPIC \
         \\  libbz2.a
-        \\mkdir -p "$prefix/lib" "$prefix/include"
-        \\cp libbz2.a "$prefix/lib/libbz2.a"
-        \\cp bzlib.h "$prefix/include/bzlib.h"
+        \\mkdir -p "$prefix/lib" "$prefix/include" >>"$log" 2>&1
+        \\run_logged cp libbz2.a "$prefix/lib/libbz2.a"
+        \\run_logged cp bzlib.h "$prefix/include/bzlib.h"
     ,
         .{
             source.archive_kind.tarExtractFlag(),
@@ -859,7 +894,7 @@ fn bootstrapBzip2(b: *std.Build) BootstrappedPrefix {
     );
     const bootstrap = b.addSystemCommand(&.{ "sh", "-ceu", bootstrap_script, "vendor-bootstrap-bzip2" });
     bootstrap.addFileArg(tarball);
-    const prefix = bootstrap.addOutputDirectoryArg("bzip2-prefix");
+    const prefix = bootstrap.addOutputDirectoryArg("bzip2");
 
     return .{
         .prefix = prefix,
@@ -888,8 +923,19 @@ fn bootstrapLibarchive(
         \\  rm -rf "$tmpdir"
         \\}}
         \\trap cleanup EXIT INT TERM
+        \\mkdir -p "$prefix"
+        \\log="$prefix/.mere-build.log"
+        \\: > "$log"
+        \\run_logged() {{
+        \\  "$@" >>"$log" 2>&1 || {{
+        \\    status="$?"
+        \\    echo "vendor bootstrap failed, see $log" >&2
+        \\    tail -n 50 "$log" >&2 || true
+        \\    exit "$status"
+        \\  }}
+        \\}}
         \\
-        \\tar {s} "$tarball" -C "$tmpdir"
+        \\run_logged tar {s} "$tarball" -C "$tmpdir"
         \\src="$tmpdir/{s}"
         \\build="$tmpdir/build"
         \\mkdir -p "$build"
@@ -915,9 +961,9 @@ fn bootstrapLibarchive(
         \\  CFLAGS=-Os\ -fPIC \
         \\  CPPFLAGS=-I"$zlib_prefix/include"\ -I"$bzip2_prefix/include"\ -I"$zstd_prefix/include"\ -I"$lzma_prefix/include" \
         \\  LDFLAGS=-L"$zlib_prefix/lib"\ -L"$bzip2_prefix/lib"\ -L"$zstd_prefix/lib"\ -L"$lzma_prefix/lib"
-        \\"$@"
-        \\make -j"$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 1)"
-        \\make install
+        \\run_logged "$@"
+        \\run_logged make -j"$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 1)"
+        \\run_logged make install
     ,
         .{
             source.archive_kind.tarExtractFlag(),
@@ -926,7 +972,7 @@ fn bootstrapLibarchive(
     );
     const bootstrap = b.addSystemCommand(&.{ "sh", "-ceu", bootstrap_script, "vendor-bootstrap-libarchive" });
     bootstrap.addFileArg(tarball);
-    const prefix = bootstrap.addOutputDirectoryArg("libarchive-prefix");
+    const prefix = bootstrap.addOutputDirectoryArg("libarchive");
     bootstrap.addDirectoryArg(zlib.prefix);
     bootstrap.addDirectoryArg(bzip2.prefix);
     bootstrap.addDirectoryArg(zstd.prefix);
@@ -957,8 +1003,19 @@ fn bootstrapCurl(
         \\  rm -rf "$tmpdir"
         \\}}
         \\trap cleanup EXIT INT TERM
+        \\mkdir -p "$prefix"
+        \\log="$prefix/.mere-build.log"
+        \\: > "$log"
+        \\run_logged() {{
+        \\  "$@" >>"$log" 2>&1 || {{
+        \\    status="$?"
+        \\    echo "vendor bootstrap failed, see $log" >&2
+        \\    tail -n 50 "$log" >&2 || true
+        \\    exit "$status"
+        \\  }}
+        \\}}
         \\
-        \\tar {s} "$tarball" -C "$tmpdir"
+        \\run_logged tar {s} "$tarball" -C "$tmpdir"
         \\src="$tmpdir/{s}"
         \\build="$tmpdir/build"
         \\mkdir -p "$build"
@@ -999,9 +1056,9 @@ fn bootstrapCurl(
         \\  CFLAGS=-Os\ -fPIC \
         \\  CPPFLAGS=-D_GNU_SOURCE\ -I"$zlib_prefix/include"\ -I"$mbedtls_prefix/include"\ -I"$zstd_prefix/include" \
         \\  LDFLAGS=-L"$zlib_prefix/lib"\ -L"$mbedtls_prefix/lib"\ -L"$zstd_prefix/lib"
-        \\"$@"
-        \\make -j"$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 1)"
-        \\make install
+        \\run_logged "$@"
+        \\run_logged make -j"$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 1)"
+        \\run_logged make install
     ,
         .{
             source.archive_kind.tarExtractFlag(),
@@ -1010,7 +1067,7 @@ fn bootstrapCurl(
     );
     const bootstrap = b.addSystemCommand(&.{ "sh", "-ceu", bootstrap_script, "vendor-bootstrap-curl" });
     bootstrap.addFileArg(tarball);
-    const prefix = bootstrap.addOutputDirectoryArg("curl-prefix");
+    const prefix = bootstrap.addOutputDirectoryArg("curl");
     bootstrap.addDirectoryArg(zlib.prefix);
     bootstrap.addDirectoryArg(mbedtls.prefix);
     bootstrap.addDirectoryArg(zstd.prefix);

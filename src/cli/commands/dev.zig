@@ -282,7 +282,7 @@ fn handleClean(ctx: *mere.Context, args: *const types.ParsedArgs) MereError!type
         args.getBool("outputs"),
     );
 
-    var summary_parts: std.ArrayList(CleanSummaryPart) = .{};
+    var summary_parts: std.ArrayList(CleanSummaryPart) = .empty;
     defer summary_parts.deinit(ctx.allocator);
 
     const clean_result = dev_cleanup.clean(ctx, selection) catch |err| {

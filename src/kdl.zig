@@ -168,7 +168,6 @@ const Parser = struct {
             else => return event,
         }
     }
-
 };
 
 /// Parsed KDL node with its arguments and properties collected
@@ -183,9 +182,9 @@ pub const Node = struct {
         const name_copy = allocator.dupe(u8, name) catch return KdlError.OutOfMemory;
         return Node{
             .name = name_copy,
-            .arguments = std.ArrayList(Value){},
+            .arguments = .empty,
             .properties = std.StringHashMapUnmanaged(Value){},
-            .children = std.ArrayList(Node){},
+            .children = .empty,
             .allocator = allocator,
         };
     }
@@ -279,7 +278,6 @@ pub const Node = struct {
         }
         return null;
     }
-
 };
 
 pub const Value = struct {
@@ -372,13 +370,13 @@ fn parseDocumentInternal(
     var parser = try Parser.init(allocator, input);
     defer parser.deinit();
 
-    var nodes = std.ArrayList(Node){};
+    var nodes: std.ArrayList(Node) = .empty;
     errdefer {
         for (nodes.items) |*n| n.deinit();
         nodes.deinit(allocator);
     }
 
-    var node_stack = std.ArrayList(*Node){};
+    var node_stack: std.ArrayList(*Node) = .empty;
     defer node_stack.deinit(allocator);
 
     while (parser.nextEvent() catch |err| {

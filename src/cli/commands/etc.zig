@@ -216,7 +216,7 @@ pub fn handleStatus(ctx: *mere.Context, args: *const types.ParsedArgs) MereError
         };
     }
 
-    var output: std.ArrayList(u8) = .{};
+    var output: std.ArrayList(u8) = .empty;
     defer output.deinit(ctx.allocator);
 
     const writer = output.writer(ctx.allocator);

@@ -29,7 +29,9 @@ fn resolvePackagePath(ctx: *Context, file_path: []const u8) !ResolveResult {
     if (std.fs.path.isAbsolute(file_path)) {
         return ResolveResult{ .final_path = file_path, .allocated = null };
     }
-    const abs = try std.fs.realpathAlloc(ctx.allocator, file_path);
+    var abs_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const resolved = try p.resolveToAbsolutePath(file_path, &abs_buf);
+    const abs = try ctx.allocator.dupe(u8, resolved);
     return ResolveResult{ .final_path = abs, .allocated = abs };
 }
 
@@ -45,9 +47,9 @@ fn resolveRepoSource(ctx: *Context, repo_name: []const u8) !RepoSourceResult {
     };
     ctx.debug("resolveRepoSource: repo_path={s}", .{repo_path});
 
-    if (std.fs.openDirAbsolute(repo_path, .{})) |dir| {
+    if (p.openExistingDir(repo_path)) |dir| {
         var d = dir;
-        d.close();
+        d.close(p.currentIo());
         return RepoSourceResult{ .dir_path = repo_path, .allocated = true };
     } else |_| {
         ctx.allocator.free(repo_path);
@@ -75,7 +77,13 @@ fn bootstrapRepoSource(ctx: *Context, repo_path: []const u8) !void {
         if (diag.details == null) {
             ctx.setDiagnosticContext(repo_path, "failed to initialize repository");
         }
-        std.fs.deleteTreeAbsolute(repo_path) catch {};
+        if (std.fs.path.dirname(repo_path)) |parent_path| {
+            if (p.openExistingDir(parent_path) catch null) |parent_dir| {
+                var dir = parent_dir;
+                defer dir.close(p.currentIo());
+                dir.deleteTree(p.currentIo(), std.fs.path.basename(repo_path)) catch {};
+            }
+        }
         return ImportError.FileSystem;
     };
     repo.deinit();
@@ -161,16 +169,17 @@ fn readManifestAndCreatePackage(ctx: *Context, temp_dir: []const u8) !ManifestRe
     };
     defer ctx.allocator.free(manifest_path);
 
-    const manifest_file = std.fs.openFileAbsolute(manifest_path, .{}) catch |err| {
+    const io = p.currentIo();
+    var manifest_file = p.openExistingFile(manifest_path) catch |err| {
         if (err == error.FileNotFound) {
             // Missing manifest means the package is invalid / not found as far as import
             return ImportError.PackageNotFound;
         }
         return ctx.fail(ImportError.FileSystem, manifest_path, "failed to open manifest");
     };
-    defer manifest_file.close();
+    defer manifest_file.close(io);
 
-    const stat = manifest_file.stat() catch {
+    const stat = manifest_file.stat(io) catch {
         return ctx.fail(ImportError.FileSystem, manifest_path, "failed to stat manifest");
     };
 
@@ -184,7 +193,7 @@ fn readManifestAndCreatePackage(ctx: *Context, temp_dir: []const u8) !ManifestRe
     };
     errdefer ctx.allocator.free(manifest_data);
 
-    const bytes_read = manifest_file.readAll(manifest_data) catch {
+    const bytes_read = manifest_file.readPositionalAll(io, manifest_data, 0) catch {
         return ctx.fail(ImportError.FileSystem, manifest_path, "failed to read manifest");
     };
 
@@ -307,7 +316,7 @@ fn validateProjectionIndex(ctx: *Context, temp_dir: []const u8) !void {
 
 fn storeArtifactAtomically(ctx: *Context, pkg: *const package.Package, final_pkg_path: []const u8) ![]const u8 {
     const packages_dir = try std.fs.path.join(ctx.allocator, &.{ ctx.root_path, "mere", "cache", "packages" });
-    std.fs.cwd().makePath(packages_dir) catch {
+    p.ensureDirExists(packages_dir) catch {
         ctx.setDiagnosticContext(packages_dir, "failed to create package pool dir");
         ctx.allocator.free(packages_dir);
         return ImportError.FileSystem;
@@ -322,9 +331,10 @@ fn storeArtifactAtomically(ctx: *Context, pkg: *const package.Package, final_pkg
 
     // The shared package pool is content-addressed by canonical archive name.
     // If the canonical file already exists as a regular file, the artifact is already present.
-    if (std.fs.openFileAbsolute(repo_pkg_path, .{})) |existing_file| {
-        defer existing_file.close();
-        const stat = existing_file.stat() catch {
+    if (p.openExistingFile(repo_pkg_path)) |existing_file| {
+        const io = p.currentIo();
+        defer existing_file.close(io);
+        const stat = existing_file.stat(io) catch {
             ctx.allocator.free(packages_dir);
             ctx.allocator.free(canonical_name);
             defer ctx.allocator.free(repo_pkg_path);
@@ -349,40 +359,37 @@ fn storeArtifactAtomically(ctx: *Context, pkg: *const package.Package, final_pkg
         },
     }
 
+    const io = p.currentIo();
     var random_bytes: [8]u8 = undefined;
-    std.crypto.random.bytes(&random_bytes);
+    io.random(&random_bytes);
     const random_hex = std.fmt.bytesToHex(random_bytes, .lower);
-    const now_ns = std.time.nanoTimestamp();
-    const tmp_suffix = try std.fmt.allocPrint(ctx.allocator, "{d}-{s}", .{ now_ns, random_hex[0..] });
-    const repo_pkg_temp_path = try std.fmt.allocPrint(ctx.allocator, "{s}.{s}.tmp", .{ repo_pkg_path, tmp_suffix });
+    const repo_pkg_temp_path = try std.fmt.allocPrint(ctx.allocator, "{s}.{s}.tmp", .{ repo_pkg_path, random_hex[0..] });
 
     p.copyFile(final_pkg_path, repo_pkg_temp_path) catch {
         defer ctx.allocator.free(repo_pkg_path);
         ctx.allocator.free(packages_dir);
         ctx.allocator.free(canonical_name);
-        ctx.allocator.free(tmp_suffix);
         ctx.allocator.free(repo_pkg_temp_path);
         return ctx.fail(ImportError.PackageImportFailed, repo_pkg_path, "failed to copy package file to package pool");
     };
 
-    std.fs.cwd().rename(repo_pkg_temp_path, repo_pkg_path) catch |err| {
+    std.Io.Dir.renameAbsolute(repo_pkg_temp_path, repo_pkg_path, io) catch |err| {
         if (std.fs.path.dirname(repo_pkg_temp_path)) |parent| {
-            if (p.makePathAndOpenDir(parent) catch null) |dir_ptr| {
+            if (p.openExistingDir(parent) catch null) |dir_ptr| {
                 var dir = dir_ptr;
                 const base = std.fs.path.basename(repo_pkg_temp_path);
-                dir.deleteFile(base) catch {};
-                dir.close();
+                dir.deleteFile(io, base) catch {};
+                dir.close(io);
             }
         }
         if (err == error.PathAlreadyExists) {
-            if (std.fs.openFileAbsolute(repo_pkg_path, .{})) |existing_file| {
-                defer existing_file.close();
-                const maybe_stat = existing_file.stat() catch null;
+            if (p.openExistingFile(repo_pkg_path)) |existing_file| {
+                defer existing_file.close(io);
+                const maybe_stat = existing_file.stat(io) catch null;
                 if (maybe_stat) |stat| {
                     if (stat.kind == .file) {
                         ctx.allocator.free(packages_dir);
                         ctx.allocator.free(canonical_name);
-                        ctx.allocator.free(tmp_suffix);
                         ctx.allocator.free(repo_pkg_temp_path);
                         return repo_pkg_path;
                     }
@@ -392,14 +399,12 @@ fn storeArtifactAtomically(ctx: *Context, pkg: *const package.Package, final_pkg
         defer ctx.allocator.free(repo_pkg_path);
         ctx.allocator.free(packages_dir);
         ctx.allocator.free(canonical_name);
-        ctx.allocator.free(tmp_suffix);
         ctx.allocator.free(repo_pkg_temp_path);
         return ctx.fail(ImportError.PackageImportFailed, repo_pkg_path, "failed to atomically rename persisted package file in pool");
     };
 
     ctx.allocator.free(packages_dir);
     ctx.allocator.free(canonical_name);
-    ctx.allocator.free(tmp_suffix);
     ctx.allocator.free(repo_pkg_temp_path);
 
     return repo_pkg_path;
@@ -433,17 +438,18 @@ fn attachManifestSignature(ctx: *Context, temp_dir: []const u8, pkg: *package.Pa
     };
     defer ctx.allocator.free(sig_path);
 
-    const sig_file = std.fs.openFileAbsolute(sig_path, .{}) catch |err| {
+    const io = p.currentIo();
+    var sig_file = p.openExistingFile(sig_path) catch |err| {
         if (err == error.FileNotFound) {
             ctx.debug("manifest signature file not found", .{});
             return ctx.fail(ImportError.SignatureInvalid, sig_path, "manifest signature file not found");
         }
         return ctx.fail(ImportError.FileSystem, sig_path, "failed to read manifest signature file");
     };
-    defer sig_file.close();
+    defer sig_file.close(io);
 
     var sig_bytes: [sign.c.crypto_sign_BYTES]u8 = undefined;
-    const n = sig_file.readAll(&sig_bytes) catch {
+    const n = sig_file.readPositionalAll(io, &sig_bytes, 0) catch {
         return ctx.fail(ImportError.FileSystem, sig_path, "failed to read manifest signature file");
     };
     if (n != sign.c.crypto_sign_BYTES) {
@@ -509,10 +515,11 @@ fn prepareVerifiedImport(ctx: *Context, final_pkg_path: []const u8) !PreparedImp
 }
 
 fn validatePackageArchiveFormat(ctx: *Context, pkg_path: []const u8) !void {
-    const file = std.fs.openFileAbsolute(pkg_path, .{}) catch {
+    const io = p.currentIo();
+    var file = p.openExistingFile(pkg_path) catch {
         return ctx.fail(ImportError.FileSystem, pkg_path, "failed to open package file for validation");
     };
-    defer file.close();
+    defer file.close(io);
 
     const kind = filetype.detect(&file) catch {
         return ctx.fail(ImportError.InvalidInput, pkg_path, "failed to detect package file type");
@@ -524,7 +531,7 @@ fn validatePackageArchiveFormat(ctx: *Context, pkg_path: []const u8) !void {
 }
 
 fn collectTrustedFingerprintsForImport(ctx: *Context) !std.ArrayList([]const u8) {
-    var trusted_fingerprints = std.ArrayList([]const u8){};
+    var trusted_fingerprints: std.ArrayList([]const u8) = .empty;
     errdefer {
         for (trusted_fingerprints.items) |fp| {
             ctx.allocator.free(fp);
@@ -547,7 +554,7 @@ fn collectTrustedFingerprintsForImport(ctx: *Context) !std.ArrayList([]const u8)
         }
     }
 
-    var loaded_keys = sign.loadAllKeys(ctx) catch std.ArrayList(sign.LoadedKey){};
+    var loaded_keys = sign.loadAllKeys(ctx) catch std.ArrayList(sign.LoadedKey).empty;
     defer {
         for (loaded_keys.items) |*key| {
             key.deinit(ctx.allocator);
@@ -575,7 +582,7 @@ fn resolveOrBootstrapRepoDir(ctx: *Context, repo_name: []const u8) !RepoSourceRe
         };
         defer ctx.allocator.free(resolved_key);
 
-        std.fs.cwd().access(resolved_key, .{}) catch {
+        std.Io.Dir.cwd().access(p.currentIo(), resolved_key, .{}) catch {
             return ctx.fail(ImportError.PackageNotFound, repo_name, resolved_key);
         };
 
@@ -650,7 +657,7 @@ fn insertPruneAndCommit(
     };
     defer staged.deinit();
 
-    var touched_pairs: std.ArrayList(NameArchPair) = .{};
+    var touched_pairs: std.ArrayList(NameArchPair) = .empty;
     defer {
         for (touched_pairs.items) |pair| {
             ctx.allocator.free(pair.name);
@@ -808,7 +815,7 @@ pub fn packages(ctx: *Context, repo_name: []const u8, file_paths: []const []cons
     const resolved_repo = try resolveOrBootstrapRepoDir(ctx, repo_name);
     defer if (resolved_repo.allocated) ctx.allocator.free(resolved_repo.dir_path);
 
-    var records = std.ArrayList(PreparedImportRecord){};
+    var records: std.ArrayList(PreparedImportRecord) = .empty;
     defer {
         for (records.items) |*record| {
             record.deinit(ctx.allocator);
@@ -954,14 +961,14 @@ test "packages with missing manifest.v1" {
 
     const tar_contents = try std.testing.allocator.dupe(u8, buffer.written());
     defer std.testing.allocator.free(tar_contents);
-    const pkg_file_handle = try std.fs.createFileAbsolute(pkg_path, .{});
-    try pkg_file_handle.writeAll(tar_contents);
-    pkg_file_handle.close();
+    var pkg_file_handle = try std.Io.Dir.createFileAbsolute(p.currentIo(), pkg_path, .{});
+    defer pkg_file_handle.close(p.currentIo());
+    try pkg_file_handle.writeStreamingAll(p.currentIo(), tar_contents);
 
     // Generate a key pair for signing
     const key_dir = try std.fs.path.join(std.testing.allocator, &.{ test_env.path, "keys" });
     defer std.testing.allocator.free(key_dir);
-    try std.fs.cwd().makePath(key_dir);
+    try p.ensureDirExists(key_dir);
 
     const key_pair = try sign.generateKeyPair();
     const secret_key_path = try std.fs.path.join(std.testing.allocator, &.{ key_dir, "test.key" });
@@ -1014,27 +1021,28 @@ test "packages duplicate without force does not overwrite package artifact" {
     });
     defer ctx.allocator.free(pool_dir);
 
-    var dir = try std.fs.openDirAbsolute(pool_dir, .{ .iterate = true });
-    defer dir.close();
+    const io = p.currentIo();
+    var dir = try std.Io.Dir.openDirAbsolute(io, pool_dir, .{ .iterate = true });
+    defer dir.close(io);
     var iter = dir.iterate();
-    const first_entry = (try iter.next()) orelse return error.TestUnexpectedResult;
+    const first_entry = (try iter.next(io)) orelse return error.TestUnexpectedResult;
     try std.testing.expect(first_entry.kind == .file);
 
     const repo_pkg_path = try std.fs.path.join(ctx.allocator, &.{ pool_dir, first_entry.name });
     defer ctx.allocator.free(repo_pkg_path);
 
-    const before_file = try std.fs.openFileAbsolute(repo_pkg_path, .{});
-    defer before_file.close();
-    const before_stat = try before_file.stat();
+    var before_file = try p.openExistingFile(repo_pkg_path);
+    defer before_file.close(io);
+    const before_stat = try before_file.stat(io);
 
     const dup_single = [_][]const u8{result.pkg_path};
     const dup_result = packages(&ctx, "import", dup_single[0..], false);
     try std.testing.expectError(repodb.RepoDBError.PackageAlreadyExists, dup_result);
     ctx.resetDiagnostics();
 
-    const after_file = try std.fs.openFileAbsolute(repo_pkg_path, .{});
-    defer after_file.close();
-    const after_stat = try after_file.stat();
+    var after_file = try p.openExistingFile(repo_pkg_path);
+    defer after_file.close(io);
+    const after_stat = try after_file.stat(io);
     try std.testing.expectEqual(before_stat.inode, after_stat.inode);
 }
 
@@ -1059,14 +1067,14 @@ test "storeArtifactAtomically cleans temp file when rename fails" {
     const src_path = try std.fs.path.join(ctx.allocator, &.{ test_env.path, "rename-fail-src.tar" });
     defer ctx.allocator.free(src_path);
     {
-        var f = try std.fs.createFileAbsolute(src_path, .{});
-        defer f.close();
-        try f.writeAll("dummy archive content");
+        var f = try std.Io.Dir.createFileAbsolute(p.currentIo(), src_path, .{});
+        defer f.close(p.currentIo());
+        try f.writeStreamingAll(p.currentIo(), "dummy archive content");
     }
 
     const packages_dir = try std.fs.path.join(ctx.allocator, &.{ ctx.root_path, "mere", "cache", "packages" });
     defer ctx.allocator.free(packages_dir);
-    try std.fs.cwd().makePath(packages_dir);
+    try p.ensureDirExists(packages_dir);
 
     const canonical_name = try pkg.canonicalArchiveName();
     defer ctx.allocator.free(canonical_name);
@@ -1074,8 +1082,16 @@ test "storeArtifactAtomically cleans temp file when rename fails" {
     defer ctx.allocator.free(final_path);
 
     // Force rename failure by creating a directory at the destination path.
-    try std.fs.cwd().makePath(final_path);
-    defer std.fs.cwd().deleteTree(final_path) catch {};
+    try p.ensureDirExists(final_path);
+    defer {
+        if (std.fs.path.dirname(final_path)) |parent_path| {
+            if (p.openExistingDir(parent_path) catch null) |parent_dir| {
+                var dir = parent_dir;
+                defer dir.close(p.currentIo());
+                dir.deleteTree(p.currentIo(), std.fs.path.basename(final_path)) catch {};
+            }
+        }
+    }
 
     try std.testing.expectError(
         ImportError.PackageImportFailed,
@@ -1084,10 +1100,11 @@ test "storeArtifactAtomically cleans temp file when rename fails" {
     ctx.resetDiagnostics();
 
     // Ensure no temp artifacts remain for this package.
-    var dir = try std.fs.openDirAbsolute(packages_dir, .{ .iterate = true });
-    defer dir.close();
+    const io = p.currentIo();
+    var dir = try std.Io.Dir.openDirAbsolute(io, packages_dir, .{ .iterate = true });
+    defer dir.close(io);
     var iter = dir.iterate();
-    while (try iter.next()) |entry| {
+    while (try iter.next(io)) |entry| {
         if (entry.kind != .file) continue;
         try std.testing.expect(!std.mem.startsWith(u8, entry.name, canonical_name));
     }
@@ -1114,23 +1131,23 @@ test "storeArtifactAtomically treats existing canonical archive as success" {
     const src_path = try std.fs.path.join(ctx.allocator, &.{ test_env.path, "idempotent-src.tar" });
     defer ctx.allocator.free(src_path);
     {
-        var f = try std.fs.createFileAbsolute(src_path, .{});
-        defer f.close();
-        try f.writeAll("new archive content");
+        var f = try std.Io.Dir.createFileAbsolute(p.currentIo(), src_path, .{});
+        defer f.close(p.currentIo());
+        try f.writeStreamingAll(p.currentIo(), "new archive content");
     }
 
     const packages_dir = try std.fs.path.join(ctx.allocator, &.{ ctx.root_path, "mere", "cache", "packages" });
     defer ctx.allocator.free(packages_dir);
-    try std.fs.cwd().makePath(packages_dir);
+    try p.ensureDirExists(packages_dir);
 
     const canonical_name = try pkg.canonicalArchiveName();
     defer ctx.allocator.free(canonical_name);
     const final_path = try std.fs.path.join(ctx.allocator, &.{ packages_dir, canonical_name });
     defer ctx.allocator.free(final_path);
     {
-        var existing = try std.fs.createFileAbsolute(final_path, .{});
-        defer existing.close();
-        try existing.writeAll("existing archive content");
+        var existing = try std.Io.Dir.createFileAbsolute(p.currentIo(), final_path, .{});
+        defer existing.close(p.currentIo());
+        try existing.writeStreamingAll(p.currentIo(), "existing archive content");
     }
 
     const stored_path = try storeArtifactAtomically(&ctx, &pkg, src_path);
@@ -1138,9 +1155,7 @@ test "storeArtifactAtomically treats existing canonical archive as success" {
 
     try std.testing.expectEqualStrings(final_path, stored_path);
 
-    const final_file = try std.fs.openFileAbsolute(final_path, .{});
-    defer final_file.close();
-    const final_bytes = try final_file.readToEndAlloc(ctx.allocator, 1024);
+    const final_bytes = try std.Io.Dir.readFileAlloc(std.Io.Dir.cwd(), p.currentIo(), final_path, ctx.allocator, .limited(1024));
     defer ctx.allocator.free(final_bytes);
     try std.testing.expectEqualStrings("existing archive content", final_bytes);
 }
@@ -1180,14 +1195,14 @@ test "packages with invalid manifest format" {
 
     const tar_contents = try std.testing.allocator.dupe(u8, buffer.written());
     defer std.testing.allocator.free(tar_contents);
-    const pkg_file_handle = try std.fs.createFileAbsolute(pkg_path, .{});
-    try pkg_file_handle.writeAll(tar_contents);
-    pkg_file_handle.close();
+    var pkg_file_handle = try std.Io.Dir.createFileAbsolute(p.currentIo(), pkg_path, .{});
+    defer pkg_file_handle.close(p.currentIo());
+    try pkg_file_handle.writeStreamingAll(p.currentIo(), tar_contents);
 
     // Generate a key pair for signing
     const key_dir = try std.fs.path.join(std.testing.allocator, &.{ test_env.path, "keys" });
     defer std.testing.allocator.free(key_dir);
-    try std.fs.cwd().makePath(key_dir);
+    try p.ensureDirExists(key_dir);
 
     const key_pair = try sign.generateKeyPair();
     const secret_key_path = try std.fs.path.join(std.testing.allocator, &.{ key_dir, "test.key" });
@@ -1267,7 +1282,7 @@ test "packages with multiple ELF files" {
     // Create a content directory to compute hash from
     const content_dir = try std.fs.path.join(std.testing.allocator, &.{ test_env.path, "pkg_content" });
     defer std.testing.allocator.free(content_dir);
-    try std.fs.cwd().makePath(content_dir);
+    try p.ensureDirExists(content_dir);
 
     // Set up paths for two different ELF files
     const lib1_name = "usr/lib/libtest.so";
@@ -1281,20 +1296,20 @@ test "packages with multiple ELF files" {
     // Create directory structure in content dir
     const lib_dir_path = std.fs.path.dirname(lib1_path).?;
     var lib_dir = try p.makePathAndOpenDir(lib_dir_path);
-    lib_dir.close();
+    lib_dir.close(p.currentIo());
 
     // Copy test ELF libraries to content dir
     var src_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const src1_path = try std.fs.cwd().realpath("test/testdata/libtest.so", &src_buf);
-    try std.fs.copyFileAbsolute(src1_path, lib1_path, .{});
+    const src1_path = try p.resolveToAbsolutePath("test/testdata/libtest.so", &src_buf);
+    try p.copyFile(src1_path, lib1_path);
 
-    const src2_path = try std.fs.cwd().realpath("test/testdata/libsoname.so", &src_buf);
-    try std.fs.copyFileAbsolute(src2_path, lib2_path, .{});
+    const src2_path = try p.resolveToAbsolutePath("test/testdata/libsoname.so", &src_buf);
+    try p.copyFile(src2_path, lib2_path);
 
     // Create .mere directory for meta.kdl (content hash is computed without .mere/)
     const mere_dir_path = try std.fs.path.join(std.testing.allocator, &.{ content_dir, manifest.META_DIR });
     defer std.testing.allocator.free(mere_dir_path);
-    try std.fs.cwd().makePath(mere_dir_path);
+    try p.ensureDirExists(mere_dir_path);
 
     // Create meta.kdl with test dependencies and provisions
     // These are the dependencies that the test expects to find
@@ -1310,9 +1325,9 @@ test "packages with multiple ELF files" {
         \\    elf-soname "libcustom.so.1"
         \\}
     ;
-    const meta_file = try std.fs.createFileAbsolute(meta_path, .{});
-    try meta_file.writeAll(meta_content);
-    meta_file.close();
+    var meta_file = try std.Io.Dir.createFileAbsolute(p.currentIo(), meta_path, .{});
+    defer meta_file.close(p.currentIo());
+    try meta_file.writeStreamingAll(p.currentIo(), meta_content);
 
     // Compute the content hash of the content directory (before adding manifest)
     const content_hash_hex = try hash.calculateStoreContentHash(ctx.allocator, content_dir, null);
@@ -1330,7 +1345,7 @@ test "packages with multiple ELF files" {
     // Create manifest
     const pkg_manifest = manifest.PackageManifestV1{
         .schema_version = 1,
-        .created_at = @intCast(@as(u64, @bitCast(std.time.timestamp()))),
+        .created_at = @intCast(std.Io.Clock.real.now(p.currentIo()).toSeconds()),
         .release = 1,
         .arch = "x86_64",
         .name = pkg_name,
@@ -1387,7 +1402,7 @@ test "packages with multiple ELF files" {
         ctx.debug("sql bind result: {d}", .{bind_result});
 
         // Use a simple array to collect dependencies
-        var deps_array = std.ArrayList([]u8){};
+        var deps_array: std.ArrayList([]u8) = .empty;
         defer {
             for (deps_array.items) |item| {
                 std.testing.allocator.free(item);
@@ -1537,16 +1552,16 @@ test "signDb creates valid signature" {
     defer std.testing.allocator.free(db_path);
 
     // Create a simple database file with some content
-    const db_file = try std.fs.createFileAbsolute(db_path, .{});
-    try db_file.writeAll("This is a test database file");
-    db_file.close();
+    var db_file = try std.Io.Dir.createFileAbsolute(p.currentIo(), db_path, .{});
+    defer db_file.close(p.currentIo());
+    try db_file.writeStreamingAll(p.currentIo(), "This is a test database file");
 
     // Generate a key pair for signing
     const key_dir = try std.fs.path.join(std.testing.allocator, &.{ test_env.path, "keys" });
     defer std.testing.allocator.free(key_dir);
 
     // Create the key directory
-    try std.fs.cwd().makePath(key_dir);
+    try p.ensureDirExists(key_dir);
 
     // Generate key pair
     const key_pair = try sign.generateKeyPair();
@@ -1573,8 +1588,8 @@ test "signDb creates valid signature" {
 
     // Verify the signature file exists
 
-    const sig_file = try std.fs.openFileAbsolute(sig_path, .{});
-    sig_file.close();
+    var sig_file = try p.openExistingFile(sig_path);
+    sig_file.close(p.currentIo());
 
     // Verify the signature is valid
     try sign.verifySignature(&ctx, db_path, public_key_path, sig_path);
@@ -1594,7 +1609,7 @@ test "packages handles ./manifest.v1 path prefix" {
     // Create a content directory to compute hash from (empty package, just manifest)
     const content_dir = try std.fs.path.join(std.testing.allocator, &.{ test_env.path, "pkg_content" });
     defer std.testing.allocator.free(content_dir);
-    try std.fs.cwd().makePath(content_dir);
+    try p.ensureDirExists(content_dir);
 
     // Compute the content hash of the empty content directory
     const content_hash_hex = try hash.calculateStoreContentHash(ctx.allocator, content_dir, null);
@@ -1612,7 +1627,7 @@ test "packages handles ./manifest.v1 path prefix" {
     // Create signed manifest
     const pkg_manifest = manifest.PackageManifestV1{
         .schema_version = 1,
-        .created_at = @intCast(@as(u64, @bitCast(std.time.timestamp()))),
+        .created_at = @intCast(std.Io.Clock.real.now(p.currentIo()).toSeconds()),
         .release = 1,
         .arch = "x86_64",
         .name = pkg_name,
@@ -1657,9 +1672,9 @@ test "packages handles ./manifest.v1 path prefix" {
 
     const tar_contents = try std.testing.allocator.dupe(u8, buffer.written());
     defer std.testing.allocator.free(tar_contents);
-    const pkg_file_handle = try std.fs.createFileAbsolute(pkg_path, .{});
-    try pkg_file_handle.writeAll(tar_contents);
-    pkg_file_handle.close();
+    var pkg_file_handle = try std.Io.Dir.createFileAbsolute(p.currentIo(), pkg_path, .{});
+    defer pkg_file_handle.close(p.currentIo());
+    try pkg_file_handle.writeStreamingAll(p.currentIo(), tar_contents);
 
     // Set signing key in context to enable bootstrap
     const repo_name = "import";
@@ -1701,7 +1716,7 @@ test "packages prevents SQL injection" {
     // Create a content directory to compute hash from (empty package, just manifest)
     const content_dir = try std.fs.path.join(std.testing.allocator, &.{ test_env.path, "pkg_content" });
     defer std.testing.allocator.free(content_dir);
-    try std.fs.cwd().makePath(content_dir);
+    try p.ensureDirExists(content_dir);
 
     // Compute the content hash of the empty content directory
     const content_hash_hex = try hash.calculateStoreContentHash(ctx.allocator, content_dir, null);
@@ -1719,7 +1734,7 @@ test "packages prevents SQL injection" {
     // Create manifest with SQL injection payload as package name
     const pkg_manifest = manifest.PackageManifestV1{
         .schema_version = 1,
-        .created_at = @intCast(@as(u64, @bitCast(std.time.timestamp()))),
+        .created_at = @intCast(std.Io.Clock.real.now(p.currentIo()).toSeconds()),
         .release = 1,
         .arch = "x86_64",
         .name = inj_name,
@@ -1801,8 +1816,16 @@ test "packages allows older created_at during dev import when force-replacing" {
         ) ![]const u8 {
             const content_dir = try std.fs.path.join(std.testing.allocator, &.{ env.path, "pkg_content_rollback" });
             defer std.testing.allocator.free(content_dir);
-            try std.fs.cwd().makePath(content_dir);
-            defer std.fs.deleteTreeAbsolute(content_dir) catch {};
+            try p.ensureDirExists(content_dir);
+            defer {
+                if (std.fs.path.dirname(content_dir)) |parent_path| {
+                    if (p.openExistingDir(parent_path) catch null) |parent_dir| {
+                        var dir = parent_dir;
+                        defer dir.close(p.currentIo());
+                        dir.deleteTree(p.currentIo(), std.fs.path.basename(content_dir)) catch {};
+                    }
+                }
+            }
 
             // Compute content hash
             const content_hash_hex = try hash.calculateStoreContentHash(ctx_inner.allocator, content_dir, null);
@@ -1881,13 +1904,13 @@ test "packages rejects missing projection.v1" {
 
     const content_dir = try std.fs.path.join(std.testing.allocator, &.{ test_env.path, "pkg_content_missing_projection" });
     defer std.testing.allocator.free(content_dir);
-    try std.fs.cwd().makePath(content_dir);
+    try p.ensureDirExists(content_dir);
 
     const dummy_path = try std.fs.path.join(std.testing.allocator, &.{ content_dir, "dummy.txt" });
     defer std.testing.allocator.free(dummy_path);
-    var dummy_file = try std.fs.createFileAbsolute(dummy_path, .{});
-    defer dummy_file.close();
-    try dummy_file.writeAll("content");
+    var dummy_file = try std.Io.Dir.createFileAbsolute(p.currentIo(), dummy_path, .{});
+    defer dummy_file.close(p.currentIo());
+    try dummy_file.writeStreamingAll(p.currentIo(), "content");
 
     const content_hash_hex = try hash.calculateStoreContentHash(test_env.ctx.allocator, content_dir, null);
     defer test_env.ctx.allocator.free(content_hash_hex);
@@ -1901,7 +1924,7 @@ test "packages rejects missing projection.v1" {
 
     const pkg_manifest = manifest.PackageManifestV1{
         .schema_version = 1,
-        .created_at = @intCast(@as(u64, @bitCast(std.time.timestamp()))),
+        .created_at = @intCast(std.Io.Clock.real.now(p.currentIo()).toSeconds()),
         .release = 1,
         .arch = "x86_64",
         .name = pkg_name,

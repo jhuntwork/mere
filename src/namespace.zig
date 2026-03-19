@@ -1,6 +1,6 @@
 const std = @import("std");
 const errors = @import("errors.zig");
-const builtin = @import("builtin");
+const path_mod = @import("path.zig");
 const posix = std.posix;
 
 const c = @cImport({
@@ -10,6 +10,7 @@ const c = @cImport({
     @cInclude("sys/mount.h");
     @cInclude("sys/stat.h");
     @cInclude("sys/types.h");
+    @cInclude("sys/wait.h");
     @cInclude("errno.h");
     @cInclude("string.h");
     @cInclude("stddef.h");
@@ -75,8 +76,16 @@ pub fn cloneHostEnvWithVar(
     key: []const u8,
     value: []const u8,
 ) ![]const [*:0]const u8 {
-    var env_map = try std.process.getEnvMap(allocator);
+    var env_map = std.process.Environ.Map.init(allocator);
     defer env_map.deinit();
+
+    var envp = std.c.environ;
+    var i: usize = 0;
+    while (envp[i]) |entry| : (i += 1) {
+        const kv = std.mem.span(entry);
+        const sep = std.mem.indexOfScalar(u8, kv, '=') orelse continue;
+        try env_map.put(kv[0..sep], kv[sep + 1 ..]);
+    }
 
     try env_map.put(key, value);
 
@@ -84,10 +93,10 @@ pub fn cloneHostEnvWithVar(
     var result = try allocator.alloc([*:0]const u8, count);
     errdefer allocator.free(result);
 
-    var i: usize = 0;
+    var result_index: usize = 0;
     errdefer {
         var j: usize = 0;
-        while (j < i) : (j += 1) {
+        while (j < result_index) : (j += 1) {
             const slice = std.mem.span(result[j]);
             allocator.free(result[j][0 .. slice.len + 1]);
         }
@@ -98,8 +107,8 @@ pub fn cloneHostEnvWithVar(
         const kv = try std.fmt.allocPrint(allocator, "{s}={s}", .{ entry.key_ptr.*, entry.value_ptr.* });
         defer allocator.free(kv);
         const kv_z = try allocator.dupeZ(u8, kv);
-        result[i] = kv_z.ptr;
-        i += 1;
+        result[result_index] = kv_z.ptr;
+        result_index += 1;
     }
 
     return result;
@@ -197,26 +206,29 @@ pub fn enterEnv(allocator: std.mem.Allocator, mode: EnvMode, opts: EnvOptions) E
 }
 
 pub fn forkAndEnterEnv(allocator: std.mem.Allocator, mode: EnvMode, opts: EnvOptions) EnvError!u8 {
-    const stdout_pipe = posix.pipe() catch return EnvError.ForkError;
+    var stdout_pipe: [2]posix.fd_t = undefined;
+    if (c.pipe(&stdout_pipe) != 0) return EnvError.ForkError;
     errdefer {
-        posix.close(stdout_pipe[0]);
-        posix.close(stdout_pipe[1]);
+        _ = c.close(stdout_pipe[0]);
+        _ = c.close(stdout_pipe[1]);
     }
-    const stderr_pipe = posix.pipe() catch return EnvError.ForkError;
+    var stderr_pipe: [2]posix.fd_t = undefined;
+    if (c.pipe(&stderr_pipe) != 0) return EnvError.ForkError;
     errdefer {
-        posix.close(stderr_pipe[0]);
-        posix.close(stderr_pipe[1]);
+        _ = c.close(stderr_pipe[0]);
+        _ = c.close(stderr_pipe[1]);
     }
 
-    const pid = posix.fork() catch return EnvError.ForkError;
+    const pid = c.fork();
+    if (pid < 0) return EnvError.ForkError;
 
     if (pid == 0) {
-        posix.close(stdout_pipe[0]);
-        posix.close(stderr_pipe[0]);
+        _ = c.close(stdout_pipe[0]);
+        _ = c.close(stderr_pipe[0]);
         _ = c.dup2(stdout_pipe[1], c.STDOUT_FILENO);
         _ = c.dup2(stderr_pipe[1], c.STDERR_FILENO);
-        posix.close(stdout_pipe[1]);
-        posix.close(stderr_pipe[1]);
+        _ = c.close(stdout_pipe[1]);
+        _ = c.close(stderr_pipe[1]);
 
         enterEnv(allocator, mode, opts) catch {
             std.process.exit(1);
@@ -224,8 +236,8 @@ pub fn forkAndEnterEnv(allocator: std.mem.Allocator, mode: EnvMode, opts: EnvOpt
         unreachable;
     }
 
-    posix.close(stdout_pipe[1]);
-    posix.close(stderr_pipe[1]);
+    _ = c.close(stdout_pipe[1]);
+    _ = c.close(stderr_pipe[1]);
 
     var poll_fds = [_]c.struct_pollfd{
         .{ .fd = stdout_pipe[0], .events = c.POLLIN | c.POLLHUP | c.POLLERR, .revents = 0 },
@@ -252,22 +264,23 @@ pub fn forkAndEnterEnv(allocator: std.mem.Allocator, mode: EnvMode, opts: EnvOpt
                     handler.handle(data, is_stderr);
                 } else {
                     if (is_stderr) {
-                        std.fs.File.stderr().writeAll(data) catch {};
+                        std.Io.File.stderr().writeStreamingAll(path_mod.currentIo(), data) catch {};
                     } else {
-                        std.fs.File.stdout().writeAll(data) catch {};
+                        std.Io.File.stdout().writeStreamingAll(path_mod.currentIo(), data) catch {};
                     }
                 }
             } else {
-                posix.close(pfd.fd);
+                _ = c.close(pfd.fd);
                 pfd.fd = -1;
                 open_streams -= 1;
             }
         }
     }
 
-    const result = posix.waitpid(pid, 0);
+    var wait_status: c_int = 0;
+    if (c.waitpid(@intCast(pid), &wait_status, 0) < 0) return 128;
     // Decode the wait status: exit code is in bits 8-15 if exited normally
-    const status = result.status;
+    const status: u32 = @bitCast(wait_status);
     if (status & 0x7f == 0) {
         // Normal exit: extract exit code from bits 8-15
         return @truncate(status >> 8);
@@ -277,7 +290,7 @@ pub fn forkAndEnterEnv(allocator: std.mem.Allocator, mode: EnvMode, opts: EnvOpt
 }
 
 fn validateInputs(opts: EnvOptions, mode: EnvMode) EnvError!void {
-    std.fs.accessAbsolute(opts.profile_root, .{}) catch |err| {
+    std.Io.Dir.accessAbsolute(path_mod.currentIo(), opts.profile_root, .{}) catch |err| {
         return switch (err) {
             error.FileNotFound => EnvError.ProfileNotFound,
             error.AccessDenied => EnvError.PermissionDenied,
@@ -293,7 +306,7 @@ fn validateInputs(opts: EnvOptions, mode: EnvMode) EnvError!void {
 
     if (mode == .build) {
         if (opts.workspace) |ws| {
-            std.fs.accessAbsolute(ws, .{}) catch |err| {
+            std.Io.Dir.accessAbsolute(path_mod.currentIo(), ws, .{}) catch |err| {
                 return switch (err) {
                     error.FileNotFound => EnvError.WorkspaceNotFound,
                     error.AccessDenied => EnvError.PermissionDenied,
@@ -305,10 +318,11 @@ fn validateInputs(opts: EnvOptions, mode: EnvMode) EnvError!void {
 }
 
 fn checkCapabilities(mode: EnvMode, no_etc_overlay: bool) EnvError!void {
-    if (std.fs.openFileAbsolute("/proc/sys/user/max_user_namespaces", .{})) |file| {
-        defer file.close();
+    const io = path_mod.currentIo();
+    if (std.Io.Dir.openFileAbsolute(io, "/proc/sys/user/max_user_namespaces", .{})) |file| {
+        defer file.close(io);
         var buf: [32]u8 = undefined;
-        if (file.readAll(&buf)) |bytes_read| {
+        if (file.readPositionalAll(io, &buf, 0)) |bytes_read| {
             const content = std.mem.trim(u8, buf[0..bytes_read], " \n\t");
             if (std.mem.eql(u8, content, "0")) {
                 return EnvError.UserNamespacesDisabled;
@@ -317,10 +331,10 @@ fn checkCapabilities(mode: EnvMode, no_etc_overlay: bool) EnvError!void {
     } else |_| {}
 
     if (mode == .shell and !no_etc_overlay) {
-        if (std.fs.openFileAbsolute("/proc/filesystems", .{})) |file| {
-            defer file.close();
+        if (std.Io.Dir.openFileAbsolute(io, "/proc/filesystems", .{})) |file| {
+            defer file.close(io);
             var buf: [4096]u8 = undefined;
-            if (file.readAll(&buf)) |bytes_read| {
+            if (file.readPositionalAll(io, &buf, 0)) |bytes_read| {
                 if (std.mem.indexOf(u8, buf[0..bytes_read], "overlay") == null) {
                     return EnvError.OverlayFsUnavailable;
                 }
@@ -337,10 +351,11 @@ fn createUserNamespace() EnvError!void {
 }
 
 fn writeIdMappings(uid: c_uint, gid: c_uint, identity: NamespaceIdentity) EnvError!void {
+    const io = path_mod.currentIo();
     // Disable setgroups before writing gid_map
-    if (std.fs.openFileAbsolute("/proc/self/setgroups", .{ .mode = .write_only })) |file| {
-        defer file.close();
-        file.writeAll("deny") catch {};
+    if (std.Io.Dir.openFileAbsolute(io, "/proc/self/setgroups", .{ .mode = .write_only })) |file| {
+        defer file.close(io);
+        file.writeStreamingAll(io, "deny") catch {};
     } else |_| {}
 
     {
@@ -349,11 +364,11 @@ fn writeIdMappings(uid: c_uint, gid: c_uint, identity: NamespaceIdentity) EnvErr
             return EnvError.OutOfMemory;
         };
 
-        var file = std.fs.openFileAbsolute("/proc/self/uid_map", .{ .mode = .write_only }) catch {
+        var file = std.Io.Dir.openFileAbsolute(io, "/proc/self/uid_map", .{ .mode = .write_only }) catch {
             return EnvError.UidMapError;
         };
-        defer file.close();
-        file.writeAll(id_map) catch {
+        defer file.close(io);
+        file.writeStreamingAll(io, id_map) catch {
             return EnvError.UidMapError;
         };
     }
@@ -364,11 +379,11 @@ fn writeIdMappings(uid: c_uint, gid: c_uint, identity: NamespaceIdentity) EnvErr
             return EnvError.OutOfMemory;
         };
 
-        var file = std.fs.openFileAbsolute("/proc/self/gid_map", .{ .mode = .write_only }) catch {
+        var file = std.Io.Dir.openFileAbsolute(io, "/proc/self/gid_map", .{ .mode = .write_only }) catch {
             return EnvError.GidMapError;
         };
-        defer file.close();
-        file.writeAll(id_map) catch {
+        defer file.close(io);
+        file.writeStreamingAll(io, id_map) catch {
             return EnvError.GidMapError;
         };
     }
@@ -390,7 +405,7 @@ fn makeMountsPrivate() EnvError!void {
 
 fn generateSessionId() [32]u8 {
     var bytes: [16]u8 = undefined;
-    std.crypto.random.bytes(&bytes);
+    path_mod.currentIo().random(&bytes);
 
     var hex: [32]u8 = undefined;
     const hex_chars = "0123456789abcdef";
@@ -402,6 +417,7 @@ fn generateSessionId() [32]u8 {
 }
 
 fn createSessionAtBase(allocator: std.mem.Allocator, mode: EnvMode, env_base: []const u8) EnvError!SessionInfo {
+    const io = path_mod.currentIo();
     const id = generateSessionId();
 
     const base_path = std.fmt.allocPrint(allocator, "{s}/{s}/", .{ env_base, id }) catch {
@@ -422,7 +438,7 @@ fn createSessionAtBase(allocator: std.mem.Allocator, mode: EnvMode, env_base: []
         else
             dir;
 
-        std.fs.cwd().makePath(clean_dir) catch {
+        std.Io.Dir.cwd().createDirPath(io, clean_dir) catch {
             return EnvError.SessionSetupError;
         };
     }
@@ -438,15 +454,15 @@ fn createSessionAtBase(allocator: std.mem.Allocator, mode: EnvMode, env_base: []
         };
         defer allocator.free(etc_work);
 
-        std.fs.cwd().makePath(etc_upper) catch return EnvError.SessionSetupError;
-        std.fs.cwd().makePath(etc_work) catch return EnvError.SessionSetupError;
+        std.Io.Dir.cwd().createDirPath(io, etc_upper) catch return EnvError.SessionSetupError;
+        std.Io.Dir.cwd().createDirPath(io, etc_work) catch return EnvError.SessionSetupError;
     } else {
         const etc_gen = std.fmt.allocPrint(allocator, "{s}etc-gen", .{base_path}) catch {
             return EnvError.OutOfMemory;
         };
         defer allocator.free(etc_gen);
 
-        std.fs.cwd().makePath(etc_gen) catch return EnvError.SessionSetupError;
+        std.Io.Dir.cwd().createDirPath(io, etc_gen) catch return EnvError.SessionSetupError;
     }
 
     return SessionInfo{
@@ -459,8 +475,8 @@ fn createSessionAtBase(allocator: std.mem.Allocator, mode: EnvMode, env_base: []
 }
 
 fn createSession(allocator: std.mem.Allocator, mode: EnvMode) EnvError!SessionInfo {
-    if (std.posix.getenv("XDG_RUNTIME_DIR")) |xdg_runtime| {
-        const xdg_base = buildEnvBasePath(allocator, xdg_runtime) catch {
+    if (c.getenv("XDG_RUNTIME_DIR")) |xdg_runtime| {
+        const xdg_base = buildEnvBasePath(allocator, std.mem.span(xdg_runtime)) catch {
             return EnvError.OutOfMemory;
         };
         defer allocator.free(xdg_base);
@@ -482,6 +498,7 @@ fn createSession(allocator: std.mem.Allocator, mode: EnvMode) EnvError!SessionIn
 }
 
 fn buildSyntheticRoot(allocator: std.mem.Allocator, session: *const SessionInfo, profile_root: []const u8) EnvError!void {
+    const io = path_mod.currentIo();
     const root = if (session.root_path.len > 0 and session.root_path[session.root_path.len - 1] == '/')
         session.root_path[0 .. session.root_path.len - 1]
     else
@@ -496,7 +513,7 @@ fn buildSyntheticRoot(allocator: std.mem.Allocator, session: *const SessionInfo,
         };
         defer allocator.free(full_path);
 
-        std.fs.cwd().makePath(full_path) catch return EnvError.SyntheticRootSetupError;
+        std.Io.Dir.cwd().createDirPath(io, full_path) catch return EnvError.SyntheticRootSetupError;
     }
 
     if (session.mode == .build) {
@@ -505,7 +522,7 @@ fn buildSyntheticRoot(allocator: std.mem.Allocator, session: *const SessionInfo,
         };
         defer allocator.free(work_path);
 
-        std.fs.cwd().makePath(work_path) catch return EnvError.SyntheticRootSetupError;
+        std.Io.Dir.cwd().createDirPath(io, work_path) catch return EnvError.SyntheticRootSetupError;
     }
 
     // Bind-mount profile directories (bin, sbin, lib, usr) if they exist in the profile
@@ -520,7 +537,7 @@ fn buildSyntheticRoot(allocator: std.mem.Allocator, session: *const SessionInfo,
         defer allocator.free(source_path);
 
         // Check if this directory exists in the profile
-        std.fs.accessAbsolute(source_path, .{}) catch {
+        std.Io.Dir.accessAbsolute(io, source_path, .{}) catch {
             // Directory doesn't exist in profile, skip it
             continue;
         };
@@ -531,7 +548,7 @@ fn buildSyntheticRoot(allocator: std.mem.Allocator, session: *const SessionInfo,
         defer allocator.free(target_path);
 
         // Create the mount point directory
-        std.fs.cwd().makePath(target_path) catch return EnvError.SyntheticRootSetupError;
+        std.Io.Dir.cwd().createDirPath(io, target_path) catch return EnvError.SyntheticRootSetupError;
 
         // Bind-mount the profile directory (read-only for safety)
         try mountBind(source_path, target_path, true);
@@ -648,7 +665,7 @@ fn applyBuildMounts(allocator: std.mem.Allocator, session: *const SessionInfo, o
 }
 
 fn mountBind(source: []const u8, target: []const u8, read_only: bool) EnvError!void {
-    std.fs.accessAbsolute(source, .{}) catch |err| {
+    std.Io.Dir.accessAbsolute(path_mod.currentIo(), source, .{}) catch |err| {
         return switch (err) {
             error.FileNotFound => EnvError.MountSourceMissing,
             error.AccessDenied => EnvError.PermissionDenied,
@@ -785,27 +802,29 @@ fn setupMinimalDev(allocator: std.mem.Allocator, dev_path: []const u8) EnvError!
         }
     }
 
-    var dev_dir = std.fs.openDirAbsolute(dev_path, .{}) catch {
+    const io = path_mod.currentIo();
+    var dev_dir = std.Io.Dir.openDirAbsolute(io, dev_path, .{}) catch {
         return EnvError.DeviceSetupError;
     };
-    defer dev_dir.close();
+    defer dev_dir.close(io);
 
-    dev_dir.symLink("/proc/self/fd", "fd", .{}) catch |err| {
+    dev_dir.symLink(io, "/proc/self/fd", "fd", .{}) catch |err| {
         if (err != error.PathAlreadyExists) {
             return EnvError.DeviceSetupError;
         }
     };
 
-    dev_dir.symLink("/proc/self/fd/0", "stdin", .{}) catch {};
-    dev_dir.symLink("/proc/self/fd/1", "stdout", .{}) catch {};
-    dev_dir.symLink("/proc/self/fd/2", "stderr", .{}) catch {};
+    dev_dir.symLink(io, "/proc/self/fd/0", "stdin", .{}) catch {};
+    dev_dir.symLink(io, "/proc/self/fd/1", "stdout", .{}) catch {};
+    dev_dir.symLink(io, "/proc/self/fd/2", "stderr", .{}) catch {};
 }
 
 fn bindDeviceNode(target: []const u8, name: []const u8) EnvError!void {
-    var file = std.fs.createFileAbsolute(target, .{}) catch {
+    const io = path_mod.currentIo();
+    var file = std.Io.Dir.createFileAbsolute(io, target, .{}) catch {
         return EnvError.DeviceSetupError;
     };
-    file.close();
+    file.close(io);
 
     var host_path_buf: [256]u8 = undefined;
     const host_path = std.fmt.bufPrint(&host_path_buf, "/dev/{s}", .{name}) catch {
@@ -816,7 +835,8 @@ fn bindDeviceNode(target: []const u8, name: []const u8) EnvError!void {
 }
 
 fn generateMinimalEtc(allocator: std.mem.Allocator, etc_path: []const u8) EnvError!void {
-    std.fs.cwd().makePath(etc_path) catch return EnvError.EtcSetupError;
+    const io = path_mod.currentIo();
+    std.Io.Dir.cwd().createDirPath(io, etc_path) catch return EnvError.EtcSetupError;
 
     const passwd_content = "root:x:0:0:root:/root:/bin/sh\nnobody:x:65534:65534:nobody:/nonexistent:/usr/sbin/nologin\n";
     try writeFile(allocator, etc_path, "passwd", passwd_content);
@@ -837,7 +857,7 @@ fn generateMinimalEtc(allocator: std.mem.Allocator, etc_path: []const u8) EnvErr
     };
     defer allocator.free(ssl_certs_path);
 
-    std.fs.cwd().makePath(ssl_certs_path) catch return EnvError.EtcSetupError;
+    std.Io.Dir.cwd().createDirPath(io, ssl_certs_path) catch return EnvError.EtcSetupError;
 
     if (readHostFile("/etc/ssl/certs/ca-certificates.crt", 1024 * 1024)) |content| {
         defer std.heap.page_allocator.free(content);
@@ -846,25 +866,24 @@ fn generateMinimalEtc(allocator: std.mem.Allocator, etc_path: []const u8) EnvErr
 }
 
 fn writeFile(allocator: std.mem.Allocator, dir_path: []const u8, name: []const u8, content: []const u8) EnvError!void {
-    const path = std.fs.path.join(allocator, &.{ dir_path, name }) catch {
+    const io = path_mod.currentIo();
+    const file_path = std.fs.path.join(allocator, &.{ dir_path, name }) catch {
         return EnvError.OutOfMemory;
     };
-    defer allocator.free(path);
+    defer allocator.free(file_path);
 
-    var file = std.fs.createFileAbsolute(path, .{}) catch {
+    var file = std.Io.Dir.createFileAbsolute(io, file_path, .{}) catch {
         return EnvError.EtcSetupError;
     };
-    defer file.close();
+    defer file.close(io);
 
-    file.writeAll(content) catch {
+    file.writeStreamingAll(io, content) catch {
         return EnvError.EtcSetupError;
     };
 }
 
-fn readHostFile(path: []const u8, max_size: usize) ?[]u8 {
-    const file = std.fs.openFileAbsolute(path, .{}) catch return null;
-    defer file.close();
-    return file.readToEndAlloc(std.heap.page_allocator, max_size) catch null;
+fn readHostFile(file_path: []const u8, max_size: usize) ?[]u8 {
+    return std.Io.Dir.cwd().readFileAlloc(path_mod.currentIo(), file_path, std.heap.page_allocator, .limited(max_size)) catch null;
 }
 
 fn chrootAndChdir(root_path: []const u8, cwd: ?[]const u8) EnvError!void {
@@ -947,13 +966,24 @@ fn execCommand(allocator: std.mem.Allocator, command: ?[]const []const u8, env_o
         allocated_argv += 1;
     }
 
-    const envp: [*:null]const ?[*:0]const u8 = if (env_opt) |e|
-        @ptrCast(e.ptr)
-    else
-        @ptrCast(std.c.environ);
+    var owned_envp: ?[:null]?[*:0]const u8 = null;
+    defer if (owned_envp) |buf| allocator.free(buf);
 
-    std.posix.execvpeZ(argv[0].?, argv, envp) catch {};
-    // execvpeZ only returns on error; if we get here, exec failed
+    const envp: [*:null]const ?[*:0]const u8 = if (env_opt) |e| blk: {
+        const buf = allocator.allocSentinel(?[*:0]const u8, e.len, null) catch return EnvError.OutOfMemory;
+        for (e, 0..) |entry, i| buf[i] = entry;
+        owned_envp = buf;
+        break :blk buf.ptr;
+    } else @ptrCast(std.c.environ);
+
+    const exec_path = try resolveExecutablePath(allocator, cmd[0], env_opt);
+    defer allocator.free(exec_path);
+
+    const exec_path_z = allocator.dupeZ(u8, exec_path) catch return EnvError.OutOfMemory;
+    defer allocator.free(exec_path_z);
+
+    _ = c.execve(exec_path_z.ptr, @ptrCast(argv.ptr), @ptrCast(envp));
+    // execve only returns on error; if we get here, exec failed
     for (argv[0..allocated_argv]) |arg| {
         if (arg) |ptr| {
             const slice: [:0]const u8 = std.mem.span(ptr);
@@ -965,6 +995,43 @@ fn execCommand(allocator: std.mem.Allocator, command: ?[]const []const u8, env_o
         allocator.free(cmd);
     }
     return EnvError.ExecError;
+}
+
+fn resolveExecutablePath(
+    allocator: std.mem.Allocator,
+    arg0: []const u8,
+    env_opt: ?[]const [*:0]const u8,
+) EnvError![]u8 {
+    if (std.mem.indexOfScalar(u8, arg0, '/')) |_| {
+        return allocator.dupe(u8, arg0) catch return EnvError.OutOfMemory;
+    }
+
+    const path_value = findEnvValue(env_opt, "PATH") orelse "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
+    var it = std.mem.tokenizeScalar(u8, path_value, ':');
+    while (it.next()) |entry| {
+        const candidate = if (entry.len == 0)
+            std.fmt.allocPrint(allocator, "./{s}", .{arg0}) catch return EnvError.OutOfMemory
+        else
+            std.fmt.allocPrint(allocator, "{s}/{s}", .{ entry, arg0 }) catch return EnvError.OutOfMemory;
+        errdefer allocator.free(candidate);
+
+        std.Io.Dir.accessAbsolute(path_mod.currentIo(), candidate, .{}) catch {
+            continue;
+        };
+        return candidate;
+    }
+
+    return EnvError.ExecError;
+}
+
+fn findEnvValue(env_opt: ?[]const [*:0]const u8, key: []const u8) ?[]const u8 {
+    const envp = env_opt orelse return null;
+    for (envp) |entry| {
+        const kv = std.mem.span(entry);
+        const sep = std.mem.indexOfScalar(u8, kv, '=') orelse continue;
+        if (std.mem.eql(u8, kv[0..sep], key)) return kv[sep + 1 ..];
+    }
+    return null;
 }
 
 fn toCString(s: []const u8) error{OutOfMemory}![:0]u8 {
@@ -1079,7 +1146,8 @@ test "validateInputs returns WorkspaceNotFound for build mode with nonexistent w
     defer tmp_dir.cleanup();
 
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const tmp_path = tmp_dir.dir.realpath(".", &path_buf) catch unreachable;
+    const tmp_path_len = tmp_dir.dir.realPath(path_mod.currentIo(), &path_buf) catch unreachable;
+    const tmp_path = path_buf[0..tmp_path_len];
 
     const opts = EnvOptions{
         .profile_root = tmp_path,
@@ -1096,7 +1164,8 @@ test "validateInputs succeeds for valid shell mode options" {
     defer tmp_dir.cleanup();
 
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const tmp_path = tmp_dir.dir.realpath(".", &path_buf) catch unreachable;
+    const tmp_path_len = tmp_dir.dir.realPath(path_mod.currentIo(), &path_buf) catch unreachable;
+    const tmp_path = path_buf[0..tmp_path_len];
 
     const opts = EnvOptions{
         .profile_root = tmp_path,
@@ -1112,10 +1181,11 @@ test "validateInputs succeeds for valid build mode options with workspace" {
     defer tmp_dir.cleanup();
 
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const tmp_path = tmp_dir.dir.realpath(".", &path_buf) catch unreachable;
+    const tmp_path_len = tmp_dir.dir.realPath(path_mod.currentIo(), &path_buf) catch unreachable;
+    const tmp_path = path_buf[0..tmp_path_len];
 
     // Create workspace subdirectory
-    try tmp_dir.dir.makeDir("workspace");
+    try tmp_dir.dir.createDir(path_mod.currentIo(), "workspace", .default_dir);
     const workspace_path = std.fs.path.join(std.testing.allocator, &.{ tmp_path, "workspace" }) catch unreachable;
     defer std.testing.allocator.free(workspace_path);
 
@@ -1133,7 +1203,8 @@ test "validateInputs rejects relative cwd" {
     defer tmp_dir.cleanup();
 
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const tmp_path = tmp_dir.dir.realpath(".", &path_buf) catch unreachable;
+    const tmp_path_len = tmp_dir.dir.realPath(path_mod.currentIo(), &path_buf) catch unreachable;
+    const tmp_path = path_buf[0..tmp_path_len];
 
     const opts = EnvOptions{
         .profile_root = tmp_path,
@@ -1150,7 +1221,8 @@ test "validateInputs allows null workspace in build mode" {
     defer tmp_dir.cleanup();
 
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const tmp_path = tmp_dir.dir.realpath(".", &path_buf) catch unreachable;
+    const tmp_path_len = tmp_dir.dir.realPath(path_mod.currentIo(), &path_buf) catch unreachable;
+    const tmp_path = path_buf[0..tmp_path_len];
 
     const opts = EnvOptions{
         .profile_root = tmp_path,
@@ -1198,7 +1270,8 @@ test "bindDeviceNode fails when bind mount fails" {
     defer tmp_dir.cleanup();
 
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const tmp_path = try tmp_dir.dir.realpath(".", &path_buf);
+    const tmp_path_len = try tmp_dir.dir.realPath(path_mod.currentIo(), &path_buf);
+    const tmp_path = path_buf[0..tmp_path_len];
     const target = try std.fs.path.join(std.testing.allocator, &.{ tmp_path, "dev-node" });
     defer std.testing.allocator.free(target);
 
@@ -1266,7 +1339,8 @@ test "createSessionAtBase creates a session under the requested base" {
     defer tmp_dir.cleanup();
 
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const tmp_path = try tmp_dir.dir.realpath(".", &path_buf);
+    const tmp_path_len = try tmp_dir.dir.realPath(path_mod.currentIo(), &path_buf);
+    const tmp_path = path_buf[0..tmp_path_len];
     const base = try std.fs.path.join(std.testing.allocator, &.{ tmp_path, "mere", "env" });
     defer std.testing.allocator.free(base);
 

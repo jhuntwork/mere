@@ -1,6 +1,7 @@
 const std = @import("std");
 const store = @import("store.zig");
 const errors = @import("errors.zig");
+const path_mod = @import("path.zig");
 
 const Std = errors.StandardErrors;
 pub const PinError = Std.OutOfMemory || Std.FileSystem || Std.PermissionDenied || Std.InvalidInput || error{
@@ -33,7 +34,7 @@ pub const List = struct {
     pub fn init(allocator: std.mem.Allocator) List {
         return .{
             .allocator = allocator,
-            .pins = .{},
+            .pins = .empty,
         };
     }
 
@@ -52,6 +53,7 @@ pub fn create(
     store_path: []const u8,
     note: ?[]const u8,
 ) PinError!void {
+    const io = path_mod.currentIo();
     if (pin_name.len == 0 or pin_name.len > 255) {
         return PinError.InvalidInput;
     }
@@ -74,7 +76,7 @@ pub fn create(
     };
     defer allocator.free(pin_path);
 
-    if (std.fs.accessAbsolute(pin_path, .{})) |_| {
+    if (std.Io.Dir.accessAbsolute(io, pin_path, .{})) |_| {
         return PinError.PinExists;
     } else |err| {
         if (err != error.FileNotFound) {
@@ -85,20 +87,28 @@ pub fn create(
         }
     }
 
-    std.fs.cwd().makePath(gc_roots_dir) catch |err| {
+    path_mod.ensureDirExists(gc_roots_dir) catch |err| {
         return switch (err) {
             error.AccessDenied => PinError.PermissionDenied,
             else => PinError.FileSystem,
         };
     };
 
-    std.posix.symlinkat(store_path, std.fs.cwd().fd, pin_path) catch |err| {
+    var gc_roots_dir_handle = path_mod.openExistingDir(gc_roots_dir) catch |err| {
         return switch (err) {
             error.AccessDenied => PinError.PermissionDenied,
             else => PinError.FileSystem,
         };
     };
-    errdefer std.fs.cwd().deleteFile(pin_path) catch {};
+    defer gc_roots_dir_handle.close(io);
+
+    gc_roots_dir_handle.symLink(io, store_path, pin_name, .{}) catch |err| {
+        return switch (err) {
+            error.AccessDenied => PinError.PermissionDenied,
+            else => PinError.FileSystem,
+        };
+    };
+    errdefer gc_roots_dir_handle.deleteFile(io, pin_name) catch {};
 
     if (note) |n| {
         const note_path = std.fmt.allocPrint(allocator, "{s}.note", .{pin_path}) catch {
@@ -107,18 +117,18 @@ pub fn create(
         defer allocator.free(note_path);
 
         var note_created = false;
-        errdefer if (note_created) std.fs.cwd().deleteFile(note_path) catch {};
+        errdefer if (note_created) std.Io.Dir.deleteFileAbsolute(io, note_path) catch {};
 
-        var file = std.fs.createFileAbsolute(note_path, .{}) catch |err| {
+        var file = std.Io.Dir.createFileAbsolute(io, note_path, .{}) catch |err| {
             return switch (err) {
                 error.AccessDenied => PinError.PermissionDenied,
                 else => PinError.FileSystem,
             };
         };
         note_created = true;
-        defer file.close();
+        defer file.close(io);
 
-        file.writeAll(n) catch |err| {
+        file.writeStreamingAll(io, n) catch |err| {
             return switch (err) {
                 error.AccessDenied => PinError.PermissionDenied,
                 else => PinError.FileSystem,
@@ -132,13 +142,14 @@ pub fn remove(
     gc_roots_dir: []const u8,
     pin_name: []const u8,
 ) PinError!void {
+    const io = path_mod.currentIo();
     const pin_path = std.fs.path.join(allocator, &.{ gc_roots_dir, pin_name }) catch {
         return PinError.OutOfMemory;
     };
     defer allocator.free(pin_path);
 
     var link_buf: [std.fs.max_path_bytes]u8 = undefined;
-    _ = std.fs.readLinkAbsolute(pin_path, &link_buf) catch |err| {
+    _ = std.Io.Dir.readLinkAbsolute(io, pin_path, &link_buf) catch |err| {
         return switch (err) {
             error.FileNotFound => PinError.PinNotFound,
             error.NotLink => PinError.PinNotFound,
@@ -146,7 +157,15 @@ pub fn remove(
         };
     };
 
-    std.fs.cwd().deleteFile(pin_path) catch |err| {
+    var gc_roots_dir_handle = path_mod.openExistingDir(gc_roots_dir) catch |err| {
+        return switch (err) {
+            error.AccessDenied => PinError.PermissionDenied,
+            else => PinError.FileSystem,
+        };
+    };
+    defer gc_roots_dir_handle.close(io);
+
+    gc_roots_dir_handle.deleteFile(io, pin_name) catch |err| {
         return switch (err) {
             error.AccessDenied => PinError.PermissionDenied,
             else => PinError.FileSystem,
@@ -158,8 +177,7 @@ pub fn remove(
     };
     defer allocator.free(note_path);
 
-    std.fs.cwd().deleteFile(note_path) catch {
-    };
+    std.Io.Dir.deleteFileAbsolute(io, note_path) catch {};
 }
 
 pub fn get(
@@ -167,13 +185,14 @@ pub fn get(
     gc_roots_dir: []const u8,
     pin_name: []const u8,
 ) PinError!Info {
+    const io = path_mod.currentIo();
     const pin_path = std.fs.path.join(allocator, &.{ gc_roots_dir, pin_name }) catch {
         return PinError.OutOfMemory;
     };
     defer allocator.free(pin_path);
 
     var target_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const target = std.fs.readLinkAbsolute(pin_path, &target_buf) catch |err| {
+    const target_len = std.Io.Dir.readLinkAbsolute(io, pin_path, &target_buf) catch |err| {
         return switch (err) {
             error.FileNotFound => PinError.PinNotFound,
             error.NotLink => PinError.PinNotFound,
@@ -181,6 +200,7 @@ pub fn get(
             else => PinError.FileSystem,
         };
     };
+    const target = target_buf[0..target_len];
 
     _ = store.parseStorePath(target) catch {
         return PinError.InvalidStorePath;
@@ -204,14 +224,14 @@ pub fn get(
     defer allocator.free(note_path);
 
     const note: ?[]const u8 = blk: {
-        var file = std.fs.openFileAbsolute(note_path, .{}) catch |err| {
+        var file = std.Io.Dir.openFileAbsolute(io, note_path, .{}) catch |err| {
             if (err == error.FileNotFound) break :blk null;
             if (err == error.AccessDenied) break :blk null;
             return PinError.FileSystem;
         };
-        defer file.close();
+        defer file.close(io);
 
-        const stat = file.stat() catch |err| {
+        const stat = file.stat(io) catch |err| {
             if (err == error.AccessDenied) break :blk null;
             return PinError.FileSystem;
         };
@@ -224,7 +244,7 @@ pub fn get(
             break :blk null;
         };
 
-        const bytes_read = file.readAll(content) catch |err| {
+        const bytes_read = file.readPositionalAll(io, content, 0) catch |err| {
             allocator.free(content);
             if (err == error.AccessDenied) break :blk null;
             return PinError.FileSystem;
@@ -250,20 +270,21 @@ pub fn list(
     allocator: std.mem.Allocator,
     gc_roots_dir: []const u8,
 ) PinError!List {
+    const io = path_mod.currentIo();
     var result = List.init(allocator);
     errdefer result.deinit();
 
-    var dir = std.fs.openDirAbsolute(gc_roots_dir, .{ .iterate = true }) catch |err| {
+    var dir = std.Io.Dir.openDirAbsolute(io, gc_roots_dir, .{ .iterate = true }) catch |err| {
         return switch (err) {
             error.FileNotFound => result,
             error.AccessDenied => PinError.PermissionDenied,
             else => PinError.FileSystem,
         };
     };
-    defer dir.close();
+    defer dir.close(io);
 
     var iter = dir.iterate();
-    while (iter.next() catch {
+    while (iter.next(io) catch {
         return PinError.FileSystem;
     }) |entry| {
         if (std.mem.endsWith(u8, entry.name, ".note")) {
@@ -340,7 +361,7 @@ test "create and remove work correctly" {
     const hash = "a" ** 64;
     const store_path = try std.fs.path.join(allocator, &.{ test_env.path, "mere", "store", hash ++ "-test-pkg-1.0" });
     defer allocator.free(store_path);
-    try std.fs.cwd().makePath(store_path);
+    try path_mod.ensureDirExists(store_path);
 
     // Create a pin
     try create(allocator, gc_roots, "my-pin", store_path, "Test pin note");
@@ -383,7 +404,7 @@ test "create rejects duplicate pins" {
     const hash = "b" ** 64;
     const store_path = try std.fs.path.join(allocator, &.{ test_env.path, "mere", "store", hash ++ "-foo-2.0" });
     defer allocator.free(store_path);
-    try std.fs.cwd().makePath(store_path);
+    try path_mod.ensureDirExists(store_path);
 
     // Create first pin
     try create(allocator, gc_roots, "foo", store_path, null);
@@ -433,7 +454,7 @@ test "createPin validates pin name" {
     const hash = "d" ** 64;
     const store_path = try std.fs.path.join(allocator, &.{ test_env.path, "mere", "store", hash ++ "-pkg-1.0" });
     defer allocator.free(store_path);
-    try std.fs.cwd().makePath(store_path);
+    try path_mod.ensureDirExists(store_path);
 
     // Empty name
     try std.testing.expectError(PinError.InvalidInput, create(allocator, gc_roots, "", store_path, null));
@@ -453,17 +474,17 @@ test "createPin rolls back symlink when note creation fails" {
     const allocator = test_env.ctx.allocator;
     const gc_roots = try std.fs.path.join(allocator, &.{ test_env.path, "gc-roots" });
     defer allocator.free(gc_roots);
-    try std.fs.cwd().makePath(gc_roots);
+    try path_mod.ensureDirExists(gc_roots);
 
     const hash = "a" ** 64;
     const store_path = try std.fs.path.join(allocator, &.{ test_env.path, "mere", "store", hash ++ "-test-pkg-1.0" });
     defer allocator.free(store_path);
-    try std.fs.cwd().makePath(store_path);
+    try path_mod.ensureDirExists(store_path);
 
     // Force note creation failure after symlink creation by pre-creating <pin>.note as a directory.
     const blocking_note_dir = try std.fs.path.join(allocator, &.{ gc_roots, "rollback-pin.note" });
     defer allocator.free(blocking_note_dir);
-    try std.fs.cwd().makePath(blocking_note_dir);
+    try path_mod.ensureDirExists(blocking_note_dir);
 
     try std.testing.expectError(
         PinError.FileSystem,
@@ -492,12 +513,12 @@ test "listPins returns all user pins" {
     const hash1 = "e" ** 64;
     const store1 = try std.fs.path.join(allocator, &.{ test_env.path, "mere", "store", hash1 ++ "-pkg1-1.0" });
     defer allocator.free(store1);
-    try std.fs.cwd().makePath(store1);
+    try path_mod.ensureDirExists(store1);
 
     const hash2 = "f" ** 64;
     const store2 = try std.fs.path.join(allocator, &.{ test_env.path, "mere", "store", hash2 ++ "-pkg2-2.0" });
     defer allocator.free(store2);
-    try std.fs.cwd().makePath(store2);
+    try path_mod.ensureDirExists(store2);
 
     try create(allocator, gc_roots, "pin1", store1, null);
     try create(allocator, gc_roots, "pin2", store2, "Note for pin2");
@@ -521,22 +542,30 @@ test "listPins skips system roots" {
 
     const gc_roots = try std.fs.path.join(allocator, &.{ test_env.path, "gc-roots" });
     defer allocator.free(gc_roots);
-    try std.fs.cwd().makePath(gc_roots);
+    try path_mod.ensureDirExists(gc_roots);
 
     // Create system-managed roots (should be skipped)
     const current_path = try std.fs.path.join(allocator, &.{ gc_roots, "current" });
     defer allocator.free(current_path);
-    std.posix.symlinkat("/mere/profiles/system/current", std.fs.cwd().fd, current_path) catch {};
+    {
+        var dir = try path_mod.openExistingDir(gc_roots);
+        defer dir.close(path_mod.currentIo());
+        dir.symLink(path_mod.currentIo(), "/mere/profiles/system/current", "current", .{}) catch {};
+    }
 
     const gen1_path = try std.fs.path.join(allocator, &.{ gc_roots, "gen-1" });
     defer allocator.free(gen1_path);
-    std.posix.symlinkat("/mere/profiles/system/gen-1", std.fs.cwd().fd, gen1_path) catch {};
+    {
+        var dir = try path_mod.openExistingDir(gc_roots);
+        defer dir.close(path_mod.currentIo());
+        dir.symLink(path_mod.currentIo(), "/mere/profiles/system/gen-1", "gen-1", .{}) catch {};
+    }
 
     // Create a user pin
     const hash = "0" ** 64;
     const store_path = try std.fs.path.join(allocator, &.{ test_env.path, "mere", "store", hash ++ "-user-pkg-1.0" });
     defer allocator.free(store_path);
-    try std.fs.cwd().makePath(store_path);
+    try path_mod.ensureDirExists(store_path);
 
     try create(allocator, gc_roots, "user-pin", store_path, null);
 
@@ -565,7 +594,7 @@ test "getPinForPackage finds pin by package name" {
     const hash = "1" ** 64;
     const store_path = try std.fs.path.join(allocator, &.{ test_env.path, "mere", "store", hash ++ "-my-app-3.0" });
     defer allocator.free(store_path);
-    try std.fs.cwd().makePath(store_path);
+    try path_mod.ensureDirExists(store_path);
 
     // Pin with custom name
     try create(allocator, gc_roots, "stable-app", store_path, null);

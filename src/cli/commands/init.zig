@@ -48,7 +48,7 @@ pub fn handleInit(ctx: *mere.Context, args: *const types.ParsedArgs) MereError!t
     defer result.deinit();
 
     // Build output
-    var output: std.ArrayList(u8) = .{};
+    var output: std.ArrayList(u8) = .empty;
     defer output.deinit(ctx.allocator);
 
     const writer = output.writer(ctx.allocator);

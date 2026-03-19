@@ -47,7 +47,7 @@ pub const RepoConfig = struct {
         errdefer allocator.free(url_copy);
 
         // Deep copy the fingerprints list
-        var fingerprints_copy = std.ArrayList([]const u8){};
+        var fingerprints_copy: std.ArrayList([]const u8) = .empty;
         errdefer {
             for (fingerprints_copy.items) |fp| allocator.free(fp);
             fingerprints_copy.deinit(allocator);
@@ -131,7 +131,7 @@ pub const RepoConfig = struct {
 
         // Parse trusted fingerprints from child node
         // Format: trusted-fingerprints "fp1" "fp2" ...
-        var fingerprints = std.ArrayList([]const u8){};
+        var fingerprints: std.ArrayList([]const u8) = .empty;
         errdefer {
             for (fingerprints.items) |fp| allocator.free(fp);
             fingerprints.deinit(allocator);
@@ -218,7 +218,7 @@ pub const Config = struct {
     /// Pass `ctx.allocator` for persistent configs or an arena allocator for transient parsing.
     pub fn init(ctx: *Context, alloc: std.mem.Allocator) Config {
         return Config{
-            .repos = std.ArrayList(RepoConfig){},
+            .repos = .empty,
             .ctx = ctx,
             .alloc = alloc,
             .color = null,
@@ -231,7 +231,7 @@ pub const Config = struct {
     /// Returns a new ArrayList containing pointers to enabled repos sorted by priority
     /// The caller MUST NOT free the RepoConfig items since they are owned by this Config
     pub fn getFilteredAndSortedRepos(self: *const Config, allocator: std.mem.Allocator) !std.ArrayList(*RepoConfig) {
-        var filtered_repos = std.ArrayList(*RepoConfig){};
+        var filtered_repos: std.ArrayList(*RepoConfig) = .empty;
         errdefer filtered_repos.deinit(allocator); // Only free the list, not the RepoConfig items
 
         // Filter repos by enabled status
@@ -321,53 +321,55 @@ pub const Config = struct {
 
     /// Convert a Config to a KDL string.
     /// Caller owns returned memory and must free with self.alloc.
-    pub fn toKdl(self: *const Config) ![]const u8 {
-        var buf = std.ArrayList(u8){};
+    pub fn toKdl(self: *const Config) error{OutOfMemory}![]const u8 {
+        var buf: std.ArrayList(u8) = .empty;
         errdefer buf.deinit(self.alloc);
-        const writer = buf.writer(self.alloc);
+        var out_buf: std.Io.Writer.Allocating = .fromArrayList(self.alloc, &buf);
+        const out = &out_buf.writer;
 
-        try writer.writeAll("// Mere Linux configuration\n\n");
+        out.writeAll("// Mere Linux configuration\n\n") catch return error.OutOfMemory;
 
         if (self.color != null or self.sync_ttl_seconds != default_sync_ttl_seconds or self.sync_timeout_seconds != default_sync_timeout_seconds) {
-            try writer.writeAll("settings {\n");
+            out.writeAll("settings {\n") catch return error.OutOfMemory;
             if (self.color) |color| {
-                try writer.print("    color {}\n", .{color});
+                out.print("    color {}\n", .{color}) catch return error.OutOfMemory;
             }
             if (self.sync_ttl_seconds != default_sync_ttl_seconds) {
-                try writer.print("    sync-ttl {d}\n", .{self.sync_ttl_seconds});
+                out.print("    sync-ttl {d}\n", .{self.sync_ttl_seconds}) catch return error.OutOfMemory;
             }
             if (self.sync_timeout_seconds != default_sync_timeout_seconds) {
-                try writer.print("    sync-timeout {d}\n", .{self.sync_timeout_seconds});
+                out.print("    sync-timeout {d}\n", .{self.sync_timeout_seconds}) catch return error.OutOfMemory;
             }
-            try writer.writeAll("}\n\n");
+            out.writeAll("}\n\n") catch return error.OutOfMemory;
         }
 
         for (self.repos.items) |repo| {
-            try writer.print("repo \"{s}\" {{\n", .{repo.name});
-            try writer.print("    url \"{s}\"\n", .{repo.url});
+            out.print("repo \"{s}\" {{\n", .{repo.name}) catch return error.OutOfMemory;
+            out.print("    url \"{s}\"\n", .{repo.url}) catch return error.OutOfMemory;
             // Write trusted fingerprints if any
             if (repo.trusted_fingerprints.items.len > 0) {
-                try writer.writeAll("    trusted-fingerprints");
+                out.writeAll("    trusted-fingerprints") catch return error.OutOfMemory;
                 for (repo.trusted_fingerprints.items) |fp| {
-                    try writer.print(" \"{s}\"", .{fp});
+                    out.print(" \"{s}\"", .{fp}) catch return error.OutOfMemory;
                 }
-                try writer.writeAll("\n");
+                out.writeAll("\n") catch return error.OutOfMemory;
             }
-            try writer.print("    priority {d}\n", .{repo.priority});
+            out.print("    priority {d}\n", .{repo.priority}) catch return error.OutOfMemory;
             if (repo.sync_ttl_seconds != self.sync_ttl_seconds) {
-                try writer.print("    sync-ttl {d}\n", .{repo.sync_ttl_seconds});
+                out.print("    sync-ttl {d}\n", .{repo.sync_ttl_seconds}) catch return error.OutOfMemory;
             }
             if (repo.sync_timeout_seconds != self.sync_timeout_seconds) {
-                try writer.print("    sync-timeout {d}\n", .{repo.sync_timeout_seconds});
+                out.print("    sync-timeout {d}\n", .{repo.sync_timeout_seconds}) catch return error.OutOfMemory;
             }
             // Only write enabled if false (true is the default)
             if (!repo.enabled) {
-                try writer.writeAll("    enabled false\n");
+                out.writeAll("    enabled false\n") catch return error.OutOfMemory;
             }
-            try writer.writeAll("}\n\n");
+            out.writeAll("}\n\n") catch return error.OutOfMemory;
         }
 
-        return buf.toOwnedSlice(self.alloc);
+        buf = out_buf.toArrayList();
+        return buf.toOwnedSlice(self.alloc) catch error.OutOfMemory;
     }
 
     /// Add a repository to the config
@@ -407,7 +409,7 @@ pub const Config = struct {
         errdefer allocator.free(url_copy);
 
         // Deep copy the fingerprints list
-        var fingerprints_copy = std.ArrayList([]const u8){};
+        var fingerprints_copy: std.ArrayList([]const u8) = .empty;
         errdefer {
             for (fingerprints_copy.items) |fp| allocator.free(fp);
             fingerprints_copy.deinit(allocator);
@@ -534,30 +536,28 @@ pub fn readConfigFile(ctx: *Context, file_path: []const u8) !Config {
 pub fn readConfigFileWithAllocator(ctx: *Context, file_path: []const u8, allocator: std.mem.Allocator) !Config {
     ctx.debug("reading config file: {s}", .{file_path});
 
-    // Resolve relative paths to an absolute path using path.resolveToAbsolutePath.
-    // This preserves use of std.fs.openFileAbsolute while accepting relative input.
+    // Resolve relative paths to an absolute path so config reads work from any cwd.
     var buf: [std.fs.max_path_bytes]u8 = undefined;
     const abs_path = path.resolveToAbsolutePath(file_path, &buf) catch |err| {
         ctx.debug("resolveToAbsolutePath failed: {}", .{err});
         return switch (err) {
-            error.FileNotFound => Config.init(ctx, allocator),
             error.PathTooLong => ctx.fail(error.ReadError, file_path, "config path too long"),
             else => ctx.fail(error.ReadError, file_path, "failed to resolve config path"),
         };
     };
 
     // Try to open the file
-    const file = std.fs.openFileAbsolute(abs_path, .{}) catch |err| {
+    const file = path.openExistingFile(abs_path) catch |err| {
         ctx.debug("failed to open config file: {}", .{err});
         return switch (err) {
             error.FileNotFound => Config.init(ctx, allocator),
             else => ctx.fail(error.ReadError, file_path, "failed to open config file"),
         };
     };
-    defer file.close();
+    defer file.close(path.currentIo());
 
     // Read the file content
-    const file_size = try file.getEndPos();
+    const file_size = (try file.stat(path.currentIo())).size;
     if (file_size > 1024 * 1024) { // 1MB limit
         return ctx.fail(error.ReadError, file_path, "config file too large (max 1MB)");
     }
@@ -565,12 +565,11 @@ pub fn readConfigFileWithAllocator(ctx: *Context, file_path: []const u8, allocat
     const content = try allocator.alloc(u8, file_size);
     defer allocator.free(content);
 
-    const bytes_read = file.readAll(content) catch {
+    var read_buf: [4096]u8 = undefined;
+    var reader = file.reader(path.currentIo(), &read_buf);
+    reader.interface.readSliceAll(content) catch {
         return ctx.fail(error.ReadError, file_path, "failed to read config file");
     };
-    if (bytes_read != file_size) {
-        return ctx.fail(error.ReadError, file_path, "short read while loading config file");
-    }
 
     return Config.fromKdl(ctx, content, allocator) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
@@ -595,7 +594,7 @@ pub fn writeConfigFile(ctx: *Context, file_path: []const u8, config: *const Conf
     var dir = path.makePathAndOpenDir(parent_dir) catch |err| {
         return ctx.fail(err, file_path, "failed to create config directory");
     };
-    defer dir.close();
+    defer dir.close(path.currentIo());
 
     // Convert config to KDL
     const kdl_str = config.toKdl() catch |err| {
@@ -607,9 +606,9 @@ pub fn writeConfigFile(ctx: *Context, file_path: []const u8, config: *const Conf
     const file = path.makePathAndOpenFile(file_path) catch |err| {
         return ctx.fail(err, file_path, "failed to open config file for writing");
     };
-    defer file.close();
+    defer file.close(path.currentIo());
 
-    file.writeAll(kdl_str) catch |err| {
+    file.writeStreamingAll(path.currentIo(), kdl_str) catch |err| {
         return ctx.fail(err, file_path, "failed to write config file");
     };
 }
@@ -680,14 +679,14 @@ test "Config to KDL roundtrip" {
         .name = try test_env.ctx.allocator.dupe(u8, "core"),
         .url = try test_env.ctx.allocator.dupe(u8, "https://example.com/repo/core"),
         .priority = 100,
-        .trusted_fingerprints = std.ArrayList([]const u8){},
+        .trusted_fingerprints = .empty,
     });
 
     try config.repos.append(test_env.ctx.allocator, RepoConfig{
         .name = try test_env.ctx.allocator.dupe(u8, "extra"),
         .url = try test_env.ctx.allocator.dupe(u8, "https://example.com/repo/extra"),
         .priority = 200,
-        .trusted_fingerprints = std.ArrayList([]const u8){},
+        .trusted_fingerprints = .empty,
     });
 
     // Convert to KDL
@@ -727,7 +726,7 @@ test "Config merge" {
         .name = try test_env.ctx.allocator.dupe(u8, "core"),
         .url = try test_env.ctx.allocator.dupe(u8, "https://example.com/repo/core"),
         .priority = 100,
-        .trusted_fingerprints = std.ArrayList([]const u8){},
+        .trusted_fingerprints = .empty,
     });
 
     // Add repos to config2 (including one with the same name)
@@ -735,14 +734,14 @@ test "Config merge" {
         .name = try test_env.ctx.allocator.dupe(u8, "core"),
         .url = try test_env.ctx.allocator.dupe(u8, "https://example.com/repo/core-override"),
         .priority = 150,
-        .trusted_fingerprints = std.ArrayList([]const u8){},
+        .trusted_fingerprints = .empty,
     });
 
     try config2.repos.append(test_env.ctx.allocator, RepoConfig{
         .name = try test_env.ctx.allocator.dupe(u8, "extra"),
         .url = try test_env.ctx.allocator.dupe(u8, "https://example.com/repo/extra"),
         .priority = 200,
-        .trusted_fingerprints = std.ArrayList([]const u8){},
+        .trusted_fingerprints = .empty,
     });
 
     // Merge config2 into config1
@@ -778,14 +777,14 @@ test "Config file read/write" {
         .name = try test_env.ctx.allocator.dupe(u8, "core"),
         .url = try test_env.ctx.allocator.dupe(u8, "https://example.com/repo/core"),
         .priority = 100,
-        .trusted_fingerprints = std.ArrayList([]const u8){},
+        .trusted_fingerprints = .empty,
     });
 
     try test_config.repos.append(test_env.ctx.allocator, RepoConfig{
         .name = try test_env.ctx.allocator.dupe(u8, "extra"),
         .url = try test_env.ctx.allocator.dupe(u8, "https://example.com/repo/extra"),
         .priority = 200,
-        .trusted_fingerprints = std.ArrayList([]const u8){},
+        .trusted_fingerprints = .empty,
     });
 
     // Get the system config path
@@ -824,7 +823,7 @@ test "Add and remove repositories" {
         .name = try test_env.ctx.allocator.dupe(u8, "core"),
         .url = try test_env.ctx.allocator.dupe(u8, "https://example.com/repo/core"),
         .priority = 100,
-        .trusted_fingerprints = std.ArrayList([]const u8){},
+        .trusted_fingerprints = .empty,
     };
     try test_config.addRepo(repo1);
 
@@ -837,7 +836,7 @@ test "Add and remove repositories" {
         .name = try test_env.ctx.allocator.dupe(u8, "extra"),
         .url = try test_env.ctx.allocator.dupe(u8, "https://example.com/repo/extra"),
         .priority = 200,
-        .trusted_fingerprints = std.ArrayList([]const u8){},
+        .trusted_fingerprints = .empty,
     };
     try test_config.addRepo(repo2);
 
@@ -849,7 +848,7 @@ test "Add and remove repositories" {
         .name = try test_env.ctx.allocator.dupe(u8, "core"),
         .url = try test_env.ctx.allocator.dupe(u8, "https://example.com/repo/core-new"),
         .priority = 150,
-        .trusted_fingerprints = std.ArrayList([]const u8){},
+        .trusted_fingerprints = .empty,
     };
     try test_config.addRepo(repo3);
 
@@ -897,7 +896,7 @@ test "Config KDL after removing last repo has no repo blocks" {
         .name = try test_env.ctx.allocator.dupe(u8, "core"),
         .url = try test_env.ctx.allocator.dupe(u8, "https://example.com/repo/core"),
         .priority = 100,
-        .trusted_fingerprints = std.ArrayList([]const u8){},
+        .trusted_fingerprints = .empty,
     });
     const removed = config.removeRepo("core");
     try std.testing.expect(removed);
@@ -928,13 +927,13 @@ test "Config merge replaces repo with same name and validates" {
         .name = try test_env.ctx.allocator.dupe(u8, "repo"),
         .url = try test_env.ctx.allocator.dupe(u8, "https://example.com/one"),
         .priority = 1,
-        .trusted_fingerprints = std.ArrayList([]const u8){},
+        .trusted_fingerprints = .empty,
     });
 
     try config2.repos.append(test_env.ctx.allocator, RepoConfig{
         .name = try test_env.ctx.allocator.dupe(u8, "repo"),
         .url = try test_env.ctx.allocator.dupe(u8, "https://example.com/two"),
-        .trusted_fingerprints = std.ArrayList([]const u8){},
+        .trusted_fingerprints = .empty,
         .priority = 2,
     });
 
@@ -1004,7 +1003,7 @@ test "Allocator mismatch avoided when merging with arena allocator" {
         .name = try arena_alloc.dupe(u8, "arena_repo"),
         .url = try arena_alloc.dupe(u8, "https://example.com/arena"),
         .priority = 10,
-        .trusted_fingerprints = std.ArrayList([]const u8){},
+        .trusted_fingerprints = .empty,
     });
 
     // Merged config also uses arena allocator (matching loadConfig behavior)
@@ -1095,14 +1094,15 @@ test "readConfigFileWithAllocator rejects files larger than 1MB" {
     for (buf) |*b| b.* = 'a';
 
     {
-        const f = try std.fs.createFileAbsolute(big_path, .{});
-        try f.writeAll(buf);
-        f.close();
+        const io = path.currentIo();
+        const f = try std.Io.Dir.createFileAbsolute(io, big_path, .{});
+        try f.writeStreamingAll(io, buf);
+        f.close(io);
     }
 
     try std.testing.expectError(error.ReadError, readConfigFileWithAllocator(&test_env.ctx, big_path, test_env.ctx.allocator));
     // cleanup file
-    std.fs.deleteFileAbsolute(big_path) catch {};
+    std.Io.Dir.deleteFileAbsolute(path.currentIo(), big_path) catch {};
 }
 
 test "readConfigFileWithAllocator returns empty config for FileNotFound" {
@@ -1121,7 +1121,7 @@ test "readConfigFileWithAllocator returns empty config for FileNotFound" {
 }
 
 test "readConfigFileWithAllocator reports ReadError on permission denied" {
-    if (std.posix.geteuid() == 0) return error.SkipZigTest;
+    if (std.os.linux.geteuid() == 0) return error.SkipZigTest;
 
     var test_env = try @import("test_helpers.zig").createTestEnv();
     defer {
@@ -1132,13 +1132,19 @@ test "readConfigFileWithAllocator reports ReadError on permission denied" {
     const blocked = try std.fs.path.join(test_env.ctx.allocator, &.{ test_env.path, "blocked-config.kdl" });
     defer test_env.ctx.allocator.free(blocked);
     {
-        const f = try std.fs.createFileAbsolute(blocked, .{ .truncate = true });
-        try f.writeAll("repo \"x\" { url \"https://example.com/repo.db\" trusted-fingerprints \"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\" }");
-        f.close();
+        const io = path.currentIo();
+        const f = try std.Io.Dir.createFileAbsolute(io, blocked, .{ .truncate = true });
+        try f.writeStreamingAll(io, "repo \"x\" { url \"https://example.com/repo.db\" trusted-fingerprints \"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\" }");
+        f.close(io);
     }
 
-    try std.posix.fchmodat(std.posix.AT.FDCWD, blocked, 0, 0);
-    defer std.posix.fchmodat(std.posix.AT.FDCWD, blocked, 0o644, 0) catch {};
+    const blocked_z = try test_env.ctx.allocator.dupeZ(u8, blocked);
+    defer test_env.ctx.allocator.free(blocked_z);
+    switch (std.posix.errno(std.c.chmod(blocked_z, 0))) {
+        .SUCCESS => {},
+        else => return error.FileSystem,
+    }
+    defer _ = std.c.chmod(blocked_z, 0o644);
 
     try std.testing.expectError(error.ReadError, readConfigFileWithAllocator(&test_env.ctx, blocked, test_env.ctx.allocator));
 }
@@ -1158,7 +1164,7 @@ test "Config.validate rejects invalid url" {
         .name = try test_env.ctx.allocator.dupe(u8, "badurl"),
         .url = try test_env.ctx.allocator.dupe(u8, "not-a-url"),
         .priority = 1,
-        .trusted_fingerprints = std.ArrayList([]const u8){},
+        .trusted_fingerprints = .empty,
     });
 
     try std.testing.expectError(error.InvalidConfig, cfg.validate());
@@ -1179,7 +1185,7 @@ test "Config.deepCopy OutOfMemory error on allocation failure" {
         .name = try test_env.ctx.allocator.dupe(u8, "test-repo"),
         .url = try test_env.ctx.allocator.dupe(u8, "https://example.com"),
         .priority = 1,
-        .trusted_fingerprints = std.ArrayList([]const u8){},
+        .trusted_fingerprints = .empty,
     });
 
     // Test that deepCopy properly returns OutOfMemory when allocation fails
