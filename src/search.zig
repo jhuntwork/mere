@@ -27,7 +27,7 @@ pub const SearchResult = struct {
 };
 
 pub fn searchPackages(ctx: *mere.Context, term: []const u8) SearchError!std.ArrayList(SearchResult) {
-    var results = std.ArrayList(SearchResult){};
+    var results: std.ArrayList(SearchResult) = .empty;
     errdefer {
         for (results.items) |*r| r.deinit(ctx.allocator);
         results.deinit(ctx.allocator);

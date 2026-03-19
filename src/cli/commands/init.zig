@@ -50,12 +50,12 @@ pub fn handleInit(ctx: *mere.Context, args: *const types.ParsedArgs) MereError!t
     // Build output
     var output: std.ArrayList(u8) = .empty;
     defer output.deinit(ctx.allocator);
-
-    const writer = output.writer(ctx.allocator);
+    var out_buf: std.Io.Writer.Allocating = .fromArrayList(ctx.allocator, &output);
+    const out = &out_buf.writer;
 
     // Show what will be done or was done
     if (result.issues_found == 0 and result.changes_applied == 0) {
-        try writer.writeAll("All directories are correctly configured");
+        out.writeAll("All directories are correctly configured") catch return MereError.OutOfMemory;
     } else {
         // Always show the summary of changes
         for (result.checks.items) |check| {
@@ -63,52 +63,53 @@ pub fn handleInit(ctx: *mere.Context, args: *const types.ParsedArgs) MereError!t
                 .ok => {},
                 .missing => {
                     if (dry_run) {
-                        try writer.print("Would create {s} (mode {o:0>4})\n", .{ check.path, check.expected_mode });
+                        out.print("Would create {s} (mode {o:0>4})\n", .{ check.path, check.expected_mode }) catch return MereError.OutOfMemory;
                     } else {
-                        try writer.print("Created {s} (mode {o:0>4})\n", .{ check.path, check.expected_mode });
+                        out.print("Created {s} (mode {o:0>4})\n", .{ check.path, check.expected_mode }) catch return MereError.OutOfMemory;
                     }
                 },
                 .wrong_permissions => {
                     if (dry_run) {
-                        try writer.print("Would fix permissions on {s} ({o:0>4} -> {o:0>4})\n", .{
+                        out.print("Would fix permissions on {s} ({o:0>4} -> {o:0>4})\n", .{
                             check.path,
                             check.actual_mode.?,
                             check.expected_mode,
-                        });
+                        }) catch return MereError.OutOfMemory;
                     } else {
-                        try writer.print("Fixed permissions on {s} ({o:0>4} -> {o:0>4})\n", .{
+                        out.print("Fixed permissions on {s} ({o:0>4} -> {o:0>4})\n", .{
                             check.path,
                             check.actual_mode.?,
                             check.expected_mode,
-                        });
+                        }) catch return MereError.OutOfMemory;
                     }
                 },
                 .wrong_ownership => {
                     if (dry_run) {
-                        try writer.print("Would fix ownership on {s} ({s} -> {s})\n", .{
+                        out.print("Would fix ownership on {s} ({s} -> {s})\n", .{
                             check.path,
                             check.actual_owner.?,
                             check.expected_owner,
-                        });
+                        }) catch return MereError.OutOfMemory;
                     } else {
-                        try writer.print("Fixed ownership on {s} ({s} -> {s})\n", .{
+                        out.print("Fixed ownership on {s} ({s} -> {s})\n", .{
                             check.path,
                             check.actual_owner.?,
                             check.expected_owner,
-                        });
+                        }) catch return MereError.OutOfMemory;
                     }
                 },
-                .not_directory => try writer.print("Error: {s} exists but is not a directory\n", .{check.path}),
+                .not_directory => out.print("Error: {s} exists but is not a directory\n", .{check.path}) catch return MereError.OutOfMemory,
             }
         }
 
         // Summary
         if (dry_run) {
-            try writer.print("\n{d} change(s) would be applied", .{result.issues_found});
+            out.print("\n{d} change(s) would be applied", .{result.issues_found}) catch return MereError.OutOfMemory;
         } else {
-            try writer.print("\n{d} change(s) applied", .{result.changes_applied});
+            out.print("\n{d} change(s) applied", .{result.changes_applied}) catch return MereError.OutOfMemory;
         }
     }
+    output = out_buf.toArrayList();
 
     // Always succeed if we got here - any errors during fixes would have returned early
     const success = true;

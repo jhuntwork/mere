@@ -8,10 +8,10 @@
 
 const std = @import("std");
 
-pub fn main() u8 {
+pub fn main(init: std.process.Init) u8 {
     var build_mode = false;
 
-    var args = std.process.args();
+    var args = std.process.Args.iterate(init.minimal.args);
     _ = args.skip();
     while (args.next()) |arg| {
         if (std.mem.eql(u8, arg, "--build")) {
@@ -19,24 +19,24 @@ pub fn main() u8 {
         }
     }
 
-    std.fs.accessAbsolute("/bin", .{}) catch return 1;
+    std.Io.Dir.accessAbsolute(init.io, "/bin", .{}) catch return 1;
 
     if (!build_mode) {
-        std.fs.accessAbsolute("/proc", .{}) catch return 2;
-        std.fs.accessAbsolute("/tmp", .{}) catch return 3;
-        std.fs.accessAbsolute("/etc", .{}) catch return 4;
-        std.fs.accessAbsolute("/mere", .{}) catch return 5;
+        std.Io.Dir.accessAbsolute(init.io, "/proc", .{}) catch return 2;
+        std.Io.Dir.accessAbsolute(init.io, "/tmp", .{}) catch return 3;
+        std.Io.Dir.accessAbsolute(init.io, "/etc", .{}) catch return 4;
+        std.Io.Dir.accessAbsolute(init.io, "/mere", .{}) catch return 5;
     }
 
     if (build_mode) {
-        std.fs.accessAbsolute("/work", .{}) catch return 10;
-        if (std.fs.accessAbsolute("/mere", .{})) |_| {
+        std.Io.Dir.accessAbsolute(init.io, "/work", .{}) catch return 10;
+        if (std.Io.Dir.accessAbsolute(init.io, "/mere", .{})) |_| {
             return 6;
         } else |_| {}
-        std.fs.accessAbsolute("/tmp", .{}) catch return 7;
-        std.fs.accessAbsolute("/var/tmp", .{}) catch return 8;
-        std.fs.accessAbsolute("/etc", .{}) catch return 9;
-        std.fs.accessAbsolute("/dev/null", .{}) catch return 11;
+        std.Io.Dir.accessAbsolute(init.io, "/tmp", .{}) catch return 7;
+        std.Io.Dir.accessAbsolute(init.io, "/var/tmp", .{}) catch return 8;
+        std.Io.Dir.accessAbsolute(init.io, "/etc", .{}) catch return 9;
+        std.Io.Dir.accessAbsolute(init.io, "/dev/null", .{}) catch return 11;
     }
 
     return 0;

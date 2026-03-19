@@ -224,17 +224,18 @@ pub fn handleList(ctx: *mere.Context, args: *const types.ParsedArgs) MereError!t
     // Build output string
     var output: std.ArrayList(u8) = .empty;
     defer output.deinit(ctx.allocator);
-
-    const writer = output.writer(ctx.allocator);
-    try writer.writeAll("Pins:\n");
+    var out_buf: std.Io.Writer.Allocating = .fromArrayList(ctx.allocator, &output);
+    const out = &out_buf.writer;
+    out.writeAll("Pins:\n") catch return MereError.OutOfMemory;
 
     for (pins.pins.items) |p| {
-        try writer.print("  {s} -> {s}-{s}\n", .{ p.name, p.package_name, p.package_version });
-        try writer.print("    {s}\n", .{p.store_path});
+        out.print("  {s} -> {s}-{s}\n", .{ p.name, p.package_name, p.package_version }) catch return MereError.OutOfMemory;
+        out.print("    {s}\n", .{p.store_path}) catch return MereError.OutOfMemory;
         if (p.note) |n| {
-            try writer.print("    Note: {s}\n", .{n});
+            out.print("    Note: {s}\n", .{n}) catch return MereError.OutOfMemory;
         }
     }
+    output = out_buf.toArrayList();
 
     return types.CommandResult{
         .success = true,

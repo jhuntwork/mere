@@ -4,6 +4,7 @@ const types = @import("../types.zig");
 const command = @import("../command.zig");
 const MereError = mere.errors.MereError;
 const emit = mere.ui.emit;
+const path = mere.path;
 
 // Import generation-related modules
 const activation = @import("mere").activation;
@@ -186,9 +187,9 @@ pub fn handleList(ctx: *mere.Context, args: *const types.ParsedArgs) MereError!t
     // Build output
     var output: std.ArrayList(u8) = .empty;
     defer output.deinit(ctx.allocator);
-
-    const writer = output.writer(ctx.allocator);
-    try writer.writeAll("Generations for profile 'system':\n");
+    var out_buf: std.Io.Writer.Allocating = .fromArrayList(ctx.allocator, &output);
+    const out = &out_buf.writer;
+    out.writeAll("Generations for profile 'system':\n") catch return MereError.OutOfMemory;
 
     for (all_gens) |gen| {
         const is_current = current != null and current.? == gen;
@@ -219,13 +220,14 @@ pub fn handleList(ctx: *mere.Context, args: *const types.ParsedArgs) MereError!t
         const flags = if (flags_len > 0) flags_buf[0..flags_len] else "";
 
         if (flags.len > 0) {
-            try writer.print("  gen-{d} [{s}]\n", .{ gen, flags });
+            out.print("  gen-{d} [{s}]\n", .{ gen, flags }) catch return MereError.OutOfMemory;
         } else {
-            try writer.print("  gen-{d}\n", .{gen});
+            out.print("  gen-{d}\n", .{gen}) catch return MereError.OutOfMemory;
         }
     }
 
-    try writer.writeAll("\nLegend: * = current, R = rooted (GC protected), K = explicitly kept\n");
+    out.writeAll("\nLegend: * = current, R = rooted (GC protected), K = explicitly kept\n") catch return MereError.OutOfMemory;
+    output = out_buf.toArrayList();
 
     return types.CommandResult{
         .success = true,
@@ -405,7 +407,7 @@ pub fn handleActivate(ctx: *mere.Context, args: *const types.ParsedArgs) MereErr
     };
     defer ctx.allocator.free(gen_path);
 
-    std.fs.accessAbsolute(gen_path, .{}) catch {
+    std.Io.Dir.accessAbsolute(path.currentIo(), gen_path, .{}) catch {
         return types.CommandResult{
             .success = false,
             .exit_code = 1,

@@ -2,6 +2,7 @@ const std = @import("std");
 const mere = @import("mere");
 const types = @import("types.zig");
 const MereError = mere.errors.MereError;
+const path = mere.path;
 const Flag = types.Flag;
 const Arg = types.Arg;
 
@@ -29,36 +30,38 @@ pub const HelpFormatter = struct {
         var usage = std.ArrayList(u8).empty;
         defer usage.deinit(self.allocator);
 
-        var writer = usage.writer(self.allocator);
+        var out_buf: std.Io.Writer.Allocating = .fromArrayList(self.allocator, &usage);
+        const out = &out_buf.writer;
 
         // Usage: mere command subcommand
-        try writer.writeAll("Usage: ");
-        try writer.writeAll(self.program_name);
+        try out.writeAll("Usage: ");
+        try out.writeAll(self.program_name);
 
         for (command_path) |part| {
-            try writer.writeByte(' ');
-            try writer.writeAll(part);
+            try out.writeByte(' ');
+            try out.writeAll(part);
         }
 
         // Add subcommands placeholder
         if (has_subcommands) {
-            try writer.writeAll(" <subcommand>");
+            try out.writeAll(" <subcommand>");
         }
 
         // Add arguments
         for (args) |arg| {
-            try writer.writeByte(' ');
+            try out.writeByte(' ');
             if (arg.required) {
-                try writer.print("<{s}>", .{arg.name});
+                try out.print("<{s}>", .{arg.name});
             } else {
-                try writer.print("[{s}]", .{arg.name});
+                try out.print("[{s}]", .{arg.name});
             }
         }
 
         // Add options placeholder if we have flags
         if (flags.len > 0 or global_flags.len > 0) {
-            try writer.writeAll(" [options]");
+            try out.writeAll(" [options]");
         }
+        usage = out_buf.toArrayList();
 
         return self.allocator.dupe(u8, usage.items);
     }
@@ -77,64 +80,66 @@ pub const HelpFormatter = struct {
         var help = std.ArrayList(u8).empty;
         defer help.deinit(self.allocator);
 
-        var writer = help.writer(self.allocator);
+        var out_buf: std.Io.Writer.Allocating = .fromArrayList(self.allocator, &help);
+        const out = &out_buf.writer;
 
         // Usage line
         const usage = try self.formatUsage(command_path, args, flags, global_flags, subcommands.len > 0);
         defer self.allocator.free(usage);
-        try writer.writeAll(usage);
-        try writer.writeAll("\n\n");
+        try out.writeAll(usage);
+        try out.writeAll("\n\n");
 
         // Description
-        try writer.writeAll(description);
-        try writer.writeAll("\n");
+        try out.writeAll(description);
+        try out.writeAll("\n");
 
         // Arguments section
         if (args.len > 0) {
-            try writer.writeAll("\nArguments:\n");
+            try out.writeAll("\nArguments:\n");
             for (args) |arg| {
-                try writer.print("  {s:<12} {s}\n", .{ arg.name, arg.description });
+                try out.print("  {s:<12} {s}\n", .{ arg.name, arg.description });
             }
         }
 
         // Command flags section
         if (flags.len > 0) {
-            try writer.writeAll("\nOptions:\n");
+            try out.writeAll("\nOptions:\n");
             const name_width = 6 + maxFlagNameLen(flags);
             for (flags) |flag| {
                 const flag_text = try self.formatFlagName(flag);
                 defer self.allocator.free(flag_text);
-                try writeAlignedLine(&writer, flag_text, flag.description, name_width);
+                try writeAlignedLine(out, flag_text, flag.description, name_width);
             }
         }
 
         // Global flags section
         if (global_flags.len > 0) {
-            try writer.writeAll("\nGlobal Options:\n");
+            try out.writeAll("\nGlobal Options:\n");
             const name_width = 6 + maxFlagNameLen(global_flags);
             for (global_flags) |flag| {
                 const flag_text = try self.formatFlagName(flag);
                 defer self.allocator.free(flag_text);
-                try writeAlignedLine(&writer, flag_text, flag.description, name_width);
+                try writeAlignedLine(out, flag_text, flag.description, name_width);
             }
         }
 
         // Subcommands section
         if (subcommands.len > 0) {
-            try writer.writeAll("\nSubcommands:\n");
+            try out.writeAll("\nSubcommands:\n");
             for (subcommands, subcommand_descriptions) |subcmd, desc| {
-                try writer.print("  {s:<12} {s}\n", .{ subcmd, desc });
+                try out.print("  {s:<12} {s}\n", .{ subcmd, desc });
             }
 
             // Help instruction
-            try writer.writeAll("\nUse '");
-            try writer.writeAll(self.program_name);
+            try out.writeAll("\nUse '");
+            try out.writeAll(self.program_name);
             for (command_path) |part| {
-                try writer.writeByte(' ');
-                try writer.writeAll(part);
+                try out.writeByte(' ');
+                try out.writeAll(part);
             }
-            try writer.writeAll(" <subcommand> --help' for more information about a subcommand.\n");
+            try out.writeAll(" <subcommand> --help' for more information about a subcommand.\n");
         }
+        help = out_buf.toArrayList();
 
         return self.allocator.dupe(u8, help.items);
     }
@@ -211,7 +216,7 @@ pub const ErrorFormatter = struct {
     /// Format and print an error message to stderr
     pub fn printError(_: *ErrorFormatter, comptime fmt: []const u8, args: anytype) void {
         var stderr_buffer: [1024]u8 = undefined;
-        var stderr_writer = std.fs.File.stderr().writer(&stderr_buffer);
+        var stderr_writer = std.Io.File.stderr().writer(path.currentIo(), &stderr_buffer);
         const stderr = &stderr_writer.interface;
         stderr.print("error: ", .{}) catch {};
         stderr.print(fmt, args) catch {};
@@ -222,7 +227,7 @@ pub const ErrorFormatter = struct {
     /// Print usage suggestion
     pub fn printUsageSuggestion(self: *ErrorFormatter, command_path: []const []const u8) void {
         var stderr_buffer: [1024]u8 = undefined;
-        var stderr_writer = std.fs.File.stderr().writer(&stderr_buffer);
+        var stderr_writer = std.Io.File.stderr().writer(path.currentIo(), &stderr_buffer);
         const stderr = &stderr_writer.interface;
         stderr.print("Try '{s}", .{self.program_name}) catch {};
         for (command_path) |part| {

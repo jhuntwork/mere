@@ -6,6 +6,7 @@ const MereError = mere.errors.MereError;
 const namespace = mere.namespace;
 const emit = mere.ui.emit;
 const profile = mere.profile;
+const path = mere.path;
 
 const shell_meta = command.CommandMeta{
     .name = "shell",
@@ -83,7 +84,7 @@ fn handleShell(ctx: *mere.Context, args: *const types.ParsedArgs) MereError!type
     };
     defer ctx.allocator.free(profile_root);
 
-    const invocation_cwd = std.fs.realpathAlloc(ctx.allocator, ".") catch {
+    const invocation_cwd = std.process.currentPathAlloc(path.currentIo(), ctx.allocator) catch {
         return types.CommandResult{
             .success = false,
             .exit_code = 1,
@@ -106,7 +107,7 @@ fn handleShell(ctx: *mere.Context, args: *const types.ParsedArgs) MereError!type
         .withSubject(profile_root);
     ctx.withDiagnosticContext(diag_ctx);
 
-    std.fs.accessAbsolute(profile_root, .{}) catch {
+    std.Io.Dir.accessAbsolute(path.currentIo(), profile_root, .{}) catch {
         const error_ctx = diag_ctx.toErrorContext();
         const formatted = error_ctx.formatWithMessage(ctx.allocator, "profile not found") catch
             try ctx.allocator.dupe(u8, "profile not found");
@@ -188,7 +189,8 @@ fn handleShell(ctx: *mere.Context, args: *const types.ParsedArgs) MereError!type
 
 // Resolve profile name according to spec §15.9 precedence
 fn resolveProfileName(ctx: *mere.Context, args: *const types.ParsedArgs) ![]const u8 {
-    const profile_name = resolveProfileNameFromSources(args.getString("profile"), std.posix.getenv("MERE_SHELL_PROFILE")) orelse {
+    const env_profile = if (std.c.getenv("MERE_SHELL_PROFILE")) |value| std.mem.span(value) else null;
+    const profile_name = resolveProfileNameFromSources(args.getString("profile"), env_profile) orelse {
         return error.NoProfileSelected;
     };
 

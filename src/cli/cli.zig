@@ -5,6 +5,7 @@ const parser = @import("parser.zig");
 const help = @import("help.zig");
 const command = @import("command.zig");
 const MereError = mere.errors.MereError;
+const path = mere.path;
 
 /// Main CLI coordinator
 pub const CLI = struct {
@@ -351,7 +352,7 @@ pub const CLI = struct {
     /// Show help for the root command
     fn showRootHelp(self: *CLI) !void {
         var stdout_buffer: [4096]u8 = undefined;
-        var stdout_writer = std.fs.File.stdout().writer(&stdout_buffer);
+        var stdout_writer = std.Io.File.stdout().writer(path.currentIo(), &stdout_buffer);
         const stdout = &stdout_writer.interface;
 
         // Get top-level commands
@@ -377,7 +378,7 @@ pub const CLI = struct {
     /// Show help for a specific command
     fn showCommandHelp(self: *CLI, cmd: *const command.Command, command_path: []const []const u8) !void {
         var stdout_buffer: [4096]u8 = undefined;
-        var stdout_writer = std.fs.File.stdout().writer(&stdout_buffer);
+        var stdout_writer = std.Io.File.stdout().writer(path.currentIo(), &stdout_buffer);
         const stdout = &stdout_writer.interface;
 
         // Get subcommands
@@ -440,7 +441,7 @@ pub const CLI = struct {
         const version_str = std.fmt.bufPrint(&version_buffer, "mere {s}\n", .{build_zon.version}) catch return 1;
 
         var stdout_buffer: [1024]u8 = undefined;
-        var stdout_writer = std.fs.File.stdout().writer(&stdout_buffer);
+        var stdout_writer = std.Io.File.stdout().writer(path.currentIo(), &stdout_buffer);
         stdout_writer.interface.writeAll(version_str) catch return 1;
         stdout_writer.interface.flush() catch return 1;
         return 0;

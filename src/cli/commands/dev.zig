@@ -242,7 +242,7 @@ fn emitCleanSummaryResult(ctx: *mere.Context, parts: []const CleanSummaryPart) !
         return types.CommandResult.createSuccess("Nothing selected to clean");
     }
 
-    var segments = std.ArrayList(mere.ui.Segment){};
+    var segments: std.ArrayList(mere.ui.Segment) = .empty;
     errdefer {
         for (segments.items) |segment| ctx.allocator.free(segment.text);
         segments.deinit(ctx.allocator);

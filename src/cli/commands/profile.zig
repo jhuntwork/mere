@@ -3,6 +3,7 @@ const mere = @import("mere");
 const types = @import("../types.zig");
 const command = @import("../command.zig");
 const MereError = mere.errors.MereError;
+const path = mere.path;
 
 // Import profile-related modules
 const profile_mod = mere.profile;
@@ -98,7 +99,7 @@ pub fn handleList(ctx: *mere.Context, args: *const types.ParsedArgs) MereError!t
     defer ctx.allocator.free(profiles_dir);
 
     // Open profiles directory
-    var dir = std.fs.openDirAbsolute(profiles_dir, .{ .iterate = true }) catch |err| {
+    var dir = path.openExistingDir(profiles_dir) catch |err| {
         return switch (err) {
             error.FileNotFound => types.CommandResult{
                 .success = true,
@@ -111,20 +112,20 @@ pub fn handleList(ctx: *mere.Context, args: *const types.ParsedArgs) MereError!t
             },
         };
     };
-    defer dir.close();
+    defer dir.close(path.currentIo());
 
     // Build output
     var output: std.ArrayList(u8) = .empty;
     defer output.deinit(ctx.allocator);
-
-    const writer = output.writer(ctx.allocator);
-    try writer.writeAll("Profiles:\n");
+    var out_buf: std.Io.Writer.Allocating = .fromArrayList(ctx.allocator, &output);
+    const out = &out_buf.writer;
+    out.writeAll("Profiles:\n") catch return MereError.OutOfMemory;
 
     var profile_count: usize = 0;
 
     // Iterate over profiles directory entries
     var iter = dir.iterate();
-    while (iter.next() catch null) |entry| {
+    while (iter.next(path.currentIo()) catch null) |entry| {
         if (entry.kind != .directory) continue;
 
         const profile_name = entry.name;
@@ -149,16 +150,16 @@ pub fn handleList(ctx: *mere.Context, args: *const types.ParsedArgs) MereError!t
             } else 0;
 
             if (current_gen) |gen| {
-                try writer.print("  {s}{s}: gen-{d} ({d} generations)\n", .{ profile_name, kind_str, gen, gen_count });
+                out.print("  {s}{s}: gen-{d} ({d} generations)\n", .{ profile_name, kind_str, gen, gen_count }) catch return MereError.OutOfMemory;
             } else {
-                try writer.print("  {s}{s}: (no current generation, {d} generations)\n", .{ profile_name, kind_str, gen_count });
+                out.print("  {s}{s}: (no current generation, {d} generations)\n", .{ profile_name, kind_str, gen_count }) catch return MereError.OutOfMemory;
             }
         } else {
             const root_path = profile_mod.getRootPath(ctx.allocator, profile_path) catch return MereError.OutOfMemory;
             defer ctx.allocator.free(root_path);
 
             const has_root = blk: {
-                std.fs.accessAbsolute(root_path, .{}) catch |err| switch (err) {
+                std.Io.Dir.accessAbsolute(path.currentIo(), root_path, .{}) catch |err| switch (err) {
                     error.FileNotFound => break :blk false,
                     else => return types.CommandResult{
                         .success = false,
@@ -169,16 +170,17 @@ pub fn handleList(ctx: *mere.Context, args: *const types.ParsedArgs) MereError!t
                 break :blk true;
             };
             if (has_root) {
-                try writer.print("  {s}{s}: root\n", .{ profile_name, kind_str });
+                out.print("  {s}{s}: root\n", .{ profile_name, kind_str }) catch return MereError.OutOfMemory;
             } else {
-                try writer.print("  {s}{s}: (empty)\n", .{ profile_name, kind_str });
+                out.print("  {s}{s}: (empty)\n", .{ profile_name, kind_str }) catch return MereError.OutOfMemory;
             }
         }
     }
 
     if (profile_count == 0) {
-        try writer.writeAll("  (no profiles found)\n");
+        out.writeAll("  (no profiles found)\n") catch return MereError.OutOfMemory;
     }
+    output = out_buf.toArrayList();
 
     return types.CommandResult{
         .success = true,
@@ -233,8 +235,8 @@ pub fn handleCreate(ctx: *mere.Context, args: *const types.ParsedArgs) MereError
     defer ctx.allocator.free(profile_path);
 
     // Check if profile already exists
-    if (std.fs.openDirAbsolute(profile_path, .{})) |d| {
-        @constCast(&d).close();
+    if (path.openExistingDir(profile_path)) |d| {
+        @constCast(&d).close(path.currentIo());
         return types.CommandResult{
             .success = false,
             .exit_code = 1,
@@ -254,7 +256,7 @@ pub fn handleCreate(ctx: *mere.Context, args: *const types.ParsedArgs) MereError
         defer ctx.allocator.free(base_path);
 
         // Check base profile exists
-        var base_dir = std.fs.openDirAbsolute(base_path, .{}) catch |err| {
+        var base_dir = path.openExistingDir(base_path) catch |err| {
             return switch (err) {
                 error.FileNotFound => types.CommandResult{
                     .success = false,
@@ -268,7 +270,7 @@ pub fn handleCreate(ctx: *mere.Context, args: *const types.ParsedArgs) MereError
                 },
             };
         };
-        base_dir.close();
+        base_dir.close(path.currentIo());
 
         const base_realization_path = if (std.mem.eql(u8, base_name, "system")) blk: {
             const current_gen = generation_mod.getCurrentGeneration(base_path) catch {
@@ -288,7 +290,7 @@ pub fn handleCreate(ctx: *mere.Context, args: *const types.ParsedArgs) MereError
             break :blk generation_mod.getGenerationPath(ctx.allocator, base_path, current_gen) catch return MereError.OutOfMemory;
         } else blk: {
             const root_path = profile_mod.getRootPath(ctx.allocator, base_path) catch return MereError.OutOfMemory;
-            std.fs.accessAbsolute(root_path, .{}) catch {
+            std.Io.Dir.accessAbsolute(path.currentIo(), root_path, .{}) catch {
                 ctx.allocator.free(root_path);
                 return types.CommandResult{
                     .success = false,
@@ -310,7 +312,7 @@ pub fn handleCreate(ctx: *mere.Context, args: *const types.ParsedArgs) MereError
         defer manifest.deinit();
 
         // Create new profile directory
-        std.fs.cwd().makePath(profile_path) catch {
+        path.ensureDirExists(profile_path) catch {
             return types.CommandResult{
                 .success = false,
                 .exit_code = 1,
@@ -356,7 +358,7 @@ pub fn handleCreate(ctx: *mere.Context, args: *const types.ParsedArgs) MereError
         return try profileCreationSegments(ctx, profile_name, base_name);
     } else {
         // Create empty profile
-        std.fs.cwd().makePath(profile_path) catch {
+        path.ensureDirExists(profile_path) catch {
             return types.CommandResult{
                 .success = false,
                 .exit_code = 1,
@@ -370,12 +372,12 @@ pub fn handleCreate(ctx: *mere.Context, args: *const types.ParsedArgs) MereError
         };
         defer ctx.allocator.free(requested_path);
 
-        var file = std.fs.createFileAbsolute(requested_path, .{}) catch {
+        var file = std.Io.Dir.createFileAbsolute(path.currentIo(), requested_path, .{}) catch {
             // Non-fatal, directory created is sufficient
             return try profileCreationSegments(ctx, profile_name, null);
         };
-        file.writeAll("// Requested packages for profile\n") catch {};
-        file.close();
+        file.writeStreamingAll(path.currentIo(), "// Requested packages for profile\n") catch {};
+        file.close(path.currentIo());
 
         return try profileCreationSegments(ctx, profile_name, null);
     }
@@ -409,7 +411,7 @@ pub fn handleDelete(ctx: *mere.Context, args: *const types.ParsedArgs) MereError
     defer ctx.allocator.free(profile_path);
 
     // Check profile exists
-    var dir = std.fs.openDirAbsolute(profile_path, .{}) catch |err| {
+    var dir = path.openExistingDir(profile_path) catch |err| {
         return switch (err) {
             error.FileNotFound => types.CommandResult{
                 .success = false,
@@ -423,10 +425,10 @@ pub fn handleDelete(ctx: *mere.Context, args: *const types.ParsedArgs) MereError
             },
         };
     };
-    dir.close();
+    dir.close(path.currentIo());
 
     // Delete profile directory recursively
-    std.fs.deleteTreeAbsolute(profile_path) catch {
+    path.deleteTreeAbsolute(profile_path) catch {
         return types.CommandResult{
             .success = false,
             .exit_code = 1,

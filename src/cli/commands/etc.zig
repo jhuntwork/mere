@@ -3,6 +3,7 @@ const mere = @import("mere");
 const types = @import("../types.zig");
 const command = @import("../command.zig");
 const MereError = mere.errors.MereError;
+const path = mere.path;
 
 // Import etc module
 const etc = @import("mere").etc;
@@ -10,13 +11,13 @@ const generation_mod = @import("mere").generation;
 
 fn writeStdout(bytes: []const u8) !void {
     var stdout_buf: [4096]u8 = undefined;
-    var stdout_writer = std.fs.File.stdout().writer(&stdout_buf);
+    var stdout_writer = std.Io.File.stdout().writer(path.currentIo(), &stdout_buf);
     try stdout_writer.interface.writeAll(bytes);
     try stdout_writer.interface.flush();
 }
 
 fn stdoutIsTty() bool {
-    return std.posix.isatty(std.fs.File.stdout().handle);
+    return std.Io.File.stdout().isTty(path.currentIo()) catch false;
 }
 
 fn mapPagerError(err: anyerror) MereError {
@@ -26,60 +27,56 @@ fn mapPagerError(err: anyerror) MereError {
     };
 }
 
-fn tryPageWithArgv(allocator: std.mem.Allocator, argv: []const []const u8, input: []const u8) MereError!bool {
-    var child = std.process.Child.init(argv, allocator);
-    child.stdin_behavior = .Pipe;
-    child.stdout_behavior = .Inherit;
-    child.stderr_behavior = .Inherit;
-
-    child.spawn() catch |err| {
+fn tryPageWithArgv(argv: []const []const u8, input: []const u8) MereError!bool {
+    var child = std.process.spawn(path.currentIo(), .{
+        .argv = argv,
+        .stdin = .pipe,
+        .stdout = .inherit,
+        .stderr = .inherit,
+    }) catch |err| {
         return switch (err) {
             error.FileNotFound => false,
             else => mapPagerError(err),
         };
     };
+    defer child.kill(path.currentIo());
 
     if (child.stdin) |stdin_file| {
-        stdin_file.writeAll(input) catch |err| switch (err) {
+        stdin_file.writeStreamingAll(path.currentIo(), input) catch |err| switch (err) {
             error.BrokenPipe => {},
             else => return mapPagerError(err),
         };
-        stdin_file.close();
+        stdin_file.close(path.currentIo());
         child.stdin = null;
     }
 
-    const term = child.wait() catch |err| return mapPagerError(err);
+    const term = child.wait(path.currentIo()) catch |err| return mapPagerError(err);
     return switch (term) {
-        .Exited => |code| code == 0,
+        .exited => |code| code == 0,
         else => false,
     };
 }
 
-fn tryPageOutput(ctx: *mere.Context, output: []const u8) MereError!void {
+fn tryPageOutput(output: []const u8) MereError!void {
     if (!stdoutIsTty()) {
         writeStdout(output) catch |err| return mapPagerError(err);
         return;
     }
 
-    const pager_env = std.process.getEnvVarOwned(ctx.allocator, "PAGER") catch |err| switch (err) {
-        error.EnvironmentVariableNotFound => null,
-        error.OutOfMemory => return MereError.OutOfMemory,
-        else => null,
-    };
-    defer if (pager_env) |pager| ctx.allocator.free(pager);
+    const pager_env = if (std.c.getenv("PAGER")) |pager| std.mem.span(pager) else null;
 
     if (pager_env) |pager| {
         if (pager.len > 0) {
             const pager_argv = [_][]const u8{ "sh", "-c", pager };
-            if (try tryPageWithArgv(ctx.allocator, &pager_argv, output)) return;
+            if (try tryPageWithArgv(&pager_argv, output)) return;
         }
     }
 
     const less_argv = [_][]const u8{"less"};
-    if (try tryPageWithArgv(ctx.allocator, &less_argv, output)) return;
+    if (try tryPageWithArgv(&less_argv, output)) return;
 
     const more_argv = [_][]const u8{"more"};
-    if (try tryPageWithArgv(ctx.allocator, &more_argv, output)) return;
+    if (try tryPageWithArgv(&more_argv, output)) return;
 
     writeStdout(output) catch |err| return mapPagerError(err);
 }
@@ -90,8 +87,7 @@ fn collectUnifiedDiff(ctx: *mere.Context, left_path: []const u8, right_path: []c
     stderr: []u8,
 } {
     const argv = [_][]const u8{ "diff", "-u", left_path, right_path };
-    const result = try std.process.Child.run(.{
-        .allocator = ctx.allocator,
+    const result = try std.process.run(ctx.allocator, path.currentIo(), .{
         .argv = &argv,
     });
     errdefer {
@@ -100,7 +96,7 @@ fn collectUnifiedDiff(ctx: *mere.Context, left_path: []const u8, right_path: []c
     }
 
     return switch (result.term) {
-        .Exited => |code| switch (code) {
+        .exited => |code| switch (code) {
             0 => .{ .identical = true, .output = result.stdout, .stderr = result.stderr },
             1 => .{ .identical = false, .output = result.stdout, .stderr = result.stderr },
             else => {
@@ -218,12 +214,12 @@ pub fn handleStatus(ctx: *mere.Context, args: *const types.ParsedArgs) MereError
 
     var output: std.ArrayList(u8) = .empty;
     defer output.deinit(ctx.allocator);
-
-    const writer = output.writer(ctx.allocator);
-    try writer.print(
+    var out_buf: std.Io.Writer.Allocating = .fromArrayList(ctx.allocator, &output);
+    const out = &out_buf.writer;
+    out.print(
         "Active system /etc status: {d} differing, {d} missing, {d} unchanged\n",
         .{ status.differing, status.missing, status.identical },
-    );
+    ) catch return MereError.OutOfMemory;
 
     for (status.entries.items) |entry| {
         if (entry.state == .identical) continue;
@@ -232,11 +228,12 @@ pub fn handleStatus(ctx: *mere.Context, args: *const types.ParsedArgs) MereError
             .different => "differing",
             .identical => unreachable,
         };
-        try writer.print("  {s}: {s} <- {s}\n", .{ state_text, entry.etc_path, entry.package_name });
+        out.print("  {s}: {s} <- {s}\n", .{ state_text, entry.etc_path, entry.package_name }) catch return MereError.OutOfMemory;
     }
 
-    try writer.writeAll("\nUse 'mere etc diff <path>' to inspect the active default\n");
-    try writer.writeAll("Use 'mere etc apply <path>' to install or replace with the active default\n");
+    out.writeAll("\nUse 'mere etc diff <path>' to inspect the active default\n") catch return MereError.OutOfMemory;
+    out.writeAll("Use 'mere etc apply <path>' to install or replace with the active default\n") catch return MereError.OutOfMemory;
+    output = out_buf.toArrayList();
 
     return types.CommandResult{
         .success = true,
@@ -297,7 +294,7 @@ pub fn handleDiff(ctx: *mere.Context, args: *const types.ParsedArgs) MereError!t
         };
     }
 
-    try tryPageOutput(ctx, diff_result.output);
+    try tryPageOutput(diff_result.output);
     return types.CommandResult{ .success = true };
 }
 

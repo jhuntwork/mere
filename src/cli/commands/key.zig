@@ -272,10 +272,11 @@ fn handleList(ctx: *mere.Context, args: *const types.ParsedArgs) MereError!types
     // Build output
     var output: std.ArrayList(u8) = .empty;
     errdefer output.deinit(ctx.allocator);
-    const writer = output.writer(ctx.allocator);
+    var out_buf: std.Io.Writer.Allocating = .fromArrayList(ctx.allocator, &output);
+    const out = &out_buf.writer;
 
     for (all_keys.items) |key| {
-        writer.print("{s}: {s}\n", .{ std.fs.path.basename(key.path), key.fingerprint }) catch {
+        out.print("{s}: {s}\n", .{ std.fs.path.basename(key.path), key.fingerprint }) catch {
             return types.CommandResult{
                 .success = false,
                 .exit_code = 1,
@@ -283,6 +284,7 @@ fn handleList(ctx: *mere.Context, args: *const types.ParsedArgs) MereError!types
             };
         };
     }
+    output = out_buf.toArrayList();
 
     return types.CommandResult{
         .success = true,

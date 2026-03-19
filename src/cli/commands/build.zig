@@ -97,7 +97,7 @@ fn handleBuild(ctx: *mere.Context, args: *const types.ParsedArgs) MereError!type
         };
     };
 
-    var recipe_file = std.fs.openFileAbsolute(abs_recipe_path, .{}) catch |err| {
+    var recipe_file = path.openExistingFile(abs_recipe_path) catch |err| {
         // Enrich diagnostic context for file open failures
         ctx.setDiagnosticContext(abs_recipe_path, "failed to open recipe file");
         // Get user-friendly error message
@@ -109,10 +109,10 @@ fn handleBuild(ctx: *mere.Context, args: *const types.ParsedArgs) MereError!type
             .message = try std.fmt.allocPrint(ctx.allocator, "Unable to open recipe '{s}': {s}", .{ abs_recipe_path, user_message }),
         };
     };
-    defer recipe_file.close();
+    defer recipe_file.close(path.currentIo());
 
     // Prefer explicit size read to avoid readToEndAlloc FileTooBig errors and to validate size.
-    const file_size = recipe_file.getEndPos() catch |err| {
+    const file_size = (recipe_file.stat(path.currentIo()) catch |err| {
         // Enrich diagnostic context for stat failures
         ctx.setDiagnosticContext(abs_recipe_path, "failed to stat recipe file");
         // Get user-friendly error message
@@ -123,7 +123,7 @@ fn handleBuild(ctx: *mere.Context, args: *const types.ParsedArgs) MereError!type
             .exit_code = 1,
             .message = try std.fmt.allocPrint(ctx.allocator, "Unable to stat recipe '{s}': {s}", .{ abs_recipe_path, user_message }),
         };
-    };
+    }).size;
 
     if (file_size > 1024 * 1024 * 10) {
         // Enrich diagnostic context for oversized recipe files
@@ -139,7 +139,7 @@ fn handleBuild(ctx: *mere.Context, args: *const types.ParsedArgs) MereError!type
     const recipe_buf = try ctx.allocator.alloc(u8, file_size);
     defer ctx.allocator.free(recipe_buf);
 
-    const bytes_read = recipe_file.readAll(recipe_buf) catch |err| {
+    const bytes_read = recipe_file.readPositionalAll(path.currentIo(), recipe_buf, 0) catch |err| {
         // Enrich diagnostic context for read failures
         ctx.setDiagnosticContext(abs_recipe_path, "failed to read recipe file");
         // Get user-friendly error message
@@ -185,6 +185,7 @@ fn handleBuild(ctx: *mere.Context, args: *const types.ParsedArgs) MereError!type
             build.BuildError.PhaseExecutionFailed => "build phase execution failed",
             build.BuildError.SplitStagingFailed => "failed to stage split packages",
             build.BuildError.PackageCreationFailed => "failed to create package archive",
+            else => getUserFriendlyMessage(err),
         };
         var diagnostic_subject = diag.subject;
         var diagnostic_details = diag.details;

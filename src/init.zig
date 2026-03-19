@@ -1,6 +1,7 @@
 const std = @import("std");
 const Context = @import("mere.zig").Context;
 const errors = @import("errors.zig");
+const path_mod = @import("path.zig");
 
 /// Init module error set
 const Std = errors.StandardErrors;
@@ -128,16 +129,22 @@ fn requiresRoot(options: InitOptions) bool {
 
 /// Get ownership information for a path
 fn getOwnership(allocator: std.mem.Allocator, path: []const u8) ![]const u8 {
-    // Use fstatat to get ownership information
-    // Note: fstatat internally calls toPosixPath, so we pass the path slice directly
-    const stat_buf = std.posix.fstatat(std.posix.AT.FDCWD, path, 0) catch |err| {
-        return switch (err) {
-            error.FileNotFound => try allocator.dupe(u8, "not found"),
-            else => mapInitFsError(err),
-        };
-    };
+    const path_z = try allocator.dupeZ(u8, path);
+    defer allocator.free(path_z);
 
-    return std.fmt.allocPrint(allocator, "uid:{d} gid:{d}", .{ stat_buf.uid, stat_buf.gid });
+    var statx = std.mem.zeroes(std.os.linux.Statx);
+    switch (std.os.linux.errno(std.os.linux.statx(std.posix.AT.FDCWD, path_z, 0, .{
+        .UID = true,
+        .GID = true,
+    }, &statx))) {
+        .SUCCESS => {},
+        .NOENT => return try allocator.dupe(u8, "not found"),
+        .ACCES, .PERM => return InitError.PermissionDenied,
+        .NAMETOOLONG => return InitError.InvalidInput,
+        else => return InitError.FileSystem,
+    }
+
+    return std.fmt.allocPrint(allocator, "uid:{d} gid:{d}", .{ statx.uid, statx.gid });
 }
 
 /// Check a single directory
@@ -154,7 +161,7 @@ fn checkDirectory(
         .actual_owner = null,
     };
 
-    const stat = std.fs.cwd().statFile(spec.path) catch |err| {
+    const stat = std.Io.Dir.cwd().statFile(path_mod.currentIo(), spec.path, .{}) catch |err| {
         return switch (err) {
             error.FileNotFound => {
                 result.status = .missing;
@@ -171,7 +178,7 @@ fn checkDirectory(
     }
 
     // Get actual mode (only permission bits)
-    result.actual_mode = @as(u32, @intCast(stat.mode & 0o7777));
+    result.actual_mode = @as(u32, @intCast(stat.permissions.toMode() & 0o7777));
 
     // Check permissions
     if (result.actual_mode.? != spec.mode) {
@@ -193,28 +200,42 @@ fn checkDirectory(
 
 /// Create a directory with specified permissions
 fn createDirectory(path: []const u8, mode: u32) !void {
-    std.fs.cwd().makePath(path) catch |err| {
+    std.Io.Dir.cwd().createDirPath(path_mod.currentIo(), path) catch |err| {
         return switch (err) {
             error.PathAlreadyExists => {}, // Already exists is ok
             else => mapInitFsError(err),
         };
     };
 
-    // Set permissions using fchmodat
-    // Note: fchmodat internally calls toPosixPath, so we pass the path slice directly
-    std.posix.fchmodat(std.posix.AT.FDCWD, path, mode, 0) catch |err| {
+    var dir = std.Io.Dir.cwd().openDir(path_mod.currentIo(), path, .{}) catch |err| {
+        return mapInitFsError(err);
+    };
+    defer dir.close(path_mod.currentIo());
+
+    dir.setPermissions(path_mod.currentIo(), .fromMode(mode)) catch |err| {
         return mapInitFsError(err);
     };
 }
 
 /// Set ownership of a directory to root:root
 fn setOwnership(path: []const u8) !void {
-    var dir = std.fs.cwd().openDir(path, .{}) catch |err| {
+    var dir = std.Io.Dir.cwd().openDir(path_mod.currentIo(), path, .{}) catch |err| {
         return mapInitFsError(err);
     };
-    defer dir.close();
+    defer dir.close(path_mod.currentIo());
 
-    dir.chown(0, 0) catch |err| {
+    dir.setOwner(path_mod.currentIo(), 0, 0) catch |err| {
+        return mapInitFsError(err);
+    };
+}
+
+fn setDirectoryPermissions(path: []const u8, mode: u32) !void {
+    var dir = std.Io.Dir.cwd().openDir(path_mod.currentIo(), path, .{}) catch |err| {
+        return mapInitFsError(err);
+    };
+    defer dir.close(path_mod.currentIo());
+
+    dir.setPermissions(path_mod.currentIo(), .fromMode(mode)) catch |err| {
         return mapInitFsError(err);
     };
 }
@@ -229,17 +250,13 @@ fn fixDirectory(spec: DirSpec, check: CheckResult) !void {
         },
         .wrong_permissions => {
             // Fix permissions - also fix ownership since we're already fixing the directory
-            std.posix.fchmodat(std.posix.AT.FDCWD, spec.path, spec.mode, 0) catch |err| {
-                return mapInitFsError(err);
-            };
+            try setDirectoryPermissions(spec.path, spec.mode);
             try setOwnership(spec.path);
         },
         .wrong_ownership => {
             // Fix ownership - also fix permissions since we're already fixing the directory
             try setOwnership(spec.path);
-            std.posix.fchmodat(std.posix.AT.FDCWD, spec.path, spec.mode, 0) catch |err| {
-                return mapInitFsError(err);
-            };
+            try setDirectoryPermissions(spec.path, spec.mode);
         },
         .not_directory => {
             return InitError.InvalidInput; // Cannot fix - path exists but is not a directory

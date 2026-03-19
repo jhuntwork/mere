@@ -78,7 +78,7 @@ fn handleImport(ctx: *mere.Context, args: *const types.ParsedArgs) MereError!typ
     // Get force flag
     const force = args.getBool("force");
 
-    var owned_package_paths = std.ArrayList([]const u8){};
+    var owned_package_paths: std.ArrayList([]const u8) = .empty;
     defer {
         for (owned_package_paths.items) |pkg_path| ctx.allocator.free(pkg_path);
         owned_package_paths.deinit(ctx.allocator);

@@ -50,10 +50,8 @@ fn handleRoot(ctx: *mere.Context, args: *const types.ParsedArgs) MereError!types
     return types.CommandResult{ .success = true };
 }
 
-pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
+pub fn main(init: std.process.Init) !void {
+    const allocator = init.gpa;
 
     // Initialize CLI system
     var cli_system = cli.CLI.init(allocator, "mere", &global_flags);
@@ -63,20 +61,19 @@ pub fn main() !void {
     defer ctx.deinit();
 
     // Set home directory from environment
-    ctx.home_dir = std.posix.getenv("HOME");
+    ctx.home_dir = init.environ_map.get("HOME");
 
     // Get command-line arguments early so global presentation flags can affect emitter setup.
-    const args = try std.process.argsAlloc(allocator);
-    defer std.process.argsFree(allocator, args);
+    const args = try init.minimal.args.toSlice(init.arena.allocator());
 
-    const stdout_file = std.fs.File.stdout();
-    const stderr_file = std.fs.File.stderr();
-    const stdout_tty = std.posix.isatty(stdout_file.handle);
+    const stdout_file = std.Io.File.stdout();
+    const stderr_file = std.Io.File.stderr();
+    const stdout_tty = stdout_file.isTty(init.io) catch false;
     var stdout_buf: [4096]u8 = undefined;
     var stderr_buf: [4096]u8 = undefined;
-    var stdout_writer = stdout_file.writer(&stdout_buf);
-    var stderr_writer = stderr_file.writer(&stderr_buf);
-    const no_color = std.posix.getenv("NO_COLOR") != null;
+    var stdout_writer = stdout_file.writer(init.io, &stdout_buf);
+    var stderr_writer = stderr_file.writer(init.io, &stderr_buf);
+    const no_color = init.environ_map.contains("NO_COLOR");
     var global_options = cli.CLI.prescanGlobalFlags(allocator, args[1..], &global_flags) catch cli.CLI.PrescanResult{
         .verbose = false,
         .no_color = false,
