@@ -7,7 +7,6 @@ const path = mere.path;
 
 // Import etc module
 const etc = @import("mere").etc;
-const generation_mod = @import("mere").generation;
 
 fn writeStdout(bytes: []const u8) !void {
     var stdout_buf: [4096]u8 = undefined;
@@ -190,18 +189,8 @@ fn handleEtc(ctx: *mere.Context, args: *const types.ParsedArgs) MereError!types.
 pub fn handleStatus(ctx: *mere.Context, args: *const types.ParsedArgs) MereError!types.CommandResult {
     _ = args;
 
-    const etc_dir = std.fs.path.join(ctx.allocator, &.{ ctx.root_path, "etc" }) catch {
-        return MereError.OutOfMemory;
-    };
-    defer ctx.allocator.free(etc_dir);
-
-    var manifest = loadActiveSystemManifest(ctx) catch |err| {
-        return mapActiveManifestError(ctx, err);
-    };
-    defer manifest.deinit();
-
-    var status = etc.collectStatus(ctx, &manifest, etc_dir) catch |err| {
-        return mapEtcCommandError(ctx, err, "failed to inspect /etc state");
+    var status = etc.collectActiveStatus(ctx) catch |err| {
+        return mapActiveStatusError(ctx, err);
     };
     defer status.deinit();
 
@@ -247,31 +236,11 @@ pub fn handleDiff(ctx: *mere.Context, args: *const types.ParsedArgs) MereError!t
         return MereError.MissingArgument;
     }
 
-    const etc_dir = std.fs.path.join(ctx.allocator, &.{ ctx.root_path, "etc" }) catch {
-        return MereError.OutOfMemory;
+    var lookup = etc.lookupActiveTemplate(ctx, args.positional[0]) catch |err| {
+        return mapActiveLookupError(ctx, args.positional[0], err);
     };
-    defer ctx.allocator.free(etc_dir);
-
-    const requested_path = try resolveEtcPath(ctx, etc_dir, args.positional[0]);
-    defer ctx.allocator.free(requested_path);
-
-    var manifest = loadActiveSystemManifest(ctx) catch |err| {
-        return mapActiveManifestError(ctx, err);
-    };
-    defer manifest.deinit();
-
-    var status = etc.collectStatus(ctx, &manifest, etc_dir) catch |err| {
-        return mapEtcCommandError(ctx, err, "failed to inspect /etc state");
-    };
-    defer status.deinit();
-
-    const entry = findTemplateEntry(&status, requested_path) orelse {
-        return types.CommandResult{
-            .success = false,
-            .exit_code = 2,
-            .message = try std.fmt.allocPrint(ctx.allocator, "no active system default found for {s}", .{requested_path}),
-        };
-    };
+    defer lookup.deinit();
+    const entry = lookup.entry();
 
     const left_path = if (entry.state == .missing) "/dev/null" else entry.etc_path;
     const diff_result = collectUnifiedDiff(ctx, left_path, entry.source_path) catch |err| {
@@ -304,31 +273,11 @@ pub fn handleApply(ctx: *mere.Context, args: *const types.ParsedArgs) MereError!
         return MereError.MissingArgument;
     }
 
-    const etc_dir = std.fs.path.join(ctx.allocator, &.{ ctx.root_path, "etc" }) catch {
-        return MereError.OutOfMemory;
+    var lookup = etc.lookupActiveTemplate(ctx, args.positional[0]) catch |err| {
+        return mapActiveLookupError(ctx, args.positional[0], err);
     };
-    defer ctx.allocator.free(etc_dir);
-
-    const requested_path = try resolveEtcPath(ctx, etc_dir, args.positional[0]);
-    defer ctx.allocator.free(requested_path);
-
-    var manifest = loadActiveSystemManifest(ctx) catch |err| {
-        return mapActiveManifestError(ctx, err);
-    };
-    defer manifest.deinit();
-
-    var status = etc.collectStatus(ctx, &manifest, etc_dir) catch |err| {
-        return mapEtcCommandError(ctx, err, "failed to inspect /etc state");
-    };
-    defer status.deinit();
-
-    const entry = findTemplateEntry(&status, requested_path) orelse {
-        return types.CommandResult{
-            .success = false,
-            .exit_code = 2,
-            .message = try std.fmt.allocPrint(ctx.allocator, "no active system default found for {s}", .{requested_path}),
-        };
-    };
+    defer lookup.deinit();
+    const entry = lookup.entry();
 
     if (entry.state == .identical) {
         const segments = [_]mere.ui.Segment{
@@ -350,65 +299,6 @@ pub fn handleApply(ctx: *mere.Context, args: *const types.ParsedArgs) MereError!
     return etcPathResult(ctx, "applied", entry.etc_path, backup_path);
 }
 
-fn loadActiveSystemManifest(ctx: *mere.Context) !generation_mod.GenerationManifest {
-    const profile_dir = std.fs.path.join(ctx.allocator, &.{ ctx.root_path, "mere", "profiles", "system" }) catch {
-        return MereError.OutOfMemory;
-    };
-    defer ctx.allocator.free(profile_dir);
-
-    const current = generation_mod.getCurrentGeneration(profile_dir) catch {
-        return MereError.FileSystem;
-    } orelse {
-        return MereError.InvalidInput;
-    };
-
-    const gen_dir = generation_mod.getGenerationPath(ctx.allocator, profile_dir, current) catch {
-        return MereError.OutOfMemory;
-    };
-    defer ctx.allocator.free(gen_dir);
-
-    return generation_mod.readManifest(ctx.allocator, gen_dir) catch {
-        return MereError.FileSystem;
-    };
-}
-
-fn mapActiveManifestError(ctx: *mere.Context, err: MereError) types.CommandResult {
-    return switch (err) {
-        MereError.InvalidInput => .{
-            .success = false,
-            .exit_code = 1,
-            .message = ctx.allocator.dupe(u8, "system profile has no active generation") catch "system profile has no active generation",
-        },
-        MereError.OutOfMemory => .{
-            .success = false,
-            .exit_code = 1,
-            .message = ctx.allocator.dupe(u8, "out of memory while loading active system generation") catch "out of memory while loading active system generation",
-        },
-        else => .{
-            .success = false,
-            .exit_code = 1,
-            .message = ctx.allocator.dupe(u8, "failed to read active system generation manifest") catch "failed to read active system generation manifest",
-        },
-    };
-}
-
-fn resolveEtcPath(ctx: *mere.Context, etc_dir: []const u8, raw_path: []const u8) ![]u8 {
-    if (std.mem.startsWith(u8, raw_path, "/etc/")) {
-        return std.fs.path.join(ctx.allocator, &.{ ctx.root_path, raw_path[1..] }) catch MereError.OutOfMemory;
-    }
-    if (std.mem.startsWith(u8, raw_path, "etc/")) {
-        return std.fs.path.join(ctx.allocator, &.{ ctx.root_path, raw_path }) catch MereError.OutOfMemory;
-    }
-    return std.fs.path.join(ctx.allocator, &.{ etc_dir, raw_path }) catch MereError.OutOfMemory;
-}
-
-fn findTemplateEntry(status: *const etc.TemplateStatus, etc_path: []const u8) ?*const etc.TemplateEntry {
-    for (status.entries.items) |*entry| {
-        if (std.mem.eql(u8, entry.etc_path, etc_path)) return entry;
-    }
-    return null;
-}
-
 fn mapEtcCommandError(ctx: *mere.Context, err: etc.EtcError, default_msg: []const u8) !types.CommandResult {
     const msg = switch (err) {
         etc.EtcError.DuplicateTemplate => "duplicate /etc template in active system generation",
@@ -419,6 +309,53 @@ fn mapEtcCommandError(ctx: *mere.Context, err: etc.EtcError, default_msg: []cons
         .success = false,
         .exit_code = 1,
         .message = try ctx.allocator.dupe(u8, msg),
+    };
+}
+
+fn mapActiveStatusError(ctx: *mere.Context, err: etc.ActiveStatusError) types.CommandResult {
+    return switch (err) {
+        error.NoActiveGeneration => .{
+            .success = false,
+            .exit_code = 1,
+            .message = ctx.allocator.dupe(u8, "system profile has no active generation") catch "system profile has no active generation",
+        },
+        error.OutOfMemory => .{
+            .success = false,
+            .exit_code = 1,
+            .message = ctx.allocator.dupe(u8, "out of memory while loading active system generation") catch "out of memory while loading active system generation",
+        },
+        error.DuplicateTemplate => .{
+            .success = false,
+            .exit_code = 1,
+            .message = ctx.allocator.dupe(u8, "duplicate /etc template in active system generation") catch "duplicate /etc template in active system generation",
+        },
+        error.PermissionDenied => .{
+            .success = false,
+            .exit_code = 1,
+            .message = ctx.allocator.dupe(u8, "permission denied") catch "permission denied",
+        },
+        else => .{
+            .success = false,
+            .exit_code = 1,
+            .message = ctx.allocator.dupe(u8, "failed to inspect /etc state") catch "failed to inspect /etc state",
+        },
+    };
+}
+
+fn mapActiveLookupError(ctx: *mere.Context, raw_path: []const u8, err: etc.ActiveLookupError) !types.CommandResult {
+    return switch (err) {
+        error.TemplateNotFound => .{
+            .success = false,
+            .exit_code = 2,
+            .message = try std.fmt.allocPrint(ctx.allocator, "no active system default found for {s}", .{raw_path}),
+        },
+        else => mapActiveStatusError(ctx, switch (err) {
+            error.NoActiveGeneration => error.NoActiveGeneration,
+            error.OutOfMemory => error.OutOfMemory,
+            error.PermissionDenied => error.PermissionDenied,
+            error.DuplicateTemplate => error.DuplicateTemplate,
+            else => error.FileSystem,
+        }),
     };
 }
 

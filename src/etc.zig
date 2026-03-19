@@ -8,6 +8,8 @@ const version = @import("version.zig");
 /// Template handling error set
 const Std = errors.StandardErrors;
 pub const EtcError = Std.OutOfMemory || Std.FileSystem || Std.PermissionDenied || error{DuplicateTemplate}; // Two packages provide same /etc path
+pub const ActiveStatusError = EtcError || error{NoActiveGeneration};
+pub const ActiveLookupError = ActiveStatusError || error{TemplateNotFound};
 
 pub const TemplateState = enum {
     missing,
@@ -56,6 +58,21 @@ pub const TemplateStatus = struct {
 
     pub fn canonicalize(self: *TemplateStatus) void {
         std.mem.sort(TemplateEntry, self.entries.items, {}, lessThanTemplateEntry);
+    }
+};
+
+pub const ActiveTemplateLookup = struct {
+    requested_path: []const u8,
+    status: TemplateStatus,
+    entry_index: usize,
+
+    pub fn deinit(self: *ActiveTemplateLookup) void {
+        self.status.allocator.free(self.requested_path);
+        self.status.deinit();
+    }
+
+    pub fn entry(self: *const ActiveTemplateLookup) *const TemplateEntry {
+        return &self.status.entries.items[self.entry_index];
     }
 };
 
@@ -161,6 +178,55 @@ pub fn collectStatus(
 
     status.canonicalize();
     return status;
+}
+
+pub fn collectActiveStatus(ctx: *Context) ActiveStatusError!TemplateStatus {
+    const etc_dir = std.fs.path.join(ctx.allocator, &.{ ctx.root_path, "etc" }) catch {
+        return ActiveStatusError.OutOfMemory;
+    };
+    defer ctx.allocator.free(etc_dir);
+
+    var manifest = loadActiveSystemManifest(ctx) catch |err| switch (err) {
+        error.NoActiveGeneration => return error.NoActiveGeneration,
+        error.OutOfMemory => return ActiveStatusError.OutOfMemory,
+        else => return ActiveStatusError.FileSystem,
+    };
+    defer manifest.deinit();
+
+    return collectStatus(ctx, &manifest, etc_dir) catch |err| switch (err) {
+        error.OutOfMemory => return ActiveStatusError.OutOfMemory,
+        error.PermissionDenied => return ActiveStatusError.PermissionDenied,
+        error.DuplicateTemplate => return ActiveStatusError.DuplicateTemplate,
+        else => return ActiveStatusError.FileSystem,
+    };
+}
+
+pub fn lookupActiveTemplate(ctx: *Context, raw_path: []const u8) ActiveLookupError!ActiveTemplateLookup {
+    const requested_path = resolveRequestedEtcPath(ctx, raw_path) catch |err| switch (err) {
+        error.OutOfMemory => return ActiveLookupError.OutOfMemory,
+    };
+    errdefer ctx.allocator.free(requested_path);
+
+    var status = collectActiveStatus(ctx) catch |err| switch (err) {
+        error.NoActiveGeneration => return error.NoActiveGeneration,
+        error.OutOfMemory => return ActiveLookupError.OutOfMemory,
+        error.PermissionDenied => return ActiveLookupError.PermissionDenied,
+        error.DuplicateTemplate => return ActiveLookupError.DuplicateTemplate,
+        else => return ActiveLookupError.FileSystem,
+    };
+    errdefer status.deinit();
+
+    for (status.entries.items, 0..) |entry, idx| {
+        if (std.mem.eql(u8, entry.etc_path, requested_path)) {
+            return .{
+                .requested_path = requested_path,
+                .status = status,
+                .entry_index = idx,
+            };
+        }
+    }
+
+    return error.TemplateNotFound;
 }
 
 /// Remove files created during template processing, in reverse order.
@@ -394,6 +460,43 @@ fn buildSortedPackageOrder(
     }.lessThan);
 
     return order;
+}
+
+fn loadActiveSystemManifest(ctx: *Context) error{ NoActiveGeneration, OutOfMemory, FileSystem }!generation.GenerationManifest {
+    const profile_dir = std.fs.path.join(ctx.allocator, &.{ ctx.root_path, "mere", "profiles", "system" }) catch {
+        return error.OutOfMemory;
+    };
+    defer ctx.allocator.free(profile_dir);
+
+    const current = generation.getCurrentGeneration(profile_dir) catch {
+        return error.FileSystem;
+    } orelse {
+        return error.NoActiveGeneration;
+    };
+
+    const gen_dir = generation.getGenerationPath(ctx.allocator, profile_dir, current) catch {
+        return error.OutOfMemory;
+    };
+    defer ctx.allocator.free(gen_dir);
+
+    return generation.readManifest(ctx.allocator, gen_dir) catch {
+        return error.FileSystem;
+    };
+}
+
+fn resolveRequestedEtcPath(ctx: *Context, raw_path: []const u8) error{OutOfMemory}![]u8 {
+    const etc_dir = std.fs.path.join(ctx.allocator, &.{ ctx.root_path, "etc" }) catch {
+        return error.OutOfMemory;
+    };
+    defer ctx.allocator.free(etc_dir);
+
+    if (std.mem.startsWith(u8, raw_path, "/etc/")) {
+        return std.fs.path.join(ctx.allocator, &.{ ctx.root_path, raw_path[1..] }) catch error.OutOfMemory;
+    }
+    if (std.mem.startsWith(u8, raw_path, "etc/")) {
+        return std.fs.path.join(ctx.allocator, &.{ ctx.root_path, raw_path }) catch error.OutOfMemory;
+    }
+    return std.fs.path.join(ctx.allocator, &.{ etc_dir, raw_path }) catch error.OutOfMemory;
 }
 
 fn lessThanTemplateEntry(_: void, a: TemplateEntry, b: TemplateEntry) bool {
