@@ -295,41 +295,86 @@ pub fn storeDirectoryForKey(
     src_dir: []const u8,
     actual_path: ?[]const u8,
 ) CacheError!CacheRecord {
-    const cache_root = try buildCacheRoot(allocator, ctx);
+    const cache_root = buildCacheRoot(allocator, ctx) catch |err| {
+        ctx.setDiagnosticContextFmt(src_dir, "failed to resolve build cache root ({s})", .{@errorName(err)});
+        return err;
+    };
     defer allocator.free(cache_root);
 
-    const artifacts_root = try std.fs.path.join(allocator, &.{ cache_root, "artifacts" });
+    const artifacts_root = std.fs.path.join(allocator, &.{ cache_root, "artifacts" }) catch |err| {
+        ctx.setDiagnosticContextFmt(cache_root, "failed to build cache artifacts path ({s})", .{@errorName(err)});
+        return mapFsError(err);
+    };
     defer allocator.free(artifacts_root);
-    const keys_root = try std.fs.path.join(allocator, &.{ cache_root, "keys", kind.asString() });
+    const keys_root = std.fs.path.join(allocator, &.{ cache_root, "keys", kind.asString() }) catch |err| {
+        ctx.setDiagnosticContextFmt(cache_root, "failed to build cache keys path for {s} ({s})", .{ kind.asString(), @errorName(err) });
+        return mapFsError(err);
+    };
     defer allocator.free(keys_root);
-    try ensurePath(artifacts_root);
-    try ensurePath(keys_root);
+    ensurePath(artifacts_root) catch |err| {
+        ctx.setDiagnosticContextFmt(artifacts_root, "failed to create cache artifacts root ({s})", .{@errorName(err)});
+        return err;
+    };
+    ensurePath(keys_root) catch |err| {
+        ctx.setDiagnosticContextFmt(keys_root, "failed to create cache keys root ({s})", .{@errorName(err)});
+        return err;
+    };
 
     const artifact_digest_hex = hash.calculateBuildSnapshotHash(allocator, src_dir, null) catch |err| {
+        ctx.setDiagnosticContextFmt(src_dir, "failed to hash source tree for cache storage ({s})", .{@errorName(err)});
         return mapHashError(err);
     };
     errdefer allocator.free(artifact_digest_hex);
 
-    const artifact_dir = try std.fs.path.join(allocator, &.{ artifacts_root, artifact_digest_hex });
+    const artifact_dir = std.fs.path.join(allocator, &.{ artifacts_root, artifact_digest_hex }) catch |err| {
+        ctx.setDiagnosticContextFmt(artifacts_root, "failed to build artifact cache dir for {s} ({s})", .{ artifact_digest_hex, @errorName(err) });
+        return mapFsError(err);
+    };
     defer allocator.free(artifact_dir);
-    const payload_dir = try std.fs.path.join(allocator, &.{ artifact_dir, "payload" });
+    const payload_dir = std.fs.path.join(allocator, &.{ artifact_dir, "payload" }) catch |err| {
+        ctx.setDiagnosticContextFmt(artifact_dir, "failed to build cache payload dir ({s})", .{@errorName(err)});
+        return mapFsError(err);
+    };
     defer allocator.free(payload_dir);
-    const metadata_path = try std.fs.path.join(allocator, &.{ artifact_dir, "meta.kdl" });
+    const metadata_path = std.fs.path.join(allocator, &.{ artifact_dir, "meta.kdl" }) catch |err| {
+        ctx.setDiagnosticContextFmt(artifact_dir, "failed to build cache metadata path ({s})", .{@errorName(err)});
+        return mapFsError(err);
+    };
     defer allocator.free(metadata_path);
 
     const payload_exists = dirExists(payload_dir);
     if (!payload_exists) {
-        try ensurePath(artifact_dir);
-        try copyTreeAtomic(allocator, src_dir, payload_dir);
-        try writeArtifactMetadata(metadata_path, kind, artifact_digest_hex);
+        ensurePath(artifact_dir) catch |err| {
+            ctx.setDiagnosticContextFmt(artifact_dir, "failed to create artifact cache dir ({s})", .{@errorName(err)});
+            return err;
+        };
+        copyTreeAtomic(allocator, ctx, src_dir, payload_dir) catch |err| {
+            if (ctx.getDiagnosticContext().details == null) {
+                ctx.setDiagnosticContextFmt(payload_dir, "failed to copy source tree into cache payload ({s})", .{@errorName(err)});
+            }
+            return err;
+        };
+        writeArtifactMetadata(metadata_path, kind, artifact_digest_hex) catch |err| {
+            ctx.setDiagnosticContextFmt(metadata_path, "failed to write cache artifact metadata ({s})", .{@errorName(err)});
+            return err;
+        };
     }
 
-    const actual_subpath = try computeActualSubpath(allocator, src_dir, actual_path);
+    const actual_subpath = computeActualSubpath(allocator, src_dir, actual_path) catch |err| {
+        ctx.setDiagnosticContextFmt(src_dir, "failed to compute cached actual subpath ({s})", .{@errorName(err)});
+        return err;
+    };
     errdefer if (actual_subpath) |subpath| allocator.free(subpath);
 
-    const key_path = try std.fs.path.join(allocator, &.{ keys_root, keyHexFilename(key_hex) });
+    const key_path = std.fs.path.join(allocator, &.{ keys_root, keyHexFilename(key_hex) }) catch |err| {
+        ctx.setDiagnosticContextFmt(keys_root, "failed to build cache key record path for {s} ({s})", .{ key_hex, @errorName(err) });
+        return mapFsError(err);
+    };
     defer allocator.free(key_path);
-    try writeKeyRecord(allocator, key_path, kind, key_hex, artifact_digest_hex, actual_subpath);
+    writeKeyRecord(allocator, key_path, kind, key_hex, artifact_digest_hex, actual_subpath) catch |err| {
+        ctx.setDiagnosticContextFmt(key_path, "failed to write cache key record ({s})", .{@errorName(err)});
+        return err;
+    };
 
     return CacheRecord{
         .kind = kind,
@@ -376,7 +421,7 @@ pub fn restoreDirectoryForKey(
     defer allocator.free(payload_dir);
     if (!dirExists(payload_dir)) return null;
 
-    replaceTreeFromCache(allocator, payload_dir, dest_dir) catch |err| {
+    replaceTreeFromCache(allocator, ctx, payload_dir, dest_dir) catch |err| {
         ctx.setDiagnosticContextFmt(dest_dir, "failed to restore cached {s} tree from {s} ({s})", .{ kind.asString(), payload_dir, @errorName(err) });
         return err;
     };
@@ -728,7 +773,7 @@ pub fn storePackageArchiveForKey(
     if (!dirExists(artifact_dir)) {
         try ensurePath(artifact_dir);
         try writeArtifactMetadata(metadata_path, .package_archive, artifact_digest_hex);
-        try copyTreeAtomic(allocator, staging_dir, staging_cache_dir);
+        try copyTreeAtomic(allocator, ctx, staging_dir, staging_cache_dir);
         try copyFileReplace(archive_path, archive_cache_path);
         try writePackageArchiveMetadata(allocator, package_meta_path, std.fs.path.basename(archive_path), content_hash, archive_hash, signature);
     }
@@ -776,7 +821,7 @@ pub fn restorePackageArchiveForKey(
 
     if (!dirExists(staging_cache_dir) or !fileExists(archive_cache_path)) return null;
 
-    try replaceTreeFromCache(allocator, staging_cache_dir, staging_dir);
+    try replaceTreeFromCache(allocator, ctx, staging_cache_dir, staging_dir);
     const meta = try readPackageArchiveMetadata(allocator, package_meta_path);
     errdefer {
         allocator.free(meta.archive_basename);
@@ -1325,17 +1370,24 @@ fn parseQuotedValue(allocator: std.mem.Allocator, line: []const u8) CacheError![
 
 fn replaceTreeFromCache(
     allocator: std.mem.Allocator,
+    ctx: *mere.Context,
     src_dir: []const u8,
     dest_dir: []const u8,
 ) CacheError!void {
     const parent_dir = std.fs.path.dirname(dest_dir) orelse return error.InvalidInput;
     const io = path_mod.currentIo();
-    try ensurePath(parent_dir);
+    ensurePath(parent_dir) catch |err| {
+        ctx.setDiagnosticContextFmt(parent_dir, "failed to create parent dir for cache restore ({s})", .{@errorName(err)});
+        return err;
+    };
 
     var rand_bytes: [8]u8 = undefined;
     io.random(&rand_bytes);
     const rand_hex = std.fmt.bytesToHex(rand_bytes[0..], .lower);
-    const tmp_dir = try std.fmt.allocPrint(allocator, "{s}.tmp-{s}", .{ dest_dir, rand_hex });
+    const tmp_dir = std.fmt.allocPrint(allocator, "{s}.tmp-{s}", .{ dest_dir, rand_hex }) catch |err| {
+        ctx.setDiagnosticContextFmt(dest_dir, "failed to allocate temporary cache restore dir path ({s})", .{@errorName(err)});
+        return error.OutOfMemory;
+    };
     defer allocator.free(tmp_dir);
     errdefer {
         if (std.fs.path.dirname(tmp_dir)) |tmp_parent| {
@@ -1356,13 +1408,20 @@ fn replaceTreeFromCache(
             else => return mapFsError(err),
         };
         defer parent.close(io);
-        parent.deleteTree(io, tmp_base) catch |err| return mapFsError(err);
+        parent.deleteTree(io, tmp_base) catch |err| {
+            ctx.setDiagnosticContextFmt(tmp_dir, "failed to clear stale temporary cache restore dir ({s})", .{@errorName(err)});
+            return mapFsError(err);
+        };
     }
-    try ensurePath(tmp_dir);
-    try copyTreeContents(allocator, src_dir, tmp_dir);
+    ensurePath(tmp_dir) catch |err| {
+        ctx.setDiagnosticContextFmt(tmp_dir, "failed to create temporary cache restore dir ({s})", .{@errorName(err)});
+        return err;
+    };
+    try copyTreeContents(allocator, ctx, src_dir, tmp_dir);
 
     if (!dirExists(dest_dir)) {
         std.Io.Dir.renameAbsolute(tmp_dir, dest_dir, io) catch |err| {
+            ctx.setDiagnosticContextFmt(dest_dir, "failed to publish restored cache dir ({s})", .{@errorName(err)});
             return mapFsError(err);
         };
         return;
@@ -1374,23 +1433,33 @@ fn replaceTreeFromCache(
         const tmp_base = std.fs.path.basename(tmp_dir);
         var parent = path_mod.openExistingDir(tmp_parent) catch |err| return mapFsError(err);
         defer parent.close(io);
-        parent.deleteTree(io, tmp_base) catch |err| return mapFsError(err);
+        parent.deleteTree(io, tmp_base) catch |err| {
+            ctx.setDiagnosticContextFmt(tmp_dir, "failed to clean replaced cache restore temp dir ({s})", .{@errorName(err)});
+            return mapFsError(err);
+        };
     }
 }
 
 fn copyTreeAtomic(
     allocator: std.mem.Allocator,
+    ctx: *mere.Context,
     src_dir: []const u8,
     dest_dir: []const u8,
 ) CacheError!void {
     const parent_dir = std.fs.path.dirname(dest_dir) orelse return error.InvalidInput;
     const io = path_mod.currentIo();
-    try ensurePath(parent_dir);
+    ensurePath(parent_dir) catch |err| {
+        ctx.setDiagnosticContextFmt(parent_dir, "failed to create parent dir for cache tree copy ({s})", .{@errorName(err)});
+        return err;
+    };
 
     var rand_bytes: [8]u8 = undefined;
     io.random(&rand_bytes);
     const rand_hex = std.fmt.bytesToHex(rand_bytes[0..], .lower);
-    const tmp_dir = try std.fmt.allocPrint(allocator, "{s}.tmp-{s}", .{ dest_dir, rand_hex });
+    const tmp_dir = std.fmt.allocPrint(allocator, "{s}.tmp-{s}", .{ dest_dir, rand_hex }) catch |err| {
+        ctx.setDiagnosticContextFmt(dest_dir, "failed to allocate temporary cache dir path ({s})", .{@errorName(err)});
+        return error.OutOfMemory;
+    };
     defer allocator.free(tmp_dir);
     errdefer {
         if (std.fs.path.dirname(tmp_dir)) |tmp_parent| {
@@ -1411,41 +1480,74 @@ fn copyTreeAtomic(
             else => return mapFsError(err),
         };
         defer parent.close(io);
-        parent.deleteTree(io, tmp_base) catch |err| return mapFsError(err);
+        parent.deleteTree(io, tmp_base) catch |err| {
+            ctx.setDiagnosticContextFmt(tmp_dir, "failed to clear stale temporary cache dir ({s})", .{@errorName(err)});
+            return mapFsError(err);
+        };
     }
-    try ensurePath(tmp_dir);
-    try copyTreeContents(allocator, src_dir, tmp_dir);
+    ensurePath(tmp_dir) catch |err| {
+        ctx.setDiagnosticContextFmt(tmp_dir, "failed to create temporary cache dir ({s})", .{@errorName(err)});
+        return err;
+    };
+    copyTreeContents(allocator, ctx, src_dir, tmp_dir) catch |err| {
+        return err;
+    };
     std.Io.Dir.renameAbsolute(tmp_dir, dest_dir, io) catch |err| {
+        ctx.setDiagnosticContextFmt(dest_dir, "failed to publish temporary cache dir ({s})", .{@errorName(err)});
         return mapFsError(err);
     };
 }
 
 fn copyTreeContents(
     allocator: std.mem.Allocator,
+    ctx: *mere.Context,
     src_dir: []const u8,
     dest_dir: []const u8,
 ) CacheError!void {
-    try ensurePath(dest_dir);
+    ensurePath(dest_dir) catch |err| {
+        ctx.setDiagnosticContextFmt(dest_dir, "failed to create destination dir for cache tree copy ({s})", .{@errorName(err)});
+        return err;
+    };
 
-    const src_contents = try std.fs.path.join(allocator, &.{ src_dir, "." });
+    const src_contents = std.fs.path.join(allocator, &.{ src_dir, "." }) catch |err| {
+        ctx.setDiagnosticContextFmt(src_dir, "failed to build source path for cache tree copy ({s})", .{@errorName(err)});
+        return error.OutOfMemory;
+    };
     defer allocator.free(src_contents);
 
-    const result = std.process.run(allocator, path_mod.currentIo(), .{
+    var child = std.process.spawn(path_mod.currentIo(), .{
         .argv = &.{ "/bin/cp", "-a", src_contents, dest_dir },
+        .stdin = .ignore,
+        .stdout = .inherit,
+        .stderr = .inherit,
     }) catch |err| switch (err) {
-        error.OutOfMemory => return error.OutOfMemory,
-        else => return error.FileSystem,
-    };
-    defer {
-        allocator.free(result.stdout);
-        allocator.free(result.stderr);
-    }
-
-    switch (result.term) {
-        .exited => |code| {
-            if (code != 0) return error.FileSystem;
+        error.OutOfMemory => {
+            ctx.setDiagnosticContextFmt(src_dir, "failed to spawn cache tree copy process ({s})", .{@errorName(err)});
+            return error.OutOfMemory;
         },
-        else => return error.FileSystem,
+        else => {
+            ctx.setDiagnosticContextFmt(src_dir, "failed to spawn cache tree copy process ({s})", .{@errorName(err)});
+            return error.FileSystem;
+        },
+    };
+    defer child.kill(path_mod.currentIo());
+
+    switch (child.wait(path_mod.currentIo()) catch |err| switch (err) {
+        else => {
+            ctx.setDiagnosticContextFmt(src_dir, "failed while waiting for cache tree copy process ({s})", .{@errorName(err)});
+            return error.FileSystem;
+        },
+    }) {
+        .exited => |code| {
+            if (code != 0) {
+                ctx.setDiagnosticContextFmt(src_dir, "cache tree copy process exited with status {d}", .{code});
+                return error.FileSystem;
+            }
+        },
+        else => {
+            ctx.setDiagnosticContext(src_dir, "cache tree copy process terminated abnormally");
+            return error.FileSystem;
+        },
     }
 }
 

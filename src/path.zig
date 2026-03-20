@@ -9,6 +9,8 @@ pub const PathError = Std.OutOfMemory || Std.FileSystem || Std.PermissionDenied 
     PathTooLong,
 };
 
+var runtime_io: ?std.Io = null;
+
 pub const TempDir = struct {
     dir: std.Io.Dir,
     parent_dir: std.Io.Dir,
@@ -28,7 +30,12 @@ pub const TempDir = struct {
 };
 
 pub fn currentIo() std.Io {
-    return if (builtin.is_test) std.testing.io else std.Options.debug_io;
+    if (builtin.is_test) return std.testing.io;
+    return runtime_io orelse @panic("path runtime io not initialized");
+}
+
+pub fn setRuntimeIo(io: std.Io) void {
+    runtime_io = io;
 }
 
 pub fn createTempDir(

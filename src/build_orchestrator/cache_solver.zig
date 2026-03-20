@@ -659,10 +659,20 @@ fn persistFetchedSources(
     parsed_recipe: *const recipe.Recipe,
     workspace_sources_dir: []const u8,
 ) build_cache.CacheError!SolvedNodeOutput {
-    const key_hex = try sourceFetchKey(allocator, ctx, recipe_dir, parsed_recipe);
+    const key_hex = sourceFetchKey(allocator, ctx, recipe_dir, parsed_recipe) catch |err| {
+        if (ctx.getDiagnosticContext().details == null) {
+            ctx.setDiagnosticContextFmt(recipe_dir, "failed to compute source-fetch cache key ({s})", .{@errorName(err)});
+        }
+        return err;
+    };
     errdefer allocator.free(key_hex);
 
-    var stored = try build_cache.storeDirectoryForKey(allocator, ctx, .source_fetch, key_hex, workspace_sources_dir, null);
+    var stored = build_cache.storeDirectoryForKey(allocator, ctx, .source_fetch, key_hex, workspace_sources_dir, null) catch |err| {
+        if (ctx.getDiagnosticContext().details == null) {
+            ctx.setDiagnosticContextFmt(workspace_sources_dir, "failed to persist fetched sources in build cache ({s})", .{@errorName(err)});
+        }
+        return err;
+    };
     defer stored.deinit();
 
     return SolvedNodeOutput{
@@ -716,13 +726,28 @@ fn persistUnpackedSources(
     workspace_src_dir: []const u8,
     actual_src_dir: ?[]const u8,
 ) build_cache.CacheError!SolvedNodeOutput {
-    const fetch_key = try sourceFetchKey(allocator, ctx, recipe_dir, parsed_recipe);
+    const fetch_key = sourceFetchKey(allocator, ctx, recipe_dir, parsed_recipe) catch |err| {
+        if (ctx.getDiagnosticContext().details == null) {
+            ctx.setDiagnosticContextFmt(recipe_dir, "failed to compute source-fetch cache key for unpack ({s})", .{@errorName(err)});
+        }
+        return err;
+    };
     defer allocator.free(fetch_key);
 
-    const unpack_key = try build_cache.computeSourceUnpackKey(allocator, fetch_key);
+    const unpack_key = build_cache.computeSourceUnpackKey(allocator, fetch_key) catch |err| {
+        if (ctx.getDiagnosticContext().details == null) {
+            ctx.setDiagnosticContextFmt(workspace_src_dir, "failed to compute source-unpack cache key ({s})", .{@errorName(err)});
+        }
+        return err;
+    };
     errdefer allocator.free(unpack_key);
 
-    var stored = try build_cache.storeDirectoryForKey(allocator, ctx, .source_unpack, unpack_key, workspace_src_dir, actual_src_dir);
+    var stored = build_cache.storeDirectoryForKey(allocator, ctx, .source_unpack, unpack_key, workspace_src_dir, actual_src_dir) catch |err| {
+        if (ctx.getDiagnosticContext().details == null) {
+            ctx.setDiagnosticContextFmt(workspace_src_dir, "failed to persist unpacked sources in build cache ({s})", .{@errorName(err)});
+        }
+        return err;
+    };
     defer stored.deinit();
 
     return SolvedNodeOutput{

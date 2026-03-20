@@ -21,6 +21,35 @@ fn mapFsError(err: anyerror) Error {
     };
 }
 
+fn ensureWorkspaceSourceMatchesCache(
+    ctx: *mere.Context,
+    cache_path: []const u8,
+    workspace_source_path: []const u8,
+) Error!void {
+    const cached_hash = hash_mod.calculateFileHash(ctx.allocator, cache_path) catch |err| {
+        ctx.setDiagnosticContext(cache_path, "failed to hash cached source");
+        return switch (err) {
+            error.OutOfMemory => Error.OutOfMemory,
+            else => mapFsError(err),
+        };
+    };
+    defer ctx.allocator.free(cached_hash);
+
+    const workspace_hash = hash_mod.calculateFileHash(ctx.allocator, workspace_source_path) catch |err| {
+        ctx.setDiagnosticContext(workspace_source_path, "failed to validate existing workspace source");
+        return switch (err) {
+            error.OutOfMemory => Error.OutOfMemory,
+            else => mapFsError(err),
+        };
+    };
+    defer ctx.allocator.free(workspace_hash);
+
+    if (!std.mem.eql(u8, cached_hash, workspace_hash)) {
+        ctx.setDiagnosticContext(workspace_source_path, "existing workspace source conflicts with cached source");
+        return Error.CorruptData;
+    }
+}
+
 fn defaultSharedCacheRoot(allocator: std.mem.Allocator, ctx: *mere.Context) Error![]const u8 {
     return std.fs.path.join(allocator, &.{ ctx.root(), "mere", "dev", "cache", "sources" }) catch error.OutOfMemory;
 }
@@ -283,6 +312,15 @@ pub fn download(ctx: *mere.Context, config: DownloadConfig) !DownloadResult {
         defer cache_file.close(path_mod.currentIo());
 
         cache_file.hardLink(path_mod.currentIo(), std.Io.Dir.cwd(), entry.workspace_source_path, .{}) catch |link_err| {
+            if (link_err == error.PathAlreadyExists) {
+                ensureWorkspaceSourceMatchesCache(ctx, entry.cache_path, entry.workspace_source_path) catch |err| {
+                    ctx.allocator.free(cache_dir);
+                    return err;
+                };
+                ctx.debug("workspace source already present and matches cache: {s}", .{entry.workspace_source_path});
+                continue;
+            }
+
             ctx.debug("hardlink failed ({s}), copying instead: {s} -> {s}", .{ @errorName(link_err), entry.cache_path, entry.workspace_source_path });
             if (path_mod.openExistingDir(entry.workspace_source_path)) |existing_dir| {
                 existing_dir.close(path_mod.currentIo());
@@ -790,6 +828,175 @@ test "download reports permission errors in cache-to-workspace fallback" {
     try std.testing.expect(diag.details != null);
     try std.testing.expectEqualStrings(expected_workspace_path, diag.subject.?);
     try std.testing.expectEqualStrings("failed to create workspace source", diag.details.?);
+}
+
+test "download accepts pre-existing matching workspace source" {
+    var test_env = try test_helpers.createTestEnv();
+    defer {
+        test_env.cleanup();
+        std.testing.allocator.destroy(test_env);
+    }
+
+    var dummy = test_helpers.DummyClient.init(test_env.ctx.allocator);
+    defer dummy.deinit();
+
+    const src_url = "http://example.com/existing-match.txt";
+    const src_content = "existing-workspace-content";
+    try dummy.set(src_url, src_content);
+
+    var vtable = download_mod.TransferClient.VTable{ .download_file = test_helpers.dummy_download_file };
+    const client = download_mod.TransferClient{ .ptr = @ptrCast(&dummy), .vtable = &vtable };
+
+    const expected_hash = try hash_mod.calculateBytesHash(test_env.ctx.allocator, src_content);
+    defer test_env.ctx.allocator.free(expected_hash);
+
+    const cache_dir = try std.fs.path.join(test_env.ctx.allocator, &.{ test_env.path, "cache_existing_match" });
+    defer test_env.ctx.allocator.free(cache_dir);
+    try path_mod.ensureDirExists(cache_dir);
+
+    const cache_file_path = try std.fs.path.join(test_env.ctx.allocator, &.{ cache_dir, "existing-match.txt" });
+    defer test_env.ctx.allocator.free(cache_file_path);
+    {
+        var cache_file = try std.Io.Dir.createFileAbsolute(path_mod.currentIo(), cache_file_path, .{});
+        defer cache_file.close(path_mod.currentIo());
+        try cache_file.writeStreamingAll(path_mod.currentIo(), src_content);
+    }
+
+    const sources_dir = try std.fs.path.join(test_env.ctx.allocator, &.{ test_env.path, "sources_existing_match" });
+    defer test_env.ctx.allocator.free(sources_dir);
+    try path_mod.ensureDirExists(sources_dir);
+
+    const workspace_file_path = try std.fs.path.join(test_env.ctx.allocator, &.{ sources_dir, "existing-match.txt" });
+    defer test_env.ctx.allocator.free(workspace_file_path);
+    {
+        var workspace_file = try std.Io.Dir.createFileAbsolute(path_mod.currentIo(), workspace_file_path, .{});
+        defer workspace_file.close(path_mod.currentIo());
+        try workspace_file.writeStreamingAll(path_mod.currentIo(), src_content);
+    }
+
+    const kdl_text = try std.fmt.allocPrint(test_env.ctx.allocator,
+        \\recipe {{
+        \\    name "existing-match"
+        \\    version "1.0"
+        \\    release 1
+        \\    archs "x86_64"
+        \\    description "existing match test"
+        \\    url "http://example.com"
+        \\    licenses "MIT"
+        \\}}
+        \\source "{s}" {{
+        \\    blake3 "{s}"
+        \\}}
+        \\build {{
+        \\    script "true"
+        \\}}
+        \\package "existing-match" {{
+        \\    files "usr/bin/*"
+        \\}}
+    , .{ src_url, expected_hash });
+    defer test_env.ctx.allocator.free(kdl_text);
+
+    var parsed = try recipe.parse(&test_env.ctx, kdl_text);
+    defer parsed.deinit();
+
+    var result = try download(&test_env.ctx, .{
+        .sources = parsed.sources.items,
+        .client = client,
+        .cache_dir = cache_dir,
+        .workspace_sources_dir = sources_dir,
+        .recipe_dir = test_env.path,
+        .recipe = &parsed,
+    });
+    defer result.deinit(test_env.ctx.allocator);
+
+    try std.testing.expectEqual(@as(u32, 0), result.downloaded_count);
+    try std.testing.expectEqual(@as(u32, 1), result.cached_count);
+    try std.testing.expectEqual(@as(u32, 1), result.total_sources);
+}
+
+test "download rejects conflicting pre-existing workspace source" {
+    var test_env = try test_helpers.createTestEnv();
+    defer {
+        test_env.cleanup();
+        std.testing.allocator.destroy(test_env);
+    }
+
+    var dummy = test_helpers.DummyClient.init(test_env.ctx.allocator);
+    defer dummy.deinit();
+
+    const src_url = "http://example.com/existing-conflict.txt";
+    const src_content = "cached-content";
+    try dummy.set(src_url, src_content);
+
+    var vtable = download_mod.TransferClient.VTable{ .download_file = test_helpers.dummy_download_file };
+    const client = download_mod.TransferClient{ .ptr = @ptrCast(&dummy), .vtable = &vtable };
+
+    const expected_hash = try hash_mod.calculateBytesHash(test_env.ctx.allocator, src_content);
+    defer test_env.ctx.allocator.free(expected_hash);
+
+    const cache_dir = try std.fs.path.join(test_env.ctx.allocator, &.{ test_env.path, "cache_existing_conflict" });
+    defer test_env.ctx.allocator.free(cache_dir);
+    try path_mod.ensureDirExists(cache_dir);
+
+    const cache_file_path = try std.fs.path.join(test_env.ctx.allocator, &.{ cache_dir, "existing-conflict.txt" });
+    defer test_env.ctx.allocator.free(cache_file_path);
+    {
+        var cache_file = try std.Io.Dir.createFileAbsolute(path_mod.currentIo(), cache_file_path, .{});
+        defer cache_file.close(path_mod.currentIo());
+        try cache_file.writeStreamingAll(path_mod.currentIo(), src_content);
+    }
+
+    const sources_dir = try std.fs.path.join(test_env.ctx.allocator, &.{ test_env.path, "sources_existing_conflict" });
+    defer test_env.ctx.allocator.free(sources_dir);
+    try path_mod.ensureDirExists(sources_dir);
+
+    const workspace_file_path = try std.fs.path.join(test_env.ctx.allocator, &.{ sources_dir, "existing-conflict.txt" });
+    defer test_env.ctx.allocator.free(workspace_file_path);
+    {
+        var workspace_file = try std.Io.Dir.createFileAbsolute(path_mod.currentIo(), workspace_file_path, .{});
+        defer workspace_file.close(path_mod.currentIo());
+        try workspace_file.writeStreamingAll(path_mod.currentIo(), "different-content");
+    }
+
+    const kdl_text = try std.fmt.allocPrint(test_env.ctx.allocator,
+        \\recipe {{
+        \\    name "existing-conflict"
+        \\    version "1.0"
+        \\    release 1
+        \\    archs "x86_64"
+        \\    description "existing conflict test"
+        \\    url "http://example.com"
+        \\    licenses "MIT"
+        \\}}
+        \\source "{s}" {{
+        \\    blake3 "{s}"
+        \\}}
+        \\build {{
+        \\    script "true"
+        \\}}
+        \\package "existing-conflict" {{
+        \\    files "usr/bin/*"
+        \\}}
+    , .{ src_url, expected_hash });
+    defer test_env.ctx.allocator.free(kdl_text);
+
+    var parsed = try recipe.parse(&test_env.ctx, kdl_text);
+    defer parsed.deinit();
+
+    try std.testing.expectError(Error.CorruptData, download(&test_env.ctx, .{
+        .sources = parsed.sources.items,
+        .client = client,
+        .cache_dir = cache_dir,
+        .workspace_sources_dir = sources_dir,
+        .recipe_dir = test_env.path,
+        .recipe = &parsed,
+    }));
+
+    const diag = test_env.ctx.getDiagnosticContext();
+    try std.testing.expect(diag.subject != null);
+    try std.testing.expect(diag.details != null);
+    try std.testing.expectEqualStrings(workspace_file_path, diag.subject.?);
+    try std.testing.expectEqualStrings("existing workspace source conflicts with cached source", diag.details.?);
 }
 
 test "clearSharedCache removes cached source entries" {

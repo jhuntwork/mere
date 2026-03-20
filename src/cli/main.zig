@@ -52,6 +52,7 @@ fn handleRoot(ctx: *mere.Context, args: *const types.ParsedArgs) MereError!types
 
 pub fn main(init: std.process.Init) !void {
     const allocator = init.gpa;
+    mere.path.setRuntimeIo(init.io);
 
     // Initialize CLI system
     var cli_system = cli.CLI.init(allocator, "mere", &global_flags);

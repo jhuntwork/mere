@@ -422,18 +422,16 @@ fn materializePackagePlan(ctx: *mere.Context, config: PackageStagingConfig, plan
         };
         defer src_file.close(path_mod.currentIo());
 
-        var dest_file = std.Io.Dir.createFileAbsolute(path_mod.currentIo(), dest_file_path, .{}) catch {
-            return fail(ctx, dest_file_path, "failed to create destination file", PackageStagingError.FileSystem);
+        std.Io.Dir.copyFileAbsolute(src_file_path, dest_file_path, path_mod.currentIo(), .{
+            .replace = true,
+        }) catch {
+            return fail(ctx, dest_file_path, "failed to copy destination file", PackageStagingError.FileSystem);
+        };
+
+        var dest_file = std.Io.Dir.openFileAbsolute(path_mod.currentIo(), dest_file_path, .{}) catch {
+            return fail(ctx, dest_file_path, "failed to reopen destination file", PackageStagingError.FileSystem);
         };
         defer dest_file.close(path_mod.currentIo());
-
-        var buf: [8192]u8 = undefined;
-        const n = src_file.readPositionalAll(path_mod.currentIo(), &buf, 0) catch {
-            return fail(ctx, src_file_path, "failed to read source file", PackageStagingError.FileSystem);
-        };
-        dest_file.writeStreamingAll(path_mod.currentIo(), buf[0..n]) catch {
-            return fail(ctx, dest_file_path, "failed to write destination file", PackageStagingError.FileSystem);
-        };
 
         const file_stat = src_file.stat(path_mod.currentIo()) catch {
             return fail(ctx, src_file_path, "failed to stat source file", PackageStagingError.FileSystem);
@@ -700,6 +698,57 @@ test "PackageStaging supports fnmatch bracket expressions" {
 
     try std.testing.expectEqual(@as(usize, 1), result.files_copied);
     try std.testing.expectEqualStrings("usr/bin/perl1", result.copied_files[0]);
+}
+
+test "PackageStaging copies full file contents beyond one buffer" {
+    const th = @import("test_helpers.zig");
+    var test_env = try th.createTestEnv();
+    defer {
+        test_env.cleanup();
+        std.testing.allocator.destroy(test_env);
+    }
+
+    const source_dir = try std.fs.path.join(test_env.ctx.allocator, &.{ test_env.path, "source" });
+    defer test_env.ctx.allocator.free(source_dir);
+
+    const bin_dir = try std.fs.path.join(test_env.ctx.allocator, &.{ source_dir, "usr", "bin" });
+    defer test_env.ctx.allocator.free(bin_dir);
+    try path_mod.ensureDirExists(bin_dir);
+
+    const app_path = try std.fs.path.join(test_env.ctx.allocator, &.{ bin_dir, "large-bin" });
+    defer test_env.ctx.allocator.free(app_path);
+
+    const large_size = 20000;
+    const large_bytes = try test_env.ctx.allocator.alloc(u8, large_size);
+    defer test_env.ctx.allocator.free(large_bytes);
+    for (large_bytes, 0..) |*b, i| b.* = @intCast(i % 251);
+
+    var app = try std.Io.Dir.createFileAbsolute(path_mod.currentIo(), app_path, .{});
+    defer app.close(path_mod.currentIo());
+    try app.writeStreamingAll(path_mod.currentIo(), large_bytes);
+
+    const dest_dir = try std.fs.path.join(test_env.ctx.allocator, &.{ test_env.path, "dest" });
+    defer test_env.ctx.allocator.free(dest_dir);
+
+    var result = try stagePackageFiles(&test_env.ctx, .{
+        .source_dir = source_dir,
+        .patterns = &[_][]const u8{"usr/bin/large-bin"},
+        .destination = dest_dir,
+    });
+    defer result.deinit();
+
+    const staged_path = try std.fs.path.join(test_env.ctx.allocator, &.{ dest_dir, "usr", "bin", "large-bin" });
+    defer test_env.ctx.allocator.free(staged_path);
+
+    var staged = try std.Io.Dir.openFileAbsolute(path_mod.currentIo(), staged_path, .{});
+    defer staged.close(path_mod.currentIo());
+
+    const staged_stat = try staged.stat(path_mod.currentIo());
+    try std.testing.expectEqual(@as(u64, large_size), staged_stat.size);
+
+    const staged_bytes = try std.Io.Dir.readFileAlloc(std.Io.Dir.cwd(), path_mod.currentIo(), staged_path, test_env.ctx.allocator, .limited(large_size + 1));
+    defer test_env.ctx.allocator.free(staged_bytes);
+    try std.testing.expectEqualSlices(u8, large_bytes, staged_bytes);
 }
 
 test "PackageStaging supports trailing slash recursive directory shorthand" {
