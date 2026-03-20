@@ -117,10 +117,7 @@ fn getRequiredDirectories(allocator: std.mem.Allocator, root: []const u8) ![]Dir
 
 /// Check if running as root
 fn isRoot() bool {
-    if (@hasDecl(std.posix, "getuid")) {
-        return std.os.linux.getuid() == 0;
-    }
-    return false;
+    return std.os.linux.geteuid() == 0;
 }
 
 fn requiresRoot(options: InitOptions) bool {

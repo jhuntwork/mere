@@ -126,7 +126,7 @@ pub fn storePathExists(store_path: []const u8) bool {
 
 /// Check if the current process is running with root privileges
 pub fn isPrivileged() bool {
-    return std.os.linux.getuid() == 0 and std.os.linux.geteuid() == 0;
+    return std.os.linux.geteuid() == 0;
 }
 
 /// Harden a store object for system use by changing ownership and permissions
