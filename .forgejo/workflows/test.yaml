@@ -5,4 +5,15 @@ jobs:
     container:
       image: mere/zig
     steps:
-      - run: zig build test --summary all
+      - name: Git checkout
+        run: |
+          git init "$GITHUB_WORKSPACE"
+          cd "$GITHUB_WORKSPACE"
+          git remote add origin "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY.git"
+          git -c http.extraHeader="Authorization: Bearer $GITHUB_TOKEN" \
+            fetch --depth=1 origin "$GITHUB_SHA"
+          git checkout --detach FETCH_HEAD
+      - name: Test
+        run: |
+          cd "$GITHUB_WORKSPACE"
+          zig build test --summary all
