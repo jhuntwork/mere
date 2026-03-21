@@ -21,7 +21,7 @@ cp ftdetect-mere-recipe.vim ~/.vim/ftdetect/
 Add to your `~/.vimrc`:
 
 ```vim
-Plug '/path/to/mere/tools', { 'rtp': '.' }
+Plug '/path/to/mere/contrib/vim', { 'rtp': '.' }
 ```
 
 Then run `:PlugInstall`
