@@ -46,14 +46,14 @@ jobs:
         run: |
           set -eu
           cd "$GITHUB_WORKSPACE"
-          mere shell -p zig -- zig build test --summary all
+          zig build test --summary all
 
       - name: Build release binary
         if: ${{ steps.meta.outputs.version_changed == 'true' }}
         run: |
           set -eu
           cd "$GITHUB_WORKSPACE"
-          mere shell -p zig -- zig build -Doptimize=ReleaseSafe
+          zig build -Doptimize=ReleaseSmall
 
       - name: Package release assets
         if: ${{ steps.meta.outputs.version_changed == 'true' }}
