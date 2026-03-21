@@ -1,6 +1,6 @@
 .{
     .name = .mere,
-    .version = "0.6.0",
+    .version = "0.6.1",
     .fingerprint = 0x86c577aae39c0548,
     .minimum_zig_version = "0.16.0",
     .paths = .{
