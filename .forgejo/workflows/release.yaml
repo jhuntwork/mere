@@ -1,0 +1,176 @@
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - build.zig.zon
+  workflow_dispatch:
+
+jobs:
+  release:
+    runs-on: docker
+    container:
+      image: mere/zig
+    steps:
+      - name: Git checkout
+        run: |
+          git init "$GITHUB_WORKSPACE"
+          cd "$GITHUB_WORKSPACE"
+          git remote add origin "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY.git"
+          git -c http.extraHeader="Authorization: Bearer $GITHUB_TOKEN" \
+            fetch --depth=50 --tags origin "$GITHUB_SHA"
+          git checkout --detach FETCH_HEAD
+
+      - name: Detect version change
+        id: meta
+        run: |
+          set -eu
+          cd "$GITHUB_WORKSPACE"
+
+          previous_file=
+          if git rev-parse --verify "$GITHUB_SHA^" >/dev/null 2>&1; then
+            git show "$GITHUB_SHA^:build.zig.zon" > previous-build.zig.zon
+            previous_file=previous-build.zig.zon
+          fi
+
+          sh .forgejo/scripts/release-ci.sh detect-version-change build.zig.zon "$previous_file" \
+            >> "$GITHUB_OUTPUT"
+
+      - name: No release needed
+        if: ${{ steps.meta.outputs.version_changed != 'true' }}
+        run: |
+          echo "build.zig.zon changed, but .version did not change."
+
+      - name: Test
+        if: ${{ steps.meta.outputs.version_changed == 'true' }}
+        run: |
+          set -eu
+          cd "$GITHUB_WORKSPACE"
+          mere shell -p zig -- zig build test --summary all
+
+      - name: Build release binary
+        if: ${{ steps.meta.outputs.version_changed == 'true' }}
+        run: |
+          set -eu
+          cd "$GITHUB_WORKSPACE"
+          mere shell -p zig -- zig build -Doptimize=ReleaseSafe
+
+      - name: Package release assets
+        if: ${{ steps.meta.outputs.version_changed == 'true' }}
+        run: |
+          set -eu
+          cd "$GITHUB_WORKSPACE"
+
+          version="${{ steps.meta.outputs.version }}"
+          os=$(uname -s | tr '[:upper:]' '[:lower:]')
+          arch=$(uname -m)
+          base=$(sh .forgejo/scripts/release-ci.sh asset-base "$version" "$os" "$arch")
+
+          mkdir -p dist
+          cp zig-out/bin/mere "dist/${base}"
+          tar -C dist -czf "dist/${base}.tar.gz" "${base}"
+
+          (
+            cd dist
+            sha256sum "${base}.tar.gz" > "SHA256SUMS"
+          )
+
+      - name: Push release tag
+        if: ${{ steps.meta.outputs.version_changed == 'true' }}
+        run: |
+          set -eu
+          cd "$GITHUB_WORKSPACE"
+
+          tag="${{ steps.meta.outputs.tag }}"
+          if git ls-remote --exit-code --tags origin "refs/tags/${tag}" >/dev/null 2>&1; then
+            printf 'Tag %s already exists on origin.\n' "$tag"
+            exit 0
+          fi
+
+          git tag -a "$tag" -m "${{ steps.meta.outputs.release_name }}" "$GITHUB_SHA"
+          git -c http.extraHeader="Authorization: Bearer $GITHUB_TOKEN" \
+            push origin "refs/tags/${tag}"
+
+      - name: Create release and upload assets
+        if: ${{ steps.meta.outputs.version_changed == 'true' }}
+        run: |
+          set -eu
+          cd "$GITHUB_WORKSPACE"
+
+          api_base="$GITHUB_SERVER_URL/api/v1/repos/$GITHUB_REPOSITORY/releases"
+          auth_header="Authorization: token $GITHUB_TOKEN"
+          tag="${{ steps.meta.outputs.tag }}"
+          version="${{ steps.meta.outputs.version }}"
+
+          release_status=$(
+            curl -sS \
+              -o release.json \
+              -w '%{http_code}' \
+              -H "$auth_header" \
+              -H "Accept: application/json" \
+              "$api_base/tags/$tag"
+          )
+
+          case "$release_status" in
+            200)
+              printf 'Release %s already exists; reusing it.\n' "$tag"
+              ;;
+            404)
+              printf '%s\n' \
+                "{\"tag_name\":\"$tag\",\"target_commitish\":\"$GITHUB_SHA\",\"name\":\"mere $version\",\"body\":\"Automated release for version $version.\",\"draft\":false,\"prerelease\":false}" \
+                > release-create.json
+
+              curl -fsS \
+                -X POST \
+                -H "$auth_header" \
+                -H "Accept: application/json" \
+                -H "Content-Type: application/json" \
+                --data-binary @release-create.json \
+                "$api_base" > release.json
+              ;;
+            *)
+              printf 'Failed to query release %s (HTTP %s).\n' "$tag" "$release_status" >&2
+              cat release.json >&2
+              exit 1
+              ;;
+          esac
+
+          release_id=$(
+            grep -o '"id":[[:space:]]*[0-9][0-9]*' release.json \
+              | head -n 1 \
+              | sed 's/[^0-9]//g'
+          )
+
+          if [ -z "$release_id" ]; then
+            printf '%s\n' "Failed to parse release id from API response." >&2
+            cat release.json >&2
+            exit 1
+          fi
+
+          for asset in dist/*; do
+            name=$(basename "$asset")
+            status=$(
+              curl -sS \
+                -o upload.json \
+                -w '%{http_code}' \
+                -X POST \
+                -H "$auth_header" \
+                -H "Accept: application/json" \
+                -F "attachment=@${asset}" \
+                "$api_base/$release_id/assets?name=$name"
+            )
+
+            case "$status" in
+              201)
+                printf 'Uploaded %s\n' "$name"
+                ;;
+              409)
+                printf 'Asset %s already exists; skipping.\n' "$name"
+                ;;
+              *)
+                printf 'Failed to upload %s (HTTP %s).\n' "$name" "$status" >&2
+                cat upload.json >&2
+                exit 1
+                ;;
+            esac
+          done
