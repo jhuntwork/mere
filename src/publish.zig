@@ -303,7 +303,27 @@ fn materializePublishedPackages(
         return ctx.fail(mapFsError(err), tmp_packages_dir, "failed to create temp packages dir");
     };
 
+    const live_packages_dir = std.fs.path.join(ctx.allocator, &.{ output_repo_dir, "packages" }) catch {
+        return ctx.fail(PublishError.OutOfMemory, output_repo_dir, "failed to allocate live packages path");
+    };
+    defer ctx.allocator.free(live_packages_dir);
+
     for (required.items) |archive_name| {
+        const live_path = std.fs.path.join(ctx.allocator, &.{ live_packages_dir, archive_name }) catch {
+            return ctx.fail(PublishError.OutOfMemory, archive_name, "failed to allocate existing published archive path");
+        };
+        defer ctx.allocator.free(live_path);
+
+        const dst_path = std.fs.path.join(ctx.allocator, &.{ tmp_packages_dir, archive_name }) catch {
+            return ctx.fail(PublishError.OutOfMemory, archive_name, "failed to allocate destination archive path");
+        };
+        defer ctx.allocator.free(dst_path);
+
+        if (path_mod.fileExists(live_path)) {
+            try createHardLinkAbsolute(ctx, live_path, dst_path);
+            continue;
+        }
+
         const src_path = std.fs.path.join(ctx.allocator, &.{ pool_dir, archive_name }) catch {
             return ctx.fail(PublishError.OutOfMemory, archive_name, "failed to allocate source archive path");
         };
@@ -312,13 +332,11 @@ fn materializePublishedPackages(
             return ctx.fail(PublishError.InvalidInput, src_path, "publish blocked: package archive missing from shared pool");
         };
 
-        const dst_path = std.fs.path.join(ctx.allocator, &.{ tmp_packages_dir, archive_name }) catch {
-            return ctx.fail(PublishError.OutOfMemory, archive_name, "failed to allocate destination archive path");
-        };
-        defer ctx.allocator.free(dst_path);
-
         path_mod.copyFile(src_path, dst_path) catch |err| {
             return ctx.fail(mapFsError(err), src_path, "failed to copy archive into published package set");
+        };
+        copyFileTimes(src_path, dst_path) catch |err| {
+            return ctx.fail(err, dst_path, "failed to preserve archive timestamps in published package set");
         };
     }
 
@@ -336,6 +354,41 @@ fn materializePublishedPackages(
 
     std.Io.Dir.renameAbsolute(tmp_packages_dir, out_packages_dir, path_mod.currentIo()) catch |err| {
         return ctx.fail(mapFsError(err), out_packages_dir, "failed to atomically publish packages directory");
+    };
+}
+
+fn createHardLinkAbsolute(ctx: *mere.Context, src_path: []const u8, dst_path: []const u8) PublishError!void {
+    const src_z = ctx.allocator.dupeZ(u8, src_path) catch return PublishError.OutOfMemory;
+    defer ctx.allocator.free(src_z);
+    const dst_z = ctx.allocator.dupeZ(u8, dst_path) catch return PublishError.OutOfMemory;
+    defer ctx.allocator.free(dst_z);
+
+    switch (std.posix.errno(std.c.link(src_z, dst_z))) {
+        .SUCCESS => {},
+        .ACCES, .PERM => return ctx.fail(PublishError.PermissionDenied, dst_path, "failed to hard-link unchanged published archive"),
+        else => return ctx.fail(PublishError.FileSystem, dst_path, "failed to hard-link unchanged published archive"),
+    }
+}
+
+fn copyFileTimes(src_path: []const u8, dest_path: []const u8) PublishError!void {
+    const io = path_mod.currentIo();
+    var src_file = std.Io.Dir.openFileAbsolute(io, src_path, .{}) catch |err| {
+        return mapFsError(err);
+    };
+    defer src_file.close(io);
+    const stat = src_file.stat(io) catch |err| {
+        return mapFsError(err);
+    };
+
+    var dest_file = std.Io.Dir.openFileAbsolute(io, dest_path, .{ .mode = .read_write }) catch |err| {
+        return mapFsError(err);
+    };
+    defer dest_file.close(io);
+    dest_file.setTimestamps(io, .{
+        .access_timestamp = .init(stat.atime),
+        .modify_timestamp = .init(stat.mtime),
+    }) catch |err| {
+        return mapFsError(err);
     };
 }
 
@@ -801,6 +854,90 @@ test "publish commit replaces output packages with exactly db-referenced set" {
         return;
     };
     return error.TestUnexpectedResult;
+}
+
+test "publish commit reuses unchanged live archives and preserves source mtime" {
+    const th = @import("test_helpers.zig");
+    const sign_mod = @import("sign.zig");
+    const io = path_mod.currentIo();
+    var test_env = try th.createTestEnv();
+    defer {
+        test_env.cleanup();
+        std.testing.allocator.destroy(test_env);
+    }
+    const ctx = &test_env.ctx;
+
+    const keypair = try sign_mod.generateKeyPair();
+    const key_dir = try std.fs.path.join(ctx.allocator, &.{ test_env.path, "keys-reuse-live" });
+    defer ctx.allocator.free(key_dir);
+    try path_mod.ensureDirExists(key_dir);
+    const key_path = try std.fs.path.join(ctx.allocator, &.{ key_dir, "publish.key" });
+    defer ctx.allocator.free(key_path);
+    try keypair.secret_key.saveToFile(key_path);
+    ctx.signing_key_path = key_path;
+
+    const pool_dir = try packagePoolDir(ctx);
+    defer ctx.allocator.free(pool_dir);
+    try path_mod.ensureDirExists(pool_dir);
+    const p1_name = try std.fmt.allocPrint(ctx.allocator, "pkg-a-1.0.0-1-x86_64-{s}.pkg.tar.zst", .{"a" ** 64});
+    defer ctx.allocator.free(p1_name);
+    const p1_pool = try std.fs.path.join(ctx.allocator, &.{ pool_dir, p1_name });
+    defer ctx.allocator.free(p1_pool);
+    {
+        const f = try std.Io.Dir.createFileAbsolute(io, p1_pool, .{});
+        try f.writeStreamingAll(io, "archive-a");
+        try f.setTimestamps(io, .{
+            .access_timestamp = .{ .new = std.Io.Timestamp.fromNanoseconds(1_700_000_000_000_000_000) },
+            .modify_timestamp = .{ .new = std.Io.Timestamp.fromNanoseconds(1_700_000_123_000_000_000) },
+        });
+        f.close(io);
+    }
+
+    const output_dir = try std.fs.path.join(ctx.allocator, &.{ test_env.path, "published-out-reuse-live" });
+    defer ctx.allocator.free(output_dir);
+    const out_package = try std.fs.path.join(ctx.allocator, &.{ output_dir, "packages", p1_name });
+    defer ctx.allocator.free(out_package);
+
+    {
+        const stage_dir = try std.fs.path.join(ctx.allocator, &.{ test_env.path, "publish-stage-reuse-live-1" });
+        defer ctx.allocator.free(stage_dir);
+        var staged = try stageEmpty(ctx, stage_dir);
+        defer staged.deinit();
+
+        var p1 = try makeTestPkg(ctx, "pkg-a", "1.0.0", "x86_64", "a" ** 64);
+        defer p1.deinit();
+        _ = try staged.db.insertPackageTransaction(&p1);
+        try staged.commit(output_dir);
+    }
+
+    var first_out_file = try path_mod.openExistingFile(out_package);
+    const first_stat = try first_out_file.stat(io);
+    first_out_file.close(io);
+
+    var pool_file = try path_mod.openExistingFile(p1_pool);
+    const pool_stat = try pool_file.stat(io);
+    pool_file.close(io);
+
+    try std.testing.expectEqual(pool_stat.mtime, first_stat.mtime);
+
+    {
+        const stage_dir = try std.fs.path.join(ctx.allocator, &.{ test_env.path, "publish-stage-reuse-live-2" });
+        defer ctx.allocator.free(stage_dir);
+        var staged = try stageEmpty(ctx, stage_dir);
+        defer staged.deinit();
+
+        var p1 = try makeTestPkg(ctx, "pkg-a", "1.0.0", "x86_64", "a" ** 64);
+        defer p1.deinit();
+        _ = try staged.db.insertPackageTransaction(&p1);
+        try staged.commit(output_dir);
+    }
+
+    var second_out_file = try path_mod.openExistingFile(out_package);
+    const second_stat = try second_out_file.stat(io);
+    second_out_file.close(io);
+
+    try std.testing.expectEqual(first_stat.inode, second_stat.inode);
+    try std.testing.expectEqual(first_stat.mtime, second_stat.mtime);
 }
 
 test "publish commit fails when db content_hash is missing/invalid" {
