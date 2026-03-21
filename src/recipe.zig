@@ -19,6 +19,16 @@ pub const RecipeError = Std.OutOfMemory || Std.FileSystem || Std.InvalidInput ||
     MalformedPlaceholder,
 };
 
+pub const LoadedRecipeFile = struct {
+    abs_path: []const u8,
+    content: []u8,
+
+    pub fn deinit(self: *LoadedRecipeFile, allocator: std.mem.Allocator) void {
+        allocator.free(self.abs_path);
+        allocator.free(self.content);
+    }
+};
+
 pub fn parse(ctx: *mere.Context, recipe_buf: []const u8) !Recipe {
     const allocator = ctx.allocator;
     // Parse KDL document
@@ -92,6 +102,75 @@ pub fn parse(ctx: *mere.Context, recipe_buf: []const u8) !Recipe {
     try validateRecipeActionable(&recipe);
 
     return recipe;
+}
+
+pub fn validateFile(ctx: *mere.Context, file_path: []const u8) !void {
+    var loaded = try loadFile(ctx, file_path);
+    defer loaded.deinit(ctx.allocator);
+
+    var parsed = parse(ctx, loaded.content) catch |err| {
+        rewriteParseDiagnosticSubject(ctx, loaded.abs_path);
+        return err;
+    };
+    defer parsed.deinit();
+}
+
+fn loadFile(ctx: *mere.Context, file_path: []const u8) !LoadedRecipeFile {
+    if (!path.isValidInputPath(file_path)) {
+        return ctx.fail(RecipeError.InvalidInput, file_path, "invalid recipe path");
+    }
+
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const abs_path_slice = path.resolveToAbsolutePath(file_path, &buf) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.PathTooLong => return ctx.fail(RecipeError.InvalidInput, file_path, "recipe path too long"),
+        else => return ctx.fail(RecipeError.FileSystem, file_path, "failed to resolve recipe path"),
+    };
+
+    const abs_path = try ctx.allocator.dupe(u8, abs_path_slice);
+    errdefer ctx.allocator.free(abs_path);
+
+    var recipe_file = path.openExistingFile(abs_path) catch {
+        return ctx.fail(RecipeError.FileSystem, abs_path, "failed to open recipe file");
+    };
+    defer recipe_file.close(path.currentIo());
+
+    const file_size = (recipe_file.stat(path.currentIo()) catch {
+        return ctx.fail(RecipeError.FileSystem, abs_path, "failed to stat recipe file");
+    }).size;
+
+    if (file_size > 1024 * 1024 * 10) {
+        return ctx.fail(RecipeError.InvalidInput, abs_path, "recipe file too large");
+    }
+
+    const recipe_buf = try ctx.allocator.alloc(u8, file_size);
+    errdefer ctx.allocator.free(recipe_buf);
+
+    const bytes_read = recipe_file.readPositionalAll(path.currentIo(), recipe_buf, 0) catch {
+        return ctx.fail(RecipeError.FileSystem, abs_path, "failed to read recipe file");
+    };
+
+    if (bytes_read != file_size) {
+        return ctx.fail(RecipeError.FileSystem, abs_path, "short read while reading recipe file");
+    }
+
+    return LoadedRecipeFile{
+        .abs_path = abs_path,
+        .content = recipe_buf,
+    };
+}
+
+fn rewriteParseDiagnosticSubject(ctx: *mere.Context, abs_path: []const u8) void {
+    const diag = ctx.getDiagnosticContext();
+    if (diag.subject) |subject| {
+        if (std.mem.eql(u8, subject, "recipe KDL") or
+            std.mem.eql(u8, subject, "recipe.kdl") or
+            std.mem.eql(u8, subject, "recipe node") or
+            std.mem.eql(u8, subject, "package node"))
+        {
+            ctx.setDiagnosticContext(abs_path, diag.details);
+        }
+    }
 }
 
 /// Parse the recipe {} node for metadata
@@ -1345,4 +1424,67 @@ test "parse: env properties parsed" {
     try std.testing.expectEqual(@as(usize, 1), r.build_env.items.len);
     try std.testing.expectEqualStrings("CFLAGS", r.build_env.items[0].key);
     try std.testing.expectEqualStrings("-O2", r.build_env.items[0].value);
+}
+
+test "validateFile accepts a valid recipe file" {
+    const th = @import("test_helpers.zig");
+    var test_env = try th.createTestEnv();
+    defer {
+        test_env.cleanup();
+        std.testing.allocator.destroy(test_env);
+    }
+
+    const recipe_path = try std.fs.path.join(test_env.ctx.allocator, &.{ test_env.path, "recipe.kdl" });
+    defer test_env.ctx.allocator.free(recipe_path);
+
+    var recipe_file = try path.makePathAndOpenFile(recipe_path);
+    defer recipe_file.close(path.currentIo());
+
+    try recipe_file.writeStreamingAll(path.currentIo(),
+        \\recipe {
+        \\    name "demo"
+        \\    version "1.0.0"
+        \\    release 1
+        \\}
+        \\build {
+        \\    script "true"
+        \\}
+        \\package "demo" {
+        \\    files "usr/bin/demo"
+        \\}
+    );
+
+    try validateFile(&test_env.ctx, recipe_path);
+}
+
+test "validateFile rewrites parse diagnostics to the recipe path" {
+    const th = @import("test_helpers.zig");
+    var test_env = try th.createTestEnv();
+    defer {
+        test_env.cleanup();
+        std.testing.allocator.destroy(test_env);
+    }
+
+    const recipe_path = try std.fs.path.join(test_env.ctx.allocator, &.{ test_env.path, "bad-recipe.kdl" });
+    defer test_env.ctx.allocator.free(recipe_path);
+
+    var recipe_file = try path.makePathAndOpenFile(recipe_path);
+    defer recipe_file.close(path.currentIo());
+
+    try recipe_file.writeStreamingAll(path.currentIo(),
+        \\recipe {
+        \\    name "demo"
+        \\    version "1.0.0"
+        \\    release 1
+        \\    bogus "nope"
+        \\}
+        \\package "demo" {
+        \\    files "usr/bin/demo"
+        \\}
+    );
+
+    try std.testing.expectError(RecipeError.InvalidInput, validateFile(&test_env.ctx, recipe_path));
+    const diag = test_env.ctx.getDiagnosticContext();
+    try std.testing.expect(diag.subject != null);
+    try std.testing.expectEqualStrings(recipe_path, diag.subject.?);
 }

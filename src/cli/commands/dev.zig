@@ -67,6 +67,19 @@ const clean_meta = command.CommandMeta{
     },
 };
 
+/// Validate subcommand metadata
+const validate_meta = command.CommandMeta{
+    .name = "validate",
+    .description = "Validate a recipe file without building it",
+    .args = &[_]types.Arg{
+        .{
+            .name = "recipe",
+            .description = "Path to recipe KDL file",
+            .required = true,
+        },
+    },
+};
+
 /// Repo sign subcommand metadata
 const repo_sign_meta = command.CommandMeta{
     .name = "sign",
@@ -216,6 +229,45 @@ fn handleHash(ctx: *mere.Context, args: *const types.ParsedArgs) MereError!types
     return types.CommandResult{
         .success = true,
         .message = formatted,
+    };
+}
+
+fn handleValidate(ctx: *mere.Context, args: *const types.ParsedArgs) MereError!types.CommandResult {
+    if (args.positional.len < 1) {
+        return MereError.MissingArgument;
+    }
+
+    const recipe_path = args.positional[0];
+    if (!path.isValidInputPath(recipe_path)) {
+        return types.CommandResult{
+            .success = false,
+            .exit_code = 2,
+            .message = try std.fmt.allocPrint(ctx.allocator, "Invalid recipe path: '{s}'", .{recipe_path}),
+        };
+    }
+
+    ctx.withDiagnosticContext(DiagnosticContext.init().withSubject(recipe_path));
+
+    mere.recipe.validateFile(ctx, recipe_path) catch |err| {
+        const base_message = switch (err) {
+            error.ParseFailed => "failed to parse recipe",
+            error.InvalidInput => "recipe validation failed",
+            else => getUserFriendlyMessage(err),
+        };
+        const error_ctx = ctx.getDiagnosticContext().toErrorContext();
+        const formatted_message = error_ctx.formatWithMessage(ctx.allocator, base_message) catch base_message;
+        defer if (formatted_message.ptr != base_message.ptr) ctx.allocator.free(formatted_message);
+
+        return types.CommandResult{
+            .success = false,
+            .exit_code = 1,
+            .message = try ctx.allocator.dupe(u8, formatted_message),
+        };
+    };
+
+    return types.CommandResult{
+        .success = true,
+        .message = try std.fmt.allocPrint(ctx.allocator, "Recipe valid: {s}", .{recipe_path}),
     };
 }
 
@@ -629,9 +681,14 @@ pub fn createCommand(allocator: std.mem.Allocator) !*command.Command {
     const clean_cmd = try allocator.create(command.Command);
     clean_cmd.* = command.Command.init(allocator, clean_meta, handleClean);
 
+    // Create validate subcommand
+    const validate_cmd = try allocator.create(command.Command);
+    validate_cmd.* = command.Command.init(allocator, validate_meta, handleValidate);
+
     // Add subcommands to dev command
     try dev_cmd.addSubcommand(hash_cmd);
     try dev_cmd.addSubcommand(clean_cmd);
+    try dev_cmd.addSubcommand(validate_cmd);
 
     // Create publish subcommand
     const publish_cmd = try allocator.create(command.Command);

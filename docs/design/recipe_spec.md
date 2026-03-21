@@ -669,6 +669,9 @@ package "myapp-doc" {    // Documentation
 Always test the build:
 
 ```sh
+# Validate the recipe
+mere dev validate recipe.kdl
+
 # Build the recipe
 mere dev build recipe.kdl
 

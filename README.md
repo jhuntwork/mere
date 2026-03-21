@@ -45,6 +45,9 @@ mere uninstall curl
 # build a package from a recipe
 mere dev build recipe.kdl
 
+# validate a recipe without building it
+mere dev validate recipe.kdl
+
 # roll back to a previous generation
 mere generation activate 15
 
