@@ -81,6 +81,9 @@ jobs:
           set -eu
           cd "$GITHUB_WORKSPACE"
 
+          git config user.name "Mere CI"
+          git config user.email "no-reply@merelinux.org"
+
           tag="${{ steps.meta.outputs.tag }}"
           if git ls-remote --exit-code --tags origin "refs/tags/${tag}" >/dev/null 2>&1; then
             printf 'Tag %s already exists on origin.\n' "$tag"
