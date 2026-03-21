@@ -448,6 +448,38 @@ pub fn restoreDirectoryForKey(
     };
 }
 
+pub fn invalidateKey(
+    allocator: std.mem.Allocator,
+    ctx: *mere.Context,
+    kind: ArtifactKind,
+    key_hex: []const u8,
+) CacheError!bool {
+    const cache_root = try buildCacheRoot(allocator, ctx);
+    defer allocator.free(cache_root);
+
+    const keys_root = std.fs.path.join(allocator, &.{ cache_root, "keys", kind.asString() }) catch |err| {
+        ctx.setDiagnosticContextFmt(cache_root, "failed to build cache keys path for {s} ({s})", .{ kind.asString(), @errorName(err) });
+        return mapFsError(err);
+    };
+    defer allocator.free(keys_root);
+
+    const key_path = std.fs.path.join(allocator, &.{ keys_root, keyHexFilename(key_hex) }) catch |err| {
+        ctx.setDiagnosticContextFmt(keys_root, "failed to build cache key path for {s} ({s})", .{ key_hex, @errorName(err) });
+        return mapFsError(err);
+    };
+    defer allocator.free(key_path);
+
+    std.Io.Dir.deleteFileAbsolute(path_mod.currentIo(), key_path) catch |err| switch (err) {
+        error.FileNotFound => return false,
+        else => {
+            ctx.setDiagnosticContextFmt(key_path, "failed to invalidate cache key record ({s})", .{@errorName(err)});
+            return mapFsError(err);
+        },
+    };
+
+    return true;
+}
+
 pub fn inspectKey(
     allocator: std.mem.Allocator,
     ctx: *mere.Context,
@@ -1544,8 +1576,8 @@ fn copyTreeContents(
                 return error.FileSystem;
             }
         },
-        else => {
-            ctx.setDiagnosticContext(src_dir, "cache tree copy process terminated abnormally");
+        else => |term| {
+            ctx.setDiagnosticContextFmt(src_dir, "cache tree copy process terminated abnormally: {any} (dest {s})", .{ term, dest_dir });
             return error.FileSystem;
         },
     }

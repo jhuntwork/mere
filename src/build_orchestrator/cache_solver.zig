@@ -699,11 +699,35 @@ fn restoreUnpackedSources(
     defer allocator.free(fetch_key);
 
     const unpack_key = try build_cache.computeSourceUnpackKey(allocator, fetch_key);
-    errdefer allocator.free(unpack_key);
+    var keep_unpack_key = false;
+    defer if (!keep_unpack_key) allocator.free(unpack_key);
 
-    var restored = try build_cache.restoreDirectoryForKey(allocator, ctx, .source_unpack, unpack_key, workspace_src_dir);
+    var restored = build_cache.restoreDirectoryForKey(allocator, ctx, .source_unpack, unpack_key, workspace_src_dir) catch |err| switch (err) {
+        error.OutOfMemory, error.PermissionDenied => return err,
+        error.InvalidInput, error.FileSystem => {
+            const diag = ctx.getDiagnosticContext();
+            if (diag.details) |details| {
+                ctx.debug("source-unpack cache restore failed for key {s}: {s} ({s})", .{
+                    unpack_key,
+                    diag.subject orelse workspace_src_dir,
+                    details,
+                });
+            } else {
+                ctx.debug("source-unpack cache restore failed for key {s}: {s}", .{ unpack_key, @errorName(err) });
+            }
+
+            _ = build_cache.invalidateKey(allocator, ctx, .source_unpack, unpack_key) catch |invalidate_err| switch (invalidate_err) {
+                error.OutOfMemory, error.PermissionDenied => return invalidate_err,
+                error.InvalidInput, error.FileSystem => return invalidate_err,
+            };
+
+            ctx.withDiagnosticContext(mere.errors.DiagnosticContext.init());
+            return null;
+        },
+    };
     if (restored) |*hit| {
         defer hit.deinit();
+        keep_unpack_key = true;
         return SolvedNodeOutput{
             .allocator = allocator,
             .key_hex = unpack_key,
@@ -714,7 +738,6 @@ fn restoreUnpackedSources(
         };
     }
 
-    allocator.free(unpack_key);
     return null;
 }
 
@@ -1250,4 +1273,76 @@ test "restoreUnpackedSources does not depend on fetch key record" {
     const content = try std.Io.Dir.readFileAlloc(std.Io.Dir.cwd(), path_mod.currentIo(), restored_file, allocator, .limited(64));
     defer allocator.free(content);
     try std.testing.expectEqualStrings("unpacked", content);
+}
+
+test "restoreUnpackedSources invalidates broken unpack key and falls back to miss" {
+    const test_helpers = @import("../test_helpers.zig");
+
+    var test_env = try test_helpers.createTestEnv();
+    defer {
+        test_env.cleanup();
+        std.testing.allocator.destroy(test_env);
+    }
+
+    const allocator = test_env.ctx.allocator;
+
+    const recipe_dir = try std.fs.path.join(allocator, &.{ test_env.path, "recipe" });
+    defer allocator.free(recipe_dir);
+    var recipe_dir_handle = try path_mod.makePathAndOpenDir(recipe_dir);
+    recipe_dir_handle.close(path_mod.currentIo());
+
+    const source_file = try std.fs.path.join(allocator, &.{ recipe_dir, "source.txt" });
+    defer allocator.free(source_file);
+    var source_handle = try std.Io.Dir.createFileAbsolute(path_mod.currentIo(), source_file, .{});
+    defer source_handle.close(path_mod.currentIo());
+    try source_handle.writeStreamingAll(path_mod.currentIo(), "source");
+
+    const recipe_buf =
+        \\recipe {
+        \\  name "demo"
+        \\  version "1.0.0"
+        \\  release 1
+        \\}
+        \\source "source.txt" {}
+        \\package "demo" {
+        \\  files "usr/share/demo/*"
+        \\}
+    ;
+    var parsed_recipe = try recipe.parse(&test_env.ctx, recipe_buf);
+    defer parsed_recipe.deinit();
+
+    const fetch_key = try build_cache.computeSourceFetchKey(allocator, &test_env.ctx, recipe_dir, &parsed_recipe);
+    defer allocator.free(fetch_key);
+    const unpack_key = try build_cache.computeSourceUnpackKey(allocator, fetch_key);
+    defer allocator.free(unpack_key);
+
+    const cache_root = try std.fs.path.join(allocator, &.{ test_env.ctx.root(), "mere", "dev", "cache", "build" });
+    defer allocator.free(cache_root);
+    const key_path = try std.fs.path.join(allocator, &.{ cache_root, "keys", build_cache.ArtifactKind.source_unpack.asString(), unpack_key });
+    defer allocator.free(key_path);
+    if (std.fs.path.dirname(key_path)) |key_parent| {
+        var key_parent_dir = try path_mod.makePathAndOpenDir(key_parent);
+        key_parent_dir.close(path_mod.currentIo());
+    }
+
+    var key_file = try std.Io.Dir.createFileAbsolute(path_mod.currentIo(), key_path, .{ .truncate = true });
+    defer key_file.close(path_mod.currentIo());
+    try key_file.writeStreamingAll(path_mod.currentIo(), "broken\n");
+
+    const restore_dir = try std.fs.path.join(allocator, &.{ test_env.path, "restore-unpacked" });
+    defer allocator.free(restore_dir);
+
+    const restored = try restoreUnpackedSources(
+        allocator,
+        &test_env.ctx,
+        true,
+        recipe_dir,
+        &parsed_recipe,
+        restore_dir,
+    );
+    try std.testing.expect(restored == null);
+    try std.testing.expectError(error.FileNotFound, std.Io.Dir.accessAbsolute(path_mod.currentIo(), key_path, .{}));
+    const diag = test_env.ctx.getDiagnosticContext();
+    try std.testing.expect(diag.subject == null);
+    try std.testing.expect(diag.details == null);
 }
