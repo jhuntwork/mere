@@ -167,6 +167,7 @@ pub fn unpackFirstSource(
 
     var iter = src_dir_handle.iterate();
     var single_dir_name: ?[]const u8 = null;
+    defer if (single_dir_name) |name| allocator.free(name);
     var entry_count: usize = 0;
     while (true) {
         const entry = iter.next(path_mod.currentIo()) catch |err| {
@@ -180,8 +181,12 @@ pub fn unpackFirstSource(
         if (std.mem.eql(u8, e.name, ".") or std.mem.eql(u8, e.name, "..")) continue;
         entry_count += 1;
         if (entry_count == 1 and e.kind == .directory) {
-            single_dir_name = e.name;
+            single_dir_name = try allocator.dupe(u8, e.name);
         } else {
+            if (single_dir_name) |name| {
+                allocator.free(name);
+                single_dir_name = null;
+            }
             single_dir_name = null;
             break;
         }
@@ -303,8 +308,24 @@ test "SourceUnpacker handles single-directory detection functionally" {
     defer res.deinit(test_env.ctx.allocator);
 
     try std.testing.expect(res.detected_format == .tar);
-    try std.testing.expect(res.actual_src_dir.len > 0);
-    try std.testing.expect(std.mem.indexOf(u8, res.actual_src_dir, "onlydir") != null);
+    const expected_src_dir = try std.fmt.allocPrint(test_env.ctx.allocator, "{s}/onlydir", .{dest_dir});
+    defer test_env.ctx.allocator.free(expected_src_dir);
+    try std.testing.expectEqualStrings(expected_src_dir, res.actual_src_dir);
+
+    var actual_src_dir = try path_mod.openExistingDir(res.actual_src_dir);
+    actual_src_dir.close(path_mod.currentIo());
+
+    const extracted_file = try std.fmt.allocPrint(test_env.ctx.allocator, "{s}/file", .{res.actual_src_dir});
+    defer test_env.ctx.allocator.free(extracted_file);
+    const extracted_content = try std.Io.Dir.readFileAlloc(
+        std.Io.Dir.cwd(),
+        path_mod.currentIo(),
+        extracted_file,
+        test_env.ctx.allocator,
+        .limited(1024 * 16),
+    );
+    defer test_env.ctx.allocator.free(extracted_content);
+    try std.testing.expectEqualStrings("test content", extracted_content);
 }
 
 test "detectSourceArchiveFormat identifies common source archive types" {
