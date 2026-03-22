@@ -93,7 +93,10 @@ pub fn publish(
     };
     defer ctx.allocator.free(stage_dir);
 
-    var staged = try publish_mod.stageFromPublishedBaseline(ctx, stage_dir, out_dir_abs);
+    // Correctness constraint: the published output must reflect exactly the
+    // selected package set from the source repo, not stale rows inherited from
+    // the previous published baseline.
+    var staged = try publish_mod.stageEmpty(ctx, stage_dir);
     defer staged.deinit();
 
     for (selected.items) |*pkg| {
@@ -309,6 +312,54 @@ fn countPublishedPackages(ctx: *mere.Context, output_dir: []const u8) !u32 {
     return @intCast(repodb_c.sqlite3_column_int(stmt.?, 0));
 }
 
+fn publishedPackageExists(
+    ctx: *mere.Context,
+    output_dir: []const u8,
+    name: []const u8,
+    version: []const u8,
+    release: u32,
+    arch: []const u8,
+) !bool {
+    const db_path = try std.fs.path.join(ctx.allocator, &.{ output_dir, "repo.db" });
+    defer ctx.allocator.free(db_path);
+
+    var db = try RepoDB.init(ctx, db_path, true);
+    defer {
+        db.deinit();
+        ctx.allocator.destroy(db);
+    }
+
+    const sqlite_db = db.db orelse return error.FileSystem;
+    const sql = "SELECT 1 FROM packages WHERE name = ? AND version = ? AND release = ? AND arch = ? LIMIT 1;";
+    var stmt: ?*repodb_c.sqlite3_stmt = null;
+    if (repodb_c.sqlite3_prepare_v2(sqlite_db, sql.ptr, @intCast(sql.len), &stmt, null) != repodb_c.SQLITE_OK or stmt == null) {
+        return error.FileSystem;
+    }
+    defer _ = repodb_c.sqlite3_finalize(stmt.?);
+    _ = repodb_c.sqlite3_bind_text(stmt.?, 1, name.ptr, @intCast(name.len), repodb_c.SQLITE_STATIC);
+    _ = repodb_c.sqlite3_bind_text(stmt.?, 2, version.ptr, @intCast(version.len), repodb_c.SQLITE_STATIC);
+    _ = repodb_c.sqlite3_bind_int64(stmt.?, 3, @intCast(release));
+    _ = repodb_c.sqlite3_bind_text(stmt.?, 4, arch.ptr, @intCast(arch.len), repodb_c.SQLITE_STATIC);
+    return repodb_c.sqlite3_step(stmt.?) == repodb_c.SQLITE_ROW;
+}
+
+fn countPublishedArchiveFiles(ctx: *mere.Context, output_dir: []const u8) !u32 {
+    const packages_dir = try std.fs.path.join(ctx.allocator, &.{ output_dir, "packages" });
+    defer ctx.allocator.free(packages_dir);
+
+    var dir = try std.Io.Dir.openDirAbsolute(path.currentIo(), packages_dir, .{ .iterate = true });
+    defer dir.close(path.currentIo());
+
+    var iter = dir.iterate();
+    var count: u32 = 0;
+    while (try iter.next(path.currentIo())) |entry| {
+        if (entry.kind != .file) continue;
+        if (std.mem.endsWith(u8, entry.name, ".pkg.tar.zst")) count += 1;
+    }
+
+    return count;
+}
+
 test "publish with keep count selects latest local versions on initial publish" {
     const th = @import("test_helpers.zig");
     const repository = @import("repository.zig");
@@ -357,7 +408,7 @@ test "publish with keep count selects latest local versions on initial publish" 
     try std.Io.Dir.accessAbsolute(path.currentIo(), pkg6_path, .{});
 }
 
-test "publish with keep count retains published baseline lineage" {
+test "publish removes packages no longer present in source repo" {
     const th = @import("test_helpers.zig");
     const repository = @import("repository.zig");
     var test_env = try th.createTestEnv();
@@ -398,11 +449,16 @@ test "publish with keep count retains published baseline lineage" {
 
     const result = try publish(ctx, "local", output_dir, &.{}, 2);
     try std.testing.expectEqual(@as(usize, 1), result.applied_count);
-    try std.testing.expectEqual(@as(u32, 2), try countPublishedPackages(ctx, output_dir));
+    try std.testing.expectEqual(@as(u32, 1), try countPublishedPackages(ctx, output_dir));
+    try std.testing.expectEqual(@as(u32, 1), try countPublishedArchiveFiles(ctx, output_dir));
+    try std.testing.expect(!(try publishedPackageExists(ctx, output_dir, "llvm", "21.1.8", 5, "x86_64")));
+    try std.testing.expect(try publishedPackageExists(ctx, output_dir, "llvm", "21.1.8", 6, "x86_64"));
 
     const pkg5_path = try std.fs.path.join(ctx.allocator, &.{ output_dir, "packages", "llvm-21.1.8-5-x86_64-" ++ ("5" ** 64) ++ ".pkg.tar.zst" });
     defer ctx.allocator.free(pkg5_path);
-    try std.Io.Dir.accessAbsolute(path.currentIo(), pkg5_path, .{});
+    std.Io.Dir.accessAbsolute(path.currentIo(), pkg5_path, .{}) catch |err| {
+        try std.testing.expect(err == error.FileNotFound);
+    };
 
     const pkg6_path = try std.fs.path.join(ctx.allocator, &.{ output_dir, "packages", "llvm-21.1.8-6-x86_64-" ++ ("6" ** 64) ++ ".pkg.tar.zst" });
     defer ctx.allocator.free(pkg6_path);
