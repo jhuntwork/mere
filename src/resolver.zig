@@ -7,6 +7,7 @@ const store = @import("store.zig");
 const RepoCache = @import("repocache.zig").RepoCache;
 const version_constraint = @import("version_constraint.zig");
 const errors = @import("errors.zig");
+const builtin = @import("builtin");
 const Std = errors.StandardErrors;
 const max_requirement_depth: usize = 512;
 
@@ -565,7 +566,23 @@ fn removeEdge(graph: *DependencyGraph, from: []const u8, to: []const u8) void {
 }
 
 /// Compare candidates for sorting (higher priority first)
-fn compareCandidates(_: void, a: Candidate, b: Candidate) bool {
+fn currentTargetArch() []const u8 {
+    return @tagName(builtin.cpu.arch);
+}
+
+fn packageMatchesTargetArch(pkg: *const package.Package, target_arch: []const u8) bool {
+    const pkg_arch = pkg.arch orelse return false;
+    return std.mem.eql(u8, pkg_arch, target_arch) or std.mem.eql(u8, pkg_arch, "any");
+}
+
+fn candidateArchRank(candidate: Candidate, target_arch: []const u8) u8 {
+    const pkg_arch = candidate.pkg.arch orelse return 2;
+    if (std.mem.eql(u8, pkg_arch, target_arch)) return 0;
+    if (std.mem.eql(u8, pkg_arch, "any")) return 1;
+    return 2;
+}
+
+fn compareCandidates(target_arch: []const u8, a: Candidate, b: Candidate) bool {
     const version_mod = @import("version.zig");
 
     // 1. Compare versions and releases together
@@ -582,10 +599,16 @@ fn compareCandidates(_: void, a: Candidate, b: Candidate) bool {
     if (a.priority < b.priority) return true; // Lower priority number is better
     if (a.priority > b.priority) return false;
 
+    // 3. Prefer an exact target-arch package over "any" when all else is tied.
+    const a_arch_rank = candidateArchRank(a, target_arch);
+    const b_arch_rank = candidateArchRank(b, target_arch);
+    if (a_arch_rank < b_arch_rank) return true;
+    if (a_arch_rank > b_arch_rank) return false;
+
     return false; // Equal
 }
 
-fn sameRank(a: Candidate, b: Candidate) bool {
+fn sameRank(target_arch: []const u8, a: Candidate, b: Candidate) bool {
     const version_mod = @import("version.zig");
     const ver_cmp = version_mod.comparePackageVersions(
         a.pkg.version.?,
@@ -594,7 +617,7 @@ fn sameRank(a: Candidate, b: Candidate) bool {
         b.pkg.release.?,
     ) catch return false;
     if (ver_cmp != .equal) return false;
-    return a.priority == b.priority;
+    return a.priority == b.priority and candidateArchRank(a, target_arch) == candidateArchRank(b, target_arch);
 }
 
 fn matchesPin(pin_info: *const pin.Info, candidate: Candidate) bool {
@@ -725,6 +748,7 @@ fn collectCandidates(
     ctx: *Context,
     pkg_name: []const u8,
     repocaches: []*RepoCache,
+    target_arch: []const u8,
     allocator: std.mem.Allocator,
 ) !std.ArrayList(Candidate) {
     var candidates: std.ArrayList(Candidate) = .empty;
@@ -740,11 +764,13 @@ fn collectCandidates(
             // Try by name first
             if (repo.db.getPackagesByName(allocator, pkg_name)) |pkgs| {
                 var packages = pkgs;
+                var appended_by_name = false;
                 defer {
                     for (packages.items) |*pkg| pkg.deinit();
                     packages.deinit(allocator);
                 }
                 for (packages.items) |*pkg| {
+                    if (!packageMatchesTargetArch(pkg, target_arch)) continue;
                     try candidates.append(allocator, .{
                         .pkg = pkg.*,
                         .repocache = repocache,
@@ -752,8 +778,9 @@ fn collectCandidates(
                         .priority = repocache.priority,
                     });
                     pkg.* = package.Package.init(ctx);
+                    appended_by_name = true;
                 }
-                continue;
+                if (appended_by_name) continue;
             } else |err| switch (err) {
                 error.PackageNotFound => {},
                 else => {
@@ -769,11 +796,13 @@ fn collectCandidates(
             // Try by provision
             if (repo.db.getPackagesByProvision(allocator, pkg_name)) |pkgs| {
                 var packages = pkgs;
+                var appended_by_provision = false;
                 defer {
                     for (packages.items) |*pkg| pkg.deinit();
                     packages.deinit(allocator);
                 }
                 for (packages.items) |*pkg| {
+                    if (!packageMatchesTargetArch(pkg, target_arch)) continue;
                     try candidates.append(allocator, .{
                         .pkg = pkg.*,
                         .repocache = repocache,
@@ -781,8 +810,9 @@ fn collectCandidates(
                         .priority = repocache.priority,
                     });
                     pkg.* = package.Package.init(ctx);
+                    appended_by_provision = true;
                 }
-                continue;
+                if (appended_by_provision) continue;
             } else |err| switch (err) {
                 error.PackageNotFound => {},
                 else => {
@@ -805,6 +835,7 @@ fn collectCandidates(
                         packages.deinit(allocator);
                     }
                     for (packages.items) |*pkg| {
+                        if (!packageMatchesTargetArch(pkg, target_arch)) continue;
                         try candidates.append(allocator, .{
                             .pkg = pkg.*,
                             .repocache = repocache,
@@ -835,10 +866,11 @@ fn collectAndRankCandidates(
     ctx: *Context,
     pkg_name: []const u8,
     repocaches: []*RepoCache,
+    target_arch: []const u8,
     allocator: std.mem.Allocator,
     enforce_unique_top_rank: bool,
 ) ResolverError!std.ArrayList(Candidate) {
-    var candidates = try collectCandidates(ctx, pkg_name, repocaches, allocator);
+    var candidates = try collectCandidates(ctx, pkg_name, repocaches, target_arch, allocator);
     errdefer {
         for (candidates.items) |*c| {
             c.deinit();
@@ -851,12 +883,19 @@ fn collectAndRankCandidates(
     }
 
     // Sort candidates by version, release, and priority
-    std.mem.sort(Candidate, candidates.items, {}, compareCandidates);
+    const sort_ctx = struct {
+        target_arch: []const u8,
+
+        fn lessThan(ctx2: @This(), a: Candidate, b: Candidate) bool {
+            return compareCandidates(ctx2.target_arch, a, b);
+        }
+    }{ .target_arch = target_arch };
+    std.mem.sort(Candidate, candidates.items, sort_ctx, @TypeOf(sort_ctx).lessThan);
 
     if (enforce_unique_top_rank and candidates.items.len > 1) {
         var tied: usize = 1;
         while (tied < candidates.items.len) : (tied += 1) {
-            if (!sameRank(candidates.items[0], candidates.items[tied])) break;
+            if (!sameRank(target_arch, candidates.items[0], candidates.items[tied])) break;
         }
         if (tied > 1) {
             try formatAmbiguity(ctx, pkg_name, candidates.items[0..tied]);
@@ -871,7 +910,12 @@ fn loadPreferredCandidate(
     ctx: *Context,
     preferred: PreferredSelection,
     repocaches: []*RepoCache,
+    target_arch: []const u8,
 ) ResolverError!?Candidate {
+    if (!std.mem.eql(u8, preferred.arch, target_arch) and !std.mem.eql(u8, preferred.arch, "any")) {
+        return null;
+    }
+
     var best: ?Candidate = null;
     errdefer if (best) |*candidate| candidate.deinit();
 
@@ -930,6 +974,7 @@ fn collectPreferredCandidates(
     requirement_name: []const u8,
     repocaches: []*RepoCache,
     preferred_selections: []const PreferredSelection,
+    target_arch: []const u8,
     allocator: std.mem.Allocator,
 ) ResolverError!std.ArrayList(Candidate) {
     var candidates: std.ArrayList(Candidate) = .empty;
@@ -939,7 +984,7 @@ fn collectPreferredCandidates(
     }
 
     for (preferred_selections) |preferred| {
-        var candidate = (try loadPreferredCandidate(ctx, preferred, repocaches)) orelse continue;
+        var candidate = (try loadPreferredCandidate(ctx, preferred, repocaches, target_arch)) orelse continue;
         if (packageProvidesRequirementResource(&candidate.pkg, requirement_name)) {
             try candidates.append(allocator, candidate);
         } else {
@@ -948,7 +993,14 @@ fn collectPreferredCandidates(
     }
 
     if (candidates.items.len > 1) {
-        std.mem.sort(Candidate, candidates.items, {}, compareCandidates);
+        const sort_ctx = struct {
+            target_arch: []const u8,
+
+            fn lessThan(ctx2: @This(), a: Candidate, b: Candidate) bool {
+                return compareCandidates(ctx2.target_arch, a, b);
+            }
+        }{ .target_arch = target_arch };
+        std.mem.sort(Candidate, candidates.items, sort_ctx, @TypeOf(sort_ctx).lessThan);
     }
 
     return candidates;
@@ -1211,6 +1263,7 @@ fn resolveRequirement(
             requirement.name,
             repocaches,
             preferred_selections,
+            currentTargetArch(),
             allocator,
         );
         defer {
@@ -1258,6 +1311,7 @@ fn resolveRequirement(
         ctx,
         requirement.name,
         repocaches,
+        currentTargetArch(),
         allocator,
         maybe_pin == null,
     );
@@ -1464,7 +1518,7 @@ fn insertTestPackage(ctx: *Context, repo: *RepoCache, name: []const u8, deps: []
     pkg.name = try ctx.allocator.dupe(u8, name);
     pkg.version = try ctx.allocator.dupe(u8, "1.0.0");
     pkg.release = 1;
-    pkg.arch = try ctx.allocator.dupe(u8, "x86_64");
+    pkg.arch = try ctx.allocator.dupe(u8, currentTargetArch());
     pkg.signature = try ctx.allocator.dupe(u8, "sig");
     pkg.content_hash = try ctx.allocator.dupe(u8, "hash");
     pkg.archive_hash = try ctx.allocator.dupe(u8, "a" ** 64);
@@ -1492,7 +1546,7 @@ fn insertVersionedTestPackage(
     pkg.name = try ctx.allocator.dupe(u8, name);
     pkg.version = try ctx.allocator.dupe(u8, version);
     pkg.release = 1;
-    pkg.arch = try ctx.allocator.dupe(u8, "x86_64");
+    pkg.arch = try ctx.allocator.dupe(u8, currentTargetArch());
     pkg.signature = try ctx.allocator.dupe(u8, "sig");
     pkg.content_hash = try std.fmt.allocPrint(ctx.allocator, "hash-{s}-{s}", .{ name, version });
     pkg.archive_hash = try ctx.allocator.dupe(u8, "b" ** 64);
@@ -1514,6 +1568,12 @@ fn findInstallOrder(result: *const ResolutionResult, name: []const u8) ?usize {
         }
     }
     return null;
+}
+
+fn alternateTestArch() []const u8 {
+    const host_arch = currentTargetArch();
+    if (std.mem.eql(u8, host_arch, "x86_64")) return "aarch64";
+    return "x86_64";
 }
 
 fn sccContainsPackage(result: *const ResolutionResult, scc: []usize, name: []const u8) bool {
@@ -1805,7 +1865,7 @@ test "resolve version wins over repo priority" {
         pkg.name = try ctx.allocator.dupe(u8, "A");
         pkg.version = try ctx.allocator.dupe(u8, "1.0.0");
         pkg.release = 1;
-        pkg.arch = try ctx.allocator.dupe(u8, "x86_64");
+        pkg.arch = try ctx.allocator.dupe(u8, currentTargetArch());
         pkg.signature = try ctx.allocator.dupe(u8, "sig");
         pkg.content_hash = try ctx.allocator.dupe(u8, "hash1");
         pkg.archive_hash = try ctx.allocator.dupe(u8, "1" ** 64);
@@ -1819,7 +1879,7 @@ test "resolve version wins over repo priority" {
         pkg.name = try ctx.allocator.dupe(u8, "A");
         pkg.version = try ctx.allocator.dupe(u8, "2.0.0");
         pkg.release = 1;
-        pkg.arch = try ctx.allocator.dupe(u8, "x86_64");
+        pkg.arch = try ctx.allocator.dupe(u8, currentTargetArch());
         pkg.signature = try ctx.allocator.dupe(u8, "sig");
         pkg.content_hash = try ctx.allocator.dupe(u8, "hash2");
         pkg.archive_hash = try ctx.allocator.dupe(u8, "2" ** 64);
@@ -1868,7 +1928,7 @@ test "resolve prefers current exact selection over newer version" {
             .name = "A",
             .version = "1.0.0",
             .release = 1,
-            .arch = "x86_64",
+            .arch = currentTargetArch(),
             .content_hash = "hash-A-1.0.0",
         },
     };
@@ -1913,7 +1973,7 @@ test "resolve upgrades current selection when new dependency requires it" {
             .name = "A",
             .version = "1.0.0",
             .release = 1,
-            .arch = "x86_64",
+            .arch = currentTargetArch(),
             .content_hash = "hash-A-1.0.0",
         },
     };
@@ -2046,7 +2106,7 @@ test "resolved packages with same path produce path conflict error" {
         pkg_a.name = try allocator.dupe(u8, "pkg-a");
         pkg_a.version = try allocator.dupe(u8, "1.0.0");
         pkg_a.release = 1;
-        pkg_a.arch = try allocator.dupe(u8, "x86_64");
+        pkg_a.arch = try allocator.dupe(u8, currentTargetArch());
         pkg_a.signature = try allocator.dupe(u8, "sig-a");
         pkg_a.content_hash = try allocator.dupe(u8, "aaaa");
         pkg_a.archive_hash = try allocator.dupe(u8, "a" ** 64);
@@ -2059,7 +2119,7 @@ test "resolved packages with same path produce path conflict error" {
         pkg_b.name = try allocator.dupe(u8, "pkg-b");
         pkg_b.version = try allocator.dupe(u8, "1.0.0");
         pkg_b.release = 1;
-        pkg_b.arch = try allocator.dupe(u8, "x86_64");
+        pkg_b.arch = try allocator.dupe(u8, currentTargetArch());
         pkg_b.signature = try allocator.dupe(u8, "sig-b");
         pkg_b.content_hash = try allocator.dupe(u8, "bbbb");
         pkg_b.archive_hash = try allocator.dupe(u8, "b" ** 64);
@@ -2091,6 +2151,109 @@ test "resolved packages with same path produce path conflict error" {
     try std.testing.expectEqualStrings("usr/bin/foo", conflicts[0].path);
     try std.testing.expectEqualStrings("pkg-a", conflicts[0].package_a);
     try std.testing.expectEqualStrings("pkg-b", conflicts[0].package_b);
+}
+
+test "resolve filters out foreign-arch packages" {
+    const th = @import("test_helpers.zig");
+    var test_env = try th.createTestEnv();
+    defer {
+        test_env.cleanup();
+        std.testing.allocator.destroy(test_env);
+    }
+
+    const ctx = &test_env.ctx;
+    const allocator = ctx.allocator;
+
+    const repo_url = try std.fmt.allocPrint(allocator, "file://{s}/repo-arch-filter", .{test_env.path});
+    defer allocator.free(repo_url);
+    var repocache = try RepoCache.init(ctx, "repo-arch-filter", repo_url, &.{}, 100);
+    defer repocache.deinit();
+    try initTestRepository(&repocache);
+
+    if (repocache.repository) |*repo| {
+        var foreign_pkg = package.Package.init(ctx);
+        defer foreign_pkg.deinit();
+        foreign_pkg.name = try allocator.dupe(u8, "A");
+        foreign_pkg.version = try allocator.dupe(u8, "2.0.0");
+        foreign_pkg.release = 1;
+        foreign_pkg.arch = try allocator.dupe(u8, alternateTestArch());
+        foreign_pkg.signature = try allocator.dupe(u8, "sig-foreign");
+        foreign_pkg.content_hash = try allocator.dupe(u8, "foreign-hash");
+        foreign_pkg.archive_hash = try allocator.dupe(u8, "f" ** 64);
+        _ = try repo.db.insertPackageTransaction(&foreign_pkg);
+    }
+
+    if (repocache.repository) |*repo| {
+        var host_pkg = package.Package.init(ctx);
+        defer host_pkg.deinit();
+        host_pkg.name = try allocator.dupe(u8, "A");
+        host_pkg.version = try allocator.dupe(u8, "1.0.0");
+        host_pkg.release = 1;
+        host_pkg.arch = try allocator.dupe(u8, currentTargetArch());
+        host_pkg.signature = try allocator.dupe(u8, "sig-host");
+        host_pkg.content_hash = try allocator.dupe(u8, "host-hash");
+        host_pkg.archive_hash = try allocator.dupe(u8, "h" ** 64);
+        _ = try repo.db.insertPackageTransaction(&host_pkg);
+    }
+
+    var repocaches = [_]*RepoCache{&repocache};
+    var result = try resolve(ctx, &.{"A"}, repocaches[0..], allocator);
+    defer result.deinit();
+
+    try std.testing.expectEqual(@as(usize, 1), result.packages.len);
+    try std.testing.expectEqualStrings("1.0.0", result.packages[0].pkg.version.?);
+    try std.testing.expectEqualStrings(currentTargetArch(), result.packages[0].pkg.arch.?);
+}
+
+test "resolve prefers exact host arch over any when tied" {
+    const th = @import("test_helpers.zig");
+    var test_env = try th.createTestEnv();
+    defer {
+        test_env.cleanup();
+        std.testing.allocator.destroy(test_env);
+    }
+
+    const ctx = &test_env.ctx;
+    const allocator = ctx.allocator;
+
+    const repo_url = try std.fmt.allocPrint(allocator, "file://{s}/repo-any-tie", .{test_env.path});
+    defer allocator.free(repo_url);
+    var repocache = try RepoCache.init(ctx, "repo-any-tie", repo_url, &.{}, 100);
+    defer repocache.deinit();
+    try initTestRepository(&repocache);
+
+    if (repocache.repository) |*repo| {
+        var any_pkg = package.Package.init(ctx);
+        defer any_pkg.deinit();
+        any_pkg.name = try allocator.dupe(u8, "A");
+        any_pkg.version = try allocator.dupe(u8, "1.0.0");
+        any_pkg.release = 1;
+        any_pkg.arch = try allocator.dupe(u8, "any");
+        any_pkg.signature = try allocator.dupe(u8, "sig-any");
+        any_pkg.content_hash = try allocator.dupe(u8, "any-hash");
+        any_pkg.archive_hash = try allocator.dupe(u8, "a" ** 64);
+        _ = try repo.db.insertPackageTransaction(&any_pkg);
+    }
+
+    if (repocache.repository) |*repo| {
+        var host_pkg = package.Package.init(ctx);
+        defer host_pkg.deinit();
+        host_pkg.name = try allocator.dupe(u8, "A");
+        host_pkg.version = try allocator.dupe(u8, "1.0.0");
+        host_pkg.release = 1;
+        host_pkg.arch = try allocator.dupe(u8, currentTargetArch());
+        host_pkg.signature = try allocator.dupe(u8, "sig-host");
+        host_pkg.content_hash = try allocator.dupe(u8, "host-hash");
+        host_pkg.archive_hash = try allocator.dupe(u8, "b" ** 64);
+        _ = try repo.db.insertPackageTransaction(&host_pkg);
+    }
+
+    var repocaches = [_]*RepoCache{&repocache};
+    var result = try resolve(ctx, &.{"A"}, repocaches[0..], allocator);
+    defer result.deinit();
+
+    try std.testing.expectEqual(@as(usize, 1), result.packages.len);
+    try std.testing.expectEqualStrings(currentTargetArch(), result.packages[0].pkg.arch.?);
 }
 
 test "resolve fails cleanly when dependency recursion depth exceeds limit" {
