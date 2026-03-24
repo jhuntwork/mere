@@ -1076,13 +1076,13 @@ test "EnvOptions defaults" {
 test "cloneHostEnvWithVar injects requested variable" {
     const allocator = std.testing.allocator;
 
-    const envp = try cloneHostEnvWithVar(allocator, "MERE_SHELL_PROFILE", "zig");
+    const envp = try cloneHostEnvWithVar(allocator, "MERE_PROFILE", "zig");
     defer freeOwnedEnv(allocator, envp);
 
     var found = false;
     for (envp) |entry| {
         const kv = std.mem.span(entry);
-        if (std.mem.eql(u8, kv, "MERE_SHELL_PROFILE=zig")) {
+        if (std.mem.eql(u8, kv, "MERE_PROFILE=zig")) {
             found = true;
             break;
         }

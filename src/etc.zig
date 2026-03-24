@@ -479,7 +479,12 @@ fn loadActiveSystemManifest(ctx: *Context) error{ NoActiveGeneration, OutOfMemor
     };
     defer ctx.allocator.free(gen_dir);
 
-    return generation.readManifest(ctx.allocator, gen_dir) catch {
+    const store_root = std.fs.path.join(ctx.allocator, &.{ ctx.root_path, "mere", "store" }) catch {
+        return error.OutOfMemory;
+    };
+    defer ctx.allocator.free(store_root);
+
+    return generation.readManifest(ctx.allocator, store_root, gen_dir) catch {
         return error.FileSystem;
     };
 }

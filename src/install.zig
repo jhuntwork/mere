@@ -26,16 +26,17 @@ const activation = @import("activation.zig");
 const gcroots = @import("gcroots.zig");
 const version_mod = @import("version.zig");
 const version_constraint = @import("version_constraint.zig");
-const requested = @import("requested.zig");
 const emit = mere.ui.emit;
 
 const InstallRootRequirement = struct {
     name: []const u8,
     constraint_expr: ?[]const u8 = null,
+    content_hash: ?[]const u8 = null,
 
     fn deinit(self: *InstallRootRequirement, allocator: std.mem.Allocator) void {
         allocator.free(self.name);
         if (self.constraint_expr) |expr| allocator.free(expr);
+        if (self.content_hash) |h| allocator.free(h);
     }
 };
 
@@ -141,6 +142,128 @@ pub fn installPackagesFromConfig(
     };
 }
 
+/// Install packages from PackageSpec entries (from profile.kdl input).
+/// Converts version/release/content-hash into resolver constraints.
+pub fn installPackageSpecsFromConfig(
+    ctx: *Context,
+    specs: []const generation.PackageSpec,
+    client: download.TransferClient,
+    reinstall: bool,
+    verify_store: bool,
+    force_sync: bool,
+    profile_name: ?[]const u8,
+) !InstallCommandOutcome {
+    if (specs.len == 0) {
+        return ctx.fail(error.InvalidInput, "package", "no package specs provided");
+    }
+
+    // Extract names for the existing pipeline
+    const pkg_names = try ctx.allocator.alloc([]const u8, specs.len);
+    defer ctx.allocator.free(pkg_names);
+    for (specs, 0..) |s, i| pkg_names[i] = s.name;
+
+    const config = ctx.configuration orelse {
+        return ctx.fail(error.InvalidConfig, "configuration", "no configuration loaded");
+    };
+    config.validate() catch {
+        return ctx.fail(error.InvalidConfig, "configuration", "invalid repository configuration");
+    };
+
+    const target_behavior = determineInstallTargetBehavior(profile_name, null, store.isPrivileged());
+
+    const phase_name: []const u8 = if (specs.len == 1) specs[0].name else "multiple";
+    emit.phaseStart(ctx, .install, .{ .name = phase_name });
+    errdefer emit.phaseEnd(ctx, .install, false);
+
+    var repocaches = try repo_sources.createCaches(ctx, &config);
+    defer {
+        for (repocaches.items) |rc| {
+            rc.deinit();
+            ctx.allocator.destroy(rc);
+        }
+        repocaches.deinit(ctx.allocator);
+    }
+
+    // Convert specs to install root requirements with constraints
+    var input_requirements = try specsToInstallRequirements(ctx.allocator, specs);
+    defer deinitInstallRootRequirements(ctx.allocator, &input_requirements);
+
+    var resolver_requirements: []resolver.Requirement = &.{};
+    var owned_resolver_requirements: ?[]resolver.Requirement = null;
+    defer if (owned_resolver_requirements) |items| ctx.allocator.free(items);
+    var preferred_selections_state: ?PreferredSelectionsState = null;
+    defer if (preferred_selections_state) |*state| state.deinit();
+    var preferred_selections: []const resolver.PreferredSelection = &.{};
+
+    var requested_state: ?RequestedRootsState = null;
+    defer if (requested_state) |*state| state.deinit(ctx.allocator);
+
+    if (target_behavior == .activate_profile and profile_name != null) {
+        requested_state = try buildRequestedRootsAfterAdd(ctx, profile_name.?, input_requirements.items);
+        owned_resolver_requirements = try buildProfileResolverRequirements(
+            ctx.allocator,
+            input_requirements.items,
+            requested_state.?.packages.items,
+        );
+        resolver_requirements = owned_resolver_requirements.?;
+        preferred_selections_state = try loadCurrentGenerationPreferences(ctx, profile_name.?);
+        preferred_selections = preferred_selections_state.?.selections;
+    } else {
+        owned_resolver_requirements = try installRequirementsToResolverRequirements(ctx.allocator, input_requirements.items);
+        resolver_requirements = owned_resolver_requirements.?;
+    }
+
+    var loaded_keys = try sign.loadAllKeys(ctx);
+    defer {
+        for (loaded_keys.items) |*key| key.deinit(ctx.allocator);
+        loaded_keys.deinit(ctx.allocator);
+    }
+
+    try syncRepoCaches(ctx, repocaches.items, client, force_sync, loaded_keys.items);
+
+    var arena = std.heap.ArenaAllocator.init(ctx.allocator);
+    defer arena.deinit();
+
+    var plan = try resolveInstallPlan(ctx, repocaches.items, resolver_requirements, preferred_selections, arena.allocator());
+    defer plan.resolution.deinit();
+
+    const has_target_step = target_behavior == .activate_profile;
+    emit.stepStartLast(ctx, .install, "store admission", !has_target_step);
+    var store_step_open = true;
+    errdefer if (store_step_open) emit.stepEnd(ctx, .install, "store admission", false);
+
+    var installed_packages = try installResolvedPackages(ctx, plan.sorted, client, reinstall, loaded_keys.items);
+    emit.stepEnd(ctx, .install, "store admission", true);
+    store_step_open = false;
+
+    defer {
+        for (installed_packages.items) |*pkg_info| {
+            pkg_info.deinit(ctx.allocator);
+        }
+        installed_packages.deinit(ctx.allocator);
+    }
+
+    switch (target_behavior) {
+        .activate_profile => {
+            const target_step_name = "activation";
+            emit.stepStartLast(ctx, .install, target_step_name, true);
+            var target_step_open = true;
+            errdefer if (target_step_open) emit.stepEnd(ctx, .install, target_step_name, false);
+            try applyInstallTargets(ctx, installed_packages.items, profile_name, null, verify_store);
+            emit.stepEnd(ctx, .install, target_step_name, true);
+            target_step_open = false;
+        },
+        .store_only_system_deferred => {},
+        .store_only_requested => {},
+    }
+
+    emit.phaseEnd(ctx, .install, true);
+    return switch (target_behavior) {
+        .store_only_system_deferred => .store_only_system_activation_deferred,
+        .store_only_requested, .activate_profile => .completed,
+    };
+}
+
 pub fn uninstallPackagesFromConfig(
     ctx: *Context,
     pkg_names: []const []const u8,
@@ -173,8 +296,6 @@ pub fn uninstallPackagesFromConfig(
     if (requested_state.removed_count == 0) {
         return "No requested packages matched";
     }
-
-    try persistRequestedRoots(ctx, &requested_state);
 
     if (requested_state.packages.items.len > 0) {
         var requested_tokens: std.ArrayList([]const u8) = .empty;
@@ -302,9 +423,6 @@ pub fn installPackagesToProfile(
 
     switch (target_behavior) {
         .activate_profile => {
-            if (requested_state) |*state| {
-                try persistRequestedRoots(ctx, state);
-            }
             const target_step_name: []const u8 = if (target_profile_path != null) "profile link" else "activation";
             emit.stepStartLast(ctx, .install, target_step_name, true);
             var target_step_open = true;
@@ -321,15 +439,23 @@ pub fn installPackagesToProfile(
 }
 
 const RequestedRootsState = struct {
-    requested_path: []const u8,
-    packages: std.ArrayList(requested.RequestedPackage),
+    packages: std.ArrayList(RequestedPackage),
     changed: bool,
     removed_count: usize,
 
     fn deinit(self: *RequestedRootsState, allocator: std.mem.Allocator) void {
-        allocator.free(self.requested_path);
         for (self.packages.items) |*pkg| pkg.deinit(allocator);
         self.packages.deinit(allocator);
+    }
+};
+
+const RequestedPackage = struct {
+    name: []const u8,
+    version: ?[]const u8,
+
+    fn deinit(self: *RequestedPackage, allocator: std.mem.Allocator) void {
+        allocator.free(self.name);
+        if (self.version) |v| allocator.free(v);
     }
 };
 
@@ -368,25 +494,47 @@ fn loadRequestedRootsState(ctx: *Context, profile_name: []const u8) !RequestedRo
         };
     };
 
-    const requested_path = requested.getRequestedPath(ctx.allocator, profile_dir) catch {
-        return error.OutOfMemory;
-    };
-    errdefer ctx.allocator.free(requested_path);
-
-    var packages = requested.loadRequested(ctx.allocator, requested_path) catch |err| {
-        return mapRequestedError(err);
-    };
+    // Read package names from the current generation's profile.kdl
+    var packages: std.ArrayList(RequestedPackage) = .empty;
     errdefer {
         for (packages.items) |*pkg| pkg.deinit(ctx.allocator);
         packages.deinit(ctx.allocator);
     }
 
+    const manifest_opt = loadCurrentManifest(ctx, profile_name, profile_dir);
+    if (manifest_opt) |manifest_data| {
+        var current = manifest_data;
+        defer current.deinit();
+
+        for (current.packages.items) |pkg| {
+            const name_copy = ctx.allocator.dupe(u8, pkg.name) catch return error.OutOfMemory;
+            errdefer ctx.allocator.free(name_copy);
+            packages.append(ctx.allocator, .{ .name = name_copy, .version = null }) catch return error.OutOfMemory;
+        }
+    }
+
     return RequestedRootsState{
-        .requested_path = requested_path,
         .packages = packages,
         .changed = false,
         .removed_count = 0,
     };
+}
+
+fn loadCurrentManifest(ctx: *Context, profile_name: []const u8, profile_dir: []const u8) ?generation.GenerationManifest {
+    const store_root = std.fs.path.join(ctx.allocator, &.{ ctx.root_path, "mere", "store" }) catch return null;
+    defer ctx.allocator.free(store_root);
+
+    if (std.mem.eql(u8, profile_name, "system")) {
+        const current_gen = generation.getCurrentGeneration(profile_dir) catch return null;
+        const gen_num = current_gen orelse return null;
+        const gen_path = generation.getGenerationPath(ctx.allocator, profile_dir, gen_num) catch return null;
+        defer ctx.allocator.free(gen_path);
+        return generation.readManifest(ctx.allocator, store_root, gen_path) catch null;
+    } else {
+        const root_path = profile.getRootPath(ctx.allocator, profile_dir) catch return null;
+        defer ctx.allocator.free(root_path);
+        return generation.readManifest(ctx.allocator, store_root, root_path) catch null;
+    }
 }
 
 fn buildRequestedRootsAfterAdd(
@@ -498,6 +646,9 @@ fn loadCurrentGenerationPreferences(ctx: *Context, profile_name: []const u8) !Pr
     const profile_dir = try getProfileDir(ctx, profile_name);
     defer ctx.allocator.free(profile_dir);
 
+    const store_root = std.fs.path.join(ctx.allocator, &.{ ctx.root_path, "mere", "store" }) catch return error.OutOfMemory;
+    defer ctx.allocator.free(store_root);
+
     if (!std.mem.eql(u8, profile_name, "system")) {
         const root_path = profile.getRootPath(ctx.allocator, profile_dir) catch return error.OutOfMemory;
         defer ctx.allocator.free(root_path);
@@ -510,7 +661,7 @@ fn loadCurrentGenerationPreferences(ctx: *Context, profile_name: []const u8) !Pr
             };
         };
 
-        var manifest_data = generation.readManifest(ctx.allocator, root_path) catch |err| {
+        var manifest_data = generation.readManifest(ctx.allocator, store_root, root_path) catch |err| {
             return switch (err) {
                 generation.GenerationError.OutOfMemory => error.OutOfMemory,
                 generation.GenerationError.PermissionDenied => error.PermissionDenied,
@@ -549,7 +700,7 @@ fn loadCurrentGenerationPreferences(ctx: *Context, profile_name: []const u8) !Pr
     };
     defer ctx.allocator.free(gen_path);
 
-    var manifest_data = generation.readManifest(ctx.allocator, gen_path) catch |err| {
+    var manifest_data = generation.readManifest(ctx.allocator, store_root, gen_path) catch |err| {
         return switch (err) {
             generation.GenerationError.OutOfMemory => error.OutOfMemory,
             generation.GenerationError.PermissionDenied => error.PermissionDenied,
@@ -620,6 +771,44 @@ fn deinitInstallRootRequirements(
     requirements.deinit(allocator);
 }
 
+/// Convert PackageSpec entries (from profile.kdl) into InstallRootRequirements.
+/// Maps the input gradient: content-hash → exact match, version+release → constraint, name → unconstrained.
+fn specsToInstallRequirements(
+    allocator: std.mem.Allocator,
+    specs: []const generation.PackageSpec,
+) !std.ArrayList(InstallRootRequirement) {
+    var requirements: std.ArrayList(InstallRootRequirement) = .empty;
+    errdefer deinitInstallRootRequirements(allocator, &requirements);
+
+    for (specs) |spec| {
+        const name_copy = try allocator.dupe(u8, spec.name);
+        errdefer allocator.free(name_copy);
+
+        var content_hash_copy: ?[]const u8 = null;
+        errdefer if (content_hash_copy) |hc| allocator.free(hc);
+
+        var constraint: ?[]const u8 = null;
+        errdefer if (constraint) |cc| allocator.free(cc);
+
+        if (spec.content_hash) |h| {
+            content_hash_copy = try allocator.dupe(u8, h);
+        } else if (spec.version) |v| {
+            constraint = if (spec.release) |r|
+                try std.fmt.allocPrint(allocator, "=={s}-{d}", .{ v, r })
+            else
+                try std.fmt.allocPrint(allocator, "=={s}", .{v});
+        }
+
+        try requirements.append(allocator, .{
+            .name = name_copy,
+            .constraint_expr = constraint,
+            .content_hash = content_hash_copy,
+        });
+    }
+
+    return requirements;
+}
+
 fn installRequirementsToResolverRequirements(
     allocator: std.mem.Allocator,
     requirements: []const InstallRootRequirement,
@@ -629,6 +818,7 @@ fn installRequirementsToResolverRequirements(
         out[idx] = .{
             .name = req.name,
             .constraint_expr = req.constraint_expr,
+            .content_hash = req.content_hash,
         };
     }
     return out;
@@ -637,7 +827,7 @@ fn installRequirementsToResolverRequirements(
 fn buildProfileResolverRequirements(
     allocator: std.mem.Allocator,
     explicit_requirements: []const InstallRootRequirement,
-    packages: []const requested.RequestedPackage,
+    packages: []const RequestedPackage,
 ) ![]resolver.Requirement {
     const out = try allocator.alloc(resolver.Requirement, packages.len);
     var seen = std.StringHashMap(void).init(allocator);
@@ -648,6 +838,7 @@ fn buildProfileResolverRequirements(
         out[idx] = .{
             .name = req.name,
             .constraint_expr = req.constraint_expr,
+            .content_hash = req.content_hash,
         };
         idx += 1;
         try seen.put(req.name, {});
@@ -664,20 +855,6 @@ fn buildProfileResolverRequirements(
 
     std.debug.assert(idx == packages.len);
     return out;
-}
-
-fn persistRequestedRoots(ctx: *Context, state: *RequestedRootsState) !void {
-    if (!state.changed) return;
-    requested.saveRequested(ctx.allocator, state.requested_path, state.packages.items) catch |err| {
-        return mapRequestedError(err);
-    };
-}
-
-fn mapRequestedError(err: anyerror) anyerror {
-    return switch (err) {
-        requested.RequestedError.OutOfMemory => error.OutOfMemory,
-        else => error.FileSystem,
-    };
 }
 
 const InstallPlan = struct {
@@ -1983,7 +2160,7 @@ test "buildProfileResolverRequirements orders explicit roots before existing req
         .constraint_expr = null,
     });
 
-    var requested_packages: std.ArrayList(requested.RequestedPackage) = .empty;
+    var requested_packages: std.ArrayList(RequestedPackage) = .empty;
     defer {
         for (requested_packages.items) |*pkg| pkg.deinit(allocator);
         requested_packages.deinit(allocator);
@@ -2016,7 +2193,7 @@ test "integration: full install pipeline publishes named profile root" {
     // 3. Dependency resolution across repos
     // 4. Package download and extraction
     // 5. Store placement with content-addressed paths
-    // 6. Named-profile root publish with manifest.json
+    // 6. Named-profile root publish with profile.kdl
     // 7. Profile symlink tree building
     // 8. No generation activation state for named profiles
 
@@ -2277,12 +2454,12 @@ test "integration: full install pipeline publishes named profile root" {
     defer ctx.allocator.free(root_dir);
     try std.Io.Dir.accessAbsolute(path.currentIo(), root_dir, .{});
 
-    // 3. Verify manifest.json exists in root
-    const manifest_json_path = try std.fs.path.join(ctx.allocator, &.{ root_dir, "manifest.json" });
+    // 3. Verify profile.kdl exists in root
+    const manifest_json_path = try std.fs.path.join(ctx.allocator, &.{ root_dir, "profile.kdl" });
     defer ctx.allocator.free(manifest_json_path);
     try std.Io.Dir.accessAbsolute(path.currentIo(), manifest_json_path, .{});
 
-    // 4. Verify manifest.json contains correct packages
+    // 4. Verify profile.kdl contains correct packages
     const manifest_content = try std.Io.Dir.readFileAlloc(std.Io.Dir.cwd(), path.currentIo(), manifest_json_path, ctx.allocator, .limited(1024 * 1024));
     defer ctx.allocator.free(manifest_content);
 
@@ -2576,7 +2753,7 @@ test "integration: named profile lifecycle replaces root atomically and additive
     try std.Io.Dir.accessAbsolute(path.currentIo(), root_tool_a, .{});
     try std.Io.Dir.accessAbsolute(path.currentIo(), root_tool_c, .{});
 
-    const root_manifest_path = try std.fs.path.join(ctx.allocator, &.{ root_dir, "manifest.json" });
+    const root_manifest_path = try std.fs.path.join(ctx.allocator, &.{ root_dir, "profile.kdl" });
     defer ctx.allocator.free(root_manifest_path);
     const root_manifest_data = blk: {
         const file = try path.openExistingFile(root_manifest_path);
@@ -2597,7 +2774,9 @@ test "integration: named profile lifecycle replaces root atomically and additive
     defer ctx.allocator.free(current_link);
     try std.testing.expectError(error.FileNotFound, std.Io.Dir.accessAbsolute(path.currentIo(), current_link, .{}));
     try std.testing.expectEqual(@as(?u32, null), try generation.getCurrentGeneration(profile_dir));
-    const all_gens = try generation.listGenerations(ctx.allocator, profile_dir);
+    const test_store_root = try std.fs.path.join(ctx.allocator, &.{ ctx.root_path, "mere", "store" });
+    defer ctx.allocator.free(test_store_root);
+    const all_gens = try generation.listGenerations(ctx.allocator, test_store_root, profile_dir);
     defer ctx.allocator.free(all_gens);
     try std.testing.expectEqual(@as(usize, 0), all_gens.len);
 }
@@ -3157,7 +3336,7 @@ test "integration: multi-repository priority selection" {
     defer ctx.allocator.free(profile_dir);
     const root_dir = try profile.getRootPath(ctx.allocator, profile_dir);
     defer ctx.allocator.free(root_dir);
-    const root_manifest_path = try std.fs.path.join(ctx.allocator, &.{ root_dir, "manifest.json" });
+    const root_manifest_path = try std.fs.path.join(ctx.allocator, &.{ root_dir, "profile.kdl" });
     defer ctx.allocator.free(root_manifest_path);
 
     const root_manifest_data = blk: {
@@ -3380,7 +3559,7 @@ test "integration: garbage collection removes unreferenced store paths" {
     // Step 1: Install pkgA (creates gen-1 with only A)
     const pkg_a_names = [_][]const u8{"pkgA"};
     try installPackagesToProfile(ctx, &repocaches, pkg_a_names[0..], client, false, false, false, profile_name, null);
-    try gcroots.updateRoots(ctx.allocator, gc_roots_dir, profile_dir, 2);
+    try gcroots.updateRoots(ctx.allocator, store_dir, gc_roots_dir, profile_dir, 2);
 
     const store_path_a = try std.fmt.allocPrint(ctx.allocator, "{s}/{s}-pkgA-1.0.0", .{ store_dir, hash_a });
     defer ctx.allocator.free(store_path_a);
@@ -3391,7 +3570,7 @@ test "integration: garbage collection removes unreferenced store paths" {
     // Step 2: Install pkgB (additive: creates gen-2 with A + B)
     const pkg_b_names = [_][]const u8{"pkgB"};
     try installPackagesToProfile(ctx, &repocaches, pkg_b_names[0..], client, false, false, false, profile_name, null);
-    try gcroots.updateRoots(ctx.allocator, gc_roots_dir, profile_dir, 2);
+    try gcroots.updateRoots(ctx.allocator, store_dir, gc_roots_dir, profile_dir, 2);
 
     const store_path_b = try std.fmt.allocPrint(ctx.allocator, "{s}/{s}-pkgB-1.0.0", .{ store_dir, hash_b });
     defer ctx.allocator.free(store_path_b);

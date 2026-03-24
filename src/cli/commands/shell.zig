@@ -16,7 +16,7 @@ const shell_meta = command.CommandMeta{
         .{
             .name = "profile",
             .short = 'p',
-            .description = "Profile name (required unless MERE_SHELL_PROFILE is set)",
+            .description = "Profile name to enter",
             .flag_type = .string,
             .value_name = "name",
         },
@@ -30,21 +30,21 @@ const shell_meta = command.CommandMeta{
 
 fn handleShell(ctx: *mere.Context, args: *const types.ParsedArgs) MereError!types.CommandResult {
     const no_etc_overlay = args.getBool("no-etc-overlay");
-    if (args.positional.len > 0 and args.passthrough.len == 0) {
+    if (args.positional.len > 1 and args.passthrough.len == 0) {
         return types.CommandResult{
             .success = false,
             .exit_code = 2,
             .message = try ctx.allocator.dupe(
                 u8,
-                "unexpected positional arguments; use `mere shell -- <command> [args...]` to run a command",
+                "unexpected positional arguments; use `mere shell [profile.kdl] -- <command> [args...]`",
             ),
         };
     }
 
     // Profile resolution order:
-    // 1. --profile/-p
-    // 2. MERE_SHELL_PROFILE environment variable
-    // 3. No implicit fallback
+    // 1. --profile/-p flag (existing named profile)
+    // 2. positional arg (path to profile.kdl file)
+    // 3. profile.kdl in current directory
     const profile_name = resolveProfileName(ctx, args) catch |err| {
         if (err == error.OutOfMemory) return MereError.OutOfMemory;
         if (err == error.NoProfileSelected) {
@@ -53,14 +53,14 @@ fn handleShell(ctx: *mere.Context, args: *const types.ParsedArgs) MereError!type
                 .exit_code = 2,
                 .message = try ctx.allocator.dupe(
                     u8,
-                    "No profile selected. Use `mere shell --profile <name>` (or `-p <name>`) or set MERE_SHELL_PROFILE.",
+                    "No profile selected. Use `mere shell --profile <name>` or place a profile.kdl in the current directory.",
                 ),
             };
         }
         return types.CommandResult{
             .success = false,
             .exit_code = 1,
-            .message = try ctx.allocator.dupe(u8, "Failed to resolve profile name"),
+            .message = try ctx.allocator.dupe(u8, "Failed to resolve profile"),
         };
     };
     defer ctx.allocator.free(profile_name);
@@ -93,7 +93,7 @@ fn handleShell(ctx: *mere.Context, args: *const types.ParsedArgs) MereError!type
     };
     defer ctx.allocator.free(invocation_cwd);
 
-    const shell_env = namespace.cloneHostEnvWithVar(ctx.allocator, "MERE_SHELL_PROFILE", profile_name) catch {
+    const shell_env = namespace.cloneHostEnvWithVar(ctx.allocator, "MERE_PROFILE", profile_name) catch {
         return types.CommandResult{
             .success = false,
             .exit_code = 1,
@@ -187,38 +187,67 @@ fn handleShell(ctx: *mere.Context, args: *const types.ParsedArgs) MereError!type
     unreachable;
 }
 
-// Resolve profile name according to spec §15.9 precedence
+// Resolve profile name according to spec §15.12 precedence
 fn resolveProfileName(ctx: *mere.Context, args: *const types.ParsedArgs) ![]const u8 {
-    const env_profile = if (std.c.getenv("MERE_SHELL_PROFILE")) |value| std.mem.span(value) else null;
-    const profile_name = resolveProfileNameFromSources(args.getString("profile"), env_profile) orelse {
-        return error.NoProfileSelected;
-    };
-
-    if (args.getString("profile") == null) {
-        const segments = [_]mere.ui.Segment{
-            .{ .text = "using profile from ", .kind = .normal },
-            .{ .text = "MERE_SHELL_PROFILE", .kind = .label },
-            .{ .text = ": ", .kind = .normal },
-            .{ .text = profile_name, .kind = .detail },
-        };
-        emit.logSegmentsSeverity(ctx, .shell, .info, &segments);
+    // 1. --profile/-p flag
+    if (args.getString("profile")) |value| {
+        return try ctx.allocator.dupe(u8, value);
     }
 
-    return try ctx.allocator.dupe(u8, profile_name);
+    // 2. Positional arg (path to profile.kdl)
+    if (args.positional.len > 0 and args.passthrough.len == 0) {
+        return try buildProfileFromFile(ctx, args.positional[0]);
+    }
+
+    // 3. profile.kdl in current directory
+    return buildProfileFromFile(ctx, "profile.kdl");
 }
 
-fn resolveProfileNameFromSources(profile_flag: ?[]const u8, env_profile: ?[]const u8) ?[]const u8 {
-    // 1. --profile/-p flag
-    if (profile_flag) |value| {
-        return value;
-    }
+fn buildProfileFromFile(ctx: *mere.Context, file_path: []const u8) ![]const u8 {
+    const io = path.currentIo();
 
-    // 2. Environment variable
-    if (env_profile) |value| {
-        return value;
-    }
+    // Read file once — used for both parsing and hashing
+    var file = path.openExistingFile(file_path) catch return error.NoProfileSelected;
+    defer file.close(io);
+    const stat = file.stat(io) catch return error.NoProfileSelected;
+    const content = ctx.allocator.alloc(u8, @intCast(stat.size)) catch return error.OutOfMemory;
+    defer ctx.allocator.free(content);
+    _ = file.readPositionalAll(io, content, 0) catch return error.NoProfileSelected;
 
-    return null;
+    const specs = mere.generation.parseProfilePackageSpecs(ctx.allocator, content) catch return error.NoProfileSelected;
+    defer {
+        for (specs) |*s| @constCast(s).deinit(ctx.allocator);
+        ctx.allocator.free(specs);
+    }
+    if (specs.len == 0) return error.NoProfileSelected;
+
+    // Derive a deterministic profile name from file content hash
+    const full_hash = mere.hash.calculateBytesHash(ctx.allocator, content) catch return error.OutOfMemory;
+    defer ctx.allocator.free(full_hash);
+    const profile_name = try std.fmt.allocPrint(ctx.allocator, "shell-{s}", .{full_hash[0..12]});
+    errdefer ctx.allocator.free(profile_name);
+
+    // Skip build if this profile is already realized
+    const profiles_base = try std.fs.path.join(ctx.allocator, &.{ ctx.root_path, "mere", "profiles" });
+    defer ctx.allocator.free(profiles_base);
+    const root_path = try std.fs.path.join(ctx.allocator, &.{ profiles_base, profile_name, "root" });
+    defer ctx.allocator.free(root_path);
+
+    std.Io.Dir.accessAbsolute(io, root_path, .{}) catch {
+        const segments = [_]mere.ui.Segment{
+            .{ .text = "building shell profile from ", .kind = .normal },
+            .{ .text = file_path, .kind = .detail },
+        };
+        emit.logSegmentsSeverity(ctx, .shell, .info, &segments);
+
+        _ = try ctx.getConfig();
+        var curl_client = try mere.download.CurlTransferClient.init(ctx);
+        defer mere.download.CurlTransferClient.cleanupFn(ctx, curl_client);
+        const client = curl_client.client();
+        _ = try mere.install.installPackageSpecsFromConfig(ctx, specs, client, false, false, false, profile_name);
+    };
+
+    return profile_name;
 }
 
 fn resolveProfileRoot(allocator: std.mem.Allocator, root_path: []const u8, profile_name: []const u8) ![]const u8 {

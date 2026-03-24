@@ -392,7 +392,7 @@ fn verifyProfiles(
 
                 result.profile_realizations_checked += 1;
 
-                var gen_manifest = generation.readManifest(ctx.allocator, gen_path) catch {
+                var gen_manifest = generation.readManifest(ctx.allocator, store_root, gen_path) catch {
                     result.profile_issues += 1;
                     try addProfileIssue(ctx, result, gen_path, entry.name, pentry.name, "generation manifest missing or invalid");
                     continue;
@@ -422,7 +422,7 @@ fn verifyProfiles(
             };
 
             result.profile_realizations_checked += 1;
-            var root_manifest = generation.readManifest(ctx.allocator, root_path) catch {
+            var root_manifest = generation.readManifest(ctx.allocator, store_root, root_path) catch {
                 result.profile_issues += 1;
                 try addProfileIssue(ctx, result, root_path, entry.name, "root", "profile manifest missing or invalid");
                 continue;
@@ -871,11 +871,10 @@ test "verify profiles reports profile manifest hash mismatch without full hash" 
     defer ctx.allocator.free(store_root);
     try path_mod.ensureDirExists(store_root);
 
-    const store_hash = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
-    const manifest_hash = "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd";
-    const store_path = try store.constructStorePath(ctx, store_hash, "demo", "1.0.0");
-    defer ctx.allocator.free(store_path);
-    try path_mod.ensureDirExists(store_path);
+    // Use a content hash whose derived store path won't exist on disk.
+    // With derived store paths, the verification detects "store path does not exist"
+    // rather than a hash mismatch.
+    const content_hash = "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd";
 
     const profile_root = try std.fs.path.join(ctx.allocator, &.{ test_env.path, "mere", "profiles", "user" });
     defer ctx.allocator.free(profile_root);
@@ -885,9 +884,13 @@ test "verify profiles reports profile manifest hash mismatch without full hash" 
     defer ctx.allocator.free(root_dir);
     try path_mod.ensureDirExists(root_dir);
 
+    // Derive the store path that parse() will produce
+    const derived_store_path = try std.fs.path.join(ctx.allocator, &.{ store_root, content_hash ++ "-demo-1.0.0" });
+    defer ctx.allocator.free(derived_store_path);
+
     var manifest_data = generation.GenerationManifest.initRoot(ctx.allocator);
     defer manifest_data.deinit();
-    try manifest_data.addPackage("demo", "1.0.0", 1, "x86_64", store_path, manifest_hash);
+    try manifest_data.addPackage("demo", "1.0.0", 1, "x86_64", derived_store_path, content_hash);
     try generation.writeManifest(ctx.allocator, root_dir, &manifest_data);
 
     var result = VerifyResult{};
@@ -898,7 +901,7 @@ test "verify profiles reports profile manifest hash mismatch without full hash" 
 
     var found = false;
     for (result.issues.items) |issue| {
-        if (std.mem.containsAtLeast(u8, issue.message, 1, "profile manifest content hash does not match store path")) {
+        if (std.mem.containsAtLeast(u8, issue.message, 1, "store path does not exist")) {
             found = true;
             break;
         }
