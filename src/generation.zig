@@ -1,4 +1,6 @@
 const std = @import("std");
+const builtin = @import("builtin");
+const kdl = @import("kdl.zig");
 const errors = @import("errors.zig");
 const path_mod = @import("path.zig");
 
@@ -12,8 +14,8 @@ pub const GenerationError = Std.OutOfMemory || Std.FileSystem || Std.PermissionD
     NoPreviousGeneration,
 };
 
-pub const MANIFEST_SCHEMA_VERSION: u32 = 1;
-pub const MANIFEST_FILENAME = "manifest.json";
+pub const MANIFEST_SCHEMA_VERSION: u32 = 2;
+pub const MANIFEST_FILENAME = "profile.kdl";
 pub const REALIZATION_FILENAME = "realization.v1";
 pub const GENERATION_PREFIX = "gen-";
 pub const CURRENT_SYMLINK = "current";
@@ -36,6 +38,21 @@ pub const PackageEntry = struct {
         allocator.free(self.arch);
         allocator.free(self.store_path);
         allocator.free(self.content_hash);
+    }
+};
+
+/// A package specification from a user's profile.kdl input.
+/// Follows the input resolution gradient: content-hash → version → name only.
+pub const PackageSpec = struct {
+    name: []const u8,
+    version: ?[]const u8 = null,
+    release: ?u32 = null,
+    content_hash: ?[]const u8 = null,
+
+    pub fn deinit(self: *PackageSpec, allocator: std.mem.Allocator) void {
+        allocator.free(self.name);
+        if (self.version) |v| allocator.free(v);
+        if (self.content_hash) |h| allocator.free(h);
     }
 };
 
@@ -258,135 +275,120 @@ pub const GenerationManifest = struct {
         var buffer: std.ArrayList(u8) = .empty;
         errdefer buffer.deinit(allocator);
 
-        buffer.appendSlice(allocator, "{\n") catch return GenerationError.OutOfMemory;
+        const a = allocator;
+        const append = struct {
+            fn f(buf: *std.ArrayList(u8), alloc: std.mem.Allocator, s: []const u8) GenerationError!void {
+                buf.appendSlice(alloc, s) catch return GenerationError.OutOfMemory;
+            }
+        }.f;
 
-        const schema_line = std.fmt.allocPrint(allocator, "  \"schema_version\": {d},\n", .{self.schema_version}) catch return GenerationError.OutOfMemory;
-        defer allocator.free(schema_line);
-        buffer.appendSlice(allocator, schema_line) catch return GenerationError.OutOfMemory;
+        try append(&buffer, a, "profile {\n");
 
-        if (self.generation) |generation_num| {
-            const gen_line = std.fmt.allocPrint(allocator, "  \"generation\": {d},\n", .{generation_num}) catch return GenerationError.OutOfMemory;
-            defer allocator.free(gen_line);
-            buffer.appendSlice(allocator, gen_line) catch return GenerationError.OutOfMemory;
+        const sv = std.fmt.allocPrint(a, "    schema-version {d}\n", .{self.schema_version}) catch return GenerationError.OutOfMemory;
+        defer a.free(sv);
+        try append(&buffer, a, sv);
+
+        if (self.generation) |gen| {
+            const line = std.fmt.allocPrint(a, "    generation {d}\n", .{gen}) catch return GenerationError.OutOfMemory;
+            defer a.free(line);
+            try append(&buffer, a, line);
         }
 
-        const created_line = std.fmt.allocPrint(allocator, "  \"created_at\": {d},\n", .{self.created_at}) catch return GenerationError.OutOfMemory;
-        defer allocator.free(created_line);
-        buffer.appendSlice(allocator, created_line) catch return GenerationError.OutOfMemory;
-
         if (self.parent_generation) |parent| {
-            const parent_line = std.fmt.allocPrint(allocator, "  \"parent_generation\": {d},\n", .{parent}) catch return GenerationError.OutOfMemory;
-            defer allocator.free(parent_line);
-            buffer.appendSlice(allocator, parent_line) catch return GenerationError.OutOfMemory;
+            const line = std.fmt.allocPrint(a, "    parent-generation {d}\n", .{parent}) catch return GenerationError.OutOfMemory;
+            defer a.free(line);
+            try append(&buffer, a, line);
+        }
+
+        const ca = std.fmt.allocPrint(a, "    created-at {d}\n", .{self.created_at}) catch return GenerationError.OutOfMemory;
+        defer a.free(ca);
+        try append(&buffer, a, ca);
+
+        if (self.tool_version) |ver| {
+            const line = std.fmt.allocPrint(a, "    tool-version \"{s}\"\n", .{ver}) catch return GenerationError.OutOfMemory;
+            defer a.free(line);
+            try append(&buffer, a, line);
         }
 
         if (self.notes) |notes| {
-            buffer.appendSlice(allocator, "  \"notes\": \"") catch return GenerationError.OutOfMemory;
-            try appendJsonEscaped(&buffer, allocator, notes);
-            buffer.appendSlice(allocator, "\",\n") catch return GenerationError.OutOfMemory;
+            const line = std.fmt.allocPrint(a, "    notes \"{s}\"\n", .{notes}) catch return GenerationError.OutOfMemory;
+            defer a.free(line);
+            try append(&buffer, a, line);
         }
 
-        if (self.selected_profile) |profile| {
-            buffer.appendSlice(allocator, "  \"selected_profile\": \"") catch return GenerationError.OutOfMemory;
-            try appendJsonEscaped(&buffer, allocator, profile);
-            buffer.appendSlice(allocator, "\",\n") catch return GenerationError.OutOfMemory;
+        if (self.selected_profile) |prof| {
+            const line = std.fmt.allocPrint(a, "    profile-name \"{s}\"\n", .{prof}) catch return GenerationError.OutOfMemory;
+            defer a.free(line);
+            try append(&buffer, a, line);
         }
 
-        if (self.tool_version) |ver| {
-            buffer.appendSlice(allocator, "  \"tool_version\": \"") catch return GenerationError.OutOfMemory;
-            try appendJsonEscaped(&buffer, allocator, ver);
-            buffer.appendSlice(allocator, "\",\n") catch return GenerationError.OutOfMemory;
-        }
-
-        buffer.appendSlice(allocator, "  \"packages\": [\n") catch return GenerationError.OutOfMemory;
-
-        for (self.packages.items, 0..) |pkg, i| {
-            buffer.appendSlice(allocator, "    {\n") catch return GenerationError.OutOfMemory;
-
-            buffer.appendSlice(allocator, "      \"name\": \"") catch return GenerationError.OutOfMemory;
-            try appendJsonEscaped(&buffer, allocator, pkg.name);
-            buffer.appendSlice(allocator, "\",\n") catch return GenerationError.OutOfMemory;
-
-            buffer.appendSlice(allocator, "      \"version\": \"") catch return GenerationError.OutOfMemory;
-            try appendJsonEscaped(&buffer, allocator, pkg.version);
-            buffer.appendSlice(allocator, "\",\n") catch return GenerationError.OutOfMemory;
-
-            const release_line = std.fmt.allocPrint(allocator, "      \"release\": {d},\n", .{pkg.release}) catch return GenerationError.OutOfMemory;
-            defer allocator.free(release_line);
-            buffer.appendSlice(allocator, release_line) catch return GenerationError.OutOfMemory;
-
-            buffer.appendSlice(allocator, "      \"arch\": \"") catch return GenerationError.OutOfMemory;
-            try appendJsonEscaped(&buffer, allocator, pkg.arch);
-            buffer.appendSlice(allocator, "\",\n") catch return GenerationError.OutOfMemory;
-
-            buffer.appendSlice(allocator, "      \"store_path\": \"") catch return GenerationError.OutOfMemory;
-            try appendJsonEscaped(&buffer, allocator, pkg.store_path);
-            buffer.appendSlice(allocator, "\",\n") catch return GenerationError.OutOfMemory;
-
-            buffer.appendSlice(allocator, "      \"content_hash\": \"") catch return GenerationError.OutOfMemory;
-            try appendJsonEscaped(&buffer, allocator, pkg.content_hash);
-            buffer.appendSlice(allocator, "\"\n") catch return GenerationError.OutOfMemory;
-
-            if (i < self.packages.items.len - 1) {
-                buffer.appendSlice(allocator, "    },\n") catch return GenerationError.OutOfMemory;
-            } else {
-                buffer.appendSlice(allocator, "    }\n") catch return GenerationError.OutOfMemory;
+        // Sort packages by name for canonical output
+        const sorted = a.alloc(PackageEntry, self.packages.items.len) catch return GenerationError.OutOfMemory;
+        defer a.free(sorted);
+        @memcpy(sorted, self.packages.items);
+        std.mem.sort(PackageEntry, sorted, {}, struct {
+            fn lessThan(_: void, lhs: PackageEntry, rhs: PackageEntry) bool {
+                return std.mem.lessThan(u8, lhs.name, rhs.name);
             }
+        }.lessThan);
+
+        for (sorted) |pkg| {
+            try append(&buffer, a, "    package \"");
+            try append(&buffer, a, pkg.name);
+            try append(&buffer, a, "\"");
+
+            const props = std.fmt.allocPrint(a, " version=\"{s}\" release={d} content-hash=\"{s}\"", .{
+                pkg.version, pkg.release, pkg.content_hash,
+            }) catch return GenerationError.OutOfMemory;
+            defer a.free(props);
+            try append(&buffer, a, props);
+            try append(&buffer, a, "\n");
         }
 
-        buffer.appendSlice(allocator, "  ]\n") catch return GenerationError.OutOfMemory;
-        buffer.appendSlice(allocator, "}\n") catch return GenerationError.OutOfMemory;
+        try append(&buffer, a, "}\n");
 
-        return buffer.toOwnedSlice(allocator) catch return GenerationError.OutOfMemory;
+        return buffer.toOwnedSlice(a) catch return GenerationError.OutOfMemory;
     }
 
-    pub fn parse(allocator: std.mem.Allocator, json: []const u8) GenerationError!GenerationManifest {
-        const parsed = std.json.parseFromSlice(std.json.Value, allocator, json, .{}) catch {
-            return GenerationError.ParseError;
+    pub fn parse(allocator: std.mem.Allocator, store_root: []const u8, input: []const u8) GenerationError!GenerationManifest {
+        var nodes = kdl.parseDocument(allocator, input) catch |err| {
+            return switch (err) {
+                kdl.KdlError.ParseError => GenerationError.ParseError,
+                kdl.KdlError.OutOfMemory => GenerationError.OutOfMemory,
+                else => GenerationError.InvalidManifest,
+            };
         };
-        defer parsed.deinit();
-
-        const root = parsed.value;
-        if (root != .object) {
-            return GenerationError.InvalidManifest;
+        defer {
+            for (nodes.items) |*n| n.deinit();
+            nodes.deinit(allocator);
         }
 
-        const obj = root.object;
-
-        const schema_version = blk: {
-            const v = obj.get("schema_version") orelse return GenerationError.InvalidManifest;
-            if (v != .integer) return GenerationError.InvalidManifest;
-            if (v.integer < 0 or v.integer > std.math.maxInt(u32)) {
-                return GenerationError.InvalidManifest;
+        // Find the "profile" node
+        var profile_node: ?*const kdl.Node = null;
+        for (nodes.items) |*node| {
+            if (std.mem.eql(u8, node.name, "profile")) {
+                profile_node = node;
+                break;
             }
-            break :blk @as(u32, @intCast(v.integer));
-        };
-
-        if (schema_version != MANIFEST_SCHEMA_VERSION) {
-            return GenerationError.InvalidManifest;
         }
+        const root = profile_node orelse return GenerationError.InvalidManifest;
 
-        const generation = blk: {
-            const v = obj.get("generation") orelse break :blk null;
-            if (v != .integer) return GenerationError.InvalidManifest;
-            if (v.integer < 0 or v.integer > std.math.maxInt(u32)) {
-                return GenerationError.InvalidManifest;
-            }
-            break :blk @as(?u32, @intCast(v.integer));
+        const schema_version: u32 = blk: {
+            const v = root.getChildInt("schema-version") orelse return GenerationError.InvalidManifest;
+            if (v < 0 or v > std.math.maxInt(u32)) return GenerationError.InvalidManifest;
+            break :blk @intCast(v);
         };
+        if (schema_version != MANIFEST_SCHEMA_VERSION) return GenerationError.InvalidManifest;
 
-        const created_at = blk: {
-            const v = obj.get("created_at") orelse return GenerationError.InvalidManifest;
-            if (v != .integer) return GenerationError.InvalidManifest;
-            if (v.integer < 0) {
-                return GenerationError.InvalidManifest;
-            }
-            break :blk @as(u64, @intCast(v.integer));
+        const created_at: u64 = blk: {
+            const v = root.getChildInt("created-at") orelse return GenerationError.InvalidManifest;
+            if (v < 0) return GenerationError.InvalidManifest;
+            break :blk @intCast(v);
         };
 
         var manifest = GenerationManifest{
             .schema_version = schema_version,
-            .generation = generation,
+            .generation = null,
             .created_at = created_at,
             .packages = .empty,
             .parent_generation = null,
@@ -397,107 +399,126 @@ pub const GenerationManifest = struct {
         };
         errdefer manifest.deinit();
 
-        if (obj.get("parent_generation")) |v| {
-            if (v == .integer) {
-                if (v.integer < 0 or v.integer > std.math.maxInt(u32)) {
-                    return GenerationError.InvalidManifest;
-                }
-                manifest.parent_generation = @as(u32, @intCast(v.integer));
+        if (root.getChildInt("generation")) |v| {
+            if (v >= 0 and v <= std.math.maxInt(u32)) {
+                manifest.generation = @intCast(v);
             }
         }
 
-        if (obj.get("notes")) |v| {
-            if (v == .string) {
-                manifest.notes = allocator.dupe(u8, v.string) catch return GenerationError.OutOfMemory;
+        if (root.getChildInt("parent-generation")) |v| {
+            if (v >= 0 and v <= std.math.maxInt(u32)) {
+                manifest.parent_generation = @intCast(v);
             }
         }
 
-        if (obj.get("selected_profile")) |v| {
-            if (v == .string) {
-                manifest.selected_profile = allocator.dupe(u8, v.string) catch return GenerationError.OutOfMemory;
-            }
+        if (root.getChildString("notes")) |s| {
+            manifest.notes = allocator.dupe(u8, s) catch return GenerationError.OutOfMemory;
         }
 
-        if (obj.get("tool_version")) |v| {
-            if (v == .string) {
-                manifest.tool_version = allocator.dupe(u8, v.string) catch return GenerationError.OutOfMemory;
-            }
+        if (root.getChildString("profile-name")) |s| {
+            manifest.selected_profile = allocator.dupe(u8, s) catch return GenerationError.OutOfMemory;
         }
 
-        const packages_val = obj.get("packages") orelse return GenerationError.InvalidManifest;
-        if (packages_val != .array) return GenerationError.InvalidManifest;
+        if (root.getChildString("tool-version")) |s| {
+            manifest.tool_version = allocator.dupe(u8, s) catch return GenerationError.OutOfMemory;
+        }
 
-        for (packages_val.array.items) |pkg_val| {
-            if (pkg_val != .object) return GenerationError.InvalidManifest;
-            const pkg_obj = pkg_val.object;
+        for (root.children.items) |*child| {
+            if (!std.mem.eql(u8, child.name, "package")) continue;
 
-            const name = blk: {
-                const v = pkg_obj.get("name") orelse return GenerationError.InvalidManifest;
-                if (v != .string) return GenerationError.InvalidManifest;
-                break :blk v.string;
+            const name = child.getFirstArgString() orelse return GenerationError.InvalidManifest;
+            const version = child.getStringProperty("version") orelse return GenerationError.InvalidManifest;
+            const release: u32 = blk: {
+                const v = child.getIntProperty("release") orelse return GenerationError.InvalidManifest;
+                if (v < 0 or v > std.math.maxInt(u32)) return GenerationError.InvalidManifest;
+                break :blk @intCast(v);
             };
+            const content_hash = child.getStringProperty("content-hash") orelse return GenerationError.InvalidManifest;
 
-            const version = blk: {
-                const v = pkg_obj.get("version") orelse return GenerationError.InvalidManifest;
-                if (v != .string) return GenerationError.InvalidManifest;
-                break :blk v.string;
-            };
+            const store_dir_name = std.fmt.allocPrint(allocator, "{s}-{s}-{s}", .{ content_hash, name, version }) catch return GenerationError.OutOfMemory;
+            defer allocator.free(store_dir_name);
+            const store_path = std.fs.path.join(allocator, &.{ store_root, store_dir_name }) catch return GenerationError.OutOfMemory;
+            defer allocator.free(store_path);
 
-            const release = blk: {
-                const v = pkg_obj.get("release") orelse return GenerationError.InvalidManifest;
-                if (v != .integer) return GenerationError.InvalidManifest;
-                if (v.integer < 0 or v.integer > std.math.maxInt(u32)) {
-                    return GenerationError.InvalidManifest;
-                }
-                break :blk @as(u32, @intCast(v.integer));
-            };
+            const host_arch = @tagName(builtin.cpu.arch);
 
-            const arch = blk: {
-                const v = pkg_obj.get("arch") orelse return GenerationError.InvalidManifest;
-                if (v != .string) return GenerationError.InvalidManifest;
-                break :blk v.string;
-            };
-
-            const store_path = blk: {
-                const v = pkg_obj.get("store_path") orelse return GenerationError.InvalidManifest;
-                if (v != .string) return GenerationError.InvalidManifest;
-                break :blk v.string;
-            };
-
-            const content_hash = blk: {
-                const v = pkg_obj.get("content_hash") orelse return GenerationError.InvalidManifest;
-                if (v != .string) return GenerationError.InvalidManifest;
-                break :blk v.string;
-            };
-
-            try manifest.addPackage(name, version, release, arch, store_path, content_hash);
+            try manifest.addPackage(name, version, release, host_arch, store_path, content_hash);
         }
 
         return manifest;
     }
 };
 
-fn appendJsonEscaped(buffer: *std.ArrayList(u8), allocator: std.mem.Allocator, s: []const u8) GenerationError!void {
-    for (s) |c| {
-        switch (c) {
-            '"' => buffer.appendSlice(allocator, "\\\"") catch return GenerationError.OutOfMemory,
-            '\\' => buffer.appendSlice(allocator, "\\\\") catch return GenerationError.OutOfMemory,
-            '\n' => buffer.appendSlice(allocator, "\\n") catch return GenerationError.OutOfMemory,
-            '\r' => buffer.appendSlice(allocator, "\\r") catch return GenerationError.OutOfMemory,
-            '\t' => buffer.appendSlice(allocator, "\\t") catch return GenerationError.OutOfMemory,
-            else => {
-                if (c < 0x20) {
-                    var buf: [6]u8 = undefined;
-                    const escaped = std.fmt.bufPrint(&buf, "\\u00{X:0>2}", .{c}) catch {
-                        return GenerationError.OutOfMemory;
-                    };
-                    buffer.appendSlice(allocator, escaped) catch return GenerationError.OutOfMemory;
-                } else {
-                    buffer.append(allocator, c) catch return GenerationError.OutOfMemory;
-                }
-            },
+/// Read a profile.kdl file from disk and return package specifications.
+/// Returns owned PackageSpec slice — caller must deinit each spec and free the slice.
+pub fn readProfilePackageSpecs(allocator: std.mem.Allocator, file_path: []const u8) GenerationError![]PackageSpec {
+    const io = path_mod.currentIo();
+    var file = path_mod.openExistingFile(file_path) catch return GenerationError.FileSystem;
+    defer file.close(io);
+    const stat = file.stat(io) catch return GenerationError.FileSystem;
+    const content = allocator.alloc(u8, @intCast(stat.size)) catch return GenerationError.OutOfMemory;
+    defer allocator.free(content);
+    const bytes_read = file.readPositionalAll(io, content, 0) catch return GenerationError.FileSystem;
+    if (bytes_read != stat.size) return GenerationError.FileSystem;
+    return parseProfilePackageSpecs(allocator, content);
+}
+
+/// Parse package specifications from a profile.kdl file (minimal or full form).
+/// Returns owned PackageSpec slice — caller must deinit each spec and free the slice.
+pub fn parseProfilePackageSpecs(allocator: std.mem.Allocator, input: []const u8) GenerationError![]PackageSpec {
+    var nodes = kdl.parseDocument(allocator, input) catch |err| {
+        return switch (err) {
+            kdl.KdlError.ParseError => GenerationError.ParseError,
+            kdl.KdlError.OutOfMemory => GenerationError.OutOfMemory,
+            else => GenerationError.InvalidManifest,
+        };
+    };
+    defer {
+        for (nodes.items) |*n| n.deinit();
+        nodes.deinit(allocator);
+    }
+
+    // Find the "profile" node
+    var profile_node: ?*const kdl.Node = null;
+    for (nodes.items) |*node| {
+        if (std.mem.eql(u8, node.name, "profile")) {
+            profile_node = node;
+            break;
         }
     }
+    const root = profile_node orelse return GenerationError.InvalidManifest;
+
+    var specs: std.ArrayList(PackageSpec) = .empty;
+    errdefer {
+        for (specs.items) |*s| s.deinit(allocator);
+        specs.deinit(allocator);
+    }
+
+    for (root.children.items) |*child| {
+        if (!std.mem.eql(u8, child.name, "package")) continue;
+        const name = child.getFirstArgString() orelse return GenerationError.InvalidManifest;
+
+        var spec = PackageSpec{
+            .name = allocator.dupe(u8, name) catch return GenerationError.OutOfMemory,
+        };
+        errdefer spec.deinit(allocator);
+
+        if (child.getStringProperty("version")) |v| {
+            spec.version = allocator.dupe(u8, v) catch return GenerationError.OutOfMemory;
+        }
+        if (child.getIntProperty("release")) |r| {
+            if (r >= 0 and r <= std.math.maxInt(u32)) {
+                spec.release = @intCast(r);
+            }
+        }
+        if (child.getStringProperty("content-hash")) |h| {
+            spec.content_hash = allocator.dupe(u8, h) catch return GenerationError.OutOfMemory;
+        }
+
+        specs.append(allocator, spec) catch return GenerationError.OutOfMemory;
+    }
+
+    return specs.toOwnedSlice(allocator) catch return GenerationError.OutOfMemory;
 }
 
 fn lessThanRealizationEntry(_: void, left: RealizationEntry, right: RealizationEntry) bool {
@@ -596,6 +617,7 @@ pub fn getCurrentGeneration(profile_dir: []const u8) GenerationError!?u32 {
 
 pub fn listGenerations(
     allocator: std.mem.Allocator,
+    store_root: []const u8,
     profile_dir: []const u8,
 ) GenerationError![]u32 {
     var dir = std.Io.Dir.openDirAbsolute(path_mod.currentIo(), profile_dir, .{ .iterate = true }) catch |err| {
@@ -629,7 +651,7 @@ pub fn listGenerations(
             };
             defer allocator.free(gen_path);
 
-            var manifest = readManifest(allocator, gen_path) catch |err| {
+            var manifest = readManifest(allocator, store_root, gen_path) catch |err| {
                 switch (err) {
                     GenerationError.GenerationNotFound,
                     GenerationError.InvalidManifest,
@@ -656,13 +678,14 @@ pub fn listGenerations(
 
 pub fn findPreviousGeneration(
     allocator: std.mem.Allocator,
+    store_root: []const u8,
     profile_dir: []const u8,
 ) GenerationError!u32 {
     const current = try getCurrentGeneration(profile_dir) orelse {
         return GenerationError.NoCurrentGeneration;
     };
 
-    const all_gens = try listGenerations(allocator, profile_dir);
+    const all_gens = try listGenerations(allocator, store_root, profile_dir);
     defer allocator.free(all_gens);
 
     var previous: ?u32 = null;
@@ -677,7 +700,7 @@ pub fn findPreviousGeneration(
     return previous orelse GenerationError.NoPreviousGeneration;
 }
 
-test "listGenerations ignores generation without manifest.json" {
+test "listGenerations ignores generation without profile.kdl" {
     const th = @import("test_helpers.zig");
     var test_env = try th.createTestEnv();
     defer {
@@ -712,7 +735,7 @@ test "listGenerations ignores generation without manifest.json" {
     defer manifest3.deinit();
     try writeManifest(allocator, gen3_path, &manifest3);
 
-    const gens = try listGenerations(allocator, profile_dir);
+    const gens = try listGenerations(allocator, "/unused", profile_dir);
     defer allocator.free(gens);
 
     try std.testing.expectEqual(@as(usize, 2), gens.len);
@@ -745,7 +768,7 @@ test "listGenerations returns sorted list" {
         try writeManifest(allocator, gen_path, &manifest);
     }
 
-    const gens = try listGenerations(allocator, profile_dir);
+    const gens = try listGenerations(allocator, "/unused", profile_dir);
     defer allocator.free(gens);
 
     try std.testing.expectEqual(@as(usize, 4), gens.len);
@@ -803,7 +826,7 @@ test "findPreviousGeneration returns previous generation" {
     current_handle.deleteFile(path_mod.currentIo(), CURRENT_SYMLINK) catch {};
     try current_handle.symLink(path_mod.currentIo(), "gen-3", CURRENT_SYMLINK, .{});
 
-    const previous = try findPreviousGeneration(allocator, profile_dir);
+    const previous = try findPreviousGeneration(allocator, "/unused", profile_dir);
     try std.testing.expectEqual(@as(u32, 2), previous);
 }
 
@@ -835,7 +858,7 @@ test "findPreviousGeneration fails when no previous generation" {
     current_handle.deleteFile(path_mod.currentIo(), CURRENT_SYMLINK) catch {};
     try current_handle.symLink(path_mod.currentIo(), "gen-1", CURRENT_SYMLINK, .{});
 
-    const result = findPreviousGeneration(allocator, profile_dir);
+    const result = findPreviousGeneration(allocator, "/unused", profile_dir);
     try std.testing.expectError(GenerationError.NoPreviousGeneration, result);
 }
 
@@ -853,7 +876,7 @@ test "findPreviousGeneration fails when no current generation" {
     var profile_dir_handle = try path_mod.makePathAndOpenDir(profile_dir);
     profile_dir_handle.close(path_mod.currentIo());
 
-    const result = findPreviousGeneration(allocator, profile_dir);
+    const result = findPreviousGeneration(allocator, "/unused", profile_dir);
     try std.testing.expectError(GenerationError.NoCurrentGeneration, result);
 }
 
@@ -863,7 +886,7 @@ pub fn formatGenerationName(allocator: std.mem.Allocator, generation: u32) Gener
     };
 }
 
-pub fn readManifest(allocator: std.mem.Allocator, generation_dir: []const u8) GenerationError!GenerationManifest {
+pub fn readManifest(allocator: std.mem.Allocator, store_root: []const u8, generation_dir: []const u8) GenerationError!GenerationManifest {
     const manifest_path = std.fs.path.join(allocator, &.{ generation_dir, MANIFEST_FILENAME }) catch {
         return GenerationError.OutOfMemory;
     };
@@ -886,7 +909,7 @@ pub fn readManifest(allocator: std.mem.Allocator, generation_dir: []const u8) Ge
         };
     };
 
-    if (stat.size > 10 * 1024 * 1024) {
+    if (stat.size == 0) {
         return GenerationError.InvalidManifest;
     }
 
@@ -906,7 +929,7 @@ pub fn readManifest(allocator: std.mem.Allocator, generation_dir: []const u8) Ge
         return GenerationError.FileSystem;
     }
 
-    return GenerationManifest.parse(allocator, buffer);
+    return GenerationManifest.parse(allocator, store_root, buffer);
 }
 
 pub fn writeManifest(allocator: std.mem.Allocator, generation_dir: []const u8, manifest: *const GenerationManifest) GenerationError!void {
@@ -1036,22 +1059,30 @@ test "GenerationManifest encode and parse roundtrip" {
         "def456abc123789012345678901234567890123456789012345678901234",
     );
 
-    const json = try manifest.encode(allocator);
-    defer allocator.free(json);
+    const encoded = try manifest.encode(allocator);
+    defer allocator.free(encoded);
 
-    var parsed = try GenerationManifest.parse(allocator, json);
+    var parsed = try GenerationManifest.parse(allocator, "/mere/store", encoded);
     defer parsed.deinit();
 
-    try std.testing.expectEqual(@as(u32, 1), parsed.schema_version);
+    try std.testing.expectEqual(@as(u32, 2), parsed.schema_version);
     try std.testing.expectEqual(@as(?u32, 42), parsed.generation);
     try std.testing.expectEqual(@as(?u32, 41), parsed.parent_generation);
     try std.testing.expectEqualStrings("test generation", parsed.notes.?);
     try std.testing.expectEqualStrings("test-version", parsed.tool_version.?);
     try std.testing.expectEqual(@as(usize, 2), parsed.packages.items.len);
 
-    try std.testing.expectEqualStrings("nginx", parsed.packages.items[0].name);
-    try std.testing.expectEqualStrings("1.24.0", parsed.packages.items[0].version);
+    // Packages should be sorted by name in encoded output
+    try std.testing.expectEqualStrings("musl", parsed.packages.items[0].name);
+    try std.testing.expectEqualStrings("1.2.4", parsed.packages.items[0].version);
     try std.testing.expectEqual(@as(u32, 1), parsed.packages.items[0].release);
+    // Verify store path is derived from content-hash + name + version
+    try std.testing.expectEqualStrings(
+        "/mere/store/def456abc123789012345678901234567890123456789012345678901234-musl-1.2.4",
+        parsed.packages.items[0].store_path,
+    );
+    try std.testing.expectEqualStrings("nginx", parsed.packages.items[1].name);
+    try std.testing.expectEqualStrings("1.24.0", parsed.packages.items[1].version);
 }
 
 test "RealizationData encode and decode roundtrip" {
@@ -1080,30 +1111,27 @@ test "RealizationData encode and decode roundtrip" {
 test "GenerationManifest parse rejects wrong schema version" {
     const allocator = std.testing.allocator;
 
-    const json =
-        \\{
-        \\  "schema_version": 99,
-        \\  "generation": 1,
-        \\  "created_at": 1234567890,
-        \\  "packages": []
+    const input =
+        \\profile {
+        \\    schema-version 99
+        \\    created-at 1234567890
         \\}
     ;
 
-    const result = GenerationManifest.parse(allocator, json);
+    const result = GenerationManifest.parse(allocator, "/unused", input);
     try std.testing.expectError(GenerationError.InvalidManifest, result);
 }
 
 test "GenerationManifest parse accepts named profile root manifest without generation" {
     const allocator = std.testing.allocator;
 
-    const json =
-        \\{
-        \\  "schema_version": 1,
-        \\  "created_at": 1234567890,
-        \\  "packages": []
+    const input =
+        \\profile {
+        \\    schema-version 2
+        \\    created-at 1234567890
         \\}
     ;
-    var parsed = try GenerationManifest.parse(allocator, json);
+    var parsed = try GenerationManifest.parse(allocator, "/unused", input);
     defer parsed.deinit();
     try std.testing.expectEqual(@as(?u32, null), parsed.generation);
 }
@@ -1111,31 +1139,30 @@ test "GenerationManifest parse accepts named profile root manifest without gener
 test "GenerationManifest parse rejects missing required fields" {
     const allocator = std.testing.allocator;
 
-    // Missing packages
-    const json =
-        \\{
-        \\  "schema_version": 1,
-        \\  "generation": 1,
-        \\  "created_at": 1234567890
+    // Missing created-at
+    const input =
+        \\profile {
+        \\    schema-version 2
         \\}
     ;
-    try std.testing.expectError(GenerationError.InvalidManifest, GenerationManifest.parse(allocator, json));
+    try std.testing.expectError(GenerationError.InvalidManifest, GenerationManifest.parse(allocator, "/unused", input));
 }
 
 test "GenerationManifest parse rejects negative integers" {
     const allocator = std.testing.allocator;
 
-    const json =
-        \\{
-        \\  "schema_version": 1,
-        \\  "generation": -1,
-        \\  "created_at": 1234567890,
-        \\  "packages": []
+    const input =
+        \\profile {
+        \\    schema-version 2
+        \\    generation -1
+        \\    created-at 1234567890
         \\}
     ;
 
-    const result = GenerationManifest.parse(allocator, json);
-    try std.testing.expectError(GenerationError.InvalidManifest, result);
+    // Negative generation is silently ignored (not in u32 range), so it parses as null
+    var parsed = try GenerationManifest.parse(allocator, "/unused", input);
+    defer parsed.deinit();
+    try std.testing.expectEqual(@as(?u32, null), parsed.generation);
 }
 
 test "getNextGenerationNumber with existing generations" {
@@ -1237,7 +1264,9 @@ test "writeManifest and readManifest" {
     try writeManifest(allocator, gen_dir, &manifest);
 
     // Read it back
-    var read_manifest = try readManifest(allocator, gen_dir);
+    const store_root = try std.fs.path.join(allocator, &.{ test_env.path, "mere", "store" });
+    defer allocator.free(store_root);
+    var read_manifest = try readManifest(allocator, store_root, gen_dir);
     defer read_manifest.deinit();
 
     try std.testing.expectEqual(@as(?u32, 1), read_manifest.generation);

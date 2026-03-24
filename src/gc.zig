@@ -441,7 +441,12 @@ fn pruneGenerations(
     };
     defer allocator.free(system_profile_dir);
 
-    const all_gens = generation.listGenerations(allocator, system_profile_dir) catch |err| switch (err) {
+    const store_root = std.fs.path.join(allocator, &.{ ctx.root_path, "mere", "store" }) catch {
+        return ctx.fail(GCError.OutOfMemory, profiles_dir, "out of memory building store root path");
+    };
+    defer allocator.free(store_root);
+
+    const all_gens = generation.listGenerations(allocator, store_root, system_profile_dir) catch |err| switch (err) {
         generation.GenerationError.ProfilesNotFound => return,
         generation.GenerationError.OutOfMemory => return ctx.fail(GCError.OutOfMemory, system_profile_dir, "out of memory listing generations"),
         generation.GenerationError.PermissionDenied => return ctx.fail(GCError.PermissionDenied, system_profile_dir, "permission denied listing generations"),
@@ -451,7 +456,7 @@ fn pruneGenerations(
 
     if (all_gens.len == 0) return;
 
-    const kept_gens = gcroots.getKeptGenerations(allocator, system_profile_dir, retention_count) catch |err| switch (err) {
+    const kept_gens = gcroots.getKeptGenerations(allocator, store_root, system_profile_dir, retention_count) catch |err| switch (err) {
         gcroots.GCRootsError.OutOfMemory => return ctx.fail(GCError.OutOfMemory, system_profile_dir, "out of memory determining kept generations"),
         gcroots.GCRootsError.PermissionDenied => return ctx.fail(GCError.PermissionDenied, system_profile_dir, "permission denied reading keep markers"),
         else => return ctx.fail(GCError.FileSystem, system_profile_dir, "failed to determine kept generations"),
@@ -677,7 +682,7 @@ fn collectFromRoot(
     reachable: *std.StringHashMap(void),
 ) GCError!void {
     const allocator = ctx.allocator;
-    // Check if this is a profile directory (contains manifest.json)
+    // Check if this is a profile directory (contains profile.kdl)
     const manifest_path = std.fs.path.join(allocator, &.{ root_target, generation.MANIFEST_FILENAME }) catch {
         return ctx.fail(GCError.OutOfMemory, root_target, "out of memory building manifest path");
     };
@@ -686,7 +691,12 @@ fn collectFromRoot(
     // Try to read as a generation manifest
     if (std.Io.Dir.accessAbsolute(path_mod.currentIo(), manifest_path, .{})) |_| {
         // This is a generation - read manifest and extract store paths
-        var manifest = generation.readManifest(allocator, root_target) catch |err| {
+        const store_root = std.fs.path.join(allocator, &.{ ctx.root_path, "mere", "store" }) catch {
+            return ctx.fail(GCError.OutOfMemory, root_target, "out of memory building store root path");
+        };
+        defer allocator.free(store_root);
+
+        var manifest = generation.readManifest(allocator, store_root, root_target) catch |err| {
             return switch (err) {
                 error.OutOfMemory => ctx.fail(GCError.OutOfMemory, root_target, "out of memory reading generation manifest"),
                 error.PermissionDenied => ctx.fail(GCError.PermissionDenied, root_target, "permission denied reading generation manifest"),
@@ -935,32 +945,35 @@ test "collectGarbage collects from generation manifest" {
 
     const allocator = test_env.ctx.allocator;
 
-    const gc_roots_dir = try std.fs.path.join(allocator, &.{ test_env.path, "gc-roots" });
+    const gc_roots_dir = try std.fs.path.join(allocator, &.{ test_env.path, "mere", "gc-roots" });
     defer allocator.free(gc_roots_dir);
     try path_mod.ensureDirExists(gc_roots_dir);
 
-    const store_dir = try std.fs.path.join(allocator, &.{ test_env.path, "store" });
+    const store_dir = try std.fs.path.join(allocator, &.{ test_env.path, "mere", "store" });
     defer allocator.free(store_dir);
     try path_mod.ensureDirExists(store_dir);
 
-    const profiles_dir = try std.fs.path.join(allocator, &.{ test_env.path, "profiles" });
+    const profiles_dir = try std.fs.path.join(allocator, &.{ test_env.path, "mere", "profiles" });
     defer allocator.free(profiles_dir);
     try path_mod.ensureDirExists(profiles_dir);
 
-    const profile_dir = try std.fs.path.join(allocator, &.{ test_env.path, "profiles", "system" });
+    const profile_dir = try std.fs.path.join(allocator, &.{ test_env.path, "mere", "profiles", "system" });
     defer allocator.free(profile_dir);
     try path_mod.ensureDirExists(profile_dir);
 
     // Create store objects
-    const pkg1_path = try std.fs.path.join(allocator, &.{ store_dir, "abc123-pkg1-1.0" });
+    const hash1 = "abc1230000000000000000000000000000000000000000000000000000000000";
+    const hash2 = "def4560000000000000000000000000000000000000000000000000000000000";
+
+    const pkg1_path = try std.fs.path.join(allocator, &.{ store_dir, hash1 ++ "-pkg1-1.0" });
     defer allocator.free(pkg1_path);
     try path_mod.ensureDirExists(pkg1_path);
 
-    const pkg2_path = try std.fs.path.join(allocator, &.{ store_dir, "def456-pkg2-2.0" });
+    const pkg2_path = try std.fs.path.join(allocator, &.{ store_dir, hash2 ++ "-pkg2-2.0" });
     defer allocator.free(pkg2_path);
     try path_mod.ensureDirExists(pkg2_path);
 
-    const unreachable_path = try std.fs.path.join(allocator, &.{ store_dir, "xyz789-old-0.1" });
+    const unreachable_path = try std.fs.path.join(allocator, &.{ store_dir, "xyz789000000000000000000000000000000000000000000000000000000000a-old-0.1" });
     defer allocator.free(unreachable_path);
     try path_mod.ensureDirExists(unreachable_path);
 
@@ -978,7 +991,7 @@ test "collectGarbage collects from generation manifest" {
         1,
         "x86_64",
         pkg1_path,
-        "abc1230000000000000000000000000000000000000000000000000000000000",
+        hash1,
     );
     try manifest.addPackage(
         "pkg2",
@@ -986,7 +999,7 @@ test "collectGarbage collects from generation manifest" {
         1,
         "x86_64",
         pkg2_path,
-        "def4560000000000000000000000000000000000000000000000000000000000",
+        hash2,
     );
 
     try generation.writeManifest(allocator, gen_dir, &manifest);
@@ -1001,7 +1014,7 @@ test "collectGarbage collects from generation manifest" {
     defer gc_result.deinit();
 
     try std.testing.expectEqual(@as(usize, 1), gc_result.deleted_paths.items.len);
-    try std.testing.expect(std.mem.endsWith(u8, gc_result.deleted_paths.items[0], "xyz789-old-0.1"));
+    try std.testing.expect(std.mem.endsWith(u8, gc_result.deleted_paths.items[0], "-old-0.1"));
 }
 
 // Spec #12: GC deletes unreachable store paths
@@ -1194,15 +1207,15 @@ test "collectGarbage preserves store paths from both pins and generation manifes
 
     const allocator = test_env.ctx.allocator;
 
-    const gc_roots_dir = try std.fs.path.join(allocator, &.{ test_env.path, "gc-roots" });
+    const gc_roots_dir = try std.fs.path.join(allocator, &.{ test_env.path, "mere", "gc-roots" });
     defer allocator.free(gc_roots_dir);
     try path_mod.ensureDirExists(gc_roots_dir);
 
-    const store_dir = try std.fs.path.join(allocator, &.{ test_env.path, "store" });
+    const store_dir = try std.fs.path.join(allocator, &.{ test_env.path, "mere", "store" });
     defer allocator.free(store_dir);
     try path_mod.ensureDirExists(store_dir);
 
-    const profiles_dir = try std.fs.path.join(allocator, &.{ test_env.path, "profiles" });
+    const profiles_dir = try std.fs.path.join(allocator, &.{ test_env.path, "mere", "profiles" });
     defer allocator.free(profiles_dir);
     try path_mod.ensureDirExists(profiles_dir);
 
@@ -1211,15 +1224,16 @@ test "collectGarbage preserves store paths from both pins and generation manifes
     try path_mod.ensureDirExists(profile_dir);
 
     // Create three store objects: two reachable (one via pin, one via generation), one unreachable
-    const pinned_obj = try std.fs.path.join(allocator, &.{ store_dir, "aaa111-pinned-1.0" });
+    const pinned_obj = try std.fs.path.join(allocator, &.{ store_dir, "aaa1110000000000000000000000000000000000000000000000000000000000-pinned-1.0" });
     defer allocator.free(pinned_obj);
     try path_mod.ensureDirExists(pinned_obj);
 
-    const gen_obj = try std.fs.path.join(allocator, &.{ store_dir, "bbb222-gen-pkg-2.0" });
+    const gen_hash = "bbb2220000000000000000000000000000000000000000000000000000000000";
+    const gen_obj = try std.fs.path.join(allocator, &.{ store_dir, gen_hash ++ "-gen-pkg-2.0" });
     defer allocator.free(gen_obj);
     try path_mod.ensureDirExists(gen_obj);
 
-    const unreachable_obj = try std.fs.path.join(allocator, &.{ store_dir, "ccc333-orphan-3.0" });
+    const unreachable_obj = try std.fs.path.join(allocator, &.{ store_dir, "ccc3330000000000000000000000000000000000000000000000000000000000-orphan-3.0" });
     defer allocator.free(unreachable_obj);
     try path_mod.ensureDirExists(unreachable_obj);
 
@@ -1241,7 +1255,7 @@ test "collectGarbage preserves store paths from both pins and generation manifes
         1,
         "x86_64",
         gen_obj,
-        "bbb2220000000000000000000000000000000000000000000000000000000000",
+        gen_hash,
     );
     try generation.writeManifest(allocator, gen_dir, &manifest);
 
@@ -1254,7 +1268,7 @@ test "collectGarbage preserves store paths from both pins and generation manifes
 
     // Only the unreachable object should be marked for deletion
     try std.testing.expectEqual(@as(usize, 1), gc_result.deleted_paths.items.len);
-    try std.testing.expect(std.mem.endsWith(u8, gc_result.deleted_paths.items[0], "ccc333-orphan-3.0"));
+    try std.testing.expect(std.mem.endsWith(u8, gc_result.deleted_paths.items[0], "-orphan-3.0"));
 
     // Verify both reachable objects still exist
     std.Io.Dir.accessAbsolute(path_mod.currentIo(), pinned_obj, .{}) catch return error.TestUnexpectedResult;

@@ -47,6 +47,7 @@ pub const ResolutionResult = struct {
 pub const Requirement = struct {
     name: []const u8,
     constraint_expr: ?[]const u8 = null,
+    content_hash: ?[]const u8 = null,
 };
 
 pub const PreferredSelection = struct {
@@ -516,6 +517,9 @@ fn packageProvidesRequirementResource(pkg: *const package.Package, requirement_n
 
 fn packageMatchesRequirement(pkg: *const package.Package, requirement: Requirement) ResolverError!bool {
     if (!packageProvidesRequirementResource(pkg, requirement.name)) return false;
+    if (requirement.content_hash) |hash| {
+        return pkg.content_hash.len > 0 and std.mem.eql(u8, pkg.content_hash, hash);
+    }
     if (requirement.constraint_expr) |expr| {
         const version = pkg.version orelse return ResolverError.InvalidInput;
         const release = pkg.release orelse return ResolverError.InvalidInput;

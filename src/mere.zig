@@ -27,7 +27,6 @@ pub const profile = @import("profile.zig");
 pub const recipe = @import("recipe.zig");
 pub const repository = @import("repository.zig");
 pub const repo_sources = @import("repo_sources.zig");
-pub const requested = @import("requested.zig");
 pub const search = @import("search.zig");
 pub const sign = @import("sign.zig");
 pub const source_manager = @import("source_manager.zig");

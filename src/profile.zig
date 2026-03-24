@@ -776,7 +776,12 @@ fn loadParentRealizationState(
     };
     errdefer allocator.free(owned_realization_dir);
 
-    var manifest_data = generation.readManifest(allocator, realization_dir) catch |err| {
+    const store_root = std.fs.path.join(allocator, &.{ ctx.root_path, "mere", "store" }) catch {
+        return ctx.fail(ProfileError.OutOfMemory, realization_dir, "failed to construct store root path");
+    };
+    defer allocator.free(store_root);
+
+    var manifest_data = generation.readManifest(allocator, store_root, realization_dir) catch |err| {
         return ctx.fail(switch (err) {
             generation.GenerationError.OutOfMemory => ProfileError.OutOfMemory,
             generation.GenerationError.PermissionDenied => ProfileError.PermissionDenied,
@@ -1100,6 +1105,9 @@ pub fn createProfile(
     return profile_dir;
 }
 
+const test_content_hash = "abc1230000000000000000000000000000000000000000000000000000000000";
+const test_content_hash_b = "def4560000000000000000000000000000000000000000000000000000000000";
+
 fn testPackageEntry(name: []const u8, store_path: []const u8) generation.PackageEntry {
     return .{
         .name = name,
@@ -1107,7 +1115,7 @@ fn testPackageEntry(name: []const u8, store_path: []const u8) generation.Package
         .release = 1,
         .arch = "x86_64",
         .store_path = store_path,
-        .content_hash = "test-hash",
+        .content_hash = test_content_hash,
     };
 }
 
@@ -1349,10 +1357,11 @@ test "createGeneration creates full generation" {
     const allocator = test_env.ctx.allocator;
 
     // Create store structure
-    const store_root = try std.fs.path.join(allocator, &.{ test_env.path, "store" });
+    const store_root = try std.fs.path.join(allocator, &.{ test_env.path, "mere", "store" });
     defer allocator.free(store_root);
+    try path.ensureDirExists(store_root);
 
-    const pkg_path = try std.fs.path.join(allocator, &.{ store_root, "abc123-test-1.0" });
+    const pkg_path = try std.fs.path.join(allocator, &.{ store_root, "abc123def456789012345678901234567890123456789012345678901234-test-1.0" });
     defer allocator.free(pkg_path);
 
     const bin_dir = try std.fs.path.join(allocator, &.{ pkg_path, "bin" });
@@ -1394,7 +1403,7 @@ test "createGeneration creates full generation" {
     // Verify generation directory exists (new layout: profile_dir/gen-N)
     const gen_path = try std.fs.path.join(allocator, &.{ profile_dir, "gen-1" });
     defer allocator.free(gen_path);
-    const manifest_path = try std.fs.path.join(allocator, &.{ gen_path, "manifest.json" });
+    const manifest_path = try std.fs.path.join(allocator, &.{ gen_path, "profile.kdl" });
     defer allocator.free(manifest_path);
     try std.testing.expect(path.fileExists(manifest_path));
     const realization_path = try std.fs.path.join(allocator, &.{ gen_path, generation.REALIZATION_FILENAME });
@@ -1409,7 +1418,7 @@ test "createGeneration creates full generation" {
     try std.testing.expectEqualStrings(file_path, buf[0..target_len]);
 
     // Verify manifest was written
-    var manifest = try generation.readManifest(allocator, gen_path);
+    var manifest = try generation.readManifest(allocator, store_root, gen_path);
     defer manifest.deinit();
     try std.testing.expectEqual(@as(u32, 1), manifest.generation);
     try std.testing.expectEqual(@as(usize, 1), manifest.packages.items.len);
@@ -1431,9 +1440,10 @@ test "createGeneration reuses unchanged entries from parent generation" {
     }
 
     const allocator = test_env.ctx.allocator;
-    const store_root = try std.fs.path.join(allocator, &.{ test_env.path, "store" });
+    const store_root = try std.fs.path.join(allocator, &.{ test_env.path, "mere", "store" });
     defer allocator.free(store_root);
-    const pkg_path = try std.fs.path.join(allocator, &.{ store_root, "abc123-test-1.0" });
+    try path.ensureDirExists(store_root);
+    const pkg_path = try std.fs.path.join(allocator, &.{ store_root, test_content_hash ++ "-test-1.0" });
     defer allocator.free(pkg_path);
     const bin_dir = try std.fs.path.join(allocator, &.{ pkg_path, "bin" });
     defer allocator.free(bin_dir);
@@ -1495,10 +1505,11 @@ test "createGeneration does not reread projection.v1 for unchanged parent packag
     }
 
     const allocator = test_env.ctx.allocator;
-    const store_root = try std.fs.path.join(allocator, &.{ test_env.path, "store" });
+    const store_root = try std.fs.path.join(allocator, &.{ test_env.path, "mere", "store" });
     defer allocator.free(store_root);
+    try path.ensureDirExists(store_root);
 
-    const pkg_a_path = try std.fs.path.join(allocator, &.{ store_root, "pkg-a-1.0" });
+    const pkg_a_path = try std.fs.path.join(allocator, &.{ store_root, test_content_hash ++ "-pkg-a-1.0" });
     defer allocator.free(pkg_a_path);
     const pkg_a_bin = try std.fs.path.join(allocator, &.{ pkg_a_path, "bin" });
     defer allocator.free(pkg_a_bin);
@@ -1512,7 +1523,7 @@ test "createGeneration does not reread projection.v1 for unchanged parent packag
     }
     try writeProjectionForTestPackage(allocator, pkg_a_path);
 
-    const pkg_b_path = try std.fs.path.join(allocator, &.{ store_root, "pkg-b-1.0" });
+    const pkg_b_path = try std.fs.path.join(allocator, &.{ store_root, test_content_hash_b ++ "-pkg-b-1.0" });
     defer allocator.free(pkg_b_path);
     const pkg_b_bin = try std.fs.path.join(allocator, &.{ pkg_b_path, "bin" });
     defer allocator.free(pkg_b_bin);
@@ -1530,6 +1541,15 @@ test "createGeneration does not reread projection.v1 for unchanged parent packag
     defer allocator.free(profile_dir);
     try path.ensureDirExists(profile_dir);
 
+    const pkg_b_entry = generation.PackageEntry{
+        .name = "pkg-b",
+        .version = "1.0",
+        .release = 1,
+        .arch = "x86_64",
+        .store_path = pkg_b_path,
+        .content_hash = test_content_hash_b,
+    };
+
     const gen1_packages = [_]generation.PackageEntry{
         testPackageEntry("pkg-a", pkg_a_path),
     };
@@ -1542,7 +1562,7 @@ test "createGeneration does not reread projection.v1 for unchanged parent packag
 
     const gen2_packages = [_]generation.PackageEntry{
         testPackageEntry("pkg-a", pkg_a_path),
-        testPackageEntry("pkg-b", pkg_b_path),
+        pkg_b_entry,
     };
     const gen2 = try createGeneration(&test_env.ctx, profile_dir, store_root, &gen2_packages, 1);
     try std.testing.expectEqual(@as(u32, 2), gen2);

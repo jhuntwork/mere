@@ -154,8 +154,13 @@ pub fn handleList(ctx: *mere.Context, args: *const types.ParsedArgs) MereError!t
     // Get current generation
     const current = generation_mod.getCurrentGeneration(profile_dir) catch null;
 
+    const store_root = std.fs.path.join(ctx.allocator, &.{ ctx.root_path, "mere", "store" }) catch {
+        return MereError.OutOfMemory;
+    };
+    defer ctx.allocator.free(store_root);
+
     // Get all generations
-    const all_gens = generation_mod.listGenerations(ctx.allocator, profile_dir) catch |err| {
+    const all_gens = generation_mod.listGenerations(ctx.allocator, store_root, profile_dir) catch |err| {
         const msg = switch (err) {
             generation_mod.GenerationError.FileSystem => "failed to read generations directory",
             else => "failed to list generations",

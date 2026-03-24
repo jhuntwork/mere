@@ -295,69 +295,153 @@ signature = ed25519_sign(secret_key, manifest_bytes)
 
 ### 6. Profile Manifest Schema
 
-`/mere/profiles/system/gen-<N>/manifest.json` and `/mere/profiles/<name>/root/manifest.json` share the same manifest schema.
+`/mere/profiles/system/gen-<N>/profile.kdl` and `/mere/profiles/<name>/root/profile.kdl` share the same manifest schema.
 
-**Required fields (v1)**:
+The profile manifest uses KDL format, consistent with the recipe format used
+throughout Mere. It serves as both the **authoritative record** of a realized
+generation and as a **declarative input** for constructing new generations.
 
-| Field            | Type    | Description                 |
+#### Bidirectional usage
+
+The same `profile.kdl` format flows in both directions — from user to system
+and from system back to user — but the user's file and the generation's file
+are separate instances with different lifecycles.
+
+- **User's file**: Lives in a project directory or is passed to
+  `mere profile apply`. Owned by the user. Contains package names and optional
+  version/release pins. Never written to by the system.
+- **Generation's file**: Lives in the generation directory, managed by the
+  system. Contains the full resolved state — versions, releases, content
+  hashes. Written after resolution. Read back by activation, verification,
+  gc, and profile projection.
+
+Feeding a generation's `profile.kdl` back as input reproduces the exact
+system on the same architecture, because the content hashes drive exact
+artifact resolution. Cross-architecture, content hashes will not resolve
+(the artifacts are different binaries); the version and release fields
+serve as fallback constraints, producing the same versions built for the
+target architecture. This makes the realized output a portable system
+specification within an architecture, and a version-pinned specification
+across architectures.
+
+Both imperative commands (`mere install X`) and declarative application
+(`mere profile apply profile.kdl`) produce the same artifact — a generation
+directory with a fully resolved `profile.kdl`.
+
+#### Input resolution gradient
+
+When `profile.kdl` is used as input, each `package` node is resolved
+according to what fields are present:
+
+1. **content-hash present** → look in local store; fetch by hash if missing.
+   Version/release are human-readable labels only. Enters the resolver as a
+   hard constraint.
+2. **version (and optionally release) present, no hash** → resolve from repo
+   with version constraint. Compute hash from fetched content.
+3. **name only** → resolve latest from repo. Compute hash from fetched content.
+
+When a profile mixes hashed and unhashed packages, the resolver handles the
+full set. Hashed packages enter as hard constraints (strongest possible pin).
+The resolver checks consistency across all packages and fails early if
+constraints conflict.
+
+#### Schema
+
+**Required top-level properties (output only — ignored on input):**
+
+| Property         | Type    | Description                 |
 | ---------------- | ------- | --------------------------- |
-| `schema_version` | integer | Schema version, starts at 1 |
-| `created_at`     | u64     | Unix epoch seconds          |
-| `packages`       | array   | List of package entries     |
+| `schema-version` | integer | Schema version, starts at 2 |
+| `created-at`     | u64     | Unix epoch seconds          |
 
-**Package entry fields**:
+**Package node properties:**
 
-| Field          | Type    | Description                                                   |
-| -------------- | ------- | ------------------------------------------------------------- |
-| `name`         | string  | Package name                                                  |
-| `version`      | string  | Package version                                               |
-| `release`      | integer | Package release number                                        |
-| `arch`         | string  | Architecture (x86_64, aarch64, any)                           |
-| `store_path`   | string  | Exact store root, e.g. `/mere/store/<hash>-<name>-<version>/` |
-| `content_hash` | string  | 64 hex chars, redundant with store_path but explicit          |
+Each `package` node's first argument is the package name (string).
 
-**Optional fields (v1, can be omitted)**:
+| Property       | Type    | On input (user-specifiable)            | On output (system-resolved)  |
+| -------------- | ------- | -------------------------------------- | ---------------------------- |
+| `version`      | string  | Optional version constraint            | Always present               |
+| `release`      | integer | Optional exact build pin               | Always present               |
+| `content-hash` | string  | Optional, 64 hex chars, exact artifact | Always present, 64 hex chars |
 
-| Field               | Type    | Description                              |
-| ------------------- | ------- | ---------------------------------------- |
-| `generation`        | integer | System generation number N               |
-| `parent_generation` | integer | Previous generation this was built from  |
-| `notes`             | string  | Human comment                            |
-| `selected_profile`  | string  | Profile name (for multi-profile support) |
-| `tool_version`      | string  | Version of `mere` that produced it       |
+On input, all properties are optional. When `content-hash` is present, it
+takes precedence — the system fetches the exact artifact by hash, and
+`version`/`release` are treated as labels. When only `version` (and
+optionally `release`) is present, the resolver uses them as constraints.
+When only the name is present, the resolver picks the latest version.
 
-**Example**:
-```json
-{
-  "schema_version": 1,
-  "generation": 42,
-  "created_at": 1769880000,
-  "packages": [
-    {
-      "name": "llvm-dev",
-      "version": "1.0-beta",
-      "release": 1,
-      "arch": "x86_64",
-      "store_path": "/mere/store/9f2c...-llvm-dev-1.0-beta/",
-      "content_hash": "9f2c... (64 hex chars)"
-    }
-  ],
-  "parent_generation": 41,
-  "notes": "weekly update"
+**Not in the format:**
+
+- **`store-path`**: derived from content-hash + name + version per spec #1.
+  The store path is `{store-root}/{content-hash}-{name}-{version}/`.
+- **`arch`**: derived from the target system. Cross-arch install is not a
+  supported input.
+
+**Optional top-level properties (may be omitted):**
+
+| Property           | Type    | Description                              |
+| ------------------ | ------- | ---------------------------------------- |
+| `generation`       | integer | System generation number N               |
+| `parent-generation`| integer | Previous generation this was built from  |
+| `notes`            | string  | Human comment                            |
+| `profile-name`     | string  | Profile name (for multi-profile support) |
+| `tool-version`     | string  | Version of `mere` that produced it       |
+
+**Emitted example (output — full resolved state):**
+```kdl
+profile {
+    schema-version 2
+    generation 42
+    parent-generation 41
+    created-at 1769880000
+    tool-version "0.6.5"
+    notes "weekly update"
+
+    package "busybox" version="1.37.0" release=5 \
+        content-hash="ab3f...64chars..."
+
+    package "llvm-dev" version="1.0-beta" release=1 \
+        content-hash="9f2c...64chars..."
 }
 ```
 
-**Signing**: Optional in v1.
+**Input example (user-authored — minimal):**
+```kdl
+profile {
+    package "llvm-dev"
+    package "busybox"
+    package "curl"
+}
+```
 
-**Rationale (JSON vs KDL)**: The profile manifest is a strict completion marker and source of truth for activation/GC.
-JSON is used here to keep the format intentionally rigid and canonical, reducing ambiguity in parsing and validation.
+**Input example (version-pinned):**
+```kdl
+profile {
+    package "llvm-dev" version="1.0-beta"
+    package "busybox" version="1.37.0" release=5
+    package "curl"
+}
+```
+
+**Canonical form**: When emitting `profile.kdl`, `mere` MUST write packages in
+sorted order by name, use consistent quoting, and omit comments. This ensures
+that identical generations produce byte-identical manifests.
+
+**Signing**: Optional in v2.
+
+**Rationale (KDL)**: KDL is the human-readable format used throughout Mere
+(recipes, package metadata). Using it for the profile manifest eliminates a
+one-off JSON format, keeps the system to two formats (binary for machine trust
+and performance, KDL for everything humans read and write), and enables the
+bidirectional input/output usage that makes declarative system management
+possible without adding a new file or concept.
 
 #### 6.1 Realization Validity
 
 A profile realization directory (`gen-N/` for system, `root/` for named profiles) is considered **valid** if and only if:
-- `manifest.json` exists
-- `manifest.json` parses successfully
-- `schema_version` is supported
+- `profile.kdl` exists
+- `profile.kdl` parses successfully
+- `schema-version` is supported
 
 **Incomplete Realizations**: Any realization directory lacking a valid manifest **MUST** be treated as:
 - Non-existent for all purposes
@@ -366,7 +450,7 @@ A profile realization directory (`gen-N/` for system, `root/` for named profiles
 **Failure Semantics**: If realization construction fails:
 - Partial directories MAY remain on disk
 - Tools MUST NOT attempt recovery
-- The absence of a valid manifest is the sole indicator of failure
+- The absence of a valid `profile.kdl` is the sole indicator of failure
 
 **Normative invariant**: The filesystem is the source of truth; the manifest is the authority. No additional state or marker files are permitted.
 
@@ -444,7 +528,7 @@ Allowed and expected. Treated as normal store payload. Requirement: when resolve
 **Switching procedure**:
 1. Validate the target generation:
    - Generation directory exists
-   - `manifest.json` exists and parses (completion marker)
+   - `profile.kdl` exists and parses (completion marker)
    - Schema version is sane
 2. Clean up any stale temp symlink (idempotent): `unlink(".current-new")` ignoring ENOENT
 3. Create temporary symlink: `/mere/profiles/system/.current-new -> gen-<N>`
@@ -484,9 +568,8 @@ Mere uses a single system-wide root at `/mere/` (or `${root}/mere/` for alternat
 │   │   ├── current -> gen-N
 │   │   └── gen-N/
 │   └── <user>/             # User profiles
-│       ├── root/           # Live realized tree for the named profile
-│       │   └── manifest.json
-│       └── requested.kdl
+│       └── root/           # Live realized tree for the named profile
+│           └── profile.kdl
 ├── dev/                    # Local development state (mode 1777 subdirs)
 │   ├── repo/
 │   │   └── <name>/
@@ -909,7 +992,7 @@ When dependency resolution fails, implementations MUST provide diagnostics that 
 
 GC roots are a combination of:
 - **Directory-namespaced symlinks under `/mere/gc-roots/`** for the system profile and explicit pins
-- **Direct named-profile manifests** under `/mere/profiles/<name>/root/manifest.json`
+- **Direct named-profile manifests** under `/mere/profiles/<name>/root/profile.kdl`
 
 **Structure**:
 ```
@@ -926,7 +1009,7 @@ GC roots are a combination of:
     └── ...
 ```
 
-Named profiles are **not** mirrored into `/mere/gc-roots/`. Their live realized trees are rooted directly by the existence of `/mere/profiles/<name>/root/manifest.json`.
+Named profiles are **not** mirrored into `/mere/gc-roots/`. Their live realized trees are rooted directly by the existence of `/mere/profiles/<name>/root/profile.kdl`.
 
 **Pins**: Named symlinks under `gc-roots/pins/` pointing to store paths. Optionally accompanied by a `.note` file (plain text) explaining why the pin exists.
 
@@ -953,7 +1036,7 @@ A generation is "kept" (has a GC root) if:
 3. For system generations not satisfying kept criteria: remove the root from `kept/`
 
 **Named profile liveness**:
-- A named profile is live if `/mere/profiles/<name>/root/manifest.json` exists and parses
+- A named profile is live if `/mere/profiles/<name>/root/profile.kdl` exists and parses
 - No additional GC-root symlink is created for named profiles
 - Deleting the profile directory removes that root
 
@@ -976,13 +1059,13 @@ Algorithm:
    - For system generation roots (under `profiles/system/`):
      - Follow symlink to generation directory
      - Read generation manifest
-     - Extract `store_path` from each package entry
+     - Derive store path from each package entry (content-hash + name + version)
      - Add each to reachable set
    - For pin roots (under `pins/`):
      - Add store path to reachable set directly
    - For each named profile under `/mere/profiles/`:
-     - If `root/manifest.json` exists, read it
-     - Extract `store_path` from each package entry
+     - If `root/profile.kdl` exists, read it
+     - Derive store path from each package entry (content-hash + name + version)
      - Add each to reachable set
 
 2. **Enumerate candidates**:
@@ -1332,13 +1415,12 @@ The system profile uses the nested generational layout.
 │   ├── bin/
 │   ├── lib/
 │   ├── share/
-│   └── manifest.json
+│   └── profile.kdl
 ├── gen-42/
 │   ├── bin/
 │   ├── lib/
 │   ├── share/
-│   └── manifest.json
-├── requested.kdl
+│   └── profile.kdl
 └── config.kdl        (optional, profile-local config)
 ```
 
@@ -1358,12 +1440,11 @@ Named profiles are **not generational**. Each named profile has at most one live
 ```
 /mere/profiles/<name>/
 ├── root/
-│   ├── manifest.json
+│   ├── profile.kdl
 │   ├── bin/
 │   ├── lib/
 │   ├── share/
 │   └── ...
-├── requested.kdl
 └── config.kdl        (optional, profile-local config)
 ```
 
@@ -1373,32 +1454,45 @@ Named profiles are **not generational**. Each named profile has at most one live
 - Named profiles do **not** have `current`, `gen-N`, retention windows, or rollback semantics
 - Updating a named profile replaces `root/` atomically as a unit
 
-#### 15.4 Requested Set (User Intent)
+#### 15.4 Bidirectional `profile.kdl`
 
-Each profile may have a **requested set** describing user intent.
+The `profile.kdl` format (spec #6) serves as both the **realized manifest** inside
+generation directories and named profile roots, and as the **declarative input**
+for building new profiles. There is no separate "requested set" or lockfile.
 
-**Location**: `/mere/profiles/<name>/requested.kdl`
+**User's file** (input): Lives in a project directory or is passed to
+`mere profile apply`. Contains package names and optional version/release pins.
+The system never writes to the user's file.
 
-**Format**: KDL, containing only user intent (not realized closure):
-- Package names
+**Generation's file** (output): Lives in the generation directory or named
+profile `root/`. Contains the full resolved state — versions, releases, content
+hashes. Store paths are not stored; they are derived from content-hash + name +
+version per spec #1.
 
-This file does NOT list dependencies or store paths. It is editable by humans and serves as input to dependency resolution.
+**Bidirectional loop**: A generation's `profile.kdl` is a valid input. When fed
+back in on the same architecture, content hashes drive exact artifact
+resolution — the system fetches the same artifacts by hash, skipping version
+resolution. Cross-architecture, content hashes will not resolve; the system
+falls back to version/release constraints, producing the same versions built
+for the target architecture.
 
-**Example**:
-```kdl
-package "vim"
-package "git"
-package "zig" version="0.12"
-```
+**Input resolution gradient** (see spec #6 for details):
+- `package "vim"` → resolve latest from repo
+- `package "vim" version="9.1.0"` → resolve with version constraint
+- `package "vim" version="9.1.0" release=1 content-hash="e5f6..."` → exact artifact
 
-**Install/uninstall semantics**:
-- `mere install <pkg...>` is **additive**: each package is added to the requested set (deduplicated by name).
-- `mere uninstall <pkg...>` removes package names from the requested set.
-- The realized system generation or named profile root is built from the **entire** requested set after each update, not only the command's explicit package list.
+**Install/uninstall semantics**: `mere install <pkg>` reads the current
+generation's `profile.kdl`, extracts the package name list, adds the new
+package, resolves the full set, and builds a new generation. `mere uninstall`
+does the same but removes a name. The realized `profile.kdl` is always the
+source of truth for what is installed — no separate bookkeeping file.
+
+**Project-local discovery**: A `profile.kdl` placed in any directory serves as
+a declarative environment specification for `mere shell` (see §15.12).
 
 #### 15.5 Realized Manifests
 
-Every realized system generation directory and every named profile `root/` contains a `manifest.json` using the same schema as spec #6. No separate "profile manifest" schema exists.
+Every realized system generation directory and every named profile `root/` contains a `profile.kdl` using the same schema as spec #6. No separate "profile manifest" schema exists. Store paths are not stored in the manifest; they are derived from content-hash + name + version per spec #1.
 
 #### 15.6 GC Roots Layout
 
@@ -1419,7 +1513,7 @@ GC roots are directory-namespaced to prevent collisions for system generations a
 ```
 
 **Direct named profile roots**:
-- `/mere/profiles/<name>/root/manifest.json` is itself a live GC root
+- `/mere/profiles/<name>/root/profile.kdl` is itself a live GC root
 - There is no `/mere/gc-roots/profiles/<name>/` subtree for named profiles
 
 **Root types**:
@@ -1428,7 +1522,7 @@ GC roots are directory-namespaced to prevent collisions for system generations a
 | ------------------------------------- | ------------------------------------------------- |
 | `gc-roots/profiles/system/current`    | Active system generation                          |
 | `gc-roots/profiles/system/kept/gen-N` | Retained system generations                       |
-| `/mere/profiles/<name>/root/manifest.json` | Live named-profile realization (direct root) |
+| `/mere/profiles/<name>/root/profile.kdl` | Live named-profile realization (direct root) |
 | `gc-roots/pins/<pin-name>`            | Admin pins (store path references, requires root) |
 
 #### 15.7 System Retention Policy
@@ -1459,7 +1553,7 @@ Retention applies to the **system profile generation history**.
 **`mere profile list`**: Lists all profiles. The system profile reports current generation state; named profiles report whether a live `root/` exists.
 
 **`mere profile create <name> [--from <base>]`**:
-- Without `--from`: Creates empty profile (directory + empty `requested.kdl`, no `root/`)
+- Without `--from`: Creates empty profile directory (no `root/`)
 - With `--from <base>`: Clones the base profile's active realized state into `<name>/root/`
 - Errors: profile exists, base doesn't exist, base has no realized state, name is `system`
 
@@ -1471,26 +1565,37 @@ Retention applies to the **system profile generation history**.
 
 **Default behavior** (`mere install <pkg...>`):
 - Targets system profile
-- Creates new generation under `/mere/profiles/system/`
+- Reads the current generation's `profile.kdl` to determine the existing package set
+- Adds the new package name(s) to the set (deduplicated by name)
+- Resolves the full set and realizes a new generation under `/mere/profiles/system/`
 - Updates `current` symlink
 - Updates `/mere/gc-roots/profiles/system/current`
-- Adds package name(s) to `/mere/profiles/system/requested.kdl` (deduplicated)
-- Resolves from the full requested set and realizes that closure in the new generation
 
 **Profile-targeted install** (`mere install --profile <name> <pkg...>`):
 - Targets `/mere/profiles/<name>/`
-- Realizes a new named-profile tree and atomically replaces `/mere/profiles/<name>/root/`
+- Reads the current `root/profile.kdl` to determine the existing package set
+- Adds the new package name(s) to the set (deduplicated by name)
+- Resolves the full set and atomically replaces `/mere/profiles/<name>/root/`
 - Does NOT affect system or host `/usr`
-- Adds package name(s) to `/mere/profiles/<name>/requested.kdl` (deduplicated)
-- Resolves from the full requested set and realizes that closure in the new `root/`
 
 **Auto-create**: If target profile doesn't exist, auto-creates it (empty, like `mere profile create <name>`).
 
 **`mere uninstall` integration** (`mere uninstall [--profile <name>] <pkg...>`):
-- Removes package name(s) from target profile's `requested.kdl`
-- For the system profile: creates and activates a new generation from the remaining requested set
+- Reads the target profile's current `profile.kdl` and removes the named package(s)
+- For the system profile: creates and activates a new generation from the remaining set
 - For a named profile: atomically replaces `root/` with the remaining realized closure
-- If the requested set becomes empty, realizes an empty system generation or an empty named `root/`
+- If the package set becomes empty, realizes an empty system generation or an empty named `root/`
+
+**`mere profile apply <file>`**:
+- Reads the supplied `profile.kdl` (minimal or full form)
+- For each package, resolves according to the input gradient (spec #6):
+  content-hash → exact artifact, version/release → constrained resolution,
+  name only → latest from repo
+- Resolves the full set through the resolver (hashed packages enter as hard
+  constraints, unhashed packages resolve normally)
+- Builds a new generation (system) or replaces `root/` (named)
+- The resulting `profile.kdl` in the new generation/root is the fully resolved output
+- Targets system profile by default; use `--profile <name>` for named profiles
 
 #### 15.10 Generation Management Commands
 
@@ -1517,11 +1622,49 @@ This switching step does not prune old generation directories. It only updates t
 
 The `/usr` symlink always points to `/mere/profiles/system/current` and never changes after bootstrap.
 
+#### 15.12 `mere shell` and Project-Local Profiles
+
+`mere shell` enters an isolated namespace with a profile's package tree as the environment.
+
+**Resolution order**:
+1. `mere shell --profile <name>` — use existing named profile `<name>`
+2. `mere shell` (no args) — discover `profile.kdl` in the current working directory
+3. `mere shell <path/to/profile.kdl>` — use the specified file
+
+If none of these resolve, `mere shell` exits with an error.
+
+**Project-local `profile.kdl`**: A `profile.kdl` placed in any directory serves as a declarative environment specification. When `mere shell` discovers it:
+1. Read the file and parse package specifications
+2. Compute a BLAKE3 hash of the file content
+3. If a cached named profile keyed on that hash exists, reuse it
+4. Otherwise, resolve packages per the input gradient (spec #6), build a new
+   named profile, and cache it under `/mere/profiles/shell-<hash-prefix>/`
+5. Enter the namespace with the resolved profile
+
+**Caching**: Resolved project-local profiles are cached as named profiles
+keyed by a hash of the `profile.kdl` file content. Editing the file produces
+a different hash and triggers a fresh resolve/build. Cached profiles are
+subject to normal GC.
+
+**Example workflow**:
+```
+$ cd ~/projects/myapp
+$ cat profile.kdl
+profile {
+    package "go"
+    package "protobuf"
+    package "grpcurl"
+}
+$ mere shell
+# → resolves packages, builds/caches profile, enters namespace
+# go, protobuf, grpcurl are available
+```
+
 **System activation / rollback** (`mere generation activate <N>`): Same atomic procedure, different target. System activation also applies system-specific host integration such as `/etc` template processing.
 
 **Named profile publishing**:
 1. Build a staged realization directory at `/mere/profiles/<name>/.root-new-<nonce>/`
-2. Validate the staged `manifest.json`
+2. Validate the staged `profile.kdl`
 3. Publish it atomically as `/mere/profiles/<name>/root/`
 4. Remove the previously live tree after the publish succeeds
 
@@ -1775,7 +1918,7 @@ A profile realization is a **symlink tree projection** of store contents. System
 **Structure** (note: content under `usr/` subtree, metadata outside):
 ```
 /mere/profiles/system/gen-42/
-├── manifest.json          # Generation metadata (NOT under usr/)
+├── profile.kdl          # Generation metadata (NOT under usr/)
 └── usr/                   # REQUIRED - visible at /usr after activation
     ├── bin/               # Symlinks to store paths
     │   ├── sh -> /mere/store/<hash>-busybox-1.0/bin/sh
@@ -1875,7 +2018,7 @@ Package-provided configuration MUST NOT be projected directly into the profile r
 
 **Validation** (after build, before publish or activation):
 - Run profile realization validator (spec #7) on all created symlinks
-- Verify manifest.json is valid and matches built content
+- Verify profile.kdl is valid and matches built content
 - Ensure no symlinks escape boundaries
 
 ---
@@ -1995,7 +2138,7 @@ No other system-global symlinks are required to change during activation. The `/
 #### 21.9 Generation Structure Requirements
 
 **Normative rules**:
-- Generation metadata (e.g., `manifest.json`) MUST be placed at the generation root, NOT under any package content directories
+- Generation metadata (e.g., `profile.kdl`) MUST be placed at the generation root, NOT under any package content directories
 - Packages may provide content under `usr/`, `bin/`, `sbin/`, `lib/` - all are valid
 - No path canonicalization is performed - packages freely choose their layout
 - External scaffolding (system symlinks) determines visibility
@@ -2010,7 +2153,7 @@ No other system-global symlinks are required to change during activation. The `/
 │   └── share/
 ├── bin/                    # Optional - only if packages provide bin/ content
 ├── lib/                    # Optional - only if packages provide lib/ content
-└── manifest.json           # REQUIRED - generation metadata at root
+└── profile.kdl           # REQUIRED - generation metadata at root
 ```
 
 #### 21.10 Expected State Before Mere Operates

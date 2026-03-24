@@ -82,6 +82,28 @@ const delete_meta = command.CommandMeta{
     },
 };
 
+/// Apply subcommand metadata
+const apply_meta = command.CommandMeta{
+    .name = "apply",
+    .description = "Apply a profile.kdl to a profile",
+    .args = &[_]types.Arg{
+        .{
+            .name = "file",
+            .description = "Path to profile.kdl file",
+            .required = true,
+        },
+    },
+    .flags = &[_]types.Flag{
+        .{
+            .name = "profile",
+            .short = 'p',
+            .description = "Target profile name (default: system)",
+            .flag_type = .string,
+            .value_name = "name",
+        },
+    },
+};
+
 /// Main profile command handler
 fn handleProfile(ctx: *mere.Context, args: *const types.ParsedArgs) MereError!types.CommandResult {
     _ = ctx;
@@ -143,7 +165,11 @@ pub fn handleList(ctx: *mere.Context, args: *const types.ParsedArgs) MereError!t
 
         if (is_system) {
             const current_gen = generation_mod.getCurrentGeneration(profile_path) catch null;
-            const generations = generation_mod.listGenerations(ctx.allocator, profile_path) catch null;
+            const store_root = std.fs.path.join(ctx.allocator, &.{ ctx.root_path, "mere", "store" }) catch {
+                return MereError.OutOfMemory;
+            };
+            defer ctx.allocator.free(store_root);
+            const generations = generation_mod.listGenerations(ctx.allocator, store_root, profile_path) catch null;
             const gen_count = if (generations) |gens| blk: {
                 defer ctx.allocator.free(gens);
                 break :blk gens.len;
@@ -302,7 +328,16 @@ pub fn handleCreate(ctx: *mere.Context, args: *const types.ParsedArgs) MereError
         };
         defer ctx.allocator.free(base_realization_path);
 
-        var manifest = generation_mod.readManifest(ctx.allocator, base_realization_path) catch {
+        const store_root = std.fs.path.join(ctx.allocator, &.{ ctx.root_path, "mere", "store" }) catch {
+            return types.CommandResult{
+                .success = false,
+                .exit_code = 1,
+                .message = try ctx.allocator.dupe(u8, "Out of memory"),
+            };
+        };
+        defer ctx.allocator.free(store_root);
+
+        var manifest = generation_mod.readManifest(ctx.allocator, store_root, base_realization_path) catch {
             return types.CommandResult{
                 .success = false,
                 .exit_code = 1,
@@ -337,11 +372,6 @@ pub fn handleCreate(ctx: *mere.Context, args: *const types.ParsedArgs) MereError
             };
         }
 
-        const store_root = std.fs.path.join(ctx.allocator, &.{ ctx.root_path, "mere", "store" }) catch {
-            return MereError.OutOfMemory;
-        };
-        defer ctx.allocator.free(store_root);
-
         _ = profile_mod.publishProfileRoot(
             ctx,
             profile_path,
@@ -365,19 +395,6 @@ pub fn handleCreate(ctx: *mere.Context, args: *const types.ParsedArgs) MereError
                 .message = try ctx.allocator.dupe(u8, "Failed to create profile directory"),
             };
         };
-
-        // Create empty requested.kdl
-        const requested_path = std.fs.path.join(ctx.allocator, &.{ profile_path, "requested.kdl" }) catch {
-            return MereError.OutOfMemory;
-        };
-        defer ctx.allocator.free(requested_path);
-
-        var file = std.Io.Dir.createFileAbsolute(path.currentIo(), requested_path, .{}) catch {
-            // Non-fatal, directory created is sufficient
-            return try profileCreationSegments(ctx, profile_name, null);
-        };
-        file.writeStreamingAll(path.currentIo(), "// Requested packages for profile\n") catch {};
-        file.close(path.currentIo());
 
         return try profileCreationSegments(ctx, profile_name, null);
     }
@@ -446,6 +463,58 @@ pub fn handleDelete(ctx: *mere.Context, args: *const types.ParsedArgs) MereError
     return types.CommandResult.createSuccessSegments(ctx.allocator, &delete_segments);
 }
 
+/// Apply handler - reads a profile.kdl and installs its packages to a profile
+pub fn handleApply(ctx: *mere.Context, args: *const types.ParsedArgs) MereError!types.CommandResult {
+    if (args.positional.len < 1) {
+        return MereError.MissingArgument;
+    }
+
+    const file_path = args.positional[0];
+    const profile_name = args.getString("profile") orelse "system";
+
+    const result = performApply(ctx, file_path, profile_name) catch |err| {
+        const user_message = mere.errors.getUserFriendlyMessage(err);
+        const error_ctx = ctx.getDiagnosticContext().toErrorContext();
+        const formatted = error_ctx.formatWithMessage(ctx.allocator, user_message) catch user_message;
+        return types.CommandResult{
+            .success = false,
+            .exit_code = 1,
+            .message = if (formatted.ptr != user_message.ptr) formatted else try ctx.allocator.dupe(u8, formatted),
+        };
+    };
+
+    return result;
+}
+
+fn performApply(ctx: *mere.Context, file_path: []const u8, profile_name: []const u8) !types.CommandResult {
+    const specs = generation_mod.readProfilePackageSpecs(ctx.allocator, file_path) catch {
+        return error.InvalidInput;
+    };
+    defer {
+        for (specs) |*s| @constCast(s).deinit(ctx.allocator);
+        ctx.allocator.free(specs);
+    }
+    if (specs.len == 0) return error.InvalidInput;
+
+    _ = try ctx.getConfig();
+    var curl_client = try mere.download.CurlTransferClient.init(ctx);
+    defer mere.download.CurlTransferClient.cleanupFn(ctx, curl_client);
+    const client = curl_client.client();
+
+    _ = try mere.install.installPackageSpecsFromConfig(ctx, specs, client, false, false, false, profile_name);
+
+    const segments = [_]mere.ui.Segment{
+        .{ .text = "profile ", .kind = .normal },
+        .{ .text = "applied", .kind = .success },
+        .{ .text = ": ", .kind = .normal },
+        .{ .text = file_path, .kind = .detail },
+        .{ .text = " → '", .kind = .normal },
+        .{ .text = profile_name, .kind = .detail },
+        .{ .text = "'", .kind = .normal },
+    };
+    return types.CommandResult.createSuccessSegments(ctx.allocator, &segments);
+}
+
 /// Create the profile command with its subcommands
 pub fn createCommand(allocator: std.mem.Allocator) !*command.Command {
     const profile_cmd = try allocator.create(command.Command);
@@ -460,9 +529,13 @@ pub fn createCommand(allocator: std.mem.Allocator) !*command.Command {
     const delete_cmd = try allocator.create(command.Command);
     delete_cmd.* = command.Command.init(allocator, delete_meta, handleDelete);
 
+    const apply_cmd = try allocator.create(command.Command);
+    apply_cmd.* = command.Command.init(allocator, apply_meta, handleApply);
+
     try profile_cmd.addSubcommand(list_cmd);
     try profile_cmd.addSubcommand(create_cmd);
     try profile_cmd.addSubcommand(delete_cmd);
+    try profile_cmd.addSubcommand(apply_cmd);
 
     return profile_cmd;
 }

@@ -138,10 +138,11 @@ pub fn unkeepGeneration(
 /// Caller owns returned slice.
 pub fn getKeptGenerations(
     allocator: std.mem.Allocator,
+    store_root: []const u8,
     profile_dir: []const u8,
     retention_count: u32,
 ) GCRootsError![]u32 {
-    const all_gens = generation.listGenerations(allocator, profile_dir) catch |err| {
+    const all_gens = generation.listGenerations(allocator, store_root, profile_dir) catch |err| {
         return switch (err) {
             generation.GenerationError.OutOfMemory => GCRootsError.OutOfMemory,
             else => mapGenerationError(err),
@@ -184,6 +185,7 @@ pub fn getKeptGenerations(
 
 pub fn updateRoots(
     allocator: std.mem.Allocator,
+    store_root: []const u8,
     gc_roots_dir: []const u8,
     profile_dir: []const u8,
     retention_count: u32,
@@ -195,7 +197,7 @@ pub fn updateRoots(
     };
     defer allocator.free(profile_gc_dir);
 
-    const state = try buildRootUpdateState(allocator, profile_gc_dir, profile_dir, retention_count);
+    const state = try buildRootUpdateState(allocator, store_root, profile_gc_dir, profile_dir, retention_count);
     defer {
         allocator.free(state.kept_gens);
         allocator.free(state.all_gens);
@@ -207,6 +209,7 @@ pub fn updateRoots(
 
 pub fn ensureRequiredRootsForProfile(
     allocator: std.mem.Allocator,
+    store_root: []const u8,
     gc_roots_dir: []const u8,
     profile_dir: []const u8,
     retention_count: u32,
@@ -217,7 +220,7 @@ pub fn ensureRequiredRootsForProfile(
     };
     defer allocator.free(profile_gc_dir);
 
-    const state = try buildRootUpdateState(allocator, profile_gc_dir, profile_dir, retention_count);
+    const state = try buildRootUpdateState(allocator, store_root, profile_gc_dir, profile_dir, retention_count);
     defer {
         allocator.free(state.kept_gens);
         allocator.free(state.all_gens);
@@ -228,6 +231,7 @@ pub fn ensureRequiredRootsForProfile(
 
 pub fn pruneObsoleteRootsForProfile(
     allocator: std.mem.Allocator,
+    store_root: []const u8,
     gc_roots_dir: []const u8,
     profile_dir: []const u8,
     retention_count: u32,
@@ -238,7 +242,7 @@ pub fn pruneObsoleteRootsForProfile(
     };
     defer allocator.free(profile_gc_dir);
 
-    const state = try buildRootUpdateState(allocator, profile_gc_dir, profile_dir, retention_count);
+    const state = try buildRootUpdateState(allocator, store_root, profile_gc_dir, profile_dir, retention_count);
     defer {
         allocator.free(state.kept_gens);
         allocator.free(state.all_gens);
@@ -254,6 +258,7 @@ const RootUpdateState = struct {
 
 fn buildRootUpdateState(
     allocator: std.mem.Allocator,
+    store_root: []const u8,
     profile_gc_dir: []const u8,
     profile_dir: []const u8,
     retention_count: u32,
@@ -261,10 +266,10 @@ fn buildRootUpdateState(
     var profile_gc_dir_handle = path_mod.makePathAndOpenDir(profile_gc_dir) catch |err| return mapGCRootFsError(err);
     profile_gc_dir_handle.close(path_mod.currentIo());
 
-    const kept_gens = try getKeptGenerations(allocator, profile_dir, retention_count);
+    const kept_gens = try getKeptGenerations(allocator, store_root, profile_dir, retention_count);
     errdefer allocator.free(kept_gens);
 
-    const all_gens = generation.listGenerations(allocator, profile_dir) catch |err| {
+    const all_gens = generation.listGenerations(allocator, store_root, profile_dir) catch |err| {
         return switch (err) {
             generation.GenerationError.OutOfMemory => GCRootsError.OutOfMemory,
             else => mapGenerationError(err),
@@ -667,7 +672,7 @@ test "getKeptGenerations returns last K generations" {
     }
 
     // With retention_count=2, should keep 4 and 5
-    const kept = try getKeptGenerations(allocator, profile_dir, 2);
+    const kept = try getKeptGenerations(allocator, "/unused", profile_dir, 2);
     defer allocator.free(kept);
 
     try std.testing.expectEqual(@as(usize, 2), kept.len);
@@ -706,7 +711,7 @@ test "getKeptGenerations includes explicitly kept" {
     try keepGeneration(allocator, profile_dir, 1, null);
 
     // With retention_count=2, should keep 1 (explicit), 4, and 5 (recent)
-    const kept = try getKeptGenerations(allocator, profile_dir, 2);
+    const kept = try getKeptGenerations(allocator, "/unused", profile_dir, 2);
     defer allocator.free(kept);
 
     try std.testing.expectEqual(@as(usize, 3), kept.len);
@@ -748,7 +753,7 @@ test "updateRoots creates correct symlinks" {
     profile_handle.symLink(path_mod.currentIo(), "gen-3", "current", .{}) catch {};
 
     // Update roots with retention_count=2
-    try updateRoots(allocator, gc_roots_dir, profile_dir, 2);
+    try updateRoots(allocator, "/unused", gc_roots_dir, profile_dir, 2);
 
     // Check roots exist in the nested structure (profiles/system/kept/)
     const profile_gc_dir = try std.fs.path.join(allocator, &.{ gc_roots_dir, "profiles", "system" });
