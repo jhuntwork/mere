@@ -96,18 +96,14 @@ available. Type `exit` to return to your host environment.
 # see what's in your profile
 mere profile list
 
+# search for packages
+mere search
+
 # install more packages
 mere install -p test busybox curl git
 
 # inspect the store
 ls /mere/store/
-
-# build a package from a recipe
-mere dev build recipe.kdl
-
-# roll back to a previous system generation
-sudo mere generation list
-sudo mere generation activate 1
 ```
 
 ## Building from Source
