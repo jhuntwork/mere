@@ -64,7 +64,7 @@ sudo mere init
 
 Add a basic config for the official repository and its public key:
 
-```sh`
+```sh
 sudo curl -so /mere/config.kdl https://pkgs.merelinux.org/config.kdl
 sudo curl -so /mere/keys/mere.pub https://pkgs.merelinux.org/mere.pub
 ```
