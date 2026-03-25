@@ -29,6 +29,8 @@ pub const InitOptions = struct {
     dry_run: bool = false,
     /// If true, show detailed information
     verbose: bool = false,
+    /// If true, also create system symlinks exposing the active profile
+    system: bool = false,
 };
 
 /// Result of initialization check
@@ -261,6 +263,117 @@ fn fixDirectory(spec: DirSpec, check: CheckResult) !void {
     }
 }
 
+/// Symlink specification for system bootstrap
+const SymlinkSpec = struct {
+    target: []const u8,
+    link: []const u8,
+};
+
+const system_profile = "/mere/profiles/system/current";
+
+/// System symlinks that expose the active profile at standard paths
+const system_symlinks = [_]SymlinkSpec{
+    .{ .target = system_profile ++ "/bin", .link = "/bin" },
+    .{ .target = system_profile ++ "/lib", .link = "/lib" },
+    .{ .target = system_profile ++ "/sbin", .link = "/sbin" },
+    .{ .target = system_profile ++ "/usr/bin", .link = "/usr/bin" },
+    .{ .target = system_profile ++ "/usr/include", .link = "/usr/include" },
+    .{ .target = system_profile ++ "/usr/lib", .link = "/usr/lib" },
+    .{ .target = system_profile ++ "/usr/libexec", .link = "/usr/libexec" },
+    .{ .target = system_profile ++ "/usr/sbin", .link = "/usr/sbin" },
+    .{ .target = system_profile ++ "/usr/share", .link = "/usr/share" },
+};
+
+/// Additional directories needed for a usable system
+const system_extra_dirs = [_]struct { path: []const u8, mode: u32 }{
+    .{ .path = "/etc", .mode = 0o755 },
+    .{ .path = "/tmp", .mode = 0o1777 },
+    .{ .path = "/usr", .mode = 0o755 },
+};
+
+var link_buf: [std.fs.max_path_bytes]u8 = undefined;
+
+/// Create system symlinks and directories for a usable base system
+fn createSystemLayout(result: *InitResult, allocator: std.mem.Allocator, dry_run: bool) !void {
+    // Create required parent directories
+    for (system_extra_dirs) |dir| {
+        _ = std.Io.Dir.cwd().statFile(path_mod.currentIo(), dir.path, .{}) catch |err| {
+            switch (err) {
+                error.FileNotFound => {
+                    const check = CheckResult{
+                        .path = try allocator.dupe(u8, dir.path),
+                        .status = .missing,
+                        .expected_mode = dir.mode,
+                        .actual_mode = null,
+                        .expected_owner = try allocator.dupe(u8, "uid:0 gid:0"),
+                        .actual_owner = null,
+                    };
+                    try result.checks.append(allocator, check);
+                    result.issues_found += 1;
+                    if (!dry_run) {
+                        try createDirectory(dir.path, dir.mode);
+                        try setOwnership(dir.path);
+                        result.changes_applied += 1;
+                    }
+                    continue;
+                },
+                else => return mapInitFsError(err),
+            }
+        };
+    }
+
+    // Create symlinks
+    for (system_symlinks) |spec| {
+        const existing_len = std.Io.Dir.readLinkAbsolute(path_mod.currentIo(), spec.link, &link_buf) catch |err| {
+            switch (err) {
+                error.FileNotFound => {
+                    const check = CheckResult{
+                        .path = try allocator.dupe(u8, spec.link),
+                        .status = .missing,
+                        .expected_mode = 0o777,
+                        .actual_mode = null,
+                        .expected_owner = try allocator.dupe(u8, spec.target),
+                        .actual_owner = null,
+                    };
+                    try result.checks.append(allocator, check);
+                    result.issues_found += 1;
+                    if (!dry_run) {
+                        std.Io.Dir.cwd().symLink(path_mod.currentIo(), spec.target, spec.link, .{}) catch |e| {
+                            return mapInitFsError(e);
+                        };
+                        result.changes_applied += 1;
+                    }
+                    continue;
+                },
+                else => return mapInitFsError(err),
+            }
+        };
+
+        const existing = link_buf[0..existing_len];
+        if (!std.mem.eql(u8, existing, spec.target)) {
+            const check = CheckResult{
+                .path = try allocator.dupe(u8, spec.link),
+                .status = .wrong_permissions,
+                .expected_mode = 0o777,
+                .actual_mode = null,
+                .expected_owner = try allocator.dupe(u8, spec.target),
+                .actual_owner = try allocator.dupe(u8, existing),
+            };
+            try result.checks.append(allocator, check);
+            result.issues_found += 1;
+            if (!dry_run) {
+                std.Io.Dir.cwd().deleteFile(path_mod.currentIo(), spec.link) catch |e| {
+                    return mapInitFsError(e);
+                };
+                std.Io.Dir.cwd().symLink(path_mod.currentIo(), spec.target, spec.link, .{}) catch |e| {
+                    return mapInitFsError(e);
+                };
+                result.changes_applied += 1;
+            }
+        }
+    }
+}
+
 /// Initialize and validate Mere filesystem layout
 pub fn initialize(ctx: *Context, options: InitOptions) !InitResult {
     // Check if running as root
@@ -308,6 +421,11 @@ pub fn initialize(ctx: *Context, options: InitOptions) !InitResult {
 
     // After fixes, issues_found represents issues that existed and were fixed
     // (we don't re-check because we want to report what was changed)
+
+    // Create system layout if requested
+    if (options.system) {
+        try createSystemLayout(&result, ctx.allocator, options.dry_run);
+    }
 
     return result;
 }
