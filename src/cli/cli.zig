@@ -405,6 +405,7 @@ pub const CLI = struct {
     fn isHelpRequest(self: *CLI, args: []const []const u8) bool {
         _ = self;
         for (args[1..]) |arg| {
+            if (std.mem.eql(u8, arg, "--")) break;
             if (std.mem.eql(u8, arg, "help") or
                 std.mem.eql(u8, arg, "--help") or
                 std.mem.eql(u8, arg, "-h"))
@@ -419,6 +420,7 @@ pub const CLI = struct {
     fn isVersionRequest(self: *CLI, args: []const []const u8) bool {
         _ = self;
         for (args[1..]) |arg| {
+            if (std.mem.eql(u8, arg, "--")) break;
             if (std.mem.eql(u8, arg, "--version")) {
                 return true;
             }
