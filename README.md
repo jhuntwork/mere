@@ -33,26 +33,81 @@ changes the entire system view atomically.
 - **Explicit trust** — repos and packages are accepted only when Ed25519 signatures verify against trusted keys
 - **Filesystem as truth** — store objects, profiles, manifests, and repository databases are all inspectable on disk
 
-## Quick Start
+## Try It
+
+`mere` is a statically linked binary that runs on any Linux system. You can
+try it alongside your existing distribution — everything lives under `/mere`
+and won't interfere with your host system.
+
+### 1. Download
+
+Grab the latest release for your architecture:
 
 ```sh
-# install packages
-mere install busybox curl
+# x86_64
+curl -Lo mere https://codeberg.org/merelinux/mere/releases/download/v0.8.0/mere-0.8.0-linux-x86_64
 
-# remove a package
-mere uninstall curl
+# aarch64
+curl -Lo mere https://codeberg.org/merelinux/mere/releases/download/v0.8.0/mere-0.8.0-linux-aarch64
+
+sudo install -m 755 mere /usr/local/bin/
+```
+
+### 2. Initialize
+
+Preview what `mere init` will create, then apply it:
+
+```sh
+sudo mere init --dry-run
+sudo mere init
+```
+
+Add a basic config for the official repository and its public key:
+
+```sh`
+sudo curl -so /mere/config.kdl https://pkgs.merelinux.org/config.kdl
+sudo curl -so /mere/keys/mere.pub https://pkgs.merelinux.org/mere.pub
+```
+
+### 3. Create a profile and install packages
+
+```sh
+mere profile create test
+mere install -p test python
+```
+
+This fetches Python and its dependencies from the Mere repository, verifies
+signatures, places everything in the content-addressed store at `/mere/store`,
+and realizes the profile.
+
+### 4. Try it out
+
+```sh
+mere shell -p test
+python3 --version
+```
+
+`mere shell` drops you into an interactive shell with the profile's packages
+available. Type `exit` to return to your host environment.
+
+### 5. Explore
+
+```sh
+# see what's in your profile
+mere profile list
+
+# install more packages
+mere install -p test busybox curl git
+
+# inspect the store
+ls /mere/store/
 
 # build a package from a recipe
 mere dev build recipe.kdl
 
-# validate a recipe without building it
-mere dev validate recipe.kdl
-
-# roll back to a previous generation
-mere generation activate 15
-
-# garbage-collect unreferenced store objects
-mere gc
+# roll back to a previous system generation
+sudo mere generation list
+sudo mere generation activate 1
 ```
 
 ## Building from Source
@@ -77,7 +132,3 @@ Linux system, but the CLI surface and some subsystems are still stabilizing.
 - [Specification Details](docs/design/specification-details.md) — full system specification
 - [Recipe Specification](docs/design/recipe_spec.md) — guide to writing build recipes
 - [Build Isolation Model](docs/design/namespaces.md) — namespace and chroot design
-
-## License
-
-MIT
