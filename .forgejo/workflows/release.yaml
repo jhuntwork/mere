@@ -48,32 +48,25 @@ jobs:
           cd "$GITHUB_WORKSPACE"
           zig build test --summary all
 
-      - name: Build release binary
-        if: ${{ steps.meta.outputs.version_changed == 'true' }}
-        run: |
-          set -eu
-          cd "$GITHUB_WORKSPACE"
-          zig build -Doptimize=ReleaseSmall
-
-      - name: Package release assets
+      - name: Build and package release binaries
         if: ${{ steps.meta.outputs.version_changed == 'true' }}
         run: |
           set -eu
           cd "$GITHUB_WORKSPACE"
 
           version="${{ steps.meta.outputs.version }}"
-          os=$(uname -s | tr '[:upper:]' '[:lower:]')
-          arch=$(uname -m)
-          base=$(sh .forgejo/scripts/release-ci.sh asset-base "$version" "$os" "$arch")
-
           mkdir -p dist
-          cp zig-out/bin/mere "dist/${base}"
-          tar -C dist -czf "dist/${base}.tar.gz" "${base}"
 
-          (
-            cd dist
-            sha256sum "${base}.tar.gz" > "SHA256SUMS"
-          )
+          for target in x86_64-linux-musl aarch64-linux-musl; do
+            arch="${target%%-*}"
+            zig build -Doptimize=ReleaseSmall -Dtarget="$target"
+            base=$(sh .forgejo/scripts/release-ci.sh asset-base "$version" linux "$arch")
+            cp zig-out/bin/mere "dist/${base}"
+            tar -C dist -czf "dist/${base}.tar.gz" "${base}"
+            rm "dist/${base}"
+          done
+
+          ( cd dist && sha256sum *.tar.gz > SHA256SUMS )
 
       - name: Push release tag
         if: ${{ steps.meta.outputs.version_changed == 'true' }}

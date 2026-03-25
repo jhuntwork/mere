@@ -59,12 +59,72 @@ const SourceTree = struct {
     }
 };
 
+const CrossToolchain = struct {
+    triple: []const u8,
+    cc: []const u8,
+    ar: []const u8,
+    ranlib: []const u8,
+    cmake_setup_step: *std.Build.Step,
+    cmake_wrapper_dir: std.Build.LazyPath,
+    cmake_system_name: []const u8,
+    cmake_system_processor: []const u8,
+};
+
+fn detectCrossToolchain(b: *std.Build, target: std.Build.ResolvedTarget) ?CrossToolchain {
+    const target_query = target.query;
+    const host = @import("builtin");
+
+    const target_arch = target_query.cpu_arch orelse host.cpu.arch;
+    const target_os: std.Target.Os.Tag = target_query.os_tag orelse host.os.tag;
+    const target_abi: std.Target.Abi = target_query.abi orelse host.abi;
+
+    const is_cross = target_arch != host.cpu.arch or
+        target_os != host.os.tag or
+        target_abi != host.abi;
+
+    if (!is_cross) return null;
+
+    const triple = target.query.zigTriple(b.allocator) catch @panic("OOM");
+
+    // Cmake needs CMAKE_C_COMPILER to be a single executable path, so we
+    // create wrapper scripts. Autotools/make are fine with spaces in CC.
+    const setup = b.addSystemCommand(&.{
+        "sh", "-ceu",
+        b.fmt(
+            \\dir="$1"
+            \\mkdir -p "$dir"
+            \\printf '%s\n' '#!/bin/sh' 'exec zig cc --target={0s} "$@"' > "$dir/zig-cc"
+            \\printf '%s\n' '#!/bin/sh' 'exec zig c++ --target={0s} "$@"' > "$dir/zig-c++"
+            \\printf '%s\n' '#!/bin/sh' 'exec zig ar "$@"' > "$dir/zig-ar"
+            \\printf '%s\n' '#!/bin/sh' 'exec zig ranlib "$@"' > "$dir/zig-ranlib"
+            \\chmod +x "$dir"/zig-*
+        , .{triple}),
+        "cross-wrappers",
+    });
+    const wrapper_dir = setup.addOutputDirectoryArg("cross-wrappers");
+
+    return .{
+        .triple = triple,
+        .cc = b.fmt("zig cc --target={s}", .{triple}),
+        .ar = "zig ar",
+        .ranlib = "zig ranlib",
+        .cmake_setup_step = &setup.step,
+        .cmake_wrapper_dir = wrapper_dir,
+        .cmake_system_name = switch (target_os) {
+            .linux => "Linux",
+            else => "Generic",
+        },
+        .cmake_system_processor = @tagName(target_arch),
+    };
+}
+
 const CMakeBootstrap = struct {
     step_name: []const u8,
     output_dirname: []const u8,
     source: VendorSource,
     cmake_source_subdir: ?[]const u8 = null,
     cmake_flags: []const []const u8,
+    cross: ?CrossToolchain = null,
 };
 
 const AutotoolsBootstrap = struct {
@@ -72,6 +132,7 @@ const AutotoolsBootstrap = struct {
     output_dirname: []const u8,
     source: VendorSource,
     configure_args: []const []const u8,
+    cross: ?CrossToolchain = null,
 };
 
 const SourceTreeBootstrap = struct {
@@ -289,13 +350,14 @@ fn vendorSource(comptime dep: VendorDep) VendorSource {
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
+    const cross = detectCrossToolchain(b, target);
     const deps = VendoredDeps{
-        .zlib = bootstrapZlib(b),
-        .mbedtls = bootstrapMbedTls(b),
-        .libsodium = bootstrapLibsodium(b),
-        .zstd = bootstrapZstd(b),
-        .lzma = bootstrapLzma(b),
-        .bzip2 = bootstrapBzip2(b),
+        .zlib = bootstrapZlib(b, cross),
+        .mbedtls = bootstrapMbedTls(b, cross),
+        .libsodium = bootstrapLibsodium(b, cross),
+        .zstd = bootstrapZstd(b, cross),
+        .lzma = bootstrapLzma(b, cross),
+        .bzip2 = bootstrapBzip2(b, cross),
         .libarchive = undefined,
         .curl = undefined,
         .sqlite = unpackVendorSourceTree(b, .{
@@ -310,8 +372,8 @@ pub fn build(b: *std.Build) void {
         }),
     };
     var vendored = deps;
-    vendored.libarchive = bootstrapLibarchive(b, vendored.zlib, vendored.bzip2, vendored.zstd, vendored.lzma);
-    vendored.curl = bootstrapCurl(b, vendored.zlib, vendored.mbedtls, vendored.zstd);
+    vendored.libarchive = bootstrapLibarchive(b, vendored.zlib, vendored.bzip2, vendored.zstd, vendored.lzma, cross);
+    vendored.curl = bootstrapCurl(b, vendored.zlib, vendored.mbedtls, vendored.zstd, cross);
 
     // Create mere module (Zig code only - no C sources here)
     const mere_module = b.addModule("mere", .{
@@ -667,6 +729,20 @@ fn appendShellSetArgs(b: *std.Build, args: []const []const u8) []const u8 {
 
 fn bootstrapCMakePrefix(b: *std.Build, spec: CMakeBootstrap) BootstrappedPrefix {
     const tarball = downloadVendorSource(b, spec.source);
+    const cross_env_setup = if (spec.cross) |cross|
+        b.fmt(
+            \\cross_dir="$(realpath "$3")"
+            \\cross_flags="-DCMAKE_SYSTEM_NAME={s} -DCMAKE_SYSTEM_PROCESSOR={s}"
+            \\cross_flags="$cross_flags -DCMAKE_C_COMPILER=$cross_dir/zig-cc"
+            \\cross_flags="$cross_flags -DCMAKE_CXX_COMPILER=$cross_dir/zig-c++"
+            \\cross_flags="$cross_flags -DCMAKE_ASM_COMPILER=$cross_dir/zig-cc"
+            \\cross_flags="$cross_flags -DCMAKE_AR=$cross_dir/zig-ar"
+            \\cross_flags="$cross_flags -DCMAKE_RANLIB=$cross_dir/zig-ranlib"
+            \\cross_flags="$cross_flags -DCMAKE_CROSSCOMPILING=ON"
+            \\
+        , .{ cross.cmake_system_name, cross.cmake_system_processor })
+    else
+        "cross_flags=\n";
     const cmake_flags = appendCMakeFlags(b, spec.cmake_flags);
     const source_subdir = spec.cmake_source_subdir orelse "";
     const source_suffix = if (source_subdir.len == 0)
@@ -676,6 +752,7 @@ fn bootstrapCMakePrefix(b: *std.Build, spec: CMakeBootstrap) BootstrappedPrefix 
     const bootstrap_script = b.fmt(
         \\tarball="$1"
         \\prefix="$2"
+        \\{s}
         \\tmpdir="$(mktemp -d)"
         \\cleanup() {{
         \\  rm -rf "$tmpdir"
@@ -697,11 +774,13 @@ fn bootstrapCMakePrefix(b: *std.Build, spec: CMakeBootstrap) BootstrappedPrefix 
         \\src="$tmpdir/{s}{s}"
         \\build="$tmpdir/build"
         \\
-        \\run_logged cmake -Wno-dev -S "$src" -B "$build"{s}
+        \\# shellcheck disable=SC2086
+        \\run_logged cmake -Wno-dev -S "$src" -B "$build" $cross_flags{s}
         \\run_logged cmake --build "$build"
         \\run_logged cmake --install "$build" --prefix "$prefix"
     ,
         .{
+            cross_env_setup,
             spec.source.archive_kind.tarExtractFlag(),
             spec.source.source_dirname,
             source_suffix,
@@ -711,6 +790,10 @@ fn bootstrapCMakePrefix(b: *std.Build, spec: CMakeBootstrap) BootstrappedPrefix 
     const bootstrap = b.addSystemCommand(&.{ "sh", "-ceu", bootstrap_script, spec.step_name });
     bootstrap.addFileArg(tarball);
     const prefix = bootstrap.addOutputDirectoryArg(spec.output_dirname);
+    if (spec.cross) |cross| {
+        bootstrap.step.dependOn(cross.cmake_setup_step);
+        bootstrap.addDirectoryArg(cross.cmake_wrapper_dir);
+    }
 
     return .{
         .prefix = prefix,
@@ -721,6 +804,19 @@ fn bootstrapCMakePrefix(b: *std.Build, spec: CMakeBootstrap) BootstrappedPrefix 
 fn bootstrapAutotoolsPrefix(b: *std.Build, spec: AutotoolsBootstrap) BootstrappedPrefix {
     const tarball = downloadVendorSource(b, spec.source);
     const configure_args = appendShellSetArgs(b, spec.configure_args);
+    const cross_env = if (spec.cross) |cross|
+        b.fmt(
+            \\export CC="{s}"
+            \\export AR="{s}"
+            \\export RANLIB="{s}"
+            \\
+        , .{ cross.cc, cross.ar, cross.ranlib })
+    else
+        "";
+    const cross_host = if (spec.cross) |cross|
+        b.fmt(" --host={s}", .{cross.triple})
+    else
+        "";
     const bootstrap_script = b.fmt(
         \\tarball="$1"
         \\prefix="$2"
@@ -740,21 +836,23 @@ fn bootstrapAutotoolsPrefix(b: *std.Build, spec: AutotoolsBootstrap) Bootstrappe
         \\    exit "$status"
         \\  }}
         \\}}
-        \\
+        \\{s}
         \\run_logged tar {s} "$tarball" -C "$tmpdir"
         \\src="$tmpdir/{s}"
         \\build="$tmpdir/build"
         \\mkdir -p "$build"
         \\cd "$build"
         \\
-        \\set -- "$src/configure" --prefix="$prefix" --libdir="$prefix/lib"{s}
+        \\set -- "$src/configure" --prefix="$prefix" --libdir="$prefix/lib"{s}{s}
         \\run_logged "$@"
         \\run_logged make -j"$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 1)"
         \\run_logged make install
     ,
         .{
+            cross_env,
             spec.source.archive_kind.tarExtractFlag(),
             spec.source.source_dirname,
+            cross_host,
             configure_args,
         },
     );
@@ -768,7 +866,7 @@ fn bootstrapAutotoolsPrefix(b: *std.Build, spec: AutotoolsBootstrap) Bootstrappe
     };
 }
 
-fn bootstrapZlib(b: *std.Build) BootstrappedPrefix {
+fn bootstrapZlib(b: *std.Build, cross: ?CrossToolchain) BootstrappedPrefix {
     return bootstrapCMakePrefix(b, .{
         .step_name = "vendor-bootstrap-zlib",
         .output_dirname = "zlib-ng",
@@ -781,10 +879,11 @@ fn bootstrapZlib(b: *std.Build) BootstrappedPrefix {
             "-DZLIB_ENABLE_TESTS=OFF",
             "-DZLIBNG_ENABLE_TESTS=OFF",
         },
+        .cross = cross,
     });
 }
 
-fn bootstrapMbedTls(b: *std.Build) BootstrappedPrefix {
+fn bootstrapMbedTls(b: *std.Build, cross: ?CrossToolchain) BootstrappedPrefix {
     return bootstrapCMakePrefix(b, .{
         .step_name = "vendor-bootstrap-mbedtls",
         .output_dirname = "mbedtls",
@@ -798,10 +897,11 @@ fn bootstrapMbedTls(b: *std.Build) BootstrappedPrefix {
             "-DUSE_STATIC_MBEDTLS_LIBRARY=ON",
             "-DUSE_SHARED_MBEDTLS_LIBRARY=OFF",
         },
+        .cross = cross,
     });
 }
 
-fn bootstrapLibsodium(b: *std.Build) BootstrappedPrefix {
+fn bootstrapLibsodium(b: *std.Build, cross: ?CrossToolchain) BootstrappedPrefix {
     return bootstrapAutotoolsPrefix(b, .{
         .step_name = "vendor-bootstrap-libsodium",
         .output_dirname = "libsodium",
@@ -811,10 +911,11 @@ fn bootstrapLibsodium(b: *std.Build) BootstrappedPrefix {
             "--enable-static",
             "--enable-minimal",
         },
+        .cross = cross,
     });
 }
 
-fn bootstrapZstd(b: *std.Build) BootstrappedPrefix {
+fn bootstrapZstd(b: *std.Build, cross: ?CrossToolchain) BootstrappedPrefix {
     return bootstrapCMakePrefix(b, .{
         .step_name = "vendor-bootstrap-zstd",
         .output_dirname = "zstd",
@@ -828,10 +929,11 @@ fn bootstrapZstd(b: *std.Build) BootstrappedPrefix {
             "-DZSTD_BUILD_STATIC=ON",
             "-DZSTD_BUILD_TESTS=OFF",
         },
+        .cross = cross,
     });
 }
 
-fn bootstrapLzma(b: *std.Build) BootstrappedPrefix {
+fn bootstrapLzma(b: *std.Build, cross: ?CrossToolchain) BootstrappedPrefix {
     return bootstrapAutotoolsPrefix(b, .{
         .step_name = "vendor-bootstrap-lzma",
         .output_dirname = "lzma",
@@ -847,12 +949,16 @@ fn bootstrapLzma(b: *std.Build) BootstrappedPrefix {
             "--disable-doc",
             "--disable-nls",
         },
+        .cross = cross,
     });
 }
 
-fn bootstrapBzip2(b: *std.Build) BootstrappedPrefix {
+fn bootstrapBzip2(b: *std.Build, cross: ?CrossToolchain) BootstrappedPrefix {
     const source = vendorSource(.bzip2);
     const tarball = downloadVendorSource(b, source);
+    const cc = if (cross) |c| c.cc else "cc";
+    const ar = if (cross) |c| c.ar else "ar";
+    const ranlib = if (cross) |c| c.ranlib else "ranlib";
     const bootstrap_script = b.fmt(
         \\tarball="$1"
         \\prefix="$2"
@@ -878,9 +984,9 @@ fn bootstrapBzip2(b: *std.Build) BootstrappedPrefix {
         \\cd "$src"
         \\make -f Makefile-libbz2_so clean >>"$log" 2>&1 || true
         \\run_logged make \
-        \\  CC=cc \
-        \\  AR=ar \
-        \\  RANLIB=ranlib \
+        \\  CC="{s}" \
+        \\  AR="{s}" \
+        \\  RANLIB="{s}" \
         \\  CFLAGS=-O2\ -fPIC \
         \\  libbz2.a
         \\mkdir -p "$prefix/lib" "$prefix/include" >>"$log" 2>&1
@@ -890,6 +996,9 @@ fn bootstrapBzip2(b: *std.Build) BootstrappedPrefix {
         .{
             source.archive_kind.tarExtractFlag(),
             source.source_dirname,
+            cc,
+            ar,
+            ranlib,
         },
     );
     const bootstrap = b.addSystemCommand(&.{ "sh", "-ceu", bootstrap_script, "vendor-bootstrap-bzip2" });
@@ -908,9 +1017,23 @@ fn bootstrapLibarchive(
     bzip2: BootstrappedPrefix,
     zstd: BootstrappedPrefix,
     lzma: BootstrappedPrefix,
+    cross: ?CrossToolchain,
 ) BootstrappedPrefix {
     const source = vendorSource(.libarchive);
     const tarball = downloadVendorSource(b, source);
+    const cross_env = if (cross) |c|
+        b.fmt(
+            \\export CC="{s}"
+            \\export AR="{s}"
+            \\export RANLIB="{s}"
+            \\
+        , .{ c.cc, c.ar, c.ranlib })
+    else
+        "";
+    const cross_host = if (cross) |c|
+        b.fmt(" --host={s}", .{c.triple})
+    else
+        "";
     const bootstrap_script = b.fmt(
         \\tarball="$1"
         \\prefix="$2"
@@ -934,7 +1057,7 @@ fn bootstrapLibarchive(
         \\    exit "$status"
         \\  }}
         \\}}
-        \\
+        \\{s}
         \\run_logged tar {s} "$tarball" -C "$tmpdir"
         \\src="$tmpdir/{s}"
         \\build="$tmpdir/build"
@@ -943,7 +1066,7 @@ fn bootstrapLibarchive(
         \\
         \\set -- "$src/configure" \
         \\  --prefix="$prefix" \
-        \\  --libdir="$prefix/lib" \
+        \\  --libdir="$prefix/lib"{s} \
         \\  --enable-static \
         \\  --disable-shared \
         \\  --disable-bsdtar \
@@ -966,8 +1089,10 @@ fn bootstrapLibarchive(
         \\run_logged make install
     ,
         .{
+            cross_env,
             source.archive_kind.tarExtractFlag(),
             source.source_dirname,
+            cross_host,
         },
     );
     const bootstrap = b.addSystemCommand(&.{ "sh", "-ceu", bootstrap_script, "vendor-bootstrap-libarchive" });
@@ -989,9 +1114,23 @@ fn bootstrapCurl(
     zlib: BootstrappedPrefix,
     mbedtls: BootstrappedPrefix,
     zstd: BootstrappedPrefix,
+    cross: ?CrossToolchain,
 ) BootstrappedPrefix {
     const source = vendorSource(.curl);
     const tarball = downloadVendorSource(b, source);
+    const cross_env = if (cross) |c|
+        b.fmt(
+            \\export CC="{s}"
+            \\export AR="{s}"
+            \\export RANLIB="{s}"
+            \\
+        , .{ c.cc, c.ar, c.ranlib })
+    else
+        "";
+    const cross_host = if (cross) |c|
+        b.fmt(" --host={s}", .{c.triple})
+    else
+        "";
     const bootstrap_script = b.fmt(
         \\tarball="$1"
         \\prefix="$2"
@@ -1014,7 +1153,7 @@ fn bootstrapCurl(
         \\    exit "$status"
         \\  }}
         \\}}
-        \\
+        \\{s}
         \\run_logged tar {s} "$tarball" -C "$tmpdir"
         \\src="$tmpdir/{s}"
         \\build="$tmpdir/build"
@@ -1023,7 +1162,7 @@ fn bootstrapCurl(
         \\
         \\set -- "$src/configure" \
         \\  --prefix="$prefix" \
-        \\  --libdir="$prefix/lib" \
+        \\  --libdir="$prefix/lib"{s} \
         \\  --disable-shared \
         \\  --enable-static \
         \\  --disable-ftp \
@@ -1061,8 +1200,10 @@ fn bootstrapCurl(
         \\run_logged make install
     ,
         .{
+            cross_env,
             source.archive_kind.tarExtractFlag(),
             source.source_dirname,
+            cross_host,
         },
     );
     const bootstrap = b.addSystemCommand(&.{ "sh", "-ceu", bootstrap_script, "vendor-bootstrap-curl" });
