@@ -46,6 +46,7 @@ test {
     _ = @import("repocache.zig");
     _ = @import("repository.zig");
     _ = @import("resolver.zig");
+    _ = @import("search.zig");
     _ = @import("sign.zig");
     _ = @import("sign_crypto.zig");
     _ = @import("sign_io.zig");
