@@ -25,7 +25,11 @@ fn handleSearch(ctx: *mere.Context, args: *const types.ParsedArgs) MereError!typ
 
     const term = args.positional[0];
 
-    var results = mere.search.searchPackages(ctx, term) catch |err| {
+    var curl_client = try mere.download.CurlTransferClient.init(ctx);
+    defer mere.download.CurlTransferClient.cleanupFn(ctx, curl_client);
+    const client = curl_client.client();
+
+    var results = mere.search.searchPackages(ctx, term, client) catch |err| {
         const user_message = mere.errors.getUserFriendlyMessage(err);
         return types.CommandResult{
             .success = false,
