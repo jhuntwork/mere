@@ -326,6 +326,10 @@ fn parseKdlPackageNode(
     if (node.getChildBool("compress-manpages")) |val| {
         artifact.compress_manpages = val;
     }
+    // arch overrides automatic architecture inference for this package
+    if (node.getChildString("arch")) |val| {
+        artifact.arch = try allocator.dupe(u8, val);
+    }
 
     try packages.append(allocator, artifact);
 }
@@ -436,6 +440,7 @@ pub const BuildArtifact = struct {
     logs: std.ArrayList([]const u8),
     strip: bool,
     compress_manpages: bool,
+    arch: ?[]const u8,
 
     pub fn init(allocator: std.mem.Allocator) !BuildArtifact {
         return BuildArtifact{
@@ -449,6 +454,7 @@ pub const BuildArtifact = struct {
             .logs = try std.ArrayList([]const u8).initCapacity(allocator, 0),
             .strip = true,
             .compress_manpages = true,
+            .arch = null,
         };
     }
 
@@ -463,6 +469,7 @@ pub const BuildArtifact = struct {
         if (self.content_hash) |ch| gpa.free(ch);
         if (self.archive_hash) |ah| gpa.free(ah);
         if (self.signature) |sig| gpa.free(sig);
+        if (self.arch) |a| gpa.free(a);
 
         for (self.logs.items) |l| {
             gpa.free(l);

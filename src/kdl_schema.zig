@@ -484,6 +484,7 @@ const recipe_package_children = [_]NodeSpec{
     .{ .name = "files", .required = true, .args = .{ .kind = .string, .min = 1, .label = "value" } },
     .{ .name = "strip", .args = .{ .kind = .boolean, .min = 1, .max = 1, .label = "value" } },
     .{ .name = "compress-manpages", .args = .{ .kind = .boolean, .min = 1, .max = 1, .label = "value" } },
+    .{ .name = "arch", .args = .{ .kind = .string, .min = 1, .max = 1, .label = "value" } },
 };
 
 const recipe_top_level = [_]NodeSpec{

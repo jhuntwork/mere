@@ -403,6 +403,77 @@ fn loadElfStringTable(file: *const std.Io.File, allocator: std.mem.Allocator, of
     return buf;
 }
 
+/// Read the ELF e_machine field from a file at a given byte offset.
+/// Returns null if the data at that offset is not a valid ELF header.
+pub fn readElfMachineAt(file: *const std.Io.File, offset: u64) ?u16 {
+    const io = path_mod.currentIo();
+    var header_bytes: [20]u8 = undefined;
+    const n = file.readPositionalAll(io, &header_bytes, offset) catch return null;
+    if (n < 20) return null;
+    if (!std.mem.eql(u8, header_bytes[0..4], "\x7fELF")) return null;
+
+    const endian: std.builtin.Endian = switch (header_bytes[std.elf.EI_DATA]) {
+        std.elf.ELFDATA2LSB => .little,
+        std.elf.ELFDATA2MSB => .big,
+        else => return null,
+    };
+    const e_machine_bytes: [2]u8 = .{ header_bytes[18], header_bytes[19] };
+    return std.mem.readInt(u16, &e_machine_bytes, endian);
+}
+
+/// Read the e_machine from the first ELF object inside an ar archive.
+/// Returns null if the file is not an ar archive or contains no ELF members.
+pub fn readElfMachineFromArArchive(file_path: []const u8) ?u16 {
+    const io = path_mod.currentIo();
+    var file = path_mod.openExistingFile(file_path) catch return null;
+    defer file.close(io);
+
+    // ar global magic: "!<arch>\n" (8 bytes)
+    var magic: [8]u8 = undefined;
+    const magic_n = file.readPositionalAll(io, &magic, 0) catch return null;
+    if (magic_n < 8 or !std.mem.eql(u8, &magic, "!<arch>\n")) return null;
+
+    // Walk ar members looking for the first ELF object.
+    // Each member header is 60 bytes: name[16] mtime[12] uid[6] gid[6] mode[8] size[10] fmag[2]
+    var pos: u64 = 8;
+    while (true) {
+        var hdr: [60]u8 = undefined;
+        const hdr_n = file.readPositionalAll(io, &hdr, pos) catch return null;
+        if (hdr_n < 60) return null;
+        // Validate fmag
+        if (!std.mem.eql(u8, hdr[58..60], "`\n")) return null;
+
+        // Parse size (bytes 48..58, ASCII decimal, space-padded)
+        const size = parseArSize(hdr[48..58]) orelse return null;
+        const data_offset = pos + 60;
+
+        // Check if this member starts with ELF magic
+        if (readElfMachineAt(&file, data_offset)) |machine| return machine;
+
+        // Advance to next member (sizes are 2-byte aligned)
+        pos = data_offset + size;
+        if (size % 2 != 0) pos += 1;
+    }
+}
+
+fn parseArSize(raw: *const [10]u8) ?u64 {
+    // Trim trailing spaces
+    var len: usize = 10;
+    while (len > 0 and raw[len - 1] == ' ') len -= 1;
+    if (len == 0) return null;
+    return std.fmt.parseInt(u64, raw[0..len], 10) catch return null;
+}
+
+/// Map an ELF e_machine value to a Mere architecture string.
+/// Returns null for unrecognized machine types.
+pub fn archFromMachine(machine: u16) ?[]const u8 {
+    return switch (@as(std.elf.EM, @enumFromInt(machine))) {
+        .X86_64 => "x86_64",
+        .AARCH64 => "aarch64",
+        else => null,
+    };
+}
+
 /// Deduplicate and sort a string slice
 pub fn dedupAndSort(arena: std.mem.Allocator, items: []const []const u8) ![][]const u8 {
     if (items.len == 0) return &.{};
@@ -731,4 +802,71 @@ test "scanElfMetadata with actual dependencies and sonames" {
         try std.testing.expect(found_libc);
         try std.testing.expect(found_interpreter);
     }
+}
+
+test "readElfMachineAt returns machine for valid ELF" {
+    const io = path_mod.currentIo();
+    var file = path_mod.openExistingFile("test/testdata/dummy") catch return;
+    defer file.close(io);
+    const machine = readElfMachineAt(&file, 0);
+    try std.testing.expect(machine != null);
+    try std.testing.expectEqual(@intFromEnum(std.elf.EM.X86_64), machine.?);
+}
+
+test "readElfMachineAt returns null for non-ELF offset" {
+    const th = @import("test_helpers.zig");
+    var test_env = try th.createTestEnv();
+    defer {
+        test_env.cleanup();
+        std.testing.allocator.destroy(test_env);
+    }
+    const io = path_mod.currentIo();
+    const txt_path = try std.fs.path.join(std.testing.allocator, &.{ test_env.path, "plain.txt" });
+    defer std.testing.allocator.free(txt_path);
+    {
+        var f = try path_mod.makePathAndOpenFile(txt_path);
+        defer f.close(io);
+        try f.writeStreamingAll(io, "not an elf file");
+    }
+    var f = path_mod.openExistingFile(txt_path) catch return;
+    defer f.close(io);
+    try std.testing.expect(readElfMachineAt(&f, 0) == null);
+}
+
+test "archFromMachine maps known architectures" {
+    try std.testing.expectEqualStrings("x86_64", archFromMachine(@intFromEnum(std.elf.EM.X86_64)).?);
+    try std.testing.expectEqualStrings("aarch64", archFromMachine(@intFromEnum(std.elf.EM.AARCH64)).?);
+    try std.testing.expect(archFromMachine(0) == null);
+    try std.testing.expect(archFromMachine(999) == null);
+}
+
+test "readElfMachineFromArArchive returns null for non-ar file" {
+    const th = @import("test_helpers.zig");
+    var test_env = try th.createTestEnv();
+    defer {
+        test_env.cleanup();
+        std.testing.allocator.destroy(test_env);
+    }
+    const io = path_mod.currentIo();
+    const txt_path = try std.fs.path.join(std.testing.allocator, &.{ test_env.path, "fake.a" });
+    defer std.testing.allocator.free(txt_path);
+    {
+        var f = try path_mod.makePathAndOpenFile(txt_path);
+        defer f.close(io);
+        try f.writeStreamingAll(io, "not an archive");
+    }
+    try std.testing.expect(readElfMachineFromArArchive(txt_path) == null);
+}
+
+test "readElfMachineFromArArchive returns null for nonexistent file" {
+    try std.testing.expect(readElfMachineFromArArchive("/nonexistent/path/to/file.a") == null);
+}
+
+test "parseArSize parses valid sizes" {
+    const s1: [10]u8 = "1234      ".*;
+    try std.testing.expectEqual(@as(u64, 1234), parseArSize(&s1).?);
+    const s2: [10]u8 = "0         ".*;
+    try std.testing.expectEqual(@as(u64, 0), parseArSize(&s2).?);
+    const s3: [10]u8 = "          ".*;
+    try std.testing.expect(parseArSize(&s3) == null);
 }
