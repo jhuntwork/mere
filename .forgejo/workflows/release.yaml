@@ -25,9 +25,9 @@ jobs:
           cd "$GITHUB_WORKSPACE"
           git remote add origin "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY.git"
           git -c http.extraHeader="Authorization: Bearer $GITHUB_TOKEN" \
-            fetch --depth=50 --tags origin "$GITHUB_SHA"
-          git -c http.extraHeader="Authorization: Bearer $GITHUB_TOKEN" \
             fetch --tags origin
+          git -c http.extraHeader="Authorization: Bearer $GITHUB_TOKEN" \
+            fetch --depth=50 origin "$GITHUB_SHA"
           git checkout --detach FETCH_HEAD
 
       - name: Detect version change
