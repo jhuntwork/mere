@@ -40,13 +40,14 @@ asset_base() {
 }
 
 changelog() {
-    old_tag=$1
+    prev_tag=$(git describe --tags --abbrev=0 "${GITHUB_SHA}^" 2>/dev/null || true)
 
-    if [ -z "$old_tag" ] || ! git rev-parse --verify "$old_tag" >/dev/null 2>&1; then
-        git log --pretty=format:'- %s' -20 "$GITHUB_SHA"
-    else
-        git log --pretty=format:'- %s' "${old_tag}..${GITHUB_SHA}"
+    if [ -z "$prev_tag" ]; then
+        printf 'No previous tag found; skipping changelog.\n' >&2
+        return
     fi
+
+    git log --pretty=format:'- %s' "${prev_tag}..${GITHUB_SHA}"
 }
 
 case "${1-}" in
@@ -59,8 +60,7 @@ case "${1-}" in
         asset_base "$@"
         ;;
     changelog)
-        shift
-        changelog "$@"
+        changelog
         ;;
     *)
         printf '%s\n' "usage: $0 detect-version-change <current> [previous]" >&2

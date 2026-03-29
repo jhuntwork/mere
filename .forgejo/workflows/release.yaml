@@ -26,6 +26,8 @@ jobs:
           git remote add origin "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY.git"
           git -c http.extraHeader="Authorization: Bearer $GITHUB_TOKEN" \
             fetch --depth=50 --tags origin "$GITHUB_SHA"
+          git -c http.extraHeader="Authorization: Bearer $GITHUB_TOKEN" \
+            fetch --tags origin
           git checkout --detach FETCH_HEAD
 
       - name: Detect version change
@@ -43,13 +45,7 @@ jobs:
           sh .forgejo/scripts/release-ci.sh detect-version-change build.zig.zon "$previous_file" \
             >> "$GITHUB_OUTPUT"
 
-          old_version=$(grep '^old_version=' "$GITHUB_OUTPUT" | tail -1 | cut -d= -f2)
-          old_tag=""
-          if [ -n "$old_version" ]; then
-            old_tag="v${old_version}"
-          fi
-
-          changelog=$(sh .forgejo/scripts/release-ci.sh changelog "$old_tag")
+          changelog=$(sh .forgejo/scripts/release-ci.sh changelog)
           {
             printf 'changelog<<EOF\n'
             printf '%s\n' "$changelog"
@@ -306,7 +302,7 @@ jobs:
     if: needs.detect.outputs.version_changed == 'true'
     runs-on: docker
     container:
-      image: mere/ci
+      image: mere/zig
     steps:
       - name: Upload SHA256SUMS
         run: |
