@@ -117,6 +117,8 @@ jobs:
             push origin "refs/tags/${tag}"
 
       - name: Create release and upload assets
+        env:
+          CHANGELOG: ${{ needs.detect.outputs.changelog }}
         run: |
           set -eu
           cd "$GITHUB_WORKSPACE"
@@ -140,10 +142,17 @@ jobs:
               printf 'Release %s already exists; reusing it.\n' "$tag"
               ;;
             404)
-              body=$(printf '%s' "${{ needs.detect.outputs.changelog }}" | sed 's/\\/\\\\/g; s/"/\\"/g; s/$/\\n/' | tr -d '\n' | sed 's/\\n$//')
-              printf '%s\n' \
-                "{\"tag_name\":\"$tag\",\"target_commitish\":\"$GITHUB_SHA\",\"name\":\"mere $version\",\"body\":\"$body\",\"draft\":false,\"prerelease\":false}" \
-                > release-create.json
+              python3 -c "
+import json, os
+body = os.environ.get('CHANGELOG', 'Automated release for version $version.')
+print(json.dumps({
+    'tag_name': '$tag',
+    'target_commitish': '$GITHUB_SHA',
+    'name': 'mere $version',
+    'body': body,
+    'draft': False,
+    'prerelease': False,
+}))" > release-create.json
 
               curl -fsS \
                 -X POST \
@@ -160,9 +169,7 @@ jobs:
               ;;
           esac
 
-          release_id=$(
-            sed -n 's/.*"id":[[:space:]]*\([0-9][0-9]*\).*/\1/p' release.json | head -n 1
-          )
+          release_id=$(python3 -c 'import json; print(json.load(open("release.json"))["id"])')
 
           if [ -z "$release_id" ]; then
             printf '%s\n' "Failed to parse release id from API response." >&2
@@ -258,9 +265,7 @@ jobs:
             exit 1
           fi
 
-          release_id=$(
-            sed -n 's/.*"id":[[:space:]]*\([0-9][0-9]*\).*/\1/p' release.json | head -n 1
-          )
+          release_id=$(python3 -c 'import json; print(json.load(open("release.json"))["id"])')
 
           for asset in dist/*; do
             name=$(basename "$asset")
@@ -318,9 +323,7 @@ jobs:
             -H "Accept: application/json" \
             "$api_base/tags/$tag" > release.json
 
-          release_id=$(
-            sed -n 's/.*"id":[[:space:]]*\([0-9][0-9]*\).*/\1/p' release.json | head -n 1
-          )
+          release_id=$(python3 -c 'import json; print(json.load(open("release.json"))["id"])')
 
           status=$(
             curl -sS \
