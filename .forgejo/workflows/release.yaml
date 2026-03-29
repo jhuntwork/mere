@@ -119,14 +119,17 @@ jobs:
       - name: Create release and upload assets
         env:
           CHANGELOG: ${{ needs.detect.outputs.changelog }}
+          TAG: ${{ needs.detect.outputs.tag }}
+          VERSION: ${{ needs.detect.outputs.version }}
+          COMMIT_SHA: ${{ github.sha }}
         run: |
           set -eu
           cd "$GITHUB_WORKSPACE"
 
           api_base="$GITHUB_SERVER_URL/api/v1/repos/$GITHUB_REPOSITORY/releases"
           auth_header="Authorization: token $GITHUB_TOKEN"
-          tag="${{ needs.detect.outputs.tag }}"
-          version="${{ needs.detect.outputs.version }}"
+          tag="$TAG"
+          version="$VERSION"
 
           release_status=$(
             curl -sS \
@@ -142,17 +145,7 @@ jobs:
               printf 'Release %s already exists; reusing it.\n' "$tag"
               ;;
             404)
-              python3 -c "
-import json, os
-body = os.environ.get('CHANGELOG', 'Automated release for version $version.')
-print(json.dumps({
-    'tag_name': '$tag',
-    'target_commitish': '$GITHUB_SHA',
-    'name': 'mere $version',
-    'body': body,
-    'draft': False,
-    'prerelease': False,
-}))" > release-create.json
+              python3 .forgejo/scripts/release-body.py > release-create.json
 
               curl -fsS \
                 -X POST \
