@@ -161,9 +161,7 @@ jobs:
           esac
 
           release_id=$(
-            grep -o '"id":[[:space:]]*[0-9][0-9]*' release.json \
-              | head -n 1 \
-              | sed 's/[^0-9]//g'
+            sed -n 's/.*"id":[[:space:]]*\([0-9][0-9]*\).*/\1/p' release.json | head -n 1
           )
 
           if [ -z "$release_id" ]; then
@@ -261,9 +259,7 @@ jobs:
           fi
 
           release_id=$(
-            grep -o '"id":[[:space:]]*[0-9][0-9]*' release.json \
-              | head -n 1 \
-              | sed 's/[^0-9]//g'
+            sed -n 's/.*"id":[[:space:]]*\([0-9][0-9]*\).*/\1/p' release.json | head -n 1
           )
 
           for asset in dist/*; do
@@ -323,9 +319,7 @@ jobs:
             "$api_base/tags/$tag" > release.json
 
           release_id=$(
-            grep -o '"id":[[:space:]]*[0-9][0-9]*' release.json \
-              | head -n 1 \
-              | sed 's/[^0-9]//g'
+            sed -n 's/.*"id":[[:space:]]*\([0-9][0-9]*\).*/\1/p' release.json | head -n 1
           )
 
           status=$(
