@@ -39,6 +39,16 @@ asset_base() {
     printf 'mere-%s-%s-%s\n' "$version" "$os" "$arch"
 }
 
+changelog() {
+    old_tag=$1
+
+    if [ -z "$old_tag" ] || ! git rev-parse --verify "$old_tag" >/dev/null 2>&1; then
+        git log --pretty=format:'- %s' -20 "$GITHUB_SHA"
+    else
+        git log --pretty=format:'- %s' "${old_tag}..${GITHUB_SHA}"
+    fi
+}
+
 case "${1-}" in
     detect-version-change)
         shift
@@ -48,9 +58,14 @@ case "${1-}" in
         shift
         asset_base "$@"
         ;;
+    changelog)
+        shift
+        changelog "$@"
+        ;;
     *)
         printf '%s\n' "usage: $0 detect-version-change <current> [previous]" >&2
         printf '%s\n' "   or: $0 asset-base <version> <os> <arch>" >&2
+        printf '%s\n' "   or: $0 changelog <old-tag>" >&2
         exit 1
         ;;
 esac
