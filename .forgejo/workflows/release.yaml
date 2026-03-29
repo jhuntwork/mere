@@ -11,6 +11,13 @@ jobs:
     runs-on: docker
     container:
       image: mere/zig
+    outputs:
+      version_changed: ${{ steps.meta.outputs.version_changed }}
+      version: ${{ steps.meta.outputs.version }}
+      old_version: ${{ steps.meta.outputs.old_version }}
+      tag: ${{ steps.meta.outputs.tag }}
+      release_name: ${{ steps.meta.outputs.release_name }}
+      changelog: ${{ steps.meta.outputs.changelog }}
     steps:
       - name: Git checkout
         run: |
@@ -60,6 +67,8 @@ jobs:
     runs-on: docker
     container:
       image: mere/zig
+    outputs:
+      checksum: ${{ steps.build.outputs.checksum }}
     steps:
       - name: Git checkout
         run: |
@@ -203,6 +212,8 @@ jobs:
     runs-on: docker-aarch64
     container:
       image: mere/zig
+    outputs:
+      checksum: ${{ steps.build.outputs.checksum }}
     steps:
       - name: Git checkout
         run: |
