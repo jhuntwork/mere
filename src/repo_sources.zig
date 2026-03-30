@@ -3,14 +3,11 @@ const mere = @import("mere.zig");
 const Context = mere.Context;
 const config = @import("config.zig");
 const Config = config.Config;
-const RepoConfig = config.RepoConfig;
 const RepoCache = @import("repocache.zig").RepoCache;
 const repo_history = @import("repo_history.zig");
 const sign = @import("sign.zig");
 const kdl = @import("kdl.zig");
 const path_mod = @import("path.zig");
-
-const default_sync_timeout_seconds: u32 = 30;
 
 pub fn createCaches(ctx: *Context, cfg: *const Config) !std.ArrayList(*RepoCache) {
     var repocaches: std.ArrayList(*RepoCache) = .empty;
@@ -21,6 +18,9 @@ pub fn createCaches(ctx: *Context, cfg: *const Config) !std.ArrayList(*RepoCache
         }
         repocaches.deinit(ctx.allocator);
     }
+
+    // Discover local dev repos first (priority 50, overlay on remote repos)
+    try appendDiscoveredLocalRepoCaches(ctx, &repocaches);
 
     var repo_configs = try cfg.getFilteredAndSortedRepos(ctx.allocator);
     defer repo_configs.deinit(ctx.allocator);
@@ -154,7 +154,11 @@ pub fn loadTrustedFingerprints(ctx: *Context) !std.ArrayList([]const u8) {
     return fingerprints;
 }
 
-fn appendDiscoveredLocalRepos(ctx: *Context, cfg: *Config) !void {
+/// Discover local dev repos under /mere/dev/repo/ and append them as
+/// RepoCaches directly. This avoids injecting them into the Config (which
+/// caused name collisions with remote repos of the same name). Local repos
+/// get priority 50 so they overlay remote repos during resolution.
+fn appendDiscoveredLocalRepoCaches(ctx: *Context, repocaches: *std.ArrayList(*RepoCache)) !void {
     var trusted_fps = try loadTrustedFingerprints(ctx);
     defer {
         for (trusted_fps.items) |fp| ctx.allocator.free(fp);
@@ -184,30 +188,49 @@ fn appendDiscoveredLocalRepos(ctx: *Context, cfg: *Config) !void {
         const repo_dir_path = try std.fs.path.join(ctx.allocator, &.{ repos_dir_path, repo_name });
         defer ctx.allocator.free(repo_dir_path);
 
-        const current_state_path = repo_history.currentStatePath(ctx.allocator, repo_dir_path) catch {
-            ctx.debug("skipping local repo {s}: out of memory building current state path", .{repo_name});
-            continue;
-        };
-        defer ctx.allocator.free(current_state_path);
+        // Try both layouts: flat (repo.db at root) and state-slot (current/repo.db)
+        const active_db_path, const active_sig_path, const cache_dir_path = blk: {
+            // Try flat layout first
+            const flat_db = std.fs.path.join(ctx.allocator, &.{ repo_dir_path, repo_history.REPO_DB_FILENAME }) catch continue;
+            const flat_sig = std.fs.path.join(ctx.allocator, &.{ repo_dir_path, repo_history.REPO_SIG_FILENAME }) catch {
+                ctx.allocator.free(flat_db);
+                continue;
+            };
 
-        const active_db_path = std.fs.path.join(ctx.allocator, &.{ current_state_path, repo_history.REPO_DB_FILENAME }) catch {
-            ctx.debug("skipping local repo {s}: out of memory building current state db path", .{repo_name});
-            continue;
+            const flat_db_exists = blk2: {
+                std.Io.Dir.accessAbsolute(path_mod.currentIo(), flat_db, .{}) catch break :blk2 false;
+                break :blk2 true;
+            };
+
+            if (flat_db_exists) {
+                break :blk .{ flat_db, flat_sig, try ctx.allocator.dupe(u8, repo_dir_path) };
+            }
+
+            ctx.allocator.free(flat_db);
+            ctx.allocator.free(flat_sig);
+
+            // Try state-slot layout
+            const current_state_path = repo_history.currentStatePath(ctx.allocator, repo_dir_path) catch continue;
+            defer ctx.allocator.free(current_state_path);
+
+            const slot_db = std.fs.path.join(ctx.allocator, &.{ current_state_path, repo_history.REPO_DB_FILENAME }) catch continue;
+            const slot_sig = std.fs.path.join(ctx.allocator, &.{ current_state_path, repo_history.REPO_SIG_FILENAME }) catch {
+                ctx.allocator.free(slot_db);
+                continue;
+            };
+
+            break :blk .{ slot_db, slot_sig, try ctx.allocator.dupe(u8, current_state_path) };
         };
         defer ctx.allocator.free(active_db_path);
-
-        const active_sig_path = std.fs.path.join(ctx.allocator, &.{ current_state_path, repo_history.REPO_SIG_FILENAME }) catch {
-            ctx.debug("skipping local repo {s}: out of memory building current state sig path", .{repo_name});
-            continue;
-        };
         defer ctx.allocator.free(active_sig_path);
+        defer ctx.allocator.free(cache_dir_path);
 
         std.Io.Dir.accessAbsolute(path_mod.currentIo(), active_db_path, .{}) catch {
-            ctx.debug("skipping {s}: current state missing db", .{repo_name});
+            ctx.debug("skipping {s}: missing db", .{repo_name});
             continue;
         };
         std.Io.Dir.accessAbsolute(path_mod.currentIo(), active_sig_path, .{}) catch {
-            ctx.debug("skipping {s}: current state missing db signature", .{repo_name});
+            ctx.debug("skipping {s}: missing db signature", .{repo_name});
             continue;
         };
 
@@ -222,49 +245,37 @@ fn appendDiscoveredLocalRepos(ctx: *Context, cfg: *Config) !void {
         };
         verify_result.deinit(ctx.allocator);
 
-        for (cfg.repos.items) |existing| {
-            if (std.mem.eql(u8, existing.name, repo_name)) {
-                return ctx.fail(error.InvalidConfig, repo_name, "local repo name conflicts with configured remote repo");
-            }
-        }
+        // Build a file:// URL pointing at the directory containing repo.db
+        const url = std.fmt.allocPrint(ctx.allocator, "file://{s}", .{cache_dir_path}) catch continue;
+        const name_copy = ctx.allocator.dupe(u8, repo_name) catch {
+            ctx.allocator.free(url);
+            continue;
+        };
 
-        const url = try std.fmt.allocPrint(ctx.allocator, "file://{s}", .{repo_dir_path});
-        errdefer ctx.allocator.free(url);
+        const rc_ptr = ctx.allocator.create(RepoCache) catch {
+            ctx.allocator.free(name_copy);
+            ctx.allocator.free(url);
+            continue;
+        };
+        rc_ptr.* = RepoCache.init(ctx, name_copy, url, trusted_fps.items, 50) catch {
+            ctx.allocator.destroy(rc_ptr);
+            ctx.allocator.free(name_copy);
+            ctx.allocator.free(url);
+            continue;
+        };
+        rc_ptr.owns_metadata = true;
 
-        const name_copy = try ctx.allocator.dupe(u8, repo_name);
-        errdefer ctx.allocator.free(name_copy);
-
-        var repo_fps: std.ArrayList([]const u8) = .empty;
-        errdefer {
-            for (repo_fps.items) |fp| ctx.allocator.free(fp);
-            repo_fps.deinit(ctx.allocator);
-        }
-        for (trusted_fps.items) |fp| {
-            const fp_copy = try ctx.allocator.dupe(u8, fp);
-            try repo_fps.append(ctx.allocator, fp_copy);
-        }
-
-        try cfg.repos.append(cfg.alloc, RepoConfig{
-            .name = name_copy,
-            .url = url,
-            .priority = 50,
-            .trusted_fingerprints = repo_fps,
-            .enabled = true,
-            .sync_ttl_seconds = 0,
-            .sync_timeout_seconds = default_sync_timeout_seconds,
-            .archives_from_shared_pool = true,
-        });
-        ctx.debug("discovered local repo: {s}", .{repo_name});
+        repocaches.append(ctx.allocator, rc_ptr) catch {
+            rc_ptr.*.deinit();
+            ctx.allocator.destroy(rc_ptr);
+            continue;
+        };
+        ctx.debug("discovered local repo overlay: {s}", .{repo_name});
     }
 }
 
 pub fn loadConfig(ctx: *Context) !Config {
-    var cfg = try config.loadConfig(ctx);
-    errdefer cfg.deinit();
-
-    try appendDiscoveredLocalRepos(ctx, &cfg);
-
-    return cfg;
+    return try config.loadConfig(ctx);
 }
 
 test "loadTrustedFingerprints loads fingerprints from trusted.kdl" {
@@ -333,7 +344,7 @@ test "resolveUserTrustedKdlPath errors when home directory missing" {
     try std.testing.expectError(error.InvalidConfig, resolveUserTrustedKdlPath(std.testing.allocator, null));
 }
 
-test "appendDiscoveredLocalRepos finds valid repositories" {
+test "appendDiscoveredLocalRepoCaches finds valid repositories" {
     var test_env = try @import("test_helpers.zig").createTestEnv();
     defer {
         test_env.cleanup();
@@ -382,17 +393,24 @@ test "appendDiscoveredLocalRepos finds valid repositories" {
     test_env.ctx.signing_key_path = secret_key_path;
     _ = try sign.writeSignatureFileWithResolver(&test_env.ctx, db_path, sig_path, null, null);
 
-    var cfg = Config.init(&test_env.ctx, test_env.ctx.allocator);
-    defer cfg.deinit();
+    var repocaches: std.ArrayList(*RepoCache) = .empty;
+    defer {
+        for (repocaches.items) |rc| {
+            rc.*.deinit();
+            test_env.ctx.allocator.destroy(rc);
+        }
+        repocaches.deinit(test_env.ctx.allocator);
+    }
 
-    try appendDiscoveredLocalRepos(&test_env.ctx, &cfg);
+    try appendDiscoveredLocalRepoCaches(&test_env.ctx, &repocaches);
 
-    try std.testing.expectEqual(@as(usize, 1), cfg.repos.items.len);
-    try std.testing.expectEqualStrings("testrepo", cfg.repos.items[0].name);
-    try std.testing.expect(std.mem.startsWith(u8, cfg.repos.items[0].url, "file://"));
+    try std.testing.expectEqual(@as(usize, 1), repocaches.items.len);
+    try std.testing.expectEqualStrings("testrepo", repocaches.items[0].name);
+    try std.testing.expectEqual(@as(u8, 50), repocaches.items[0].priority);
+    try std.testing.expect(repocaches.items[0].is_local);
 }
 
-test "appendDiscoveredLocalRepos skips directories without db" {
+test "appendDiscoveredLocalRepoCaches skips directories without db" {
     var test_env = try @import("test_helpers.zig").createTestEnv();
     defer {
         test_env.cleanup();
@@ -403,9 +421,9 @@ test "appendDiscoveredLocalRepos skips directories without db" {
     defer test_env.ctx.allocator.free(repos_dir);
     try path_mod.ensureDirExists(repos_dir);
 
-    var cfg = Config.init(&test_env.ctx, test_env.ctx.allocator);
-    defer cfg.deinit();
+    var repocaches: std.ArrayList(*RepoCache) = .empty;
+    defer repocaches.deinit(test_env.ctx.allocator);
 
-    try appendDiscoveredLocalRepos(&test_env.ctx, &cfg);
-    try std.testing.expectEqual(@as(usize, 0), cfg.repos.items.len);
+    try appendDiscoveredLocalRepoCaches(&test_env.ctx, &repocaches);
+    try std.testing.expectEqual(@as(usize, 0), repocaches.items.len);
 }

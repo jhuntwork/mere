@@ -40,10 +40,33 @@ const RepoSourceResult = struct {
     allocated: bool,
 };
 
-fn resolveRepoSource(ctx: *Context, repo_name: []const u8) !RepoSourceResult {
-    ctx.debug("resolveRepoSource: repo_name={s}", .{repo_name});
-    const repo_path = std.fs.path.join(ctx.allocator, &.{ ctx.root_path, "mere", "dev", "repo", repo_name }) catch {
-        return ctx.fail(ImportError.OutOfMemory, repo_name, "failed to construct repo path");
+/// Returns true if the input looks like a filesystem path (absolute, relative
+/// with ./ or ../, or contains a path separator).
+fn looksLikePath(input: []const u8) bool {
+    if (input.len == 0) return false;
+    if (input[0] == '/') return true;
+    if (std.mem.startsWith(u8, input, "./") or std.mem.startsWith(u8, input, "../")) return true;
+    return false;
+}
+
+fn resolveRepoSource(ctx: *Context, repo_name_or_path: []const u8) !RepoSourceResult {
+    ctx.debug("resolveRepoSource: input={s}", .{repo_name_or_path});
+
+    if (looksLikePath(repo_name_or_path)) {
+        // Treat as a direct repo directory path
+        var abs_buf: [std.fs.max_path_bytes]u8 = undefined;
+        const abs_path = p.resolveToAbsolutePath(repo_name_or_path, &abs_buf) catch {
+            return ctx.fail(ImportError.InvalidInput, repo_name_or_path, "failed to resolve repo path");
+        };
+        const dir_path = ctx.allocator.dupe(u8, abs_path) catch {
+            return ImportError.OutOfMemory;
+        };
+        return RepoSourceResult{ .dir_path = dir_path, .allocated = true };
+    }
+
+    // Legacy: treat as a repo name under /mere/dev/repo/<name>
+    const repo_path = std.fs.path.join(ctx.allocator, &.{ ctx.root_path, "mere", "dev", "repo", repo_name_or_path }) catch {
+        return ctx.fail(ImportError.OutOfMemory, repo_name_or_path, "failed to construct repo path");
     };
     ctx.debug("resolveRepoSource: repo_path={s}", .{repo_path});
 
@@ -58,19 +81,53 @@ fn resolveRepoSource(ctx: *Context, repo_name: []const u8) !RepoSourceResult {
     return ImportError.PackageNotFound; // Repo not found
 }
 
-fn getBootstrapPath(ctx: *Context, repo_name: []const u8) ![]const u8 {
-    ctx.debug("getBootstrapPath: repo_name={s}", .{repo_name});
-    const bp = std.fs.path.join(ctx.allocator, &.{ ctx.root_path, "mere", "dev", "repo", repo_name }) catch {
-        return ctx.fail(ImportError.OutOfMemory, repo_name, "failed to construct bootstrap path");
+fn getBootstrapPath(ctx: *Context, repo_name_or_path: []const u8) ![]const u8 {
+    ctx.debug("getBootstrapPath: input={s}", .{repo_name_or_path});
+
+    if (looksLikePath(repo_name_or_path)) {
+        var abs_buf: [std.fs.max_path_bytes]u8 = undefined;
+        const abs_path = p.resolveToAbsolutePath(repo_name_or_path, &abs_buf) catch {
+            return ctx.fail(ImportError.InvalidInput, repo_name_or_path, "failed to resolve bootstrap path");
+        };
+        return ctx.allocator.dupe(u8, abs_path) catch ImportError.OutOfMemory;
+    }
+
+    const bp = std.fs.path.join(ctx.allocator, &.{ ctx.root_path, "mere", "dev", "repo", repo_name_or_path }) catch {
+        return ctx.fail(ImportError.OutOfMemory, repo_name_or_path, "failed to construct bootstrap path");
     };
     ctx.debug("getBootstrapPath: bootstrap_path={s}", .{bp});
     return bp;
 }
 
 fn bootstrapRepoSource(ctx: *Context, repo_path: []const u8) !void {
-    repository.setupStateLayout(ctx.allocator, repo_path) catch {
-        return ctx.fail(ImportError.FileSystem, repo_path, "failed to create repo state layout");
+    // Determine if this is a path-based repo (flat layout) or a legacy
+    // dev repo name (state slot layout under /mere/dev/repo/).
+    const dev_repo_prefix = std.fs.path.join(ctx.allocator, &.{ ctx.root_path, "mere", "dev", "repo" }) catch {
+        return ImportError.OutOfMemory;
     };
+    defer ctx.allocator.free(dev_repo_prefix);
+
+    const is_dev_repo = std.mem.startsWith(u8, repo_path, dev_repo_prefix) and
+        repo_path.len > dev_repo_prefix.len and repo_path[dev_repo_prefix.len] == '/';
+
+    if (is_dev_repo) {
+        // Legacy dev repo: use state slot layout (current/previous)
+        repository.setupStateLayout(ctx.allocator, repo_path) catch {
+            return ctx.fail(ImportError.FileSystem, repo_path, "failed to create repo state layout");
+        };
+    } else {
+        // Path-based repo: flat layout (repo.db + packages/ at root)
+        p.ensureDirExists(repo_path) catch {
+            return ctx.fail(ImportError.FileSystem, repo_path, "failed to create repo directory");
+        };
+        const packages_dir = std.fs.path.join(ctx.allocator, &.{ repo_path, "packages" }) catch {
+            return ImportError.OutOfMemory;
+        };
+        defer ctx.allocator.free(packages_dir);
+        p.ensureDirExists(packages_dir) catch {
+            return ctx.fail(ImportError.FileSystem, packages_dir, "failed to create repo packages directory");
+        };
+    }
 
     var repo = Repository.init(ctx, repo_path, false) catch {
         const diag = ctx.getDiagnosticContext();
@@ -314,10 +371,10 @@ fn validateProjectionIndex(ctx: *Context, temp_dir: []const u8) !void {
     };
 }
 
-fn storeArtifactAtomically(ctx: *Context, pkg: *const package.Package, final_pkg_path: []const u8) ![]const u8 {
-    const packages_dir = try std.fs.path.join(ctx.allocator, &.{ ctx.root_path, "mere", "cache", "packages" });
+fn storeArtifactAtomically(ctx: *Context, pkg: *const package.Package, final_pkg_path: []const u8, repo_dir: []const u8) ![]const u8 {
+    const packages_dir = try std.fs.path.join(ctx.allocator, &.{ repo_dir, "packages" });
     p.ensureDirExists(packages_dir) catch {
-        ctx.setDiagnosticContext(packages_dir, "failed to create package pool dir");
+        ctx.setDiagnosticContext(packages_dir, "failed to create repo packages dir");
         ctx.allocator.free(packages_dir);
         return ImportError.FileSystem;
     };
@@ -329,7 +386,7 @@ fn storeArtifactAtomically(ctx: *Context, pkg: *const package.Package, final_pkg
 
     const repo_pkg_path = try std.fs.path.join(ctx.allocator, &.{ packages_dir, canonical_name });
 
-    // The shared package pool is content-addressed by canonical archive name.
+    // The repo packages dir is content-addressed by canonical archive name.
     // If the canonical file already exists as a regular file, the artifact is already present.
     if (p.openExistingFile(repo_pkg_path)) |existing_file| {
         const io = p.currentIo();
@@ -571,22 +628,22 @@ fn collectTrustedFingerprintsForImport(ctx: *Context) !std.ArrayList([]const u8)
     return trusted_fingerprints;
 }
 
-fn resolveOrBootstrapRepoDir(ctx: *Context, repo_name: []const u8) !RepoSourceResult {
-    if (resolveRepoSource(ctx, repo_name)) |resolve_result| {
+fn resolveOrBootstrapRepoDir(ctx: *Context, repo_name_or_path: []const u8) !RepoSourceResult {
+    if (resolveRepoSource(ctx, repo_name_or_path)) |resolve_result| {
         return resolve_result;
     } else |err| {
         if (err != ImportError.PackageNotFound) return err;
 
         const resolved_key = sign.resolveSigningKey(ctx, null) catch {
-            return ctx.fail(ImportError.PackageNotFound, repo_name, "signing key resolution failed");
+            return ctx.fail(ImportError.PackageNotFound, repo_name_or_path, "signing key resolution failed");
         };
         defer ctx.allocator.free(resolved_key);
 
         std.Io.Dir.cwd().access(p.currentIo(), resolved_key, .{}) catch {
-            return ctx.fail(ImportError.PackageNotFound, repo_name, resolved_key);
+            return ctx.fail(ImportError.PackageNotFound, repo_name_or_path, resolved_key);
         };
 
-        const bootstrap_path = try getBootstrapPath(ctx, repo_name);
+        const bootstrap_path = try getBootstrapPath(ctx, repo_name_or_path);
         errdefer ctx.allocator.free(bootstrap_path);
         try bootstrapRepoSource(ctx, bootstrap_path);
         return .{ .dir_path = bootstrap_path, .allocated = true };
@@ -793,8 +850,8 @@ fn preflightAndPersistArtifacts(
             };
         }
 
-        // Atomically copy the package into the shared package pool
-        const repo_pkg_path = try storeArtifactAtomically(ctx, pkg_ptr, record.package_path);
+        // Atomically copy the package into the repo packages directory
+        const repo_pkg_path = try storeArtifactAtomically(ctx, pkg_ptr, record.package_path, repo_dir);
         defer ctx.allocator.free(repo_pkg_path);
     }
 }
@@ -807,12 +864,12 @@ pub const ImportError = Std.OutOfMemory || Std.FileSystem || Std.InvalidInput ||
     PackageNotFound,
 };
 
-pub fn packages(ctx: *Context, repo_name: []const u8, file_paths: []const []const u8, force: bool) !void {
+pub fn packages(ctx: *Context, repo_name_or_path: []const u8, file_paths: []const []const u8, force: bool) !void {
     if (file_paths.len == 0) {
-        return ctx.fail(ImportError.InvalidInput, repo_name, "no package archives provided");
+        return ctx.fail(ImportError.InvalidInput, repo_name_or_path, "no package archives provided");
     }
 
-    const resolved_repo = try resolveOrBootstrapRepoDir(ctx, repo_name);
+    const resolved_repo = try resolveOrBootstrapRepoDir(ctx, repo_name_or_path);
     defer if (resolved_repo.allocated) ctx.allocator.free(resolved_repo.dir_path);
 
     var records: std.ArrayList(PreparedImportRecord) = .empty;
@@ -847,7 +904,7 @@ pub fn packages(ctx: *Context, repo_name: []const u8, file_paths: []const []cons
         const existing = ctx.getDiagnosticContext();
         if (existing.subject) |subject| {
             ctx.setDiagnosticContextFmt(subject, "repository '{s}': {s}", .{
-                repo_name,
+                repo_name_or_path,
                 existing.details orelse "preflight failed",
             });
         }
@@ -858,7 +915,7 @@ pub fn packages(ctx: *Context, repo_name: []const u8, file_paths: []const []cons
         const existing = ctx.getDiagnosticContext();
         if (existing.subject) |subject| {
             ctx.setDiagnosticContextFmt(subject, "repository '{s}': {s}", .{
-                repo_name,
+                repo_name_or_path,
                 existing.details orelse "database commit failed",
             });
         }
@@ -1016,7 +1073,9 @@ test "packages duplicate without force does not overwrite package artifact" {
     const pool_dir = try std.fs.path.join(ctx.allocator, &.{
         test_env.path,
         "mere",
-        "cache",
+        "dev",
+        "repo",
+        "import",
         "packages",
     });
     defer ctx.allocator.free(pool_dir);
@@ -1072,7 +1131,10 @@ test "storeArtifactAtomically cleans temp file when rename fails" {
         try f.writeStreamingAll(p.currentIo(), "dummy archive content");
     }
 
-    const packages_dir = try std.fs.path.join(ctx.allocator, &.{ ctx.root_path, "mere", "cache", "packages" });
+    const repo_dir = try std.fs.path.join(ctx.allocator, &.{ test_env.path, "test-repo" });
+    defer ctx.allocator.free(repo_dir);
+    try p.ensureDirExists(repo_dir);
+    const packages_dir = try std.fs.path.join(ctx.allocator, &.{ repo_dir, "packages" });
     defer ctx.allocator.free(packages_dir);
     try p.ensureDirExists(packages_dir);
 
@@ -1095,7 +1157,7 @@ test "storeArtifactAtomically cleans temp file when rename fails" {
 
     try std.testing.expectError(
         ImportError.PackageImportFailed,
-        storeArtifactAtomically(&ctx, &pkg, src_path),
+        storeArtifactAtomically(&ctx, &pkg, src_path, repo_dir),
     );
     ctx.resetDiagnostics();
 
@@ -1136,7 +1198,10 @@ test "storeArtifactAtomically treats existing canonical archive as success" {
         try f.writeStreamingAll(p.currentIo(), "new archive content");
     }
 
-    const packages_dir = try std.fs.path.join(ctx.allocator, &.{ ctx.root_path, "mere", "cache", "packages" });
+    const repo_dir = try std.fs.path.join(ctx.allocator, &.{ test_env.path, "test-repo" });
+    defer ctx.allocator.free(repo_dir);
+    try p.ensureDirExists(repo_dir);
+    const packages_dir = try std.fs.path.join(ctx.allocator, &.{ repo_dir, "packages" });
     defer ctx.allocator.free(packages_dir);
     try p.ensureDirExists(packages_dir);
 
@@ -1150,7 +1215,7 @@ test "storeArtifactAtomically treats existing canonical archive as success" {
         try existing.writeStreamingAll(p.currentIo(), "existing archive content");
     }
 
-    const stored_path = try storeArtifactAtomically(&ctx, &pkg, src_path);
+    const stored_path = try storeArtifactAtomically(&ctx, &pkg, src_path, repo_dir);
     defer ctx.allocator.free(stored_path);
 
     try std.testing.expectEqualStrings(final_path, stored_path);

@@ -1472,11 +1472,12 @@ fn installDependenciesToBuildProfile(
         return switch (err) {
             error.OutOfMemory => BuildError.OutOfMemory,
             error.Network => BuildError.Network,
-            error.PermissionDenied => BuildError.PermissionDenied,
-            error.FileSystem => BuildError.FileSystem,
-            error.SignatureInvalid => BuildError.InvalidInput,
+            error.PermissionDenied, error.AccessDenied => BuildError.PermissionDenied,
+            error.FileSystem, error.SystemResources, error.Unexpected, error.Canceled => BuildError.FileSystem,
+            error.SignatureInvalid, error.InvalidKey, error.VerifyFailed, error.SodiumInitFailed => BuildError.InvalidInput,
             error.CorruptData => BuildError.FileSystem,
             error.RollbackDetected => BuildError.InvalidInput,
+            error.InvalidInput => BuildError.InvalidInput,
         };
     };
     defer {

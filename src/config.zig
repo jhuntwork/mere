@@ -23,9 +23,6 @@ pub const RepoConfig = struct {
     sync_ttl_seconds: u64 = default_sync_ttl_seconds,
     /// Sync timeout in seconds (remote repos only; local repos ignore)
     sync_timeout_seconds: u32 = default_sync_timeout_seconds,
-    /// Whether package archives for this repo should be resolved from the
-    /// shared local pool (/mere/cache/packages) instead of "<url>/packages".
-    archives_from_shared_pool: bool = false,
 
     /// Free memory allocated for the RepoConfig using the provided allocator.
     pub fn deinit(self: *RepoConfig, allocator: std.mem.Allocator) void {
@@ -64,7 +61,6 @@ pub const RepoConfig = struct {
             .enabled = self.enabled,
             .sync_ttl_seconds = self.sync_ttl_seconds,
             .sync_timeout_seconds = self.sync_timeout_seconds,
-            .archives_from_shared_pool = self.archives_from_shared_pool,
             .trusted_fingerprints = fingerprints_copy,
         };
     }
