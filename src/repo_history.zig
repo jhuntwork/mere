@@ -51,8 +51,15 @@ fn stagingStatePath(allocator: std.mem.Allocator, repo_dir: []const u8) Error![]
     return std.fs.path.join(allocator, &.{ repo_dir, STAGING_STATE_DIR }) catch Error.OutOfMemory;
 }
 
-fn currentDbPath(allocator: std.mem.Allocator, repo_dir: []const u8) Error![]const u8 {
-    return std.fs.path.join(allocator, &.{ repo_dir, CURRENT_STATE_DIR, REPO_DB_FILENAME }) catch Error.OutOfMemory;
+fn currentDbPath(allocator: std.mem.Allocator, repo_dir: []const u8) struct { path: []const u8, flat: bool } {
+    // Prefer flat layout (repo.db at root) over state-slot layout (current/repo.db)
+    const flat_path = std.fs.path.join(allocator, &.{ repo_dir, REPO_DB_FILENAME }) catch return .{ .path = &.{}, .flat = false };
+    std.Io.Dir.accessAbsolute(path_mod.currentIo(), flat_path, .{}) catch {
+        allocator.free(flat_path);
+        const slot_path = std.fs.path.join(allocator, &.{ repo_dir, CURRENT_STATE_DIR, REPO_DB_FILENAME }) catch return .{ .path = &.{}, .flat = false };
+        return .{ .path = slot_path, .flat = false };
+    };
+    return .{ .path = flat_path, .flat = true };
 }
 
 fn previousDbPath(allocator: std.mem.Allocator, repo_dir: []const u8) Error![]const u8 {
@@ -68,6 +75,7 @@ pub const Staged = struct {
     sig_path: []const u8,
     lock_fd: std.posix.fd_t,
     committed: bool,
+    flat: bool,
 
     pub fn commit(self: *Staged) !void {
         const key_path = sign.resolveSigningKey(self.ctx, null) catch |err| {
@@ -87,25 +95,44 @@ pub const Staged = struct {
             };
         };
 
-        const current_path = try currentStatePath(self.ctx.allocator, self.repo_dir);
-        defer self.ctx.allocator.free(current_path);
-        const previous_path = try previousStatePath(self.ctx.allocator, self.repo_dir);
-        defer self.ctx.allocator.free(previous_path);
-
-        try deleteTreeIfExists(previous_path);
-
-        std.Io.Dir.renameAbsolute(current_path, previous_path, path_mod.currentIo()) catch |err| {
-            return switch (err) {
-                error.FileNotFound => Error.StateNotFound,
-                else => mapFs(err),
+        if (self.flat) {
+            // Flat layout: copy staged db and sig to repo root
+            const root_db = std.fs.path.join(self.ctx.allocator, &.{ self.repo_dir, REPO_DB_FILENAME }) catch {
+                return Error.OutOfMemory;
             };
-        };
+            defer self.ctx.allocator.free(root_db);
+            const root_sig = std.fs.path.join(self.ctx.allocator, &.{ self.repo_dir, REPO_SIG_FILENAME }) catch {
+                return Error.OutOfMemory;
+            };
+            defer self.ctx.allocator.free(root_sig);
 
-        std.Io.Dir.renameAbsolute(self.state_path, current_path, path_mod.currentIo()) catch |err| {
-            // Best effort rollback of slot move if stage activation fails.
-            std.Io.Dir.renameAbsolute(previous_path, current_path, path_mod.currentIo()) catch {};
-            return mapFs(err);
-        };
+            path_mod.copyFile(self.db_path, root_db) catch {
+                return Error.FileSystem;
+            };
+            path_mod.copyFile(self.sig_path, root_sig) catch {
+                return Error.FileSystem;
+            };
+        } else {
+            // State-slot layout: rotate current → previous, .next → current
+            const current_path = try currentStatePath(self.ctx.allocator, self.repo_dir);
+            defer self.ctx.allocator.free(current_path);
+            const previous_path = try previousStatePath(self.ctx.allocator, self.repo_dir);
+            defer self.ctx.allocator.free(previous_path);
+
+            try deleteTreeIfExists(previous_path);
+
+            std.Io.Dir.renameAbsolute(current_path, previous_path, path_mod.currentIo()) catch |err| {
+                return switch (err) {
+                    error.FileNotFound => Error.StateNotFound,
+                    else => mapFs(err),
+                };
+            };
+
+            std.Io.Dir.renameAbsolute(self.state_path, current_path, path_mod.currentIo()) catch |err| {
+                std.Io.Dir.renameAbsolute(previous_path, current_path, path_mod.currentIo()) catch {};
+                return mapFs(err);
+            };
+        }
 
         self.committed = true;
     }
@@ -164,10 +191,13 @@ pub fn stageNext(
         _ = std.c.close(lock_fd);
     }
 
-    const src_db_path = currentDbPath(allocator, repo_dir) catch {
+    const db_result = currentDbPath(allocator, repo_dir);
+    const src_db_path = db_result.path;
+    if (src_db_path.len == 0) {
         return ctx.fail(Error.OutOfMemory, repo_dir, "failed to construct current state db path");
-    };
+    }
     defer allocator.free(src_db_path);
+    const is_flat = db_result.flat;
 
     std.Io.Dir.accessAbsolute(path_mod.currentIo(), src_db_path, .{}) catch |err| {
         return ctx.fail(switch (err) {
@@ -223,6 +253,7 @@ pub fn stageNext(
         .sig_path = dst_sig_path,
         .lock_fd = lock_fd,
         .committed = false,
+        .flat = is_flat,
     };
 }
 
@@ -477,7 +508,8 @@ test "undoLastChange swaps current and previous" {
 
     try undo(&test_env.ctx, repo_dir);
 
-    const current_db = try currentDbPath(test_env.ctx.allocator, repo_dir);
+    const db_result = currentDbPath(test_env.ctx.allocator, repo_dir);
+    const current_db = db_result.path;
     defer test_env.ctx.allocator.free(current_db);
     const previous_db = try previousDbPath(test_env.ctx.allocator, repo_dir);
     defer test_env.ctx.allocator.free(previous_db);
