@@ -5,7 +5,6 @@ pub const build_cache = @import("build_cache.zig");
 pub const config = @import("config.zig");
 pub const download = @import("download.zig");
 pub const dev_cleanup = @import("dev_cleanup.zig");
-pub const dev_publish = @import("dev_publish.zig");
 pub const errors = @import("errors.zig");
 pub const etc = @import("etc.zig");
 pub const gc = @import("gc.zig");
@@ -21,7 +20,6 @@ pub const path = @import("path.zig");
 pub const package = @import("package.zig");
 pub const packaging = @import("packaging.zig");
 pub const pin = @import("pin.zig");
-pub const publish = @import("publish.zig");
 pub const repodb = @import("repodb.zig");
 pub const profile = @import("profile.zig");
 pub const recipe = @import("recipe.zig");
@@ -92,7 +90,8 @@ pub const Context = struct {
             old_config.deinit();
         }
 
-        // Load configuration including auto-discovered local repos
+        // Load configuration (remote repos only; local dev repos are
+        // discovered as overlays in repo_sources.createCaches)
         var new_config = repo_sources.loadConfig(self) catch |load_err| {
             if (load_err == error.OutOfMemory) {
                 return self.fail(MereError.ResourceLimitReached, "config", "out of memory loading config");

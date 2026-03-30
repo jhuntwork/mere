@@ -11,8 +11,8 @@ const import_meta = command.CommandMeta{
     .description = "Import package archives into a repository (defaults to /mere/dev/outputs when no package-file is given)",
     .args = &[_]types.Arg{
         .{
-            .name = "repo-name",
-            .description = "Name of the repository (resolved from /mere/dev/repo/<name>/)",
+            .name = "repo-dir",
+            .description = "Path to the repository directory, or a name resolved from /mere/dev/repo/<name>/",
             .required = true,
         },
         .{
@@ -43,13 +43,13 @@ fn handleImport(ctx: *mere.Context, args: *const types.ParsedArgs) MereError!typ
         return MereError.MissingArgument;
     }
 
-    const repo_name = args.positional[0];
+    const repo_dir = args.positional[0];
     const positional_package_paths = if (args.positional.len > 1) args.positional[1..] else &[_][]const u8{};
 
     // Create diagnostic context for this operation
     const diagnostic_ctx = mere.errors.DiagnosticContext.init()
-        .withSubject(if (positional_package_paths.len > 0) positional_package_paths[0] else repo_name)
-        .withDetails(repo_name);
+        .withSubject(if (positional_package_paths.len > 0) positional_package_paths[0] else repo_dir)
+        .withDetails(repo_dir);
     ctx.withDiagnosticContext(diagnostic_ctx);
 
     for (positional_package_paths) |package_path| {
@@ -100,7 +100,7 @@ fn handleImport(ctx: *mere.Context, args: *const types.ParsedArgs) MereError!typ
     }
 
     // Error boundary: catch all errors and map them to user-friendly messages at CLI boundary
-    performImport(ctx, repo_name, package_paths, force) catch |err| {
+    performImport(ctx, repo_dir, package_paths, force) catch |err| {
         // Map error to MereError vocabulary
         const mapped_error = mere.errors.ErrorMapping.mapModuleError(@TypeOf(err), err);
 
@@ -130,7 +130,7 @@ fn handleImport(ctx: *mere.Context, args: *const types.ParsedArgs) MereError!typ
         .{ .text = ": ", .kind = .normal },
         .{ .text = count_text, .kind = .detail },
         .{ .text = " to repository '", .kind = .normal },
-        .{ .text = repo_name, .kind = .detail },
+        .{ .text = repo_dir, .kind = .detail },
         .{ .text = "'", .kind = .normal },
     };
     return types.CommandResult.createSuccessSegments(ctx.allocator, &segments);
@@ -138,8 +138,8 @@ fn handleImport(ctx: *mere.Context, args: *const types.ParsedArgs) MereError!typ
 
 /// Perform the actual import logic without error logging
 /// All errors are propagated to the CLI boundary for single-point logging
-fn performImport(ctx: *mere.Context, repo_name: []const u8, package_paths: []const []const u8, force: bool) !void {
-    try mere.import.packages(ctx, repo_name, package_paths, force);
+fn performImport(ctx: *mere.Context, repo_dir: []const u8, package_paths: []const []const u8, force: bool) !void {
+    try mere.import.packages(ctx, repo_dir, package_paths, force);
 }
 
 /// Create the import command

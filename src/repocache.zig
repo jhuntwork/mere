@@ -94,10 +94,12 @@ pub const RepoCache = struct {
     repository: ?Repository,
     /// Repository priority for conflict resolution (lower number = higher priority)
     priority: u8 = 100,
+    /// Whether this RepoCache owns its name and url strings (must free in deinit).
+    /// True for discovered local repos; false for config-backed repos where
+    /// the Config owns the strings.
+    owns_metadata: bool = false,
     /// Whether this is a local (file://) repository
     is_local: bool = false,
-    /// Whether archive payloads should be sourced from /mere/cache/packages.
-    archives_from_shared_pool: bool = false,
     /// Sync TTL in seconds (remote repos only; local repos ignore)
     sync_ttl_seconds: u64 = default_sync_ttl_seconds,
     /// Sync timeout in seconds (remote repos only; local repos ignore)
@@ -146,7 +148,6 @@ pub const RepoCache = struct {
             .repository = null,
             .priority = priority,
             .is_local = local,
-            .archives_from_shared_pool = false,
             .sync_ttl_seconds = default_sync_ttl_seconds,
             .sync_timeout_seconds = default_sync_timeout_seconds,
         };
@@ -163,7 +164,6 @@ pub const RepoCache = struct {
             config.trusted_fingerprints.items,
             config.priority,
         );
-        cache.archives_from_shared_pool = config.archives_from_shared_pool;
         cache.sync_ttl_seconds = config.sync_ttl_seconds;
         cache.sync_timeout_seconds = config.sync_timeout_seconds;
         return cache;
@@ -194,6 +194,10 @@ pub const RepoCache = struct {
             repo.deinit();
         }
         self.ctx.allocator.free(self.cache_dir);
+        if (self.owns_metadata) {
+            self.ctx.allocator.free(self.name);
+            self.ctx.allocator.free(self.url);
+        }
     }
 
     /// Returns the path to the local cache directory: /mere/cache/[repo-name]
@@ -542,15 +546,10 @@ pub const RepoCache = struct {
     }
 
     /// Resolve the base URL used for archive fetches.
-    /// Local repos are backed by the shared package pool, while remote repos
-    /// use "<repo-url>/packages".
+    /// All repos use "<repo-url>/packages" — local repos have file:// URLs
+    /// that already point at the directory containing repo.db, so
+    /// "<file://...>/packages" resolves to the packages/ subdir.
     fn archiveBaseUrl(self: *RepoCache) ![]const u8 {
-        if (self.archives_from_shared_pool) {
-            return std.fmt.allocPrint(self.ctx.allocator, "file://{s}/mere/cache/packages", .{self.ctx.root_path}) catch {
-                return RepoCacheError.OutOfMemory;
-            };
-        }
-
         const url_base = trimTrailingSlash(self.url);
         return std.fmt.allocPrint(self.ctx.allocator, "{s}/packages", .{url_base}) catch {
             return RepoCacheError.OutOfMemory;

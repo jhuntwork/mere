@@ -5,7 +5,6 @@ const command = @import("../command.zig");
 const import_cmd = @import("import.zig");
 const build_cmd = @import("build.zig");
 const dev_cleanup = mere.dev_cleanup;
-const dev_publish = mere.dev_publish;
 const hash = mere.hash;
 const path = mere.path;
 const repo_history = mere.repo_history;
@@ -149,38 +148,6 @@ const repo_undo_meta = command.CommandMeta{
             .name = "repo-name",
             .description = "Name of the repository (maps to /mere/dev/repo/<name>/)",
             .required = true,
-        },
-    },
-};
-
-/// Publish subcommand metadata
-const publish_meta = command.CommandMeta{
-    .name = "publish",
-    .description = "Publish selected packages from local dev repo to an output repository directory",
-    .args = &[_]types.Arg{
-        .{
-            .name = "repo-name",
-            .description = "Name of the local dev repo (maps to /mere/dev/repo/<name>/)",
-            .required = true,
-        },
-        .{
-            .name = "out-dir",
-            .description = "Output directory for published repository",
-            .required = true,
-        },
-        .{
-            .name = "package",
-            .description = "Optional package selector(s): <name> or <name>@<version>-<release>:<arch>",
-            .required = false,
-        },
-    },
-    .flags = &[_]types.Flag{
-        .{
-            .name = "keep",
-            .description = "Number of versions to retain per package/arch during publish pruning",
-            .flag_type = .int,
-            .value_name = "N",
-            .default_value = std.fmt.comptimePrint("{d}", .{repo_history.DEFAULT_KEEP_VERSIONS}),
         },
     },
 };
@@ -606,68 +573,6 @@ fn performRepoRemove(ctx: *mere.Context, repo_name: []const u8, pkg_name: []cons
     };
 }
 
-fn handlePublish(ctx: *mere.Context, args: *const types.ParsedArgs) MereError!types.CommandResult {
-    if (args.positional.len < 2) {
-        return MereError.MissingArgument;
-    }
-
-    const repo_name = args.positional[0];
-    const out_dir = args.positional[1];
-    const selectors = if (args.positional.len > 2) args.positional[2..] else &[_][]const u8{};
-    const keep_raw = args.getInt("keep") orelse repo_history.DEFAULT_KEEP_VERSIONS;
-
-    if (keep_raw < 1) {
-        return types.CommandResult{
-            .success = false,
-            .exit_code = 2,
-            .message = try std.fmt.allocPrint(ctx.allocator, "Invalid keep count: {d} (must be at least 1)", .{keep_raw}),
-        };
-    }
-    const keep_count: u32 = @intCast(keep_raw);
-
-    if (!path.isValidInputPath(out_dir)) {
-        return types.CommandResult{
-            .success = false,
-            .exit_code = 2,
-            .message = try std.fmt.allocPrint(ctx.allocator, "Invalid output path: '{s}'", .{out_dir}),
-        };
-    }
-
-    const diagnostic_ctx = DiagnosticContext.init()
-        .withSubject(repo_name)
-        .withDetails(out_dir);
-    ctx.withDiagnosticContext(diagnostic_ctx);
-
-    const stats = dev_publish.publish(ctx, repo_name, out_dir, selectors, keep_count) catch |err| {
-        const mapped_error = ErrorMapping.mapModuleError(@TypeOf(err), err);
-        const user_message = getUserFriendlyMessage(err);
-        const error_ctx = ctx.getDiagnosticContext().toErrorContext();
-        const formatted_message = error_ctx.formatWithMessage(ctx.allocator, user_message) catch user_message;
-        defer if (formatted_message.ptr != user_message.ptr) ctx.allocator.free(formatted_message);
-        const exit_code = command.exitCodeForError(mapped_error);
-        return types.CommandResult{
-            .success = false,
-            .exit_code = exit_code,
-            .message = try ctx.allocator.dupe(u8, formatted_message),
-        };
-    };
-
-    var count_buf: [32]u8 = undefined;
-    const count_text = std.fmt.bufPrint(&count_buf, "{d}", .{stats.applied_count}) catch return MereError.OutOfMemory;
-    const publish_segments = [_]mere.ui.Segment{
-        .{ .text = "package selection", .kind = .normal },
-        .{ .text = if (stats.applied_count == 1) "" else "s", .kind = .normal },
-        .{ .text = " ", .kind = .normal },
-        .{ .text = "published", .kind = .success },
-        .{ .text = ": ", .kind = .normal },
-        .{ .text = count_text, .kind = .detail },
-        .{ .text = " to '", .kind = .normal },
-        .{ .text = out_dir, .kind = .detail },
-        .{ .text = "'", .kind = .normal },
-    };
-    return types.CommandResult.createSuccessSegments(ctx.allocator, &publish_segments);
-}
-
 /// Create the dev command with its subcommands
 pub fn createCommand(allocator: std.mem.Allocator) !*command.Command {
     const dev_cmd = try allocator.create(command.Command);
@@ -689,11 +594,6 @@ pub fn createCommand(allocator: std.mem.Allocator) !*command.Command {
     try dev_cmd.addSubcommand(hash_cmd);
     try dev_cmd.addSubcommand(clean_cmd);
     try dev_cmd.addSubcommand(validate_cmd);
-
-    // Create publish subcommand
-    const publish_cmd = try allocator.create(command.Command);
-    publish_cmd.* = command.Command.init(allocator, publish_meta, handlePublish);
-    try dev_cmd.addSubcommand(publish_cmd);
 
     // Create repo parent + subcommands
     const repo_cmd = try allocator.create(command.Command);

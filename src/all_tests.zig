@@ -14,7 +14,6 @@ test {
     _ = @import("config.zig");
     _ = @import("download.zig");
     _ = @import("dev_cleanup.zig");
-    _ = @import("dev_publish.zig");
     _ = @import("elf.zig");
     _ = @import("errors.zig");
     _ = @import("etc.zig");
@@ -37,7 +36,6 @@ test {
     _ = @import("path.zig");
     _ = @import("pin.zig");
     _ = @import("projection_index.zig");
-    _ = @import("publish.zig");
     _ = @import("profile.zig");
     _ = @import("recipe.zig");
     _ = @import("repodb.zig");
