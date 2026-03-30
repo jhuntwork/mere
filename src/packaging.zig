@@ -119,6 +119,8 @@ pub const Packager = struct {
 
         var pkg = package.Package.init(self.ctx);
         defer pkg.deinit();
+        // Set arch from recipe for the dependency scan (target_arch filtering).
+        // This will be replaced by the inferred arch after scanning.
         if (config.recipe.arch) |arch| {
             pkg.arch = self.ctx.allocator.dupe(u8, arch) catch |err| {
                 self.ctx.allocator.free(content_hash);
@@ -143,6 +145,31 @@ pub const Packager = struct {
                 .{@errorName(err)},
             );
         };
+
+        // Determine final package arch: explicit override > ELF inference > "any"
+        {
+            const final_arch = if (config.artifact.arch) |override|
+                override
+            else
+                package.inferArch(self.ctx, config.staging_dir) catch |err| {
+                    self.ctx.allocator.free(content_hash);
+                    const diag = self.ctx.getDiagnosticContext();
+                    if (diag.subject != null or diag.details != null) {
+                        return PackagingError.CreationFailed;
+                    }
+                    return self.ctx.failFmt(
+                        PackagingError.CreationFailed,
+                        config.staging_dir,
+                        "failed to infer package architecture ({s})",
+                        .{@errorName(err)},
+                    );
+                };
+            if (pkg.arch) |old| self.ctx.allocator.free(old);
+            pkg.arch = self.ctx.allocator.dupe(u8, final_arch) catch |err| {
+                self.ctx.allocator.free(content_hash);
+                return self.fail(final_arch, "failed to copy inferred architecture", if (err == error.OutOfMemory) PackagingError.OutOfMemory else PackagingError.CreationFailed);
+            };
+        }
 
         if (pkg.content_hash.len == 0) {
             pkg.content_hash = self.ctx.allocator.dupe(u8, content_hash) catch |err| {
@@ -521,9 +548,10 @@ test "Packager handles signing and metadata generation" {
     defer result.deinit(test_env.ctx.allocator);
 
     // Verify the archive filename format includes architecture + content hash
+    // No ELF files in staging, so arch is inferred as "any"
     const expected_filename_prefix = try std.fmt.allocPrint(
         test_env.ctx.allocator,
-        "custom-name-2.1.0-3-x86_64-{s}.pkg.tar.zst",
+        "custom-name-2.1.0-3-any-{s}.pkg.tar.zst",
         .{result.archive_hash},
     );
     defer test_env.ctx.allocator.free(expected_filename_prefix);
