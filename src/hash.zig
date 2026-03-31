@@ -26,12 +26,9 @@ pub const HashDiag = struct {
     path: ?[]const u8 = null,
     action: ?[]const u8 = null,
     os_error: ?anyerror = null,
-    owns_path: bool = false,
 
     pub fn deinit(self: *HashDiag, allocator: std.mem.Allocator) void {
-        if (self.owns_path) {
-            if (self.path) |p| allocator.free(p);
-        }
+        if (self.path) |p| allocator.free(p);
         self.* = .{};
     }
 };
@@ -299,14 +296,12 @@ fn setDiag(
     os_error: ?anyerror,
 ) void {
     const d = diag orelse return;
-    if (d.owns_path) {
-        if (d.path) |p| allocator.free(p);
-    }
+    if (d.path) |p| allocator.free(p);
     const dup_path = allocator.dupe(u8, path_value) catch {
-        d.* = .{ .path = null, .action = action_value, .os_error = os_error, .owns_path = false };
+        d.* = .{ .path = null, .action = action_value, .os_error = os_error };
         return;
     };
-    d.* = .{ .path = dup_path, .action = action_value, .os_error = os_error, .owns_path = true };
+    d.* = .{ .path = dup_path, .action = action_value, .os_error = os_error };
 }
 
 // Spec #1: Store content hash determinism
