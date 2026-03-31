@@ -14,8 +14,6 @@ pub const Error = Std.OutOfMemory || Std.FileSystem || Std.PermissionDenied || S
 /// Keeps the newly imported version plus 2 previous versions.
 pub const DEFAULT_KEEP_VERSIONS: u32 = 3;
 
-pub const CURRENT_STATE_DIR = "current";
-pub const PREVIOUS_STATE_DIR = "previous";
 pub const STAGING_STATE_DIR = ".next";
 
 /// Fixed database filename used by all repositories.
@@ -39,31 +37,12 @@ fn deleteTreeIfExists(path: []const u8) Error!void {
     };
 }
 
-pub fn currentStatePath(allocator: std.mem.Allocator, repo_dir: []const u8) Error![]const u8 {
-    return std.fs.path.join(allocator, &.{ repo_dir, CURRENT_STATE_DIR }) catch Error.OutOfMemory;
-}
-
-fn previousStatePath(allocator: std.mem.Allocator, repo_dir: []const u8) Error![]const u8 {
-    return std.fs.path.join(allocator, &.{ repo_dir, PREVIOUS_STATE_DIR }) catch Error.OutOfMemory;
-}
-
 fn stagingStatePath(allocator: std.mem.Allocator, repo_dir: []const u8) Error![]const u8 {
     return std.fs.path.join(allocator, &.{ repo_dir, STAGING_STATE_DIR }) catch Error.OutOfMemory;
 }
 
-fn currentDbPath(allocator: std.mem.Allocator, repo_dir: []const u8) struct { path: []const u8, flat: bool } {
-    // Prefer flat layout (repo.db at root) over state-slot layout (current/repo.db)
-    const flat_path = std.fs.path.join(allocator, &.{ repo_dir, REPO_DB_FILENAME }) catch return .{ .path = &.{}, .flat = false };
-    std.Io.Dir.accessAbsolute(path_mod.currentIo(), flat_path, .{}) catch {
-        allocator.free(flat_path);
-        const slot_path = std.fs.path.join(allocator, &.{ repo_dir, CURRENT_STATE_DIR, REPO_DB_FILENAME }) catch return .{ .path = &.{}, .flat = false };
-        return .{ .path = slot_path, .flat = false };
-    };
-    return .{ .path = flat_path, .flat = true };
-}
-
-fn previousDbPath(allocator: std.mem.Allocator, repo_dir: []const u8) Error![]const u8 {
-    return std.fs.path.join(allocator, &.{ repo_dir, PREVIOUS_STATE_DIR, REPO_DB_FILENAME }) catch Error.OutOfMemory;
+fn currentDbPath(allocator: std.mem.Allocator, repo_dir: []const u8) []const u8 {
+    return std.fs.path.join(allocator, &.{ repo_dir, REPO_DB_FILENAME }) catch return &.{};
 }
 
 pub const Staged = struct {
@@ -75,7 +54,6 @@ pub const Staged = struct {
     sig_path: []const u8,
     lock_fd: std.posix.fd_t,
     committed: bool,
-    flat: bool,
 
     pub fn commit(self: *Staged) !void {
         const key_path = sign.resolveSigningKey(self.ctx, null) catch |err| {
@@ -95,44 +73,22 @@ pub const Staged = struct {
             };
         };
 
-        if (self.flat) {
-            // Flat layout: copy staged db and sig to repo root
-            const root_db = std.fs.path.join(self.ctx.allocator, &.{ self.repo_dir, REPO_DB_FILENAME }) catch {
-                return Error.OutOfMemory;
-            };
-            defer self.ctx.allocator.free(root_db);
-            const root_sig = std.fs.path.join(self.ctx.allocator, &.{ self.repo_dir, REPO_SIG_FILENAME }) catch {
-                return Error.OutOfMemory;
-            };
-            defer self.ctx.allocator.free(root_sig);
+        // Flat layout: copy staged db and sig to repo root
+        const root_db = std.fs.path.join(self.ctx.allocator, &.{ self.repo_dir, REPO_DB_FILENAME }) catch {
+            return Error.OutOfMemory;
+        };
+        defer self.ctx.allocator.free(root_db);
+        const root_sig = std.fs.path.join(self.ctx.allocator, &.{ self.repo_dir, REPO_SIG_FILENAME }) catch {
+            return Error.OutOfMemory;
+        };
+        defer self.ctx.allocator.free(root_sig);
 
-            path_mod.copyFile(self.db_path, root_db) catch {
-                return Error.FileSystem;
-            };
-            path_mod.copyFile(self.sig_path, root_sig) catch {
-                return Error.FileSystem;
-            };
-        } else {
-            // State-slot layout: rotate current → previous, .next → current
-            const current_path = try currentStatePath(self.ctx.allocator, self.repo_dir);
-            defer self.ctx.allocator.free(current_path);
-            const previous_path = try previousStatePath(self.ctx.allocator, self.repo_dir);
-            defer self.ctx.allocator.free(previous_path);
-
-            try deleteTreeIfExists(previous_path);
-
-            std.Io.Dir.renameAbsolute(current_path, previous_path, path_mod.currentIo()) catch |err| {
-                return switch (err) {
-                    error.FileNotFound => Error.StateNotFound,
-                    else => mapFs(err),
-                };
-            };
-
-            std.Io.Dir.renameAbsolute(self.state_path, current_path, path_mod.currentIo()) catch |err| {
-                std.Io.Dir.renameAbsolute(previous_path, current_path, path_mod.currentIo()) catch {};
-                return mapFs(err);
-            };
-        }
+        path_mod.copyFile(self.db_path, root_db) catch {
+            return Error.FileSystem;
+        };
+        path_mod.copyFile(self.sig_path, root_sig) catch {
+            return Error.FileSystem;
+        };
 
         self.committed = true;
     }
@@ -192,12 +148,11 @@ pub fn stageNext(
     }
 
     const db_result = currentDbPath(allocator, repo_dir);
-    const src_db_path = db_result.path;
+    const src_db_path = db_result;
     if (src_db_path.len == 0) {
         return ctx.fail(Error.OutOfMemory, repo_dir, "failed to construct current state db path");
     }
     defer allocator.free(src_db_path);
-    const is_flat = db_result.flat;
 
     std.Io.Dir.accessAbsolute(path_mod.currentIo(), src_db_path, .{}) catch |err| {
         return ctx.fail(switch (err) {
@@ -253,72 +208,6 @@ pub fn stageNext(
         .sig_path = dst_sig_path,
         .lock_fd = lock_fd,
         .committed = false,
-        .flat = is_flat,
-    };
-}
-
-/// Undo the most recent committed change by swapping `current` and `previous`.
-pub fn undo(ctx: *mere.Context, repo_dir: []const u8) Error!void {
-    const lock_path = std.fs.path.join(ctx.allocator, &.{ repo_dir, "repo.lock" }) catch {
-        return ctx.fail(Error.OutOfMemory, repo_dir, "failed to construct lock path");
-    };
-    defer ctx.allocator.free(lock_path);
-
-    const lock_file = std.Io.Dir.createFileAbsolute(path_mod.currentIo(), lock_path, .{ .truncate = false }) catch |err| {
-        return ctx.fail(mapFs(err), lock_path, "failed to open repo lock file");
-    };
-    const lock_fd = lock_file.handle;
-    errdefer _ = std.c.close(lock_fd);
-
-    switch (std.posix.errno(std.c.flock(lock_fd, std.c.LOCK.EX))) {
-        .SUCCESS => {},
-        else => return ctx.fail(Error.FileSystem, lock_path, "failed to acquire repo lock"),
-    }
-    defer {
-        _ = std.c.flock(lock_fd, std.c.LOCK.UN);
-        _ = std.c.close(lock_fd);
-    }
-
-    const previous_db = previousDbPath(ctx.allocator, repo_dir) catch {
-        return ctx.fail(Error.OutOfMemory, repo_dir, "failed to construct previous state db path");
-    };
-    defer ctx.allocator.free(previous_db);
-
-    std.Io.Dir.accessAbsolute(path_mod.currentIo(), previous_db, .{}) catch |err| {
-        return ctx.fail(switch (err) {
-            error.FileNotFound => Error.StateNotFound,
-            else => mapFs(err),
-        }, previous_db, "no undo state available");
-    };
-
-    const current_path = try currentStatePath(ctx.allocator, repo_dir);
-    defer ctx.allocator.free(current_path);
-    const previous_path = try previousStatePath(ctx.allocator, repo_dir);
-    defer ctx.allocator.free(previous_path);
-    const swap_path = std.fs.path.join(ctx.allocator, &.{ repo_dir, ".swap" }) catch {
-        return ctx.fail(Error.OutOfMemory, repo_dir, "failed to construct swap path");
-    };
-    defer ctx.allocator.free(swap_path);
-
-    deleteTreeIfExists(swap_path) catch {};
-
-    std.Io.Dir.renameAbsolute(current_path, swap_path, path_mod.currentIo()) catch |err| {
-        return ctx.fail(switch (err) {
-            error.FileNotFound => Error.StateNotFound,
-            else => mapFs(err),
-        }, current_path, "active state not accessible");
-    };
-
-    std.Io.Dir.renameAbsolute(previous_path, current_path, path_mod.currentIo()) catch |err| {
-        std.Io.Dir.renameAbsolute(swap_path, current_path, path_mod.currentIo()) catch {};
-        return ctx.fail(mapFs(err), previous_path, "failed to activate previous state");
-    };
-
-    std.Io.Dir.renameAbsolute(swap_path, previous_path, path_mod.currentIo()) catch |err| {
-        // Best effort rollback to preserve at least one active current slot.
-        std.Io.Dir.renameAbsolute(current_path, previous_path, path_mod.currentIo()) catch {};
-        std.Io.Dir.renameAbsolute(swap_path, current_path, path_mod.currentIo()) catch {};
-        return ctx.fail(mapFs(err), swap_path, "failed to complete state swap");
     };
 }
 
@@ -423,7 +312,6 @@ test "stageNextState uses .next and copies current db" {
     const repo_dir = try std.fs.path.join(test_env.ctx.allocator, &.{ test_env.path, "repo" });
     defer test_env.ctx.allocator.free(repo_dir);
 
-    try repository.setupStateLayout(test_env.ctx.allocator, repo_dir);
     {
         var repo = try repository.Repository.init(&test_env.ctx, repo_dir, false);
         repo.deinit();
@@ -437,7 +325,7 @@ test "stageNextState uses .next and copies current db" {
     try std.Io.Dir.accessAbsolute(path_mod.currentIo(), staged_db_path, .{});
 }
 
-test "Staged.commit rotates current to previous" {
+test "Staged.commit writes db and sig to repo root" {
     const th = @import("test_helpers.zig");
     const repository = @import("repository.zig");
     const sign_mod = @import("sign.zig");
@@ -450,7 +338,6 @@ test "Staged.commit rotates current to previous" {
     const repo_dir = try std.fs.path.join(test_env.ctx.allocator, &.{ test_env.path, "repo" });
     defer test_env.ctx.allocator.free(repo_dir);
 
-    try repository.setupStateLayout(test_env.ctx.allocator, repo_dir);
     {
         var repo = try repository.Repository.init(&test_env.ctx, repo_dir, false);
         repo.deinit();
@@ -469,52 +356,13 @@ test "Staged.commit rotates current to previous" {
     try staged.commit();
     staged.deinit();
 
-    const previous_db = try previousDbPath(test_env.ctx.allocator, repo_dir);
-    defer test_env.ctx.allocator.free(previous_db);
-    try std.Io.Dir.accessAbsolute(path_mod.currentIo(), previous_db, .{});
-}
+    const root_db = try std.fs.path.join(test_env.ctx.allocator, &.{ repo_dir, REPO_DB_FILENAME });
+    defer test_env.ctx.allocator.free(root_db);
+    try std.Io.Dir.accessAbsolute(path_mod.currentIo(), root_db, .{});
 
-test "undoLastChange swaps current and previous" {
-    const th = @import("test_helpers.zig");
-    const repository = @import("repository.zig");
-    const sign_mod = @import("sign.zig");
-    var test_env = try th.createTestEnv();
-    defer {
-        test_env.cleanup();
-        std.testing.allocator.destroy(test_env);
-    }
-
-    const repo_dir = try std.fs.path.join(test_env.ctx.allocator, &.{ test_env.path, "repo" });
-    defer test_env.ctx.allocator.free(repo_dir);
-
-    try repository.setupStateLayout(test_env.ctx.allocator, repo_dir);
-    {
-        var repo = try repository.Repository.init(&test_env.ctx, repo_dir, false);
-        repo.deinit();
-    }
-
-    const key_dir = try std.fs.path.join(test_env.ctx.allocator, &.{ test_env.path, "keys" });
-    defer test_env.ctx.allocator.free(key_dir);
-    try path_mod.ensureDirExists(key_dir);
-    const kp = try sign_mod.generateKeyPair();
-    const key_path = try std.fs.path.join(test_env.ctx.allocator, &.{ key_dir, "test.key" });
-    defer test_env.ctx.allocator.free(key_path);
-    try kp.secret_key.saveToFile(key_path);
-    test_env.ctx.signing_key_path = key_path;
-
-    var staged = try stageNext(&test_env.ctx, repo_dir);
-    try staged.commit();
-    staged.deinit();
-
-    try undo(&test_env.ctx, repo_dir);
-
-    const db_result = currentDbPath(test_env.ctx.allocator, repo_dir);
-    const current_db = db_result.path;
-    defer test_env.ctx.allocator.free(current_db);
-    const previous_db = try previousDbPath(test_env.ctx.allocator, repo_dir);
-    defer test_env.ctx.allocator.free(previous_db);
-    try std.Io.Dir.accessAbsolute(path_mod.currentIo(), current_db, .{});
-    try std.Io.Dir.accessAbsolute(path_mod.currentIo(), previous_db, .{});
+    const root_sig = try std.fs.path.join(test_env.ctx.allocator, &.{ repo_dir, REPO_SIG_FILENAME });
+    defer test_env.ctx.allocator.free(root_sig);
+    try std.Io.Dir.accessAbsolute(path_mod.currentIo(), root_sig, .{});
 }
 
 test "Staged.deinit without commit cleans up staging dir" {
@@ -529,7 +377,6 @@ test "Staged.deinit without commit cleans up staging dir" {
     const repo_dir = try std.fs.path.join(test_env.ctx.allocator, &.{ test_env.path, "repo" });
     defer test_env.ctx.allocator.free(repo_dir);
 
-    try repository.setupStateLayout(test_env.ctx.allocator, repo_dir);
     {
         var repo = try repository.Repository.init(&test_env.ctx, repo_dir, false);
         repo.deinit();
@@ -562,8 +409,6 @@ test "pruneOldVersions removes excess versions" {
 
     const repo_dir = try std.fs.path.join(test_env.ctx.allocator, &.{ test_env.path, "repo" });
     defer test_env.ctx.allocator.free(repo_dir);
-
-    try repository.setupStateLayout(test_env.ctx.allocator, repo_dir);
 
     var repo = try repository.Repository.init(&test_env.ctx, repo_dir, false);
     defer repo.deinit();
@@ -599,8 +444,6 @@ test "pruneOldVersions does nothing when under keep count" {
 
     const repo_dir = try std.fs.path.join(test_env.ctx.allocator, &.{ test_env.path, "repo" });
     defer test_env.ctx.allocator.free(repo_dir);
-
-    try repository.setupStateLayout(test_env.ctx.allocator, repo_dir);
 
     var repo = try repository.Repository.init(&test_env.ctx, repo_dir, false);
     defer repo.deinit();

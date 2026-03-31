@@ -337,20 +337,10 @@ pub fn MockPubWriter(ctx: *Context, _: []const u8, pub_path: []const u8) sign.Si
 /// Resolve the active current-state directory for a local repo root
 /// (`.../mere/dev/repo/<name>/current`).
 /// Caller owns the returned path.
-pub fn resolveActiveRepoStateDir(allocator: std.mem.Allocator, repo_root: []const u8) ![]const u8 {
-    const current_dir = try std.fs.path.join(allocator, &.{ repo_root, "current" });
-    errdefer allocator.free(current_dir);
-    std.Io.Dir.accessAbsolute(path.currentIo(), current_dir, .{}) catch return error.FileNotFound;
-    return current_dir;
-}
-
-/// Resolve the active repo DB path (`.../current/repo.db`) for a local repo root.
+/// Resolve the active repo DB path (`repo.db` at repo root) for a local repo.
 /// Caller owns the returned path.
 pub fn resolveActiveRepoDbPath(allocator: std.mem.Allocator, repo_root: []const u8) ![]const u8 {
-    const active_state_dir = try resolveActiveRepoStateDir(allocator, repo_root);
-    defer allocator.free(active_state_dir);
-
-    const db_path = try std.fs.path.join(allocator, &.{ active_state_dir, "repo.db" });
+    const db_path = try std.fs.path.join(allocator, &.{ repo_root, "repo.db" });
     std.Io.Dir.accessAbsolute(path.currentIo(), db_path, .{}) catch return error.FileNotFound;
     return db_path;
 }
@@ -511,7 +501,7 @@ test "createTestEnvironment creates a valid test environment" {
     test_env.ctx.debug("test file created: {s}", .{test_file});
 }
 
-test "resolveActiveRepoDbPath follows current state layout" {
+test "resolveActiveRepoDbPath follows flat layout" {
     var test_env = try createTestEnv();
     defer {
         test_env.cleanup();
@@ -523,11 +513,7 @@ test "resolveActiveRepoDbPath follows current state layout" {
     defer allocator.free(repo_root);
     try path.ensureDirExists(repo_root);
 
-    const current_dir = try std.fs.path.join(allocator, &.{ repo_root, "current" });
-    defer allocator.free(current_dir);
-    try path.ensureDirExists(current_dir);
-
-    const db_path = try std.fs.path.join(allocator, &.{ current_dir, "repo.db" });
+    const db_path = try std.fs.path.join(allocator, &.{ repo_root, "repo.db" });
     defer allocator.free(db_path);
     {
         var f = try path.makePathAndOpenFile(db_path);
@@ -564,7 +550,7 @@ test "setupTestImport returns active current-state repo.db path" {
     defer ctx.allocator.free(result.secret_key_path);
 
     try std.testing.expect(std.mem.endsWith(u8, result.db_path, "/repo.db"));
-    try std.testing.expect(std.mem.containsAtLeast(u8, result.db_path, 1, "/current/"));
+    try std.testing.expect(!std.mem.containsAtLeast(u8, result.db_path, 1, "/current/"));
     try std.testing.expect(!std.mem.containsAtLeast(u8, result.db_path, 1, "import.db"));
     try std.Io.Dir.accessAbsolute(path.currentIo(), result.db_path, .{});
 }

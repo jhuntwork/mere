@@ -970,6 +970,30 @@ fn installResolvedPackages(
             resolved.pkg.version.?,
             resolved.pkg.release.?,
         });
+
+        // If cache_path is empty, the package is already in the store — construct entry directly
+        if (cache_path.len == 0) {
+            const store_path = try store.constructStorePath(ctx, resolved.pkg.content_hash, resolved.pkg.name.?, resolved.pkg.version.?);
+
+            const segments = [_]mere.ui.Segment{
+                .{ .text = resolved.pkg.name.?, .kind = .detail },
+                .{ .text = "-", .kind = .normal },
+                .{ .text = resolved.pkg.version.?, .kind = .detail },
+                .{ .text = " installed to store", .kind = .success },
+            };
+            emit.logSegmentsSeverity(ctx, .install, .info, &segments);
+
+            try installed_packages.append(ctx.allocator, generation.PackageEntry{
+                .name = try ctx.allocator.dupe(u8, resolved.pkg.name.?),
+                .version = try ctx.allocator.dupe(u8, resolved.pkg.version.?),
+                .release = resolved.pkg.release.?,
+                .arch = try ctx.allocator.dupe(u8, resolved.pkg.arch.?),
+                .store_path = store_path,
+                .content_hash = try ctx.allocator.dupe(u8, resolved.pkg.content_hash),
+            });
+            continue;
+        }
+
         const pkg_info = try installSinglePackageToStore(
             ctx,
             &resolved.pkg,
@@ -1014,7 +1038,34 @@ fn prefetchMissingPackageArchives(
         const cache_path = try resolved.repocache.archiveCachePath(&resolved.pkg);
         errdefer ctx.allocator.free(cache_path);
 
-        std.Io.Dir.accessAbsolute(path.currentIo(), cache_path, .{}) catch {
+        const in_cache = blk: {
+            std.Io.Dir.accessAbsolute(path.currentIo(), cache_path, .{}) catch break :blk false;
+            break :blk true;
+        };
+
+        if (in_cache) {
+            try cache_paths.append(ctx.allocator, cache_path);
+            continue;
+        }
+
+        // Not in cache — check if already in store before downloading
+        const in_store = blk: {
+            if (resolved.pkg.name) |name| {
+                if (resolved.pkg.version) |version| {
+                    const store_path = store.constructStorePath(ctx, resolved.pkg.content_hash, name, version) catch break :blk false;
+                    defer ctx.allocator.free(store_path);
+                    std.Io.Dir.accessAbsolute(path.currentIo(), store_path, .{}) catch break :blk false;
+                    break :blk true;
+                }
+            }
+            break :blk false;
+        };
+
+        if (in_store) {
+            ctx.allocator.free(cache_path);
+            const empty = try ctx.allocator.dupe(u8, "");
+            try cache_paths.append(ctx.allocator, empty);
+        } else {
             const archive_url = try resolved.repocache.archiveUrl(&resolved.pkg);
             errdefer ctx.allocator.free(archive_url);
 
@@ -1024,8 +1075,8 @@ fn prefetchMissingPackageArchives(
                 .options = .{},
             });
             try owned_urls.append(ctx.allocator, archive_url);
-        };
-        try cache_paths.append(ctx.allocator, cache_path);
+            try cache_paths.append(ctx.allocator, cache_path);
+        }
     }
 
     if (requests.items.len > 0) {

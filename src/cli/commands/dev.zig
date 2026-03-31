@@ -139,19 +139,6 @@ const repo_meta = command.CommandMeta{
     .description = "Repository utilities",
 };
 
-/// Repo undo subcommand metadata
-const repo_undo_meta = command.CommandMeta{
-    .name = "undo",
-    .description = "Undo the last change to a local repository",
-    .args = &[_]types.Arg{
-        .{
-            .name = "repo-name",
-            .description = "Name of the repository (maps to /mere/dev/repo/<name>/)",
-            .required = true,
-        },
-    },
-};
-
 /// Hash command handler
 fn handleHash(ctx: *mere.Context, args: *const types.ParsedArgs) MereError!types.CommandResult {
     if (args.positional.len < 1) {
@@ -416,57 +403,6 @@ fn performRepoSign(ctx: *mere.Context, repo_name: []const u8) !void {
     try repo.signDb();
 }
 
-/// Repo undo command handler
-fn handleRepoUndo(ctx: *mere.Context, args: *const types.ParsedArgs) MereError!types.CommandResult {
-    if (args.positional.len < 1) {
-        return MereError.MissingArgument;
-    }
-
-    const repo_name = args.positional[0];
-    const diagnostic_ctx = DiagnosticContext.init().withSubject(repo_name);
-    ctx.withDiagnosticContext(diagnostic_ctx);
-
-    performRepoUndo(ctx, repo_name) catch |err| {
-        const mapped_error = ErrorMapping.mapModuleError(@TypeOf(err), err);
-        const user_message = getUserFriendlyMessage(err);
-        const error_ctx = ctx.getDiagnosticContext().toErrorContext();
-        const formatted_message = error_ctx.formatWithMessage(ctx.allocator, user_message) catch user_message;
-        defer if (formatted_message.ptr != user_message.ptr) ctx.allocator.free(formatted_message);
-
-        const exit_code = command.exitCodeForError(mapped_error);
-        return types.CommandResult{
-            .success = false,
-            .exit_code = exit_code,
-            .message = try ctx.allocator.dupe(u8, formatted_message),
-        };
-    };
-
-    const undo_segments = [_]mere.ui.Segment{
-        .{ .text = "repository ", .kind = .normal },
-        .{ .text = "undo applied", .kind = .success },
-        .{ .text = ": '", .kind = .normal },
-        .{ .text = repo_name, .kind = .detail },
-        .{ .text = "'", .kind = .normal },
-    };
-    return types.CommandResult.createSuccessSegments(ctx.allocator, &undo_segments);
-}
-
-fn performRepoUndo(ctx: *mere.Context, repo_name: []const u8) !void {
-    const repo_dir = std.fs.path.join(ctx.allocator, &.{ ctx.root_path, "mere", "dev", "repo", repo_name }) catch {
-        return RepoError.OutOfMemory;
-    };
-    defer ctx.allocator.free(repo_dir);
-
-    repo_history.undo(ctx, repo_dir) catch |err| {
-        return switch (err) {
-            repo_history.Error.OutOfMemory => RepoError.OutOfMemory,
-            repo_history.Error.PermissionDenied => RepoError.PermissionDenied,
-            repo_history.Error.StateNotFound => repo_history.Error.StateNotFound,
-            else => RepoError.FileSystem,
-        };
-    };
-}
-
 /// Repo-remove command handler
 fn handleRepoRemove(ctx: *mere.Context, args: *const types.ParsedArgs) MereError!types.CommandResult {
     if (args.positional.len < 5) {
@@ -606,10 +542,6 @@ pub fn createCommand(allocator: std.mem.Allocator) !*command.Command {
     const repo_remove_cmd = try allocator.create(command.Command);
     repo_remove_cmd.* = command.Command.init(allocator, repo_remove_meta, handleRepoRemove);
     try repo_cmd.addSubcommand(repo_remove_cmd);
-
-    const repo_undo_cmd = try allocator.create(command.Command);
-    repo_undo_cmd.* = command.Command.init(allocator, repo_undo_meta, handleRepoUndo);
-    try repo_cmd.addSubcommand(repo_undo_cmd);
     try dev_cmd.addSubcommand(repo_cmd);
 
     // Also add the import command as a subcommand of dev
