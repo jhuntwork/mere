@@ -82,22 +82,18 @@ fn computeCacheIdentity(
 pub const RepoCache = struct {
     /// Context for logging and allocation
     ctx: *mere.Context,
-    /// The configuration name of the repository (borrowed)
+    /// The configuration name of the repository (owned)
     name: []const u8,
-    /// The remote/source URL (borrowed)
+    /// The remote/source URL (owned)
     url: []const u8,
     /// Absolute path to the local cache directory (owned)
     cache_dir: []const u8,
-    /// Allowlist of trusted key fingerprints for signature verification (borrowed)
+    /// Allowlist of trusted key fingerprints for signature verification (owned)
     trusted_fingerprints: []const []const u8,
     /// The managed local Repository instance (directory, db, packages)
     repository: ?Repository,
     /// Repository priority for conflict resolution (lower number = higher priority)
     priority: u8 = 100,
-    /// Whether this RepoCache owns its name and url strings (must free in deinit).
-    /// True for discovered local repos; false for config-backed repos where
-    /// the Config owns the strings.
-    owns_metadata: bool = false,
     /// Whether this is a local (file://) repository
     is_local: bool = false,
     /// Sync TTL in seconds (remote repos only; local repos ignore)
@@ -109,10 +105,8 @@ pub const RepoCache = struct {
 
     /// Initialize a RepoCache.
     ///
-    /// This constructor borrows repository metadata and allocates only the
-    /// derived cache directory path. Callers must ensure the input slices
-    /// outlive the RepoCache and must call deinit() to free the cache dir and
-    /// repository state when done.
+    /// This constructor takes ownership by duping all input strings.
+    /// Callers must call deinit() to free all owned state.
     pub fn init(
         ctx: *mere.Context,
         name: []const u8,
@@ -121,16 +115,24 @@ pub const RepoCache = struct {
         priority: u8,
     ) !RepoCache {
         const allocator = ctx.allocator;
-        const identity = computeCacheIdentity(allocator, name, trusted_fingerprints) catch {
+
+        const owned_name = allocator.dupe(u8, name) catch return RepoCacheError.OutOfMemory;
+        errdefer allocator.free(owned_name);
+
+        const owned_url = allocator.dupe(u8, url) catch return RepoCacheError.OutOfMemory;
+        errdefer allocator.free(owned_url);
+
+        const owned_fps = dupeFingerprints(allocator, trusted_fingerprints) catch return RepoCacheError.OutOfMemory;
+        errdefer freeFingerprints(allocator, owned_fps);
+
+        const identity = computeCacheIdentity(allocator, owned_name, owned_fps) catch {
             return RepoCacheError.OutOfMemory;
         };
         defer allocator.free(identity);
 
-        // For local (file://) repos, point cache_dir directly at the source directory
-        // to avoid duplicating data. For remote repos, use the identity-scoped cache path.
-        const local = std.mem.startsWith(u8, url, "file://");
+        const local = std.mem.startsWith(u8, owned_url, "file://");
         const cache_dir = if (local)
-            allocator.dupe(u8, url["file://".len..]) catch {
+            allocator.dupe(u8, owned_url["file://".len..]) catch {
                 return RepoCacheError.OutOfMemory;
             }
         else
@@ -141,10 +143,10 @@ pub const RepoCache = struct {
 
         return RepoCache{
             .ctx = ctx,
-            .name = name,
-            .url = url,
+            .name = owned_name,
+            .url = owned_url,
             .cache_dir = cache_dir,
-            .trusted_fingerprints = trusted_fingerprints,
+            .trusted_fingerprints = owned_fps,
             .repository = null,
             .priority = priority,
             .is_local = local,
@@ -194,10 +196,9 @@ pub const RepoCache = struct {
             repo.deinit();
         }
         self.ctx.allocator.free(self.cache_dir);
-        if (self.owns_metadata) {
-            self.ctx.allocator.free(self.name);
-            self.ctx.allocator.free(self.url);
-        }
+        freeFingerprints(self.ctx.allocator, self.trusted_fingerprints);
+        self.ctx.allocator.free(self.name);
+        self.ctx.allocator.free(self.url);
     }
 
     /// Returns the path to the local cache directory: /mere/cache/[repo-name]
@@ -890,6 +891,25 @@ fn shouldSkipSync(self: *RepoCache, now: u64, ttl_seconds: u64) RepoCacheError!b
         return true;
     }
     return false;
+}
+
+fn dupeFingerprints(allocator: std.mem.Allocator, fps: []const []const u8) ![]const []const u8 {
+    const duped = try allocator.alloc([]const u8, fps.len);
+    var i: usize = 0;
+    errdefer {
+        for (duped[0..i]) |fp| allocator.free(fp);
+        allocator.free(duped);
+    }
+    for (fps) |fp| {
+        duped[i] = try allocator.dupe(u8, fp);
+        i += 1;
+    }
+    return duped;
+}
+
+fn freeFingerprints(allocator: std.mem.Allocator, fps: []const []const u8) void {
+    for (fps) |fp| allocator.free(fp);
+    allocator.free(fps);
 }
 
 fn pathExists(path_buf: []const u8) anyerror!bool {

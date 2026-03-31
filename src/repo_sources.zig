@@ -235,23 +235,16 @@ fn appendDiscoveredLocalRepoCaches(ctx: *Context, repocaches: *std.ArrayList(*Re
 
         // Build a file:// URL pointing at the directory containing repo.db
         const url = std.fmt.allocPrint(ctx.allocator, "file://{s}", .{cache_dir_path}) catch continue;
-        const name_copy = ctx.allocator.dupe(u8, repo_name) catch {
-            ctx.allocator.free(url);
+        defer ctx.allocator.free(url);
+
+        const rc_ptr = ctx.allocator.create(RepoCache) catch {
             continue;
         };
 
-        const rc_ptr = ctx.allocator.create(RepoCache) catch {
-            ctx.allocator.free(name_copy);
-            ctx.allocator.free(url);
-            continue;
-        };
-        rc_ptr.* = RepoCache.init(ctx, name_copy, url, trusted_fps.items, 50) catch {
+        rc_ptr.* = RepoCache.init(ctx, repo_name, url, trusted_fps.items, 50) catch {
             ctx.allocator.destroy(rc_ptr);
-            ctx.allocator.free(name_copy);
-            ctx.allocator.free(url);
             continue;
         };
-        rc_ptr.owns_metadata = true;
 
         repocaches.append(ctx.allocator, rc_ptr) catch {
             rc_ptr.*.deinit();
