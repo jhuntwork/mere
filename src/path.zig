@@ -75,11 +75,19 @@ pub fn createTempDir(
 pub fn makePathAndOpenDir(
     target_path: []const u8,
 ) !std.Io.Dir {
+    return makePathAndOpenDirMode(target_path, .default_dir);
+}
+
+pub fn makePathAndOpenDirMode(
+    target_path: []const u8,
+    permissions: std.Io.File.Permissions,
+) !std.Io.Dir {
     const io = currentIo();
     if (std.fs.path.isAbsolute(target_path)) {
         var root_dir = try std.Io.Dir.openDirAbsolute(io, "/", .{});
         defer root_dir.close(io);
         return root_dir.createDirPathOpen(io, target_path, .{
+            .permissions = permissions,
             .open_options = .{
                 .iterate = true,
             },
@@ -87,6 +95,7 @@ pub fn makePathAndOpenDir(
     }
 
     return std.Io.Dir.cwd().createDirPathOpen(io, target_path, .{
+        .permissions = permissions,
         .open_options = .{
             .iterate = true,
         },

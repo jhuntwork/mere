@@ -237,8 +237,9 @@ pub const RepoCache = struct {
             }
         }
 
-        // Ensure cache directory exists using path.makePathAndOpenDir
-        var cache_dir_handle = path.makePathAndOpenDir(cache_dir) catch |err| {
+        // Ensure cache directory exists with world-writable sticky bit (matches
+        // parent /mere/cache/repos/ so any user can sync).
+        var cache_dir_handle = path.makePathAndOpenDirMode(cache_dir, std.Io.File.Permissions.fromMode(0o1777)) catch |err| {
             return switch (err) {
                 error.FileNotFound => RepoCacheError.FileSystem,
                 error.AccessDenied => RepoCacheError.PermissionDenied,
@@ -308,7 +309,11 @@ pub const RepoCache = struct {
             return;
         } else |err| {
             if (try cacheUsable(self)) {
-                ui.emit.logFmtSeverity(self.ctx, null, .warn, "sync failed for repo {s}; using cached metadata", .{self.name});
+                const hint = if (err == RepoCacheError.PermissionDenied)
+                    " (permission denied — check ownership of cache directory)"
+                else
+                    "";
+                ui.emit.logFmtSeverity(self.ctx, null, .warn, "sync failed for repo {s}{s}; using cached metadata", .{ self.name, hint });
                 return;
             }
             return err;
