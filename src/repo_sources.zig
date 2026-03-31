@@ -188,9 +188,8 @@ fn appendDiscoveredLocalRepoCaches(ctx: *Context, repocaches: *std.ArrayList(*Re
         const repo_dir_path = try std.fs.path.join(ctx.allocator, &.{ repos_dir_path, repo_name });
         defer ctx.allocator.free(repo_dir_path);
 
-        // Try both layouts: flat (repo.db at root) and state-slot (current/repo.db)
+        // Flat layout: repo.db at root
         const active_db_path, const active_sig_path, const cache_dir_path = blk: {
-            // Try flat layout first
             const flat_db = std.fs.path.join(ctx.allocator, &.{ repo_dir_path, repo_history.REPO_DB_FILENAME }) catch continue;
             const flat_sig = std.fs.path.join(ctx.allocator, &.{ repo_dir_path, repo_history.REPO_SIG_FILENAME }) catch {
                 ctx.allocator.free(flat_db);
@@ -202,24 +201,13 @@ fn appendDiscoveredLocalRepoCaches(ctx: *Context, repocaches: *std.ArrayList(*Re
                 break :blk2 true;
             };
 
-            if (flat_db_exists) {
-                break :blk .{ flat_db, flat_sig, try ctx.allocator.dupe(u8, repo_dir_path) };
+            if (!flat_db_exists) {
+                ctx.allocator.free(flat_db);
+                ctx.allocator.free(flat_sig);
+                continue;
             }
 
-            ctx.allocator.free(flat_db);
-            ctx.allocator.free(flat_sig);
-
-            // Try state-slot layout
-            const current_state_path = repo_history.currentStatePath(ctx.allocator, repo_dir_path) catch continue;
-            defer ctx.allocator.free(current_state_path);
-
-            const slot_db = std.fs.path.join(ctx.allocator, &.{ current_state_path, repo_history.REPO_DB_FILENAME }) catch continue;
-            const slot_sig = std.fs.path.join(ctx.allocator, &.{ current_state_path, repo_history.REPO_SIG_FILENAME }) catch {
-                ctx.allocator.free(slot_db);
-                continue;
-            };
-
-            break :blk .{ slot_db, slot_sig, try ctx.allocator.dupe(u8, current_state_path) };
+            break :blk .{ flat_db, flat_sig, try ctx.allocator.dupe(u8, repo_dir_path) };
         };
         defer ctx.allocator.free(active_db_path);
         defer ctx.allocator.free(active_sig_path);
@@ -353,12 +341,9 @@ test "appendDiscoveredLocalRepoCaches finds valid repositories" {
 
     const repo_root = try std.fs.path.join(test_env.ctx.allocator, &.{ test_env.path, "mere", "dev", "repo", "testrepo" });
     defer test_env.ctx.allocator.free(repo_root);
-    const current_dir = try std.fs.path.join(test_env.ctx.allocator, &.{ repo_root, "current" });
-    defer test_env.ctx.allocator.free(current_dir);
     try path_mod.ensureDirExists(repo_root);
-    try path_mod.ensureDirExists(current_dir);
 
-    const db_path = try std.fs.path.join(test_env.ctx.allocator, &.{ current_dir, "repo.db" });
+    const db_path = try std.fs.path.join(test_env.ctx.allocator, &.{ repo_root, "repo.db" });
     defer test_env.ctx.allocator.free(db_path);
     const db_file = try std.Io.Dir.createFileAbsolute(path_mod.currentIo(), db_path, .{});
     try db_file.writeStreamingAll(path_mod.currentIo(), "dummy db content");
@@ -388,7 +373,7 @@ test "appendDiscoveredLocalRepoCaches finds valid repositories" {
         trusted_file.close(path_mod.currentIo());
     }
 
-    const sig_path = try std.fs.path.join(test_env.ctx.allocator, &.{ current_dir, "repo.db.sig" });
+    const sig_path = try std.fs.path.join(test_env.ctx.allocator, &.{ repo_root, "repo.db.sig" });
     defer test_env.ctx.allocator.free(sig_path);
     test_env.ctx.signing_key_path = secret_key_path;
     _ = try sign.writeSignatureFileWithResolver(&test_env.ctx, db_path, sig_path, null, null);

@@ -313,17 +313,11 @@ fn collectReferencedPackageArchives(
             };
             defer allocator.free(repo_dir);
 
-            const current_db_path = std.fs.path.join(allocator, &.{ repo_dir, repo_history.CURRENT_STATE_DIR, repo_history.REPO_DB_FILENAME }) catch {
-                return ctx.fail(GCError.OutOfMemory, repo_dir, "out of memory building current repo db path");
+            const current_db_path = std.fs.path.join(allocator, &.{ repo_dir, repo_history.REPO_DB_FILENAME }) catch {
+                return ctx.fail(GCError.OutOfMemory, repo_dir, "out of memory building repo db path");
             };
             defer allocator.free(current_db_path);
             try collectReferencedPackageArchivesFromDb(ctx, current_db_path, &referenced);
-
-            const previous_db_path = std.fs.path.join(allocator, &.{ repo_dir, repo_history.PREVIOUS_STATE_DIR, repo_history.REPO_DB_FILENAME }) catch {
-                return ctx.fail(GCError.OutOfMemory, repo_dir, "out of memory building previous repo db path");
-            };
-            defer allocator.free(previous_db_path);
-            try collectReferencedPackageArchivesFromDb(ctx, previous_db_path, &referenced);
         }
     }
 
@@ -1555,9 +1549,7 @@ test "collectGarbage prunes unreferenced package pool archives" {
     defer allocator.free(repo_dir);
     try path_mod.ensureDirExists(repo_dir);
 
-    const current_state_dir = try std.fs.path.join(allocator, &.{ repo_dir, repo_history.CURRENT_STATE_DIR });
-    defer allocator.free(current_state_dir);
-    try writeRepoStateDb(&test_env.ctx, current_state_dir, &.{
+    try writeRepoStateDb(&test_env.ctx, repo_dir, &.{
         .{
             .name = "bash",
             .version = "5.3",
@@ -1568,27 +1560,11 @@ test "collectGarbage prunes unreferenced package pool archives" {
         },
     });
 
-    const previous_state_dir = try std.fs.path.join(allocator, &.{ repo_dir, repo_history.PREVIOUS_STATE_DIR });
-    defer allocator.free(previous_state_dir);
-    try writeRepoStateDb(&test_env.ctx, previous_state_dir, &.{
-        .{
-            .name = "coreutils",
-            .version = "9.7",
-            .release = 1,
-            .arch = "x86_64",
-            .content_hash = "2" ** 64,
-            .archive_hash = "b" ** 64,
-        },
-    });
-
     const kept_current_name = "bash-5.3-2-x86_64-" ++ ("a" ** 64) ++ ".pkg.tar.zst";
-    const kept_previous_name = "coreutils-9.7-1-x86_64-" ++ ("b" ** 64) ++ ".pkg.tar.zst";
     const orphan_name = "grep-3.12-1-x86_64-" ++ ("c" ** 64) ++ ".pkg.tar.zst";
 
     const kept_current_path = try createPackagePoolArchive(allocator, package_pool_dir, kept_current_name);
     defer allocator.free(kept_current_path);
-    const kept_previous_path = try createPackagePoolArchive(allocator, package_pool_dir, kept_previous_name);
-    defer allocator.free(kept_previous_path);
     const orphan_path = try createPackagePoolArchive(allocator, package_pool_dir, orphan_name);
     defer allocator.free(orphan_path);
 
@@ -1610,5 +1586,4 @@ test "collectGarbage prunes unreferenced package pool archives" {
         try std.testing.expectEqual(error.FileNotFound, err);
     };
     std.Io.Dir.accessAbsolute(path_mod.currentIo(), kept_current_path, .{}) catch return error.TestUnexpectedResult;
-    std.Io.Dir.accessAbsolute(path_mod.currentIo(), kept_previous_path, .{}) catch return error.TestUnexpectedResult;
 }

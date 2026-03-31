@@ -100,34 +100,17 @@ fn getBootstrapPath(ctx: *Context, repo_name_or_path: []const u8) ![]const u8 {
 }
 
 fn bootstrapRepoSource(ctx: *Context, repo_path: []const u8) !void {
-    // Determine if this is a path-based repo (flat layout) or a legacy
-    // dev repo name (state slot layout under /mere/dev/repo/).
-    const dev_repo_prefix = std.fs.path.join(ctx.allocator, &.{ ctx.root_path, "mere", "dev", "repo" }) catch {
+    // All repos use flat layout: repo.db + packages/ at root
+    p.ensureDirExists(repo_path) catch {
+        return ctx.fail(ImportError.FileSystem, repo_path, "failed to create repo directory");
+    };
+    const packages_dir = std.fs.path.join(ctx.allocator, &.{ repo_path, "packages" }) catch {
         return ImportError.OutOfMemory;
     };
-    defer ctx.allocator.free(dev_repo_prefix);
-
-    const is_dev_repo = std.mem.startsWith(u8, repo_path, dev_repo_prefix) and
-        repo_path.len > dev_repo_prefix.len and repo_path[dev_repo_prefix.len] == '/';
-
-    if (is_dev_repo) {
-        // Legacy dev repo: use state slot layout (current/previous)
-        repository.setupStateLayout(ctx.allocator, repo_path) catch {
-            return ctx.fail(ImportError.FileSystem, repo_path, "failed to create repo state layout");
-        };
-    } else {
-        // Path-based repo: flat layout (repo.db + packages/ at root)
-        p.ensureDirExists(repo_path) catch {
-            return ctx.fail(ImportError.FileSystem, repo_path, "failed to create repo directory");
-        };
-        const packages_dir = std.fs.path.join(ctx.allocator, &.{ repo_path, "packages" }) catch {
-            return ImportError.OutOfMemory;
-        };
-        defer ctx.allocator.free(packages_dir);
-        p.ensureDirExists(packages_dir) catch {
-            return ctx.fail(ImportError.FileSystem, packages_dir, "failed to create repo packages directory");
-        };
-    }
+    defer ctx.allocator.free(packages_dir);
+    p.ensureDirExists(packages_dir) catch {
+        return ctx.fail(ImportError.FileSystem, packages_dir, "failed to create repo packages directory");
+    };
 
     var repo = Repository.init(ctx, repo_path, false) catch {
         const diag = ctx.getDiagnosticContext();

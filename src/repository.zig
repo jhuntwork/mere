@@ -22,79 +22,24 @@ pub const Repository = struct {
         sig_path: []const u8,
     };
 
-    fn resolvePathForBoundaryCheck(allocator: std.mem.Allocator, input_path: []const u8) ![]const u8 {
-        var resolved_buf: [std.fs.max_path_bytes]u8 = undefined;
-        const resolved = try path.resolveToAbsolutePath(input_path, &resolved_buf);
-        return try allocator.dupe(u8, resolved);
-    }
-
-    fn isPathWithinBoundary(allocator: std.mem.Allocator, candidate_path: []const u8, boundary_path: []const u8) !bool {
-        const resolved_candidate = try resolvePathForBoundaryCheck(allocator, candidate_path);
-        defer allocator.free(resolved_candidate);
-        const resolved_boundary = try resolvePathForBoundaryCheck(allocator, boundary_path);
-        defer allocator.free(resolved_boundary);
-
-        if (std.mem.eql(u8, resolved_boundary, "/")) return true;
-        if (!std.mem.startsWith(u8, resolved_candidate, resolved_boundary)) return false;
-        if (resolved_candidate.len > resolved_boundary.len and resolved_candidate[resolved_boundary.len] != '/') return false;
-        return true;
-    }
-
     fn resolveActiveRepoStatePaths(
         ctx: *mere.Context,
         dir_path: []const u8,
+        read_only: bool,
     ) !ActiveRepoPaths {
-        const current_state_path = repo_history.currentStatePath(ctx.allocator, dir_path) catch {
-            return ctx.fail(Error.OutOfMemory, dir_path, "failed to build current state path");
-        };
-        defer ctx.allocator.free(current_state_path);
-
-        const local_repo_sources_prefix = std.fs.path.join(ctx.allocator, &.{ ctx.root_path, "mere", "dev", "repo" }) catch {
-            return ctx.fail(Error.OutOfMemory, dir_path, "failed to build local repo prefix");
-        };
-        defer ctx.allocator.free(local_repo_sources_prefix);
-        const is_local_repo_source = isPathWithinBoundary(ctx.allocator, dir_path, local_repo_sources_prefix) catch |err| {
-            return switch (err) {
-                error.OutOfMemory => ctx.fail(Error.OutOfMemory, dir_path, "out of memory classifying repository path"),
-                else => ctx.fail(Error.FileSystem, dir_path, "failed to classify repository path"),
-            };
-        };
-
-        // Local authoring repos under /mere/dev/repo use fixed state slots:
-        // <repo>/current and <repo>/previous.
-        // Other repository paths (e.g. /mere/cache/<repo-hash>) continue using flat layout.
-        const has_current_state = blk: {
-            std.Io.Dir.accessAbsolute(path.currentIo(), current_state_path, .{}) catch |err| switch (err) {
-                error.FileNotFound => break :blk false,
-                else => return ctx.fail(Error.FileSystem, current_state_path, "failed checking current state path"),
-            };
-            break :blk true;
-        };
-        if (!has_current_state and !is_local_repo_source) {
-            const db_path = std.fs.path.join(ctx.allocator, &.{ dir_path, repo_history.REPO_DB_FILENAME }) catch {
-                return ctx.fail(Error.OutOfMemory, dir_path, "failed to construct repository db path");
-            };
-            errdefer ctx.allocator.free(db_path);
-
-            const sig_path = std.fs.path.join(ctx.allocator, &.{ dir_path, repo_history.REPO_SIG_FILENAME }) catch {
-                return ctx.fail(Error.OutOfMemory, dir_path, "failed to construct repository signature path");
-            };
-            errdefer ctx.allocator.free(sig_path);
-
-            return ActiveRepoPaths{ .db_path = db_path, .sig_path = sig_path };
-        }
-
-        if (!has_current_state) {
-            return ctx.fail(Error.InvalidInput, dir_path, "local repository missing current state directory");
-        }
-
-        const db_path = std.fs.path.join(ctx.allocator, &.{ current_state_path, repo_history.REPO_DB_FILENAME }) catch {
-            return ctx.fail(Error.OutOfMemory, current_state_path, "failed to construct current state db path");
+        const db_path = std.fs.path.join(ctx.allocator, &.{ dir_path, repo_history.REPO_DB_FILENAME }) catch {
+            return ctx.fail(Error.OutOfMemory, dir_path, "failed to construct repository db path");
         };
         errdefer ctx.allocator.free(db_path);
 
-        const sig_path = std.fs.path.join(ctx.allocator, &.{ current_state_path, repo_history.REPO_SIG_FILENAME }) catch {
-            return ctx.fail(Error.OutOfMemory, current_state_path, "failed to construct current state signature path");
+        if (read_only) {
+            std.Io.Dir.accessAbsolute(path.currentIo(), db_path, .{}) catch {
+                return ctx.fail(Error.InvalidInput, dir_path, "repository has no repo.db");
+            };
+        }
+
+        const sig_path = std.fs.path.join(ctx.allocator, &.{ dir_path, repo_history.REPO_SIG_FILENAME }) catch {
+            return ctx.fail(Error.OutOfMemory, dir_path, "failed to construct repository signature path");
         };
         errdefer ctx.allocator.free(sig_path);
 
@@ -162,7 +107,7 @@ pub const Repository = struct {
             };
             dir.close(path.currentIo());
         }
-        const active_paths = try resolveActiveRepoStatePaths(ctx, dir_path);
+        const active_paths = try resolveActiveRepoStatePaths(ctx, dir_path, read_only);
         errdefer ctx.allocator.free(active_paths.db_path);
         errdefer ctx.allocator.free(active_paths.sig_path);
 
@@ -194,18 +139,6 @@ pub const Repository = struct {
     }
 };
 
-pub fn setupStateLayout(allocator: std.mem.Allocator, repo_dir: []const u8) !void {
-    try path.ensureDirExists(repo_dir);
-    const current_dir = try std.fs.path.join(allocator, &.{ repo_dir, repo_history.CURRENT_STATE_DIR });
-    defer allocator.free(current_dir);
-    try path.ensureDirExists(current_dir);
-
-    var dir = try path.openExistingDir(repo_dir);
-    defer dir.close(path.currentIo());
-    dir.deleteFile(path.currentIo(), "current") catch {};
-    dir.deleteFile(path.currentIo(), "previous") catch {};
-}
-
 test "Repository.dbPath and sigPath" {
     const th = @import("test_helpers.zig");
     var test_env = try th.createTestEnv();
@@ -216,7 +149,6 @@ test "Repository.dbPath and sigPath" {
     var ctx = &test_env.ctx;
     const repo_dir = try std.fs.path.join(ctx.allocator, &.{ test_env.path, "repo" });
     defer ctx.allocator.free(repo_dir);
-    try setupStateLayout(ctx.allocator, repo_dir);
 
     var repo = try Repository.init(ctx, repo_dir, false);
     defer repo.deinit();
@@ -228,7 +160,7 @@ test "Repository.dbPath and sigPath" {
     try std.testing.expect(std.mem.endsWith(u8, sig_path, ".db.sig"));
 }
 
-test "Repository.init resolves db and sig paths from current state" {
+test "Repository.init resolves db and sig paths with flat layout" {
     const th = @import("test_helpers.zig");
     var test_env = try th.createTestEnv();
     defer {
@@ -239,13 +171,11 @@ test "Repository.init resolves db and sig paths from current state" {
     const repo_dir = try std.fs.path.join(ctx.allocator, &.{ test_env.path, "repo-gen" });
     defer ctx.allocator.free(repo_dir);
 
-    try setupStateLayout(ctx.allocator, repo_dir);
-
     var repo = try Repository.init(ctx, repo_dir, false);
     defer repo.deinit();
 
-    try std.testing.expect(std.mem.containsAtLeast(u8, repo.dbPath(), 1, "/current/"));
-    try std.testing.expect(std.mem.containsAtLeast(u8, repo.sigPath(), 1, "/current/"));
+    try std.testing.expect(std.mem.endsWith(u8, repo.dbPath(), "/repo.db"));
+    try std.testing.expect(!std.mem.containsAtLeast(u8, repo.dbPath(), 1, "/current/"));
 }
 
 test "Repository.signDb creates signature file" {
@@ -258,7 +188,6 @@ test "Repository.signDb creates signature file" {
     var ctx = &test_env.ctx;
     const repo_dir = try std.fs.path.join(ctx.allocator, &.{ test_env.path, "repo" });
     defer ctx.allocator.free(repo_dir);
-    try setupStateLayout(ctx.allocator, repo_dir);
 
     var repo = try Repository.init(ctx, repo_dir, false);
     defer repo.deinit();
@@ -302,7 +231,6 @@ test "Repository error handling - SignatureInvalid errors" {
     const ctx = &test_env.ctx;
     const repo_dir = try std.fs.path.join(ctx.allocator, &.{ test_env.path, "repo" });
     defer ctx.allocator.free(repo_dir);
-    try setupStateLayout(ctx.allocator, repo_dir);
 
     var repo = try Repository.init(ctx, repo_dir, false);
     defer repo.deinit();
@@ -324,7 +252,7 @@ test "Repository error handling - SignatureInvalid errors" {
     try std.testing.expectError(Error.SignatureInvalid, result);
 }
 
-test "Repository.init treats sibling prefix path as non-local repo source" {
+test "Repository.init uses flat layout for all repos" {
     const th = @import("test_helpers.zig");
     var test_env = try th.createTestEnv();
     defer {
@@ -332,10 +260,10 @@ test "Repository.init treats sibling prefix path as non-local repo source" {
         std.testing.allocator.destroy(test_env);
     }
     const ctx = &test_env.ctx;
-    const sibling_repo_dir = try std.fs.path.join(ctx.allocator, &.{ ctx.root_path, "mere", "dev", "repo-evil", "sample" });
-    defer ctx.allocator.free(sibling_repo_dir);
+    const repo_dir = try std.fs.path.join(ctx.allocator, &.{ ctx.root_path, "mere", "dev", "repo", "sample" });
+    defer ctx.allocator.free(repo_dir);
 
-    var repo = try Repository.init(ctx, sibling_repo_dir, false);
+    var repo = try Repository.init(ctx, repo_dir, false);
     defer repo.deinit();
 
     try std.testing.expect(std.mem.endsWith(u8, repo.dbPath(), repo_history.REPO_DB_FILENAME));
