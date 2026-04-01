@@ -18,6 +18,7 @@ const generation = @import("generation.zig");
 const projection_index = @import("projection_index.zig");
 const path = @import("path.zig");
 const Context = @import("mere.zig").Context;
+const store = @import("store.zig");
 const errors = @import("errors.zig");
 
 pub const ROOT_DIRNAME = "root";
@@ -294,7 +295,7 @@ pub fn getRootPath(allocator: std.mem.Allocator, profile_dir: []const u8) Profil
     return std.fs.path.join(allocator, &.{ profile_dir, ROOT_DIRNAME }) catch ProfileError.OutOfMemory;
 }
 
-fn assertRootOwnedPackages(ctx: *Context, packages: []const generation.PackageEntry) ProfileError!void {
+fn ensureRootOwnedPackages(ctx: *Context, packages: []const generation.PackageEntry) ProfileError!void {
     for (packages) |pkg| {
         const store_path = pkg.store_path;
         const store_path_z = try ctx.allocator.dupeZ(u8, store_path);
@@ -312,7 +313,9 @@ fn assertRootOwnedPackages(ctx: *Context, packages: []const generation.PackageEn
         }
 
         if (statx.uid != 0 or statx.gid != 0) {
-            return ctx.fail(ProfileError.PermissionDenied, store_path, "store path is not root-owned");
+            store.hardenStoreObject(ctx, store_path) catch {
+                return ctx.fail(ProfileError.PermissionDenied, store_path, "failed to harden store path");
+            };
         }
     }
 }
@@ -1007,7 +1010,7 @@ pub fn createGeneration(
     };
 
     if (isSystemProfile(profile_dir)) {
-        try assertRootOwnedPackages(ctx, packages);
+        try ensureRootOwnedPackages(ctx, packages);
     }
 
     var parent_state = if (parent_generation) |parent_num| blk: {
