@@ -135,7 +135,7 @@ The store supports **two-tier admission**: unprivileged users can add objects fo
 - Mode `1777` (world-writable with sticky bit)
 - Allows unprivileged addition, prevents unauthorized deletion
 
-**Normative invariant**: If `/mere/store/<hash>-<name>-<version>/` exists, it is **immutable forever** (enforced by permissions and verification rules).
+**Normative invariant**: If `/mere/store/<hash>-<name>-<version>/` exists, it is **immutable forever** (enforced by permissions, ownership, and filesystem immutable flags on system-hardened objects). For system profile store objects, immutability is enforced by `FS_IMMUTABLE_FL` which prevents modification even by root. For user-owned store objects, immutability is enforced by read-only permissions only.
 
 #### Unprivileged Admission Steps
 
@@ -186,7 +186,7 @@ If `/mere/store/<hash>-<name>-<version>/` already exists and `reinstall` is fals
 - Skip payload extraction, symlink validation, and payload hash computation
 - Use the manifest content hash to compute the store path
 - **Unprivileged**: No further verification required (user is only affecting their own profile)
-- **Privileged**: MUST harden the existing store object before referencing it in a system profile. An unprivileged user may have admitted this object previously; the privileged fast-path ensures it is root-owned, read-only, and has valid symlink boundaries before any system generation uses it.
+- **Privileged**: MUST harden the existing store object before referencing it in a system profile. An unprivileged user may have admitted this object previously; the privileged fast-path ensures it is root-owned, read-only, has valid symlink boundaries, has verified content hash, and has filesystem immutable flags set before any system generation uses it. If the object is already hardened (root-owned with immutable flags set), verification and hardening are skipped — the object was verified when first admitted.
 
 This keeps installs fast for already-admitted content while enforcing the trust boundary for system profiles.
 
@@ -200,15 +200,19 @@ For privileged `sudo mere install` (system installation):
 
 2. **Verify and harden** all referenced store objects:
    - Verify integrity and signatures of all store objects referenced by the operation
+   - Recompute content hash from realized store path and compare against manifest (mandatory, not opt-in)
    - For each referenced store object:
      - Use `lstat`-based recursive traversal (MUST NOT follow symlinks outside boundary)
      - Change ownership to `root:root` recursively
      - Set read-only permissions recursively
+     - Set filesystem immutable flag (`FS_IMMUTABLE_FL` via `FS_IOC_SETFLAGS` ioctl) on all files and directories recursively
      - Verify no symlinks escape the store object boundary
+   - If the filesystem does not support immutable flags (e.g., tmpfs in containers): emit a single warning at the start of the operation and proceed without immutable flags. This is a correctness degradation, not a failure.
 
 3. **Validate publication**:
    - Ensure all referenced store paths are now owned by `root:root`
    - Ensure all referenced paths reside within `/mere/store`
+   - Ensure all files and directories have the immutable flag set (when filesystem supports it)
    - If any object cannot be verified or hardened: **fail the entire operation**
 
 4. **Create system profile generation**:
@@ -534,7 +538,7 @@ Allowed and expected. Treated as normal store payload. Requirement: when resolve
 3. Create temporary symlink: `/mere/profiles/system/.current-new -> gen-<N>`
 4. Atomic rename: `rename("/mere/profiles/system/.current-new", "/mere/profiles/system/current")`
 
-**Validation philosophy**: The manifest serves as a **completion marker** - its presence and parseability indicates "this generation was assembled coherently." Activation performs **fast integrity checks** (store paths exist, are within `/mere/store`, and are root-owned/read-only for the system profile). **Optional full verification** may recompute content hashes for each referenced store path; this is opt-in due to cost.
+**Validation philosophy**: The manifest serves as a **completion marker** - its presence and parseability indicates "this generation was assembled coherently." Activation performs **fast integrity checks** (store paths exist, are within `/mere/store`, and are root-owned/read-only for the system profile). For system profile activation, content hash verification is **mandatory for unhardened store objects** — the content hash is recomputed and compared against the manifest before hardening. Already-hardened objects (root-owned with immutable flags) skip verification since they were verified when first admitted. This ensures correctness without redundant work on subsequent installs. For named (non-system) profiles, full hash verification remains opt-in due to cost.
 
 **Idempotent cleanup**: If `.current-new` exists from a previously interrupted switch, it is deleted unconditionally before creating a new one. This makes switching idempotent and self-healing.
 
@@ -1077,6 +1081,7 @@ Algorithm:
    - For each candidate not in reachable set:
      - Verify path is exactly a direct child of `/mere/store/`
      - Verify path is a directory (not symlink or file)
+     - Clear filesystem immutable flags (`FS_IMMUTABLE_FL`) recursively on all files and directories before deletion
      - Delete recursively
 
 4. **Prune unkept system generations**:
@@ -2317,6 +2322,13 @@ During `mere init`, the implementation MUST:
 - Remove unsafe permissions (e.g., group/world write on protected dirs)
 - Refuse to proceed if critical paths are symlinks
 - Refuse to operate if `/mere` is mounted with `nosuid`, `nodev`, `noexec` in incompatible ways
+
+During system profile activation, the implementation MUST harden each referenced store object:
+- Recompute content hash and verify against manifest (mandatory)
+- Change ownership to `root:root` recursively
+- Set read-only permissions recursively
+- Set filesystem immutable flag (`FS_IMMUTABLE_FL` via `ioctl(fd, FS_IOC_SETFLAGS)`) on all files and directories recursively
+- If the filesystem does not support immutable flags: emit a single warning per operation (not per file) and proceed. The store is still protected by ownership and permissions, but not against accidental root writes through symlinks.
 
 Any violation MUST be reported. Silent repair is not permitted without user-visible output.
 

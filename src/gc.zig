@@ -22,6 +22,7 @@ const package_mod = @import("package.zig");
 const path_mod = @import("path.zig");
 const repodb = @import("repodb.zig");
 const repo_history = @import("repo_history.zig");
+const store = @import("store.zig");
 
 /// GC error set
 const Std = errors.StandardErrors;
@@ -194,6 +195,8 @@ fn collectGarbageAtPathsWithPackagePool(
             };
 
             if (!options.dry_run) {
+                // Clear immutable flags before deletion (hardened store objects have chattr +i)
+                _ = store.clearImmutable(allocator, store_path);
                 // Make directory writable before deletion (store paths are read-only)
                 makeWritable(store_path);
                 // Actually delete

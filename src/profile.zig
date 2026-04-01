@@ -297,26 +297,10 @@ pub fn getRootPath(allocator: std.mem.Allocator, profile_dir: []const u8) Profil
 
 fn ensureRootOwnedPackages(ctx: *Context, packages: []const generation.PackageEntry) ProfileError!void {
     for (packages) |pkg| {
-        const store_path = pkg.store_path;
-        const store_path_z = try ctx.allocator.dupeZ(u8, store_path);
-        defer ctx.allocator.free(store_path_z);
-
-        var statx = std.mem.zeroes(std.os.linux.Statx);
-        switch (std.os.linux.errno(std.os.linux.statx(std.posix.AT.FDCWD, store_path_z, 0, .{
-            .UID = true,
-            .GID = true,
-        }, &statx))) {
-            .SUCCESS => {},
-            .NOENT => return ctx.fail(ProfileError.StorePathNotFound, store_path, "failed to stat store path for ownership"),
-            .ACCES, .PERM => return ctx.fail(ProfileError.PermissionDenied, store_path, "failed to stat store path for ownership"),
-            else => return ctx.fail(ProfileError.FileSystem, store_path, "failed to stat store path for ownership"),
-        }
-
-        if (statx.uid != 0 or statx.gid != 0) {
-            store.hardenStoreObject(ctx, store_path) catch {
-                return ctx.fail(ProfileError.PermissionDenied, store_path, "failed to harden store path");
-            };
-        }
+        if (store.isHardened(pkg.store_path)) continue;
+        _ = store.harden(ctx, pkg.store_path) catch {
+            return ctx.fail(ProfileError.PermissionDenied, pkg.store_path, "failed to harden store path");
+        };
     }
 }
 

@@ -13,6 +13,7 @@ const sign = @import("sign.zig");
 const manifest = @import("manifest.zig");
 const hash = @import("hash.zig");
 const projection_index = @import("projection_index.zig");
+const store = @import("store.zig");
 const Repository = repository.Repository;
 
 fn makeWritable(dir_path: []const u8) void {
@@ -57,6 +58,9 @@ pub const TestEnv = struct {
         const allocator = self.debug_allocator.allocator();
         // Ensure any diagnostic arena allocations are released before deinit
         self.ctx.resetDiagnostics();
+        // Clear immutable flags before making writable (tests running as root
+        // may have set chattr +i via store.harden)
+        _ = store.clearImmutable(allocator, self.path);
         self.ctx.deinit();
         makeWritable(self.path);
         self.tmp.cleanup();

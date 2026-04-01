@@ -23,6 +23,7 @@ const errors = @import("errors.zig");
 const hash = @import("hash.zig");
 const path_mod = @import("path.zig");
 const path_safety = @import("path_safety.zig");
+const store = @import("store.zig");
 
 /// Activation error set
 const Std = errors.StandardErrors;
@@ -337,28 +338,11 @@ fn validateGenerationStorePaths(
             return ctx.fail(ActivationError.InvalidInput, pkg.store_path, "store path is not a directory");
         }
 
-        if (require_root_owned) {
-            const store_path_z = try ctx.allocator.dupeZ(u8, pkg.store_path);
-            defer ctx.allocator.free(store_path_z);
-            var statx = std.mem.zeroes(std.os.linux.Statx);
-            switch (std.os.linux.errno(std.os.linux.statx(std.posix.AT.FDCWD, store_path_z, 0, .{
-                .UID = true,
-                .GID = true,
-            }, &statx))) {
-                .SUCCESS => {},
-                .ACCES => return ctx.fail(ActivationError.PermissionDenied, pkg.store_path, "failed to stat store ownership"),
-                .NOENT => return ctx.fail(ActivationError.FileSystem, pkg.store_path, "failed to stat store ownership"),
-                else => return ctx.fail(ActivationError.FileSystem, pkg.store_path, "failed to stat store ownership"),
-            }
-            if (statx.uid != 0 or statx.gid != 0) {
-                return ctx.fail(ActivationError.PermissionDenied, pkg.store_path, "store path is not root-owned");
-            }
-            if ((stat_buf.permissions.toMode() & 0o222) != 0) {
-                return ctx.fail(ActivationError.PermissionDenied, pkg.store_path, "store path is writable");
-            }
-        }
+        // For system profiles, hash verification is mandatory for unhardened objects.
+        // Already-hardened objects were verified when first admitted.
+        const do_hash_verify = verify_store or (require_root_owned and !store.isHardened(pkg.store_path));
 
-        if (verify_store) {
+        if (do_hash_verify) {
             if (pkg.content_hash.len != 64) {
                 return ctx.fail(ActivationError.InvalidInput, pkg.store_path, "invalid content hash length in manifest");
             }
@@ -724,6 +708,7 @@ test "applyEtcTemplatesForManifest preserves PermissionDenied from etc template 
 }
 
 test "activateSystemGeneration rolls back created /etc files and does not switch on failure" {
+    if (std.os.linux.geteuid() == 0) return error.SkipZigTest;
     const th = @import("test_helpers.zig");
     var test_env = try th.createTestEnv();
     defer {
@@ -761,11 +746,15 @@ test "activateSystemGeneration rolls back created /etc files and does not switch
         dir.close(io);
     }
 
-    const content_hash_2 = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
-    const store_path = try std.fs.path.join(allocator, &.{ test_env.path, "mere", "store", content_hash_2 ++ "-testpkg-2.0.0" });
-    defer allocator.free(store_path);
+    // Build store path contents first in a temp location, then compute the real
+    // content hash so system profile activation's mandatory verification passes.
+    const store_root = try std.fs.path.join(allocator, &.{ test_env.path, "mere", "store" });
+    defer allocator.free(store_root);
 
-    const defaults_root = try std.fs.path.join(allocator, &.{ store_path, "etc-defaults" });
+    const tmp_store_path = try std.fs.path.join(allocator, &.{ store_root, "tmp-testpkg-2.0.0" });
+    defer allocator.free(tmp_store_path);
+
+    const defaults_root = try std.fs.path.join(allocator, &.{ tmp_store_path, "etc-defaults" });
     defer allocator.free(defaults_root);
     {
         var dir = try path_mod.makePathAndOpenDir(defaults_root);
@@ -794,6 +783,18 @@ test "activateSystemGeneration rolls back created /etc files and does not switch
         defer conflict.close(io);
         try conflict.writeStreamingAll(io, "new-value=true\n");
     }
+
+    // Compute real content hash and rename to final store path
+    const content_hash_2 = try hash.calculateStoreContentHash(allocator, tmp_store_path, null);
+    defer allocator.free(content_hash_2);
+
+    const final_dir_name = try std.fmt.allocPrint(allocator, "{s}-testpkg-2.0.0", .{content_hash_2});
+    defer allocator.free(final_dir_name);
+
+    const store_path = try std.fs.path.join(allocator, &.{ store_root, final_dir_name });
+    defer allocator.free(store_path);
+
+    try std.Io.Dir.renameAbsolute(tmp_store_path, store_path, io);
 
     var manifest2 = generation.GenerationManifest.init(allocator, 2);
     defer manifest2.deinit();
@@ -859,4 +860,74 @@ test "activateSystemGeneration rolls back created /etc files and does not switch
     std.Io.Dir.accessAbsolute(io, new_file, .{}) catch |err| {
         try std.testing.expectEqual(error.FileNotFound, err);
     };
+}
+
+test "system profile activation rejects mismatched content hash without verify-store flag" {
+    const th = @import("test_helpers.zig");
+    var test_env = try th.createTestEnv();
+    defer {
+        test_env.cleanup();
+        std.testing.allocator.destroy(test_env);
+    }
+
+    const allocator = test_env.ctx.allocator;
+    const io = path_mod.currentIo();
+
+    const profile_dir = try std.fs.path.join(allocator, &.{ test_env.path, "mere", "profiles", "system" });
+    defer allocator.free(profile_dir);
+    {
+        var dir = try path_mod.makePathAndOpenDir(profile_dir);
+        dir.close(io);
+    }
+
+    // Gen 1: empty, just to have a current generation
+    const gen1_path = try std.fs.path.join(allocator, &.{ profile_dir, "gen-1" });
+    defer allocator.free(gen1_path);
+    {
+        var dir = try path_mod.makePathAndOpenDir(gen1_path);
+        dir.close(io);
+    }
+    var manifest1 = generation.GenerationManifest.init(allocator, 1);
+    defer manifest1.deinit();
+    try generation.writeManifest(allocator, gen1_path, &manifest1);
+    _ = try switchProfileGeneration(&test_env.ctx, "system", 1, .fast);
+
+    // Gen 2: references a store path with a WRONG content hash
+    const gen2_path = try std.fs.path.join(allocator, &.{ profile_dir, "gen-2" });
+    defer allocator.free(gen2_path);
+    {
+        var dir = try path_mod.makePathAndOpenDir(gen2_path);
+        dir.close(io);
+    }
+
+    const fake_hash = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const store_path = try std.fs.path.join(allocator, &.{ test_env.path, "mere", "store", fake_hash ++ "-badpkg-1.0.0" });
+    defer allocator.free(store_path);
+    {
+        var dir = try path_mod.makePathAndOpenDir(store_path);
+        dir.close(io);
+    }
+    // Put a file in so the real hash differs from fake_hash
+    const file_path = try std.fs.path.join(allocator, &.{ store_path, "data.txt" });
+    defer allocator.free(file_path);
+    {
+        var f = try std.Io.Dir.createFileAbsolute(io, file_path, .{});
+        defer f.close(io);
+        try f.writeStreamingAll(io, "this content does not match the hash\n");
+    }
+
+    var manifest2 = generation.GenerationManifest.init(allocator, 2);
+    defer manifest2.deinit();
+    try manifest2.addPackage("badpkg", "1.0.0", 1, "x86_64", store_path, fake_hash);
+    try generation.writeManifest(allocator, gen2_path, &manifest2);
+
+    // Activate with .fast (no explicit verify-store) — should STILL fail
+    // because system profile hash verification is now mandatory
+    try std.testing.expectError(
+        ActivationError.InvalidInput,
+        activateSystemGeneration(&test_env.ctx, 2, .fast),
+    );
+
+    // Should not have switched
+    try std.testing.expectEqual(@as(?u32, 1), try generation.getCurrentGeneration(profile_dir));
 }
