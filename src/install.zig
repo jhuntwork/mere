@@ -975,11 +975,12 @@ fn installResolvedPackages(
         if (cache_path.len == 0) {
             const store_path = try store.constructStorePath(ctx, resolved.pkg.content_hash, resolved.pkg.name.?, resolved.pkg.version.?);
 
+            const pkg_label = try std.fmt.allocPrint(ctx.allocator, "{s}-{s}-{d}", .{ resolved.pkg.name.?, resolved.pkg.version.?, resolved.pkg.release.? });
+            defer ctx.allocator.free(pkg_label);
             const segments = [_]mere.ui.Segment{
-                .{ .text = resolved.pkg.name.?, .kind = .detail },
-                .{ .text = "-", .kind = .normal },
-                .{ .text = resolved.pkg.version.?, .kind = .detail },
-                .{ .text = " installed to store", .kind = .success },
+                .{ .text = pkg_label, .kind = .normal },
+                .{ .text = " verified", .kind = .success },
+                .{ .text = " in store", .kind = .detail },
             };
             emit.logSegmentsSeverity(ctx, .install, .info, &segments);
 
