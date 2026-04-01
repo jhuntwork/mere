@@ -186,6 +186,7 @@ pub fn getUserFriendlyMessage(err: anyerror) []const u8 {
         // Install module errors
         error.MissingDependency => "dependency not found in any repository",
         error.PackageNotFound => "package not found in any repository",
+        error.ConflictingProvision => "multiple packages provide the same file path",
         error.SymlinkEscapesBoundary => "package contains symlink that escapes installation boundary",
 
         // Import module errors

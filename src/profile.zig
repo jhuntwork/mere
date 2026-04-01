@@ -320,6 +320,19 @@ fn ensureRootOwnedPackages(ctx: *Context, packages: []const generation.PackageEn
     }
 }
 
+/// Sort packages by name to ensure indices match the canonical manifest order.
+/// The manifest encoder sorts packages alphabetically, so all index-bearing
+/// structures (realization, conflict detector) must use the same ordering.
+fn canonicalizePackages(allocator: std.mem.Allocator, packages: []const generation.PackageEntry) ProfileError![]const generation.PackageEntry {
+    const sorted = allocator.dupe(generation.PackageEntry, packages) catch return ProfileError.OutOfMemory;
+    std.mem.sort(generation.PackageEntry, sorted, {}, struct {
+        fn lessThan(_: void, a: generation.PackageEntry, b: generation.PackageEntry) bool {
+            return std.mem.lessThan(u8, a.name, b.name);
+        }
+    }.lessThan);
+    return sorted;
+}
+
 pub fn buildProfile(
     allocator: std.mem.Allocator,
     ctx: *Context,
@@ -330,9 +343,13 @@ pub fn buildProfile(
     if (profile_root.len == 0 or store_root.len == 0) {
         return ProfileError.InvalidInput;
     }
+
+    const sorted_packages = try canonicalizePackages(allocator, packages);
+    defer allocator.free(sorted_packages);
+
     const started_at = std.Io.Clock.Timestamp.now(path.currentIo(), .awake).raw.toNanoseconds();
 
-    var result = try planProfileRealization(allocator, ctx, profile_root, store_root, packages, null);
+    var result = try planProfileRealization(allocator, ctx, profile_root, store_root, sorted_packages, null);
     errdefer result.deinit();
 
     if (result.conflicts.hasConflicts()) {
@@ -343,7 +360,7 @@ pub fn buildProfile(
         allocator,
         ctx,
         profile_root,
-        packages,
+        sorted_packages,
         &result.realization,
         null,
     );
@@ -871,6 +888,9 @@ pub fn publishProfileRoot(
         return ctx.fail(ProfileError.InvalidInput, profile_dir, "system profile uses generations");
     }
 
+    const sorted_packages = try canonicalizePackages(ctx.allocator, packages);
+    defer ctx.allocator.free(sorted_packages);
+
     var random_bytes: [6]u8 = undefined;
     path.currentIo().random(&random_bytes);
     const suffix = std.fmt.bytesToHex(random_bytes, .lower);
@@ -913,20 +933,23 @@ pub fn publishProfileRoot(
         ctx,
         stage_dir,
         store_root,
-        packages,
+        sorted_packages,
         if (parent_state) |*state| state else null,
     );
     defer result.deinit();
 
     if (result.conflicts.hasConflicts()) {
-        return ProfileError.PathConflict;
+        const details = result.conflicts.formatAllConflicts(ctx.allocator) catch
+            return ctx.fail(ProfileError.PathConflict, profile_dir, "path conflicts detected (details unavailable: out of memory)");
+        defer ctx.allocator.free(details);
+        return ctx.fail(ProfileError.PathConflict, profile_dir, details);
     }
 
     const apply_stats = try applyRealization(
         ctx.allocator,
         ctx,
         stage_dir,
-        packages,
+        sorted_packages,
         &result.realization,
         if (parent_state) |*state| state else null,
     );
@@ -936,7 +959,7 @@ pub fn publishProfileRoot(
 
     var manifest = try buildProfileManifest(
         ctx.allocator,
-        packages,
+        sorted_packages,
         null,
         null,
         std.fs.path.basename(profile_dir),
@@ -987,6 +1010,9 @@ pub fn createGeneration(
     packages: []const generation.PackageEntry,
     parent_generation: ?u32,
 ) ProfileError!u32 {
+    const sorted_packages = try canonicalizePackages(ctx.allocator, packages);
+    defer ctx.allocator.free(sorted_packages);
+
     const started_at = std.Io.Clock.Timestamp.now(path.currentIo(), .awake).raw.toNanoseconds();
     const gen_num = generation.getNextGenerationNumber(profile_dir) catch |err| {
         return ctx.fail(switch (err) {
@@ -1010,7 +1036,7 @@ pub fn createGeneration(
     };
 
     if (isSystemProfile(profile_dir)) {
-        try ensureRootOwnedPackages(ctx, packages);
+        try ensureRootOwnedPackages(ctx, sorted_packages);
     }
 
     var parent_state = if (parent_generation) |parent_num| blk: {
@@ -1027,20 +1053,23 @@ pub fn createGeneration(
         ctx,
         gen_path,
         store_root,
-        packages,
+        sorted_packages,
         if (parent_state) |*state| state else null,
     );
     defer result.deinit();
 
     if (result.conflicts.hasConflicts()) {
-        return ProfileError.PathConflict;
+        const details = result.conflicts.formatAllConflicts(ctx.allocator) catch
+            return ctx.fail(ProfileError.PathConflict, profile_dir, "path conflicts detected (details unavailable: out of memory)");
+        defer ctx.allocator.free(details);
+        return ctx.fail(ProfileError.PathConflict, profile_dir, details);
     }
 
     const apply_stats = try applyRealization(
         ctx.allocator,
         ctx,
         gen_path,
-        packages,
+        sorted_packages,
         &result.realization,
         if (parent_state) |*state| state else null,
     );
@@ -1050,7 +1079,7 @@ pub fn createGeneration(
 
     var manifest = try buildProfileManifest(
         ctx.allocator,
-        packages,
+        sorted_packages,
         gen_num,
         parent_generation,
         std.fs.path.basename(profile_dir),
@@ -1637,6 +1666,91 @@ test "createGeneration detects conflicts against retained parent paths" {
         ProfileError.PathConflict,
         createGeneration(&test_env.ctx, profile_dir, store_root, &gen2_packages, 1),
     );
+}
+
+test "createGeneration realization indices match manifest package order" {
+    const th = @import("test_helpers.zig");
+    var test_env = try th.createTestEnv();
+    defer {
+        test_env.cleanup();
+        std.testing.allocator.destroy(test_env);
+    }
+
+    const allocator = test_env.ctx.allocator;
+    const store_root = try std.fs.path.join(allocator, &.{ test_env.path, "mere", "store" });
+    defer allocator.free(store_root);
+    try path.ensureDirExists(store_root);
+
+    // Create two packages with names that sort differently than input order
+    const pkg_z_hash = "aaaa000000000000000000000000000000000000000000000000000000000000";
+    const pkg_a_hash = "bbbb000000000000000000000000000000000000000000000000000000000000";
+    const pkg_z_path = try std.fs.path.join(allocator, &.{ store_root, pkg_z_hash ++ "-zzz-1.0" });
+    defer allocator.free(pkg_z_path);
+    const pkg_a_path = try std.fs.path.join(allocator, &.{ store_root, pkg_a_hash ++ "-aaa-1.0" });
+    defer allocator.free(pkg_a_path);
+
+    // pkg "zzz" has bin/ztool
+    const z_bin = try std.fs.path.join(allocator, &.{ pkg_z_path, "bin" });
+    defer allocator.free(z_bin);
+    try path.ensureDirExists(z_bin);
+    const z_file = try std.fs.path.join(allocator, &.{ z_bin, "ztool" });
+    defer allocator.free(z_file);
+    {
+        var f = try std.Io.Dir.createFileAbsolute(path.currentIo(), z_file, .{});
+        defer f.close(path.currentIo());
+        try f.writeStreamingAll(path.currentIo(), "z");
+    }
+    try writeProjectionForTestPackage(allocator, pkg_z_path);
+
+    // pkg "aaa" has bin/atool
+    const a_bin = try std.fs.path.join(allocator, &.{ pkg_a_path, "bin" });
+    defer allocator.free(a_bin);
+    try path.ensureDirExists(a_bin);
+    const a_file = try std.fs.path.join(allocator, &.{ a_bin, "atool" });
+    defer allocator.free(a_file);
+    {
+        var f = try std.Io.Dir.createFileAbsolute(path.currentIo(), a_file, .{});
+        defer f.close(path.currentIo());
+        try f.writeStreamingAll(path.currentIo(), "a");
+    }
+    try writeProjectionForTestPackage(allocator, pkg_a_path);
+
+    const profile_dir = try std.fs.path.join(allocator, &.{ test_env.path, "profiles", "dev" });
+    defer allocator.free(profile_dir);
+    try path.ensureDirExists(profile_dir);
+
+    // Pass packages in REVERSE alphabetical order (zzz first, aaa second)
+    const packages = [_]generation.PackageEntry{
+        .{ .name = "zzz", .version = "1.0", .release = 1, .arch = "x86_64", .store_path = pkg_z_path, .content_hash = pkg_z_hash },
+        .{ .name = "aaa", .version = "1.0", .release = 1, .arch = "x86_64", .store_path = pkg_a_path, .content_hash = pkg_a_hash },
+    };
+
+    const gen_num = try createGeneration(&test_env.ctx, profile_dir, store_root, &packages, null);
+    try std.testing.expectEqual(@as(u32, 1), gen_num);
+
+    const gen_path = try std.fs.path.join(allocator, &.{ profile_dir, "gen-1" });
+    defer allocator.free(gen_path);
+
+    // Read manifest — packages should be sorted alphabetically
+    var manifest = try generation.readManifest(allocator, store_root, gen_path);
+    defer manifest.deinit();
+    try std.testing.expectEqual(@as(usize, 2), manifest.packages.items.len);
+    try std.testing.expectEqualStrings("aaa", manifest.packages.items[0].name);
+    try std.testing.expectEqualStrings("zzz", manifest.packages.items[1].name);
+
+    // Read realization — owner indices must match manifest order
+    var realization = try generation.readRealization(allocator, gen_path);
+    defer realization.deinit();
+
+    for (realization.entries.items) |entry| {
+        if (std.mem.eql(u8, entry.path, "bin/atool")) {
+            // "aaa" is manifest index 0
+            try std.testing.expectEqual(@as(u32, 0), entry.owner_package_index);
+        } else if (std.mem.eql(u8, entry.path, "bin/ztool")) {
+            // "zzz" is manifest index 1
+            try std.testing.expectEqual(@as(u32, 1), entry.owner_package_index);
+        }
+    }
 }
 
 test "createProfile creates profile directory" {

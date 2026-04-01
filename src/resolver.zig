@@ -1279,6 +1279,35 @@ fn resolveRequirement(
             const candidate_label = try formatCandidateLabel(allocator, candidate.*);
             defer allocator.free(candidate_label);
 
+            // Skip preferred candidate if a newer version exists in the repo.
+            // Preferred selections stabilize dependency resolution but should
+            // not hold back upgrades when a newer version is available.
+            skip_preferred: {
+                var all_candidates = collectAndRankCandidates(
+                    ctx,
+                    candidate.pkg_name,
+                    repocaches,
+                    currentTargetArch(),
+                    allocator,
+                    false,
+                ) catch break :skip_preferred;
+                defer {
+                    for (all_candidates.items) |*c| c.deinit();
+                    all_candidates.deinit(allocator);
+                }
+                if (all_candidates.items.len > 0 and
+                    compareCandidates(currentTargetArch(), all_candidates.items[0], candidate.*))
+                {
+                    const reason = std.fmt.allocPrint(allocator, "newer version available: {s}-{s}-{d}", .{
+                        all_candidates.items[0].pkg.name.?,
+                        all_candidates.items[0].pkg.version.?,
+                        all_candidates.items[0].pkg.release.?,
+                    }) catch break :skip_preferred;
+                    try appendDecision(allocator, &decisions, candidate_label, reason);
+                    continue;
+                }
+            }
+
             if (requirement.constraint_expr) |expr| {
                 const matches = version_constraint.matchesConstraintExpr(
                     expr,
@@ -1941,8 +1970,49 @@ test "resolve prefers current exact selection over newer version" {
     var result = try withRequirements(ctx, &requirements, repocaches[0..], &preferred, allocator);
     defer result.deinit();
 
+    // Preferred selection should NOT hold back upgrades — newer version wins
     try std.testing.expectEqual(@as(usize, 1), result.packages.len);
-    try std.testing.expectEqualStrings("1.0.0", result.packages[0].pkg.version.?);
+    try std.testing.expectEqualStrings("2.0.0", result.packages[0].pkg.version.?);
+}
+
+test "resolve prefers current selection when it is already the latest" {
+    const th = @import("test_helpers.zig");
+    var test_env = try th.createTestEnv();
+    defer {
+        test_env.cleanup();
+        std.testing.allocator.destroy(test_env);
+    }
+
+    const ctx = &test_env.ctx;
+    const allocator = ctx.allocator;
+    const repo_url = try std.fmt.allocPrint(allocator, "file://{s}/repo-preferred-latest", .{test_env.path});
+    defer allocator.free(repo_url);
+    var repocache = try RepoCache.init(ctx, "repo-preferred-latest", repo_url, &.{}, 100);
+    defer repocache.deinit();
+    try initTestRepository(&repocache);
+
+    try insertVersionedTestPackage(ctx, &repocache, "A", "2.0.0", &.{});
+
+    const requirements = [_]Requirement{
+        .{ .name = "A", .constraint_expr = null },
+    };
+    const preferred = [_]PreferredSelection{
+        .{
+            .name = "A",
+            .version = "2.0.0",
+            .release = 1,
+            .arch = currentTargetArch(),
+            .content_hash = "hash-A-2.0.0",
+        },
+    };
+
+    var repocaches = [_]*RepoCache{&repocache};
+    var result = try withRequirements(ctx, &requirements, repocaches[0..], &preferred, allocator);
+    defer result.deinit();
+
+    // When preferred IS the latest, it should still be selected
+    try std.testing.expectEqual(@as(usize, 1), result.packages.len);
+    try std.testing.expectEqualStrings("2.0.0", result.packages[0].pkg.version.?);
 }
 
 test "resolve upgrades current selection when new dependency requires it" {
