@@ -536,6 +536,38 @@ pub fn scanDir(ctx: *Context, dir_path: []const u8, target_arch: []const u8) !Di
                         return e;
                     }
                 };
+                // Detect ld-musl interpreter symlinks by name alone — the symlink
+                // target may be an absolute path that doesn't resolve on the
+                // build host (e.g., /lib/libc.so won't exist on glibc systems).
+                {
+                    const norm_interp = if (entry.path[0] == '.' and entry.path.len > 1 and entry.path[1] == '/')
+                        entry.path[2..]
+                    else if (entry.path[0] == '.')
+                        entry.path[1..]
+                    else
+                        entry.path;
+
+                    if (std.mem.startsWith(u8, symlink_name, "ld-musl-") and
+                        std.mem.endsWith(u8, symlink_name, ".so.1") and
+                        std.mem.startsWith(u8, norm_interp, "lib/"))
+                    {
+                        const interp_path = std.fs.path.join(ctx.allocator, &.{ "/", norm_interp }) catch |err| {
+                            setScanDiagnosticContext(ctx, dir_path, entry.path, "package scan symlink pass failed to build interpreter provision path ({s})", .{@errorName(err)});
+                            return err;
+                        };
+                        defer ctx.allocator.free(interp_path);
+                        var interp_prov = Provision.init(ctx.allocator, interp_path, .elf_soname) catch |err| {
+                            setScanDiagnosticContext(ctx, dir_path, entry.path, "package scan symlink pass failed to record interpreter provision '{s}' ({s})", .{ interp_path, @errorName(err) });
+                            return err;
+                        };
+                        errdefer interp_prov.deinit(ctx.allocator);
+                        result.provisions.append(interp_prov) catch |err| {
+                            setScanDiagnosticContext(ctx, dir_path, entry.path, "package scan symlink pass failed to append interpreter provision '{s}' ({s})", .{ interp_path, @errorName(err) });
+                            return err;
+                        };
+                    }
+                }
+
                 if (target_exists) {
                     const file = std.Io.Dir.openFileAbsolute(io, abs_target, .{}) catch |err| {
                         ctx.debug("package scan: skipping symlink target open for {s} -> {s}: {s}", .{ entry.path, target_path, @errorName(err) });
@@ -544,13 +576,6 @@ pub fn scanDir(ctx: *Context, dir_path: []const u8, target_arch: []const u8) !Di
                     defer file.close(io);
                     if (filetype.detect(&file)) |kind| {
                         if (kind == .elf) {
-                            const norm_path = if (entry.path[0] == '.' and entry.path.len > 1 and entry.path[1] == '/')
-                                entry.path[2..]
-                            else if (entry.path[0] == '.')
-                                entry.path[1..]
-                            else
-                                entry.path;
-
                             if (isSharedObjectBasename(symlink_name)) {
                                 var soname_prov = Provision.init(ctx.allocator, symlink_name, .elf_soname) catch |err| {
                                     setScanDiagnosticContext(ctx, dir_path, entry.path, "package scan symlink pass failed to record SONAME provision '{s}' ({s})", .{ symlink_name, @errorName(err) });
@@ -559,26 +584,6 @@ pub fn scanDir(ctx: *Context, dir_path: []const u8, target_arch: []const u8) !Di
                                 errdefer soname_prov.deinit(ctx.allocator);
                                 result.provisions.append(soname_prov) catch |err| {
                                     setScanDiagnosticContext(ctx, dir_path, entry.path, "package scan symlink pass failed to append SONAME provision '{s}' ({s})", .{ symlink_name, @errorName(err) });
-                                    return err;
-                                };
-                            }
-
-                            if (std.mem.startsWith(u8, symlink_name, "ld-musl-") and
-                                std.mem.endsWith(u8, symlink_name, ".so.1") and
-                                std.mem.startsWith(u8, norm_path, "lib/"))
-                            {
-                                const interp_path = std.fs.path.join(ctx.allocator, &.{ "/", norm_path }) catch |err| {
-                                    setScanDiagnosticContext(ctx, dir_path, entry.path, "package scan symlink pass failed to build interpreter provision path ({s})", .{@errorName(err)});
-                                    return err;
-                                };
-                                defer ctx.allocator.free(interp_path);
-                                var interp_prov = Provision.init(ctx.allocator, interp_path, .elf_soname) catch |err| {
-                                    setScanDiagnosticContext(ctx, dir_path, entry.path, "package scan symlink pass failed to record interpreter provision '{s}' ({s})", .{ interp_path, @errorName(err) });
-                                    return err;
-                                };
-                                errdefer interp_prov.deinit(ctx.allocator);
-                                result.provisions.append(interp_prov) catch |err| {
-                                    setScanDiagnosticContext(ctx, dir_path, entry.path, "package scan symlink pass failed to append interpreter provision '{s}' ({s})", .{ interp_path, @errorName(err) });
                                     return err;
                                 };
                             }

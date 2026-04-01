@@ -79,7 +79,7 @@ pub fn cloneHostEnvWithVar(
     var env_map = std.process.Environ.Map.init(allocator);
     defer env_map.deinit();
 
-    var envp = std.c.environ;
+    const envp = std.c.environ;
     var i: usize = 0;
     while (envp[i]) |entry| : (i += 1) {
         const kv = std.mem.span(entry);

@@ -206,7 +206,7 @@ fn createDirectory(path: []const u8, mode: u32) !void {
         };
     };
 
-    var dir = std.Io.Dir.cwd().openDir(path_mod.currentIo(), path, .{}) catch |err| {
+    var dir = std.Io.Dir.cwd().openDir(path_mod.currentIo(), path, .{ .iterate = true }) catch |err| {
         return mapInitFsError(err);
     };
     defer dir.close(path_mod.currentIo());
@@ -218,7 +218,7 @@ fn createDirectory(path: []const u8, mode: u32) !void {
 
 /// Set ownership of a directory to root:root
 fn setOwnership(path: []const u8) !void {
-    var dir = std.Io.Dir.cwd().openDir(path_mod.currentIo(), path, .{}) catch |err| {
+    var dir = std.Io.Dir.cwd().openDir(path_mod.currentIo(), path, .{ .iterate = true }) catch |err| {
         return mapInitFsError(err);
     };
     defer dir.close(path_mod.currentIo());
@@ -229,7 +229,7 @@ fn setOwnership(path: []const u8) !void {
 }
 
 fn setDirectoryPermissions(path: []const u8, mode: u32) !void {
-    var dir = std.Io.Dir.cwd().openDir(path_mod.currentIo(), path, .{}) catch |err| {
+    var dir = std.Io.Dir.cwd().openDir(path_mod.currentIo(), path, .{ .iterate = true }) catch |err| {
         return mapInitFsError(err);
     };
     defer dir.close(path_mod.currentIo());
