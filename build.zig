@@ -1083,7 +1083,13 @@ fn bootstrapLibarchive(
         \\  --without-expat \
         \\  CFLAGS=-Os\ -fPIC \
         \\  CPPFLAGS=-I"$zlib_prefix/include"\ -I"$bzip2_prefix/include"\ -I"$zstd_prefix/include"\ -I"$lzma_prefix/include" \
-        \\  LDFLAGS=-L"$zlib_prefix/lib"\ -L"$bzip2_prefix/lib"\ -L"$zstd_prefix/lib"\ -L"$lzma_prefix/lib"
+        \\  LDFLAGS=-L"$zlib_prefix/lib"\ -L"$bzip2_prefix/lib"\ -L"$zstd_prefix/lib"\ -L"$lzma_prefix/lib" \
+        \\  ac_cv_header_md5_h=no \
+        \\  ac_cv_header_ripemd_h=no \
+        \\  ac_cv_header_sha_h=no \
+        \\  ac_cv_header_sha256_h=no \
+        \\  ac_cv_header_sha512_h=no \
+        \\  ac_cv_lib_md_MD5Init=no
         \\run_logged "$@"
         \\run_logged make -j"$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 1)"
         \\run_logged make install
@@ -1189,6 +1195,14 @@ fn bootstrapCurl(
         \\  --disable-manual \
         \\  --disable-docs \
         \\  --without-libpsl \
+        \\  --without-nghttp2 \
+        \\  --without-nghttp3 \
+        \\  --without-ngtcp2 \
+        \\  --without-brotli \
+        \\  --without-libidn2 \
+        \\  --without-librtmp \
+        \\  --disable-ldap \
+        \\  --disable-ldaps \
         \\  --with-mbedtls="$mbedtls_prefix" \
         \\  --with-zlib="$zlib_prefix" \
         \\  --with-zstd="$zstd_prefix" \

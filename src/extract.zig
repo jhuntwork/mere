@@ -123,7 +123,7 @@ fn applyArchivedSpecialBitsAtPath(
 
     switch (restore.kind) {
         .directory => {
-            var dir = std.Io.Dir.openDirAbsolute(p.currentIo(), full_path, .{}) catch |err| {
+            var dir = std.Io.Dir.openDirAbsolute(p.currentIo(), full_path, .{ .iterate = true }) catch |err| {
                 return ctx.fail(mapFsError(err), full_path, "failed to open directory for special-bit restore");
             };
             defer dir.close(p.currentIo());

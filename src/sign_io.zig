@@ -350,7 +350,7 @@ test "sign_io: writePublicKeyFile reports permission denied" {
     defer tmp.cleanup();
 
     try tmp.dir.createDirPath(path.currentIo(), "ro");
-    var ro = try tmp.dir.openDir(path.currentIo(), "ro", .{});
+    var ro = try tmp.dir.openDir(path.currentIo(), "ro", .{ .iterate = true });
     defer ro.close(path.currentIo());
     try ro.setPermissions(path.currentIo(), .fromMode(0o555));
 
@@ -374,7 +374,7 @@ test "sign_io: writeSecretKeyFile reports permission denied" {
     defer tmp.cleanup();
 
     try tmp.dir.createDirPath(path.currentIo(), "ro");
-    var ro = try tmp.dir.openDir(path.currentIo(), "ro", .{});
+    var ro = try tmp.dir.openDir(path.currentIo(), "ro", .{ .iterate = true });
     defer ro.close(path.currentIo());
     try ro.setPermissions(path.currentIo(), .fromMode(0o555));
 
@@ -398,7 +398,7 @@ test "sign_io: writeSecretKeyFile leaves no partial target on failure" {
     defer tmp.cleanup();
 
     try tmp.dir.createDirPath(path.currentIo(), "ro");
-    var ro = try tmp.dir.openDir(path.currentIo(), "ro", .{});
+    var ro = try tmp.dir.openDir(path.currentIo(), "ro", .{ .iterate = true });
     defer ro.close(path.currentIo());
     try ro.setPermissions(path.currentIo(), .fromMode(0o555));
 

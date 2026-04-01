@@ -1447,7 +1447,7 @@ fn setDirectoryReadOnly(dir_path: []const u8) !void {
         const e = entry.?;
         // Get metadata and change permissions
         if (e.kind == .directory) {
-            var subdir = dir.openDir(io, e.path, .{}) catch continue;
+            var subdir = dir.openDir(io, e.path, .{ .iterate = true }) catch continue;
             defer subdir.close(io);
             const stat = subdir.stat(io) catch continue;
             // Remove write bits (0o222) but preserve read (0o444) and execute (0o111)
@@ -4052,12 +4052,12 @@ test "setDirectoryReadOnly reports traversal permission failures" {
 
     try tmp.dir.createDirPath(path.currentIo(), "restricted");
     {
-        var restricted = try tmp.dir.openDir(path.currentIo(), "restricted", .{});
+        var restricted = try tmp.dir.openDir(path.currentIo(), "restricted", .{ .iterate = true });
         defer restricted.close(path.currentIo());
         try restricted.setPermissions(path.currentIo(), .fromMode(0o000));
     }
     defer {
-        if (tmp.dir.openDir(path.currentIo(), "restricted", .{})) |restricted| {
+        if (tmp.dir.openDir(path.currentIo(), "restricted", .{ .iterate = true })) |restricted| {
             var dir_handle = restricted;
             defer dir_handle.close(path.currentIo());
             dir_handle.setPermissions(path.currentIo(), .fromMode(0o755)) catch {};

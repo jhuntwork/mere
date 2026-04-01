@@ -570,7 +570,7 @@ fn makeWritable(dir_path: []const u8) void {
     while (walker.next(io) catch null) |entry| {
         switch (entry.kind) {
             .directory => {
-                var subdir = dir.openDir(io, entry.path, .{}) catch continue;
+                var subdir = dir.openDir(io, entry.path, .{ .iterate = true }) catch continue;
                 defer subdir.close(io);
                 const stat = subdir.stat(io) catch continue;
                 subdir.setPermissions(io, .fromMode(stat.permissions.toMode() | 0o200)) catch {};
