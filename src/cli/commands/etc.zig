@@ -114,6 +114,8 @@ fn collectUnifiedDiff(ctx: *mere.Context, left_path: []const u8, right_path: []c
 
 /// Etc command metadata
 const etc_meta = command.CommandMeta{
+    .group = "Package Management",
+    .order = 80,
     .name = "etc",
     .description = "Manage /etc configuration files",
 };

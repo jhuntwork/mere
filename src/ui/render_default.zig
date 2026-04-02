@@ -369,6 +369,7 @@ fn phaseName(phase: ?ui.Phase) ?[]const u8 {
         .key => "key",
         .etc => "etc",
         .search => "search",
+        .service => "service",
     } else null;
 }
 

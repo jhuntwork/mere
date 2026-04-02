@@ -10,7 +10,7 @@ const init_mod = @import("mere").init;
 /// Init command metadata
 const init_meta = command.CommandMeta{
     .name = "init",
-    .description = "Initialize and validate Mere filesystem layout",
+    .description = "Initialize and validate /mere filesystem layout",
     .flags = &[_]types.Flag{
         .{
             .name = "dry-run",

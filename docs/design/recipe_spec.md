@@ -337,7 +337,8 @@ package "ntpd" {
 |----------|------|----------|-------------|
 | (first arg) | string | yes | Service name |
 | `type` | string | yes | `"daemon"` (long-running) or `"oneshot"` (run-once) |
-| `essential` | boolean | no | Mark as essential boot infrastructure (default: `false`). Essential services are hidden from `service list` and placed in the `always` bundle. |
+| `essential` | boolean | no | Mark as essential boot infrastructure (default: `false`). Essential services are hidden from `mere status` and placed in the `always` bundle. |
+| `log` | boolean | no | Generate logging pipeline (default: `true`). Set to `false` for services that feed another logger (e.g., klogd → syslogd). |
 
 **Children of `service`:**
 
@@ -849,4 +850,4 @@ build {
 ## See Also
 
 - `docs/design/specification-details.md` - Build environment details
-- `docs/design/namespaces.md` - Build isolation design
+- `docs/design/specification-details.md` - Full system specification (includes build isolation model)

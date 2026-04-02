@@ -172,7 +172,7 @@ For unprivileged `mere install` or `mere dev build`:
 
 6. **Post-admission verification** (optional):
    - Not required for normal install once pre-verification + payload hash check succeeded
-   - May be performed by explicit verification tools (`mere verify`) or privileged hardening
+   - May be performed by explicit verification tools (`mere store verify`) or privileged hardening
 
 7. **Set permissions**:
    - Make the admitted directory and contents read-only for the owner
@@ -635,7 +635,7 @@ Mere uses a single system-wide root at `/mere/` (or `${root}/mere/` for alternat
 | `/mere/dev/cache/build/` | root:root | 1777 | Shared build execution cache for development builds                  |
 | `/mere/gc-roots/`     | root:root | 0755 | **Required**: Admin-controlled GC keep-set, NOT world-writable              |
 | `/mere/cache/`        | root:root | 1777 | Shared cache root, safe concurrent use                                       |
-| `/mere/cache/packages/` | root:root | 1777 | Shared package archive pool for local reuse; `mere gc` prunes unreferenced archives |
+| `/mere/cache/packages/` | root:root | 1777 | Shared package archive pool for local reuse; `mere store clean` prunes unreferenced archives |
 | `/mere/cache/repos/`  | root:root | 1777 | Remote repository sync cache                                                  |
 
 **Build Workspace Structure**:
@@ -756,7 +756,7 @@ Mere separates authoritative artifacts from synced copies:
 - Canonical filename: `<name>-<version>-<release>-<arch>-<archive_hash>.pkg.tar.zst`
 - Used by local authoring, publish staging, and remote sync ingestion to avoid duplicate archive copies
 - Repository DB entries bind to packages via `(name, version, release, arch, content_hash, archive_hash)`
-- `mere gc` prunes archives not referenced by any local repo `current/repo.db` or `previous/repo.db`
+- `mere store clean` prunes archives not referenced by any local repo `current/repo.db` or `previous/repo.db`
 
 **Repository cache** (synced, derived — remote repos only):
 - Lives at `/mere/cache/repos/<name>-<hash16>/` where `<hash16>` is the first 16 hex characters of a BLAKE3 hash derived from the repo's trust context
@@ -1020,7 +1020,7 @@ Named profiles are **not** mirrored into `/mere/gc-roots/`. Their live realized 
 **What creates/removes roots**:
 - **System generation switching**: Creates/maintains roots for active and kept system generations
 - **Named profile install/uninstall**: Replaces the live `root/` realization in-place
-- **Admin commands**: `mere pin` / `mere unpin` create/remove explicit pins (requires root)
+- **Admin commands**: `mere store pin` / `mere store pin remove` create/remove explicit pins (requires root)
 - **GC**: Never mutates roots - only deletes store paths unreachable from any root
 
 **System generation retention policy**:
@@ -1044,14 +1044,14 @@ A generation is "kept" (has a GC root) if:
 - No additional GC-root symlink is created for named profiles
 - Deleting the profile directory removes that root
 
-**Generation deletion** (`mere generation delete <N>`):
+**Generation deletion** (`mere store generation delete <N>`):
 - Removes the generation directory (`/mere/profiles/system/gen-N/`)
 - Removes the corresponding root if it exists
 - Fails if trying to delete the active generation
 
 **Explicit keep/unkeep commands**:
-- `mere generation keep <N>` - creates `.keep` marker on a system generation
-- `mere generation unkeep <N>` - removes `.keep` marker (the generation may still be rooted by the retention window)
+- `mere store generation keep <N>` - creates `.keep` marker on a system generation
+- `mere store generation unkeep <N>` - removes `.keep` marker (the generation may still be rooted by the retention window)
 
 **GC algorithm (MVP)**:
 
@@ -1089,7 +1089,7 @@ Algorithm:
    - Determine the kept set using system retention policy (`current`, last K, `.keep`)
    - Delete any system generation directory not in the kept set
 
-System generation pruning is therefore decoupled from activation: switches update the keep-set, and `mere gc` is the operation that reclaims unkept system generations on disk.
+System generation pruning is therefore decoupled from activation: switches update the keep-set, and `mere store clean` is the operation that reclaims unkept system generations on disk.
 
 **Safety measures**:
 - Refuse to run GC if `/mere/gc-roots/` has no roots
@@ -1098,8 +1098,8 @@ System generation pruning is therefore decoupled from activation: switches updat
 - Take exclusive lock (same as switching) to prevent races with installs/activation
 
 **CLI**:
-- `mere gc` - run garbage collection (store objects + unkept system generations)
-- `mere gc --dry-run` - show what would be deleted (paths + count) without deleting
+- `mere store clean` - run garbage collection (store objects + unkept system generations)
+- `mere store clean --dry-run` - show what would be deleted (paths + count) without deleting
 
 **Dry-run output**:
 ```
@@ -1309,7 +1309,9 @@ The process environment MUST be re-established for each phase. Shell process sta
 
 All builds execute inside a **mount-namespace-isolated synthetic root** with **bind mounts**, a **user namespace**, and **chroot**. Profile directories and `/mere` are bind-mounted into the synthetic root so that store symlinks resolve correctly.
 
-See `docs/design/namespaces.md` for the full isolation model specification.
+`mere shell` uses the same namespace mechanism with a different mount policy: host `/home`, `/var`, `/run`, `/dev` are accessible, `/etc` uses overlayfs (with fallback to read-only bind mount), and `/mere` is read-write so `mere install` works from inside.
+
+Session directories are created under `$XDG_RUNTIME_DIR/mere/env/<session-id>/` (or `/tmp/mere/env/<id>/`) and are ephemeral — cleaned up when the mount namespace exits.
 
 #### 14.1.1 Build Workspace Root
 
@@ -1606,13 +1608,13 @@ Retention applies to the **system profile generation history**.
 
 Generation commands apply to the **system profile only**.
 
-**`mere generation list`**: Lists system generations. Shows number, timestamp, kept status, active status.
+**`mere store generation list`**: Lists system generations. Shows number, timestamp, kept status, active status.
 
-**`mere generation keep <N>`**: Creates `.keep` marker and GC root under `kept/`.
+**`mere store generation keep <N>`**: Creates `.keep` marker and GC root under `kept/`.
 
-**`mere generation unkeep <N>`**: Removes `.keep` marker and GC root from `kept/`.
+**`mere store generation unkeep <N>`**: Removes `.keep` marker and GC root from `kept/`.
 
-**`mere generation delete <N>`**: Removes the system generation directory and GC root. Error if generation is `current`.
+**`mere store generation delete <N>`**: Removes the system generation directory and GC root. Error if generation is `current`.
 
 #### 15.11 Atomic Publishing
 
@@ -1623,7 +1625,7 @@ System activation uses atomic symlink replacement:
 3. Atomic rename: `rename(".current-new", "current")`
 4. Update GC roots
 
-This switching step does not prune old generation directories. It only updates the active pointer and GC roots; generation pruning happens later during `mere gc`.
+This switching step does not prune old generation directories. It only updates the active pointer and GC roots; generation pruning happens later during `mere store clean`.
 
 The `/usr` symlink always points to `/mere/profiles/system/current` and never changes after bootstrap.
 
@@ -1665,7 +1667,7 @@ $ mere shell
 # go, protobuf, grpcurl are available
 ```
 
-**System activation / rollback** (`mere generation activate <N>`): Same atomic procedure, different target. System activation also applies system-specific host integration such as `/etc` template processing.
+**System activation / rollback** (`mere store generation activate <N>`): Same atomic procedure, different target. System activation also applies system-specific host integration such as `/etc` template processing.
 
 **Named profile publishing**:
 1. Build a staged realization directory at `/mere/profiles/<name>/.root-new-<nonce>/`
@@ -2226,9 +2228,9 @@ When the resolver needs to select a package:
    - Pins do not "magically match" provisions; they influence provider selection when the pinned package is among candidates
 
 **CLI commands** (all require root):
-- `mere pin <store-path> [--name <label>]` - create pin (default name: package name from store path)
-- `mere unpin <name>` - remove pin
-- `mere pin list` - list all pins with their targets
+- `mere store pin add <store-path> [--name <label>]` - create pin (default name: package name from store path)
+- `mere store pin remove <name>` - remove pin
+- `mere store pin list` - list all pins with their targets
 
 **Validation**:
 - Pin target must be a valid store path (exists, matches `<hash>-<name>-<version>` format)
@@ -2241,9 +2243,9 @@ When the resolver needs to select a package:
 
 ## System Initialization
 
-### 23. mere init - System Layout Initialization
+### 23. mere store init - System Layout Initialization
 
-`mere init` initializes and validates the system-wide Mere filesystem layout and permissions. It is the only supported mechanism for creating and repairing critical `/mere` directories.
+`mere store init` initializes and validates the system-wide Mere filesystem layout and permissions. It is the only supported mechanism for creating and repairing critical `/mere` directories.
 
 **Requirements**:
 - MUST be run as root
@@ -2253,7 +2255,7 @@ When the resolver needs to select a package:
 
 #### 23.1 Purpose
 
-`mere init` exists to:
+`mere store init` exists to:
 - Ensure correct ownership and permissions
 - Prevent silent misconfiguration
 - Provide a reproducible installation baseline
@@ -2261,14 +2263,14 @@ When the resolver needs to select a package:
 
 #### 23.2 Scope
 
-`mere init` is responsible for:
+`mere store init` is responsible for:
 - Creating required directories
 - Setting required ownership and permissions
 - Applying sticky-bit where specified
 - Validating existing installations
 - Reporting misconfigurations
 
-`mere init` MUST NOT:
+`mere store init` MUST NOT:
 - Install packages
 - Activate profiles
 - Modify store contents
@@ -2277,7 +2279,7 @@ When the resolver needs to select a package:
 
 #### 23.3 Required Directory Layout
 
-After successful `mere init`, the following directories MUST exist:
+After successful `mere store init`, the following directories MUST exist:
 
 ```
 /mere/
@@ -2300,11 +2302,11 @@ After successful `mere init`, the following directories MUST exist:
 └── store/
 ```
 
-If any required directory is missing, `mere init` MUST create it.
+If any required directory is missing, `mere store init` MUST create it.
 
 #### 23.4 Ownership and Permissions
 
-`mere init` MUST enforce the canonical directory ownership and mode requirements defined in **9.0.2 Directory Permissions**.
+`mere store init` MUST enforce the canonical directory ownership and mode requirements defined in **9.0.2 Directory Permissions**.
 This section is intentionally non-duplicative to avoid configuration drift in documentation.
 
 **Sticky-bit semantics** (mode 1777):
@@ -2314,7 +2316,7 @@ This section is intentionally non-duplicative to avoid configuration drift in do
 
 #### 23.5 Hardening Rules
 
-During `mere init`, the implementation MUST:
+During `mere store init`, the implementation MUST:
 - Ensure all directories exist
 - Apply correct ownership
 - Apply correct permissions
@@ -2334,10 +2336,10 @@ Any violation MUST be reported. Silent repair is not permitted without user-visi
 
 #### 23.6 Validation Mode
 
-`mere init` provides a validation-only mode that performs verification and reports deviations without making changes.
+`mere store init` provides a validation-only mode that performs verification and reports deviations without making changes.
 
 ```bash
-mere init --dry-run  # short: -n
+mere store init --dry-run  # short: -n
 ```
 
 **Behavior**:
@@ -2358,7 +2360,7 @@ Summary: 2 issues found
 
 #### 23.7 Repair Mode
 
-`mere init` (default behavior) applies repairs when deviations are found. The command is idempotent: running it multiple times when the layout already conforms is a no-op and reports no changes.
+`mere store init` (default behavior) applies repairs when deviations are found. The command is idempotent: running it multiple times when the layout already conforms is a no-op and reports no changes.
 
 **Actions**:
 - Create missing directories
@@ -2385,7 +2387,7 @@ Summary: 3 changes applied
 
 **Example dry-run output**:
 ```bash
-$ mere init --dry-run
+$ mere store init --dry-run
 Would create /mere/profiles/system
 Would fix permissions on /mere/dev/build (0755 -> 1777)
 Would fix ownership on /mere/store (user:user -> root:root)
@@ -2395,7 +2397,7 @@ Summary: 3 changes would be applied (dry-run, no changes made)
 
 #### 23.9 Failure Semantics
 
-`mere init` MUST fail if:
+`mere store init` MUST fail if:
 - Not executed as root
 - Critical directories cannot be created
 - Ownership cannot be applied
@@ -2412,19 +2414,19 @@ Summary: 3 changes would be applied (dry-run, no changes made)
 ```
 Error: /mere/store is a symlink (expected directory)
 Refusing to proceed - potential symlink attack
-Remove the symlink and run 'mere init' again
+Remove the symlink and run 'mere store init' again
 ```
 
 #### 23.10 Relationship to Other Commands
 
 **Assumptions**:
-- `mere install` assumes `mere init` has been run
-- `mere gc` assumes validated layout
+- `mere install` assumes `mere store init` has been run
+- `mere store clean` assumes validated layout
 - `mere activate` assumes hardened profiles
-- No command except `mere init` may create top-level `/mere` directories
+- No command except `mere store init` may create top-level `/mere` directories
 
 **Bootstrap order**:
-1. `mere init` (as root) - create and validate layout
+1. `mere store init` (as root) - create and validate layout
 2. `mere import` or `mere install` - populate store and profiles
 3. `mere activate` - switch to new generation
 
@@ -2441,7 +2443,7 @@ This design ensures:
 **Alignment with Mere principles**:
 - **Filesystem as truth**: Layout is inspectable and verifiable
 - **Atomicity over cleverness**: Each directory operation is atomic
-- **Facts separate from policy**: `mere init` creates structure, doesn't impose policy
+- **Facts separate from policy**: `mere store init` creates structure, doesn't impose policy
 - **Legibility over abstraction**: Plain directories with explicit permissions
 
 ---

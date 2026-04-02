@@ -374,6 +374,10 @@ fn parseKdlPackageNode(
                 if (val.getBoolean()) |b| svc.essential = b;
             }
 
+            if (child.getChildBool("log")) |log_val| {
+                svc.log = log_val;
+            }
+
             try artifact.services.append(allocator, svc);
         }
     }
@@ -487,6 +491,7 @@ pub const ServiceDef = struct {
     depends_on: std.ArrayList([]const u8),
     ready_notification: ?i64,
     essential: bool,
+    log: bool, // true = auto logging pipeline (default), false = no logging
 
     pub fn init(allocator: std.mem.Allocator) !ServiceDef {
         return .{
@@ -498,6 +503,7 @@ pub const ServiceDef = struct {
             .depends_on = try std.ArrayList([]const u8).initCapacity(allocator, 0),
             .ready_notification = null,
             .essential = false,
+            .log = true,
         };
     }
 

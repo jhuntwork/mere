@@ -38,6 +38,7 @@ pub const Phase = enum {
     key,
     etc,
     search,
+    service,
 };
 
 pub const Subject = struct {

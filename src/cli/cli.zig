@@ -359,6 +359,7 @@ pub const CLI = struct {
         const commands = try self.registry.getTopLevelCommands(self.allocator);
         defer self.allocator.free(commands.names);
         defer self.allocator.free(commands.descriptions);
+        defer self.allocator.free(commands.groups);
 
         const help_text = try self.help_formatter.formatHelp(
             &[_][]const u8{}, // Empty command path for root
@@ -368,6 +369,7 @@ pub const CLI = struct {
             self.global_flags,
             commands.names,
             commands.descriptions,
+            commands.groups,
         );
         defer self.allocator.free(help_text);
 
@@ -385,6 +387,7 @@ pub const CLI = struct {
         const subcommands = try cmd.getSubcommands(self.allocator);
         defer self.allocator.free(subcommands.names);
         defer self.allocator.free(subcommands.descriptions);
+        defer self.allocator.free(subcommands.groups);
 
         const help_text = try self.help_formatter.formatHelp(
             command_path,
@@ -394,6 +397,7 @@ pub const CLI = struct {
             self.global_flags,
             subcommands.names,
             subcommands.descriptions,
+            subcommands.groups,
         );
         defer self.allocator.free(help_text);
 

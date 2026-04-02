@@ -28,6 +28,7 @@ pub const repo_sources = @import("repo_sources.zig");
 pub const search = @import("search.zig");
 pub const sign = @import("sign.zig");
 pub const source_manager = @import("source_manager.zig");
+pub const s6rc = @import("s6rc.zig");
 pub const store = @import("store.zig");
 pub const verify = @import("verify.zig");
 pub const workspace_manager = @import("workspace_manager.zig");

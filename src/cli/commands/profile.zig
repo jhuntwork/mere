@@ -11,6 +11,8 @@ const generation_mod = mere.generation;
 
 /// Profile command metadata
 const profile_meta = command.CommandMeta{
+    .group = "Package Management",
+    .order = 60,
     .name = "profile",
     .description = "Manage profiles",
 };
