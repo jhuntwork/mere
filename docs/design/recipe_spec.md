@@ -324,31 +324,27 @@ picks them up from there — it does not need to understand KDL.
 package "ntpd" {
     files "usr/bin/ntpd" "usr/share/man/man8/ntpd*"
 
-    service "ntpd" type="daemon" {
+    service "ntpd" {
+        type "daemon"
         command "/usr/bin/ntpd" "-n" "-d"
         depends-on "network"
     }
 }
 ```
 
-**Properties on the `service` node:**
-
-| Property | Type | Required | Description |
-|----------|------|----------|-------------|
-| (first arg) | string | yes | Service name |
-| `type` | string | yes | `"daemon"` (long-running) or `"oneshot"` (run-once) |
-| `essential` | boolean | no | Mark as essential boot infrastructure (default: `false`). Essential services are hidden from `mere status` and placed in the `always` bundle. |
-| `log` | boolean | no | Generate logging pipeline (default: `true`). Set to `false` for services that feed another logger (e.g., klogd → syslogd). |
-
 **Children of `service`:**
 
 | Child | Args | Required | Description |
 |-------|------|----------|-------------|
+| (first arg) | string | yes | Service name |
+| `type` | string | yes | `"daemon"` (long-running) or `"oneshot"` (run-once) |
 | `command` | string(s) | yes (daemon) | Executable path and arguments |
 | `up` | string(s) | yes (oneshot) | Command to bring the service up |
 | `down` | string(s) | no (oneshot) | Command to bring the service down |
 | `depends-on` | string(s) | no | Service names this service depends on |
 | `ready-notification` | integer | no | File descriptor for readiness notification (daemon only) |
+| `essential` | boolean | no | Mark as essential boot infrastructure (default: `false`). Essential services are hidden from `mere status` and placed in the `always` bundle. |
+| `log` | boolean | no | Generate logging pipeline (default: `true`). Set to `false` for services that feed another logger (e.g., klogd → syslogd). |
 | `env` | properties | no | Environment variables to set (e.g., `env { XDG_RUNTIME_DIR "/run/xdg/greeter" }`) |
 
 **Generated s6-rc source directory:**
