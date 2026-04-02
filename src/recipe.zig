@@ -331,6 +331,53 @@ fn parseKdlPackageNode(
         artifact.arch = try allocator.dupe(u8, val);
     }
 
+    // Parse service definitions
+    for (node.children.items) |*child| {
+        if (std.mem.eql(u8, child.name, "service")) {
+            var svc = try ServiceDef.init(allocator);
+            errdefer svc.deinit(allocator);
+
+            svc.name = try allocator.dupe(u8, child.getFirstArgString() orelse return RecipeError.MissingKey);
+
+            const type_str = child.getStringProperty("type") orelse return RecipeError.MissingKey;
+            if (std.mem.eql(u8, type_str, "daemon")) {
+                svc.service_type = .daemon;
+            } else if (std.mem.eql(u8, type_str, "oneshot")) {
+                svc.service_type = .oneshot;
+            } else {
+                return RecipeError.InvalidInput;
+            }
+
+            if (child.findChild("command")) |cmd| {
+                for (cmd.arguments.items) |arg| {
+                    if (arg.getString()) |s| try svc.command.append(allocator, try allocator.dupe(u8, s));
+                }
+            }
+            if (child.findChild("up")) |cmd| {
+                for (cmd.arguments.items) |arg| {
+                    if (arg.getString()) |s| try svc.up.append(allocator, try allocator.dupe(u8, s));
+                }
+            }
+            if (child.findChild("down")) |cmd| {
+                for (cmd.arguments.items) |arg| {
+                    if (arg.getString()) |s| try svc.down.append(allocator, try allocator.dupe(u8, s));
+                }
+            }
+            if (child.findChild("depends-on")) |deps| {
+                for (deps.arguments.items) |arg| {
+                    if (arg.getString()) |s| try svc.depends_on.append(allocator, try allocator.dupe(u8, s));
+                }
+            }
+            svc.ready_notification = child.getChildInt("ready-notification");
+
+            if (child.getProperty("essential")) |val| {
+                if (val.getBoolean()) |b| svc.essential = b;
+            }
+
+            try artifact.services.append(allocator, svc);
+        }
+    }
+
     try packages.append(allocator, artifact);
 }
 
@@ -429,6 +476,44 @@ pub const Source = struct {
 
 pub const BuildState = enum { Planned, Built, Scanned, Archived, Published };
 
+pub const ServiceType = enum { daemon, oneshot };
+
+pub const ServiceDef = struct {
+    name: []const u8,
+    service_type: ServiceType,
+    command: std.ArrayList([]const u8), // daemon: exec args
+    up: std.ArrayList([]const u8), // oneshot: up command
+    down: std.ArrayList([]const u8), // oneshot: down command
+    depends_on: std.ArrayList([]const u8),
+    ready_notification: ?i64,
+    essential: bool,
+
+    pub fn init(allocator: std.mem.Allocator) !ServiceDef {
+        return .{
+            .name = "",
+            .service_type = .daemon,
+            .command = try std.ArrayList([]const u8).initCapacity(allocator, 0),
+            .up = try std.ArrayList([]const u8).initCapacity(allocator, 0),
+            .down = try std.ArrayList([]const u8).initCapacity(allocator, 0),
+            .depends_on = try std.ArrayList([]const u8).initCapacity(allocator, 0),
+            .ready_notification = null,
+            .essential = false,
+        };
+    }
+
+    pub fn deinit(self: *ServiceDef, allocator: std.mem.Allocator) void {
+        if (self.name.len > 0) allocator.free(self.name);
+        for (self.command.items) |s| allocator.free(s);
+        self.command.deinit(allocator);
+        for (self.up.items) |s| allocator.free(s);
+        self.up.deinit(allocator);
+        for (self.down.items) |s| allocator.free(s);
+        self.down.deinit(allocator);
+        for (self.depends_on.items) |s| allocator.free(s);
+        self.depends_on.deinit(allocator);
+    }
+};
+
 pub const BuildArtifact = struct {
     name: []const u8,
     pkgfiles: std.ArrayList([]const u8),
@@ -441,6 +526,7 @@ pub const BuildArtifact = struct {
     strip: bool,
     compress_manpages: bool,
     arch: ?[]const u8,
+    services: std.ArrayList(ServiceDef),
 
     pub fn init(allocator: std.mem.Allocator) !BuildArtifact {
         return BuildArtifact{
@@ -455,6 +541,7 @@ pub const BuildArtifact = struct {
             .strip = true,
             .compress_manpages = true,
             .arch = null,
+            .services = try std.ArrayList(ServiceDef).initCapacity(allocator, 0),
         };
     }
 
@@ -475,6 +562,11 @@ pub const BuildArtifact = struct {
             gpa.free(l);
         }
         self.logs.deinit(gpa);
+
+        for (self.services.items) |*svc| {
+            svc.deinit(gpa);
+        }
+        self.services.deinit(gpa);
     }
 
     pub fn markBuilt(self: *BuildArtifact, allocator: std.mem.Allocator, archive_path: []const u8, content_hash: []const u8, archive_hash: []const u8, signature: []const u8) !void {

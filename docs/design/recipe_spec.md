@@ -311,6 +311,101 @@ package "myapp-dbg" {
 }
 ```
 
+### `service` Node (Optional, child of `package`)
+
+Declares a system service provided by this package. During build, `mere` generates
+s6-rc source directories from this definition and places them in the package at
+`usr/share/s6-rc/sources/<name>/`. The `service` tool (a thin s6-rc orchestrator)
+picks them up from there — it does not need to understand KDL.
+
+**Syntax:**
+
+```kdl
+package "ntpd" {
+    files "usr/bin/ntpd" "usr/share/man/man8/ntpd*"
+
+    service "ntpd" type="daemon" {
+        command "/usr/bin/ntpd" "-n" "-d"
+        depends-on "network"
+    }
+}
+```
+
+**Properties on the `service` node:**
+
+| Property | Type | Required | Description |
+|----------|------|----------|-------------|
+| (first arg) | string | yes | Service name |
+| `type` | string | yes | `"daemon"` (long-running) or `"oneshot"` (run-once) |
+| `essential` | boolean | no | Mark as essential boot infrastructure (default: `false`). Essential services are hidden from `service list` and placed in the `always` bundle. |
+
+**Children of `service`:**
+
+| Child | Args | Required | Description |
+|-------|------|----------|-------------|
+| `command` | string(s) | yes (daemon) | Executable path and arguments |
+| `up` | string(s) | yes (oneshot) | Command to bring the service up |
+| `down` | string(s) | no (oneshot) | Command to bring the service down |
+| `depends-on` | string(s) | no | Service names this service depends on |
+| `ready-notification` | integer | no | File descriptor for readiness notification (daemon only) |
+| `env` | properties | no | Environment variables to set (e.g., `env { XDG_RUNTIME_DIR "/run/xdg/greeter" }`) |
+
+**Generated s6-rc source directory:**
+
+For a daemon named `ntpd` with command `/usr/bin/ntpd -n -d`:
+
+```
+usr/share/s6-rc/sources/ntpd/
+├── type                    # "longrun"
+├── run                     # execlineb script invoking the command
+├── producer-for            # "ntpd-log"
+├── dependencies.d/
+│   └── network             # one file per dependency
+
+usr/share/s6-rc/sources/ntpd-log/
+├── type                    # "longrun"
+├── run                     # s6-log pipeline script
+├── consumer-for            # "ntpd"
+├── pipeline-name           # "ntpd-pipeline"
+```
+
+A logging pipeline (`<name>-log`) is automatically generated for every daemon service.
+Logs are written to `/var/log/<name>/` via `s6-log`.
+
+**Examples:**
+
+```kdl
+// Simple daemon
+package "ntpd" {
+    files "usr/bin/ntpd"
+
+    service "ntpd" type="daemon" {
+        command "/usr/bin/ntpd" "-n" "-d"
+    }
+}
+
+// Daemon with dependencies and readiness notification
+package "greetd" {
+    files "usr/bin/greetd" "etc/greetd/*"
+
+    service "greetd" type="daemon" {
+        command "/usr/bin/greetd"
+        depends-on "seatd"
+        ready-notification 3
+    }
+}
+
+// Oneshot
+package "hostname" {
+    files "usr/bin/hostname"
+
+    service "hostname" type="oneshot" {
+        up "/usr/bin/hostname" "-F" "/etc/hostname"
+        depends-on "mount-rw"
+    }
+}
+```
+
 ## Variable Interpolation
 
 Variables can be used in strings with `${...}` syntax.
