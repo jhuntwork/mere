@@ -7,6 +7,8 @@ const MereError = types.MereError;
 
 /// Install command metadata
 const install_meta = command.CommandMeta{
+    .group = "Package Management",
+    .order = 30,
     .name = "install",
     .description = "Install one or more packages and all dependencies",
     .args = &[_]types.Arg{

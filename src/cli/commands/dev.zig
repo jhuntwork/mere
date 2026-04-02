@@ -4,6 +4,7 @@ const types = @import("../types.zig");
 const command = @import("../command.zig");
 const import_cmd = @import("import.zig");
 const build_cmd = @import("build.zig");
+const key_cmd = @import("key.zig");
 const dev_cleanup = mere.dev_cleanup;
 const hash = mere.hash;
 const path = mere.path;
@@ -17,8 +18,10 @@ const getUserFriendlyMessage = mere.errors.getUserFriendlyMessage;
 
 /// Dev command metadata
 const dev_meta = command.CommandMeta{
+    .group = "Package Management",
+    .order = 130,
     .name = "dev",
-    .description = "Developer utilities for Mere package management",
+    .description = "Developer tooling",
 };
 
 /// Hash subcommand metadata
@@ -551,6 +554,10 @@ pub fn createCommand(allocator: std.mem.Allocator) !*command.Command {
     // Build (dev) subcommand
     const build_command = try build_cmd.createCommand(allocator);
     try dev_cmd.addSubcommand(build_command);
+
+    // Key management subcommand
+    const key_command = try key_cmd.createCommand(allocator);
+    try dev_cmd.addSubcommand(key_command);
 
     return dev_cmd;
 }

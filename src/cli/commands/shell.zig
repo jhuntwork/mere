@@ -9,6 +9,8 @@ const profile = mere.profile;
 const path = mere.path;
 
 const shell_meta = command.CommandMeta{
+    .group = "Package Management",
+    .order = 50,
     .name = "shell",
     .description = "Enter an interactive shell or run a command with a selected profile",
     .args = &[_]types.Arg{},

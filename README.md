@@ -45,21 +45,21 @@ Grab the latest release for your architecture:
 
 ```sh
 # x86_64
-curl -Lo mere https://codeberg.org/merelinux/mere/releases/download/v0.9.0/mere-0.9.0-linux-x86_64
+curl -Lo mere https://codeberg.org/merelinux/mere/releases/download/v0.11.0/mere-0.11.0-linux-x86_64
 
 # aarch64
-curl -Lo mere https://codeberg.org/merelinux/mere/releases/download/v0.9.0/mere-0.9.0-linux-aarch64
+curl -Lo mere https://codeberg.org/merelinux/mere/releases/download/v0.11.0/mere-0.11.0-linux-aarch64
 
 sudo install -m 755 mere /usr/local/bin/
 ```
 
 ### 2. Initialize
 
-Preview what `mere init` will create, then apply it:
+Preview what `mere store init` will create, then apply it:
 
 ```sh
-sudo mere init --dry-run
-sudo mere init
+sudo mere store init --dry-run
+sudo mere store init
 ```
 
 Add a basic config for the official repository and its public key:
@@ -93,18 +93,44 @@ available. Type `exit` to return to your host environment.
 ### 5. Explore
 
 ```sh
-# see what's in your profile
-mere profile list
-
 # search for packages
-mere search
+mere search python
 
 # install more packages
 mere install -p test busybox curl git
 
+# see what's in your profile
+mere profile list
+
 # inspect the store
 ls /mere/store/
+
+# store maintenance
+mere store clean --dry-run
+mere store verify
 ```
+
+## Service Management
+
+On a native Mere system using s6-rc, `mere` provides integrated service
+management as top-level commands:
+
+```sh
+mere status              # show all services with status
+mere status nginx        # detailed view for a service
+mere enable nginx        # add to boot set
+mere start nginx         # bring up now
+mere stop nginx          # bring down now
+mere restart nginx       # stop and start
+mere reload nginx        # signal config reload
+mere disable nginx       # remove from boot set
+mere logs nginx          # view service logs
+```
+
+Service definitions are generated at build time from recipe metadata and
+installed as s6-rc source directories. `mere enable` assembles definitions,
+syncs the repository, and updates the boot prescription. `mere start/stop`
+operate on live state only — the two concerns are cleanly separated.
 
 ## Building from Source
 
@@ -127,4 +153,4 @@ Linux system, but the CLI surface and some subsystems are still stabilizing.
 
 - [Specification Details](docs/design/specification-details.md) — full system specification
 - [Recipe Specification](docs/design/recipe_spec.md) — guide to writing build recipes
-- [Build Isolation Model](docs/design/namespaces.md) — namespace and chroot design
+- [Service Management](docs/design/service-management.md) — service architecture and s6-rc integration

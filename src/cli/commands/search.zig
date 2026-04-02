@@ -7,6 +7,8 @@ const ui = mere.ui;
 const emit = ui.emit;
 
 const search_meta = command.CommandMeta{
+    .group = "Package Management",
+    .order = 20,
     .name = "search",
     .description = "Search for packages by name across all configured repositories",
     .args = &[_]types.Arg{

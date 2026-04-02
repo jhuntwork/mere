@@ -74,8 +74,9 @@ pub const HelpFormatter = struct {
         args: []const Arg,
         flags: []const Flag,
         global_flags: []const Flag,
-        subcommands: []const []const u8, // Just names and descriptions
+        subcommands: []const []const u8,
         subcommand_descriptions: []const []const u8,
+        subcommand_groups: ?[]const ?[]const u8,
     ) ![]u8 {
         var help = std.ArrayList(u8).empty;
         defer help.deinit(self.allocator);
@@ -125,9 +126,55 @@ pub const HelpFormatter = struct {
 
         // Subcommands section
         if (subcommands.len > 0) {
-            try out.writeAll("\nSubcommands:\n");
-            for (subcommands, subcommand_descriptions) |subcmd, desc| {
-                try out.print("  {s:<12} {s}\n", .{ subcmd, desc });
+            const groups = subcommand_groups orelse &[_]?[]const u8{};
+            const has_groups = for (groups) |g| {
+                if (g != null) break true;
+            } else false;
+
+            if (has_groups) {
+                // Collect unique group names in order, ungrouped first
+                var seen_groups = std.StringHashMap(void).init(self.allocator);
+                defer seen_groups.deinit();
+                var group_order = std.ArrayList(?[]const u8).empty;
+                defer group_order.deinit(self.allocator);
+
+                // Ungrouped commands first
+                var has_ungrouped = false;
+                for (groups) |g| {
+                    if (g == null) { has_ungrouped = true; break; }
+                }
+                if (has_ungrouped) try group_order.append(self.allocator, null);
+
+                for (groups) |g| {
+                    if (g) |name| {
+                        if (!seen_groups.contains(name)) {
+                            try seen_groups.put(name, {});
+                            try group_order.append(self.allocator, name);
+                        }
+                    }
+                }
+
+                for (group_order.items) |current_group| {
+                    if (current_group) |gname| {
+                        try out.print("\n{s}:\n", .{gname});
+                    } else {
+                        try out.writeAll("\nSubcommands:\n");
+                    }
+                    for (subcommands, subcommand_descriptions, groups) |subcmd, desc, g| {
+                        const matches = if (current_group) |cg|
+                            (if (g) |sg| std.mem.eql(u8, cg, sg) else false)
+                        else
+                            g == null;
+                        if (matches) {
+                            try out.print("  {s:<12} {s}\n", .{ subcmd, desc });
+                        }
+                    }
+                }
+            } else {
+                try out.writeAll("\nSubcommands:\n");
+                for (subcommands, subcommand_descriptions) |subcmd, desc| {
+                    try out.print("  {s:<12} {s}\n", .{ subcmd, desc });
+                }
             }
 
             // Help instruction

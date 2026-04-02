@@ -6,6 +6,8 @@ const command = @import("../command.zig");
 const MereError = types.MereError;
 
 const uninstall_meta = command.CommandMeta{
+    .group = "Package Management",
+    .order = 40,
     .name = "uninstall",
     .description = "Uninstall one or more packages from a profile",
     .args = &[_]types.Arg{

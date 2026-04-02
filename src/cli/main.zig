@@ -8,17 +8,13 @@ const MereError = mere.errors.MereError;
 // Import command implementations
 const install = @import("commands/install.zig");
 const uninstall = @import("commands/uninstall.zig");
-const init_cmd = @import("commands/init.zig");
 const dev = @import("commands/dev.zig");
-const gc_cmd = @import("commands/gc.zig");
 const etc_cmd = @import("commands/etc.zig");
 const shell_cmd = @import("commands/shell.zig");
-const generation_cmd = @import("commands/generation.zig");
 const profile_cmd = @import("commands/profile.zig");
-const pin_cmd = @import("commands/pin.zig");
-const key_cmd = @import("commands/key.zig");
 const search_cmd = @import("commands/search.zig");
-const verify_cmd = @import("commands/verify.zig");
+const store_cmd = @import("commands/store.zig");
+const service_cmd = @import("commands/service.zig");
 
 /// Global flags available to all commands
 const global_flags = [_]types.Flag{
@@ -113,11 +109,6 @@ pub fn main(init: std.process.Init) !void {
 
 /// Register all commands with the CLI system
 fn registerCommands(allocator: std.mem.Allocator, cli_system: *cli.CLI, root_command: *command.Command) !void {
-    // Create init command
-    const init_command = try init_cmd.createCommand(allocator);
-    try cli_system.registerCommand(init_command);
-    try root_command.addSubcommand(init_command);
-
     // Create install command
     const install_command = try install.createCommand(allocator);
     try cli_system.registerCommand(install_command);
@@ -133,15 +124,10 @@ fn registerCommands(allocator: std.mem.Allocator, cli_system: *cli.CLI, root_com
     try cli_system.registerCommand(dev_command);
     try root_command.addSubcommand(dev_command);
 
-    // Create gc command
-    const gc_command = try gc_cmd.createCommand(allocator);
-    try cli_system.registerCommand(gc_command);
-    try root_command.addSubcommand(gc_command);
-
-    // Create verify command
-    const verify_command = try verify_cmd.createCommand(allocator);
-    try cli_system.registerCommand(verify_command);
-    try root_command.addSubcommand(verify_command);
+    // Create store command (clean, verify, pin, generation)
+    const store_command = try store_cmd.createCommand(allocator);
+    try cli_system.registerCommand(store_command);
+    try root_command.addSubcommand(store_command);
 
     // Create etc command with subcommands
     const etc_command = try etc_cmd.createCommand(allocator);
@@ -158,23 +144,15 @@ fn registerCommands(allocator: std.mem.Allocator, cli_system: *cli.CLI, root_com
     try cli_system.registerCommand(profile_command);
     try root_command.addSubcommand(profile_command);
 
-    // Create generation command
-    const generation_command = try generation_cmd.createCommand(allocator);
-    try cli_system.registerCommand(generation_command);
-    try root_command.addSubcommand(generation_command);
-
-    // Create pin command
-    const pin_command = try pin_cmd.createCommand(allocator);
-    try cli_system.registerCommand(pin_command);
-    try root_command.addSubcommand(pin_command);
-
-    // Create key command with subcommands (generate, fingerprint, list)
-    const key_command = try key_cmd.createCommand(allocator);
-    try cli_system.registerCommand(key_command);
-    try root_command.addSubcommand(key_command);
-
     // Create search command
     const search_command = try search_cmd.createCommand(allocator);
     try cli_system.registerCommand(search_command);
     try root_command.addSubcommand(search_command);
+
+    // Create service management commands (top-level verbs)
+    const service_commands = try service_cmd.createCommands(allocator);
+    for (service_commands) |svc_command| {
+        try cli_system.registerCommand(svc_command);
+        try root_command.addSubcommand(svc_command);
+    }
 }

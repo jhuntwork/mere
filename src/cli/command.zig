@@ -11,6 +11,8 @@ pub const CommandMeta = struct {
     args: []const types.Arg = &[_]types.Arg{},
     flags: []const types.Flag = &[_]types.Flag{},
     hidden: bool = false,
+    group: ?[]const u8 = null,
+    order: u8 = 50,
 };
 
 /// Command handler function type
@@ -50,11 +52,16 @@ pub const Command = struct {
     pub fn getSubcommands(self: *const Command, allocator: std.mem.Allocator) !struct {
         names: [][]const u8,
         descriptions: [][]const u8,
+        groups: []?[]const u8,
     } {
         var names = std.ArrayList([]const u8).empty;
         defer names.deinit(allocator);
         var descriptions = std.ArrayList([]const u8).empty;
         defer descriptions.deinit(allocator);
+        var groups = std.ArrayList(?[]const u8).empty;
+        defer groups.deinit(allocator);
+        var orders = std.ArrayList(u8).empty;
+        defer orders.deinit(allocator);
 
         var iterator = self.subcommands.iterator();
         while (iterator.next()) |entry| {
@@ -62,31 +69,41 @@ pub const Command = struct {
             if (!cmd.meta.hidden) {
                 try names.append(allocator, cmd.meta.name);
                 try descriptions.append(allocator, cmd.meta.description);
+                try groups.append(allocator, cmd.meta.group);
+                try orders.append(allocator, cmd.meta.order);
             }
         }
 
-        // Sort alphabetically by name
         const sort_context = struct {
             names_slice: [][]const u8,
             descriptions_slice: [][]const u8,
+            groups_slice: []?[]const u8,
+            orders_slice: []u8,
 
-            pub fn lessThan(ctx: @This(), a_index: usize, b_index: usize) bool {
-                return std.mem.lessThan(u8, ctx.names_slice[a_index], ctx.names_slice[b_index]);
+            pub fn lessThan(ctx: @This(), a: usize, b: usize) bool {
+                if (ctx.orders_slice[a] != ctx.orders_slice[b])
+                    return ctx.orders_slice[a] < ctx.orders_slice[b];
+                return std.mem.lessThan(u8, ctx.names_slice[a], ctx.names_slice[b]);
             }
 
-            pub fn swap(ctx: @This(), a_index: usize, b_index: usize) void {
-                std.mem.swap([]const u8, &ctx.names_slice[a_index], &ctx.names_slice[b_index]);
-                std.mem.swap([]const u8, &ctx.descriptions_slice[a_index], &ctx.descriptions_slice[b_index]);
+            pub fn swap(ctx: @This(), a: usize, b: usize) void {
+                std.mem.swap([]const u8, &ctx.names_slice[a], &ctx.names_slice[b]);
+                std.mem.swap([]const u8, &ctx.descriptions_slice[a], &ctx.descriptions_slice[b]);
+                std.mem.swap(?[]const u8, &ctx.groups_slice[a], &ctx.groups_slice[b]);
+                std.mem.swap(u8, &ctx.orders_slice[a], &ctx.orders_slice[b]);
             }
         }{
             .names_slice = names.items,
             .descriptions_slice = descriptions.items,
+            .groups_slice = groups.items,
+            .orders_slice = orders.items,
         };
         std.mem.sortContext(0, names.items.len, sort_context);
 
         return .{
             .names = try allocator.dupe([]const u8, names.items),
             .descriptions = try allocator.dupe([]const u8, descriptions.items),
+            .groups = try allocator.dupe(?[]const u8, groups.items),
         };
     }
 
@@ -168,11 +185,16 @@ pub const CommandRegistry = struct {
     pub fn getTopLevelCommands(self: *CommandRegistry, allocator: std.mem.Allocator) !struct {
         names: [][]const u8,
         descriptions: [][]const u8,
+        groups: []?[]const u8,
     } {
         var names = std.ArrayList([]const u8).empty;
         defer names.deinit(allocator);
         var descriptions = std.ArrayList([]const u8).empty;
         defer descriptions.deinit(allocator);
+        var groups = std.ArrayList(?[]const u8).empty;
+        defer groups.deinit(allocator);
+        var orders = std.ArrayList(u8).empty;
+        defer orders.deinit(allocator);
 
         var iterator = self.commands.iterator();
         while (iterator.next()) |entry| {
@@ -180,31 +202,41 @@ pub const CommandRegistry = struct {
             if (!cmd.meta.hidden) {
                 try names.append(allocator, cmd.meta.name);
                 try descriptions.append(allocator, cmd.meta.description);
+                try groups.append(allocator, cmd.meta.group);
+                try orders.append(allocator, cmd.meta.order);
             }
         }
 
-        // Sort alphabetically by name
         const sort_context = struct {
             names_slice: [][]const u8,
             descriptions_slice: [][]const u8,
+            groups_slice: []?[]const u8,
+            orders_slice: []u8,
 
-            pub fn lessThan(ctx: @This(), a_index: usize, b_index: usize) bool {
-                return std.mem.lessThan(u8, ctx.names_slice[a_index], ctx.names_slice[b_index]);
+            pub fn lessThan(ctx: @This(), a: usize, b: usize) bool {
+                if (ctx.orders_slice[a] != ctx.orders_slice[b])
+                    return ctx.orders_slice[a] < ctx.orders_slice[b];
+                return std.mem.lessThan(u8, ctx.names_slice[a], ctx.names_slice[b]);
             }
 
-            pub fn swap(ctx: @This(), a_index: usize, b_index: usize) void {
-                std.mem.swap([]const u8, &ctx.names_slice[a_index], &ctx.names_slice[b_index]);
-                std.mem.swap([]const u8, &ctx.descriptions_slice[a_index], &ctx.descriptions_slice[b_index]);
+            pub fn swap(ctx: @This(), a: usize, b: usize) void {
+                std.mem.swap([]const u8, &ctx.names_slice[a], &ctx.names_slice[b]);
+                std.mem.swap([]const u8, &ctx.descriptions_slice[a], &ctx.descriptions_slice[b]);
+                std.mem.swap(?[]const u8, &ctx.groups_slice[a], &ctx.groups_slice[b]);
+                std.mem.swap(u8, &ctx.orders_slice[a], &ctx.orders_slice[b]);
             }
         }{
             .names_slice = names.items,
             .descriptions_slice = descriptions.items,
+            .groups_slice = groups.items,
+            .orders_slice = orders.items,
         };
         std.mem.sortContext(0, names.items.len, sort_context);
 
         return .{
             .names = try allocator.dupe([]const u8, names.items),
             .descriptions = try allocator.dupe([]const u8, descriptions.items),
+            .groups = try allocator.dupe(?[]const u8, groups.items),
         };
     }
 };
