@@ -192,7 +192,7 @@ pub fn packageArtifacts(
         const artifact = &parsed_recipe.packages.items[staged.pkg_index];
         const staging_dir = staged.staging_dir;
 
-        try prepareArtifactStaging(allocator, ctx, staging_dir, artifact.strip, artifact.compress_manpages);
+        try prepareArtifactStaging(allocator, ctx, staging_dir, artifact.strip, artifact.compress_manpages, artifact.services.items);
         const packaged = try packageStagedPackage(
             allocator,
             ctx,
@@ -230,6 +230,7 @@ fn prepareArtifactStaging(
     staging_dir: []const u8,
     strip_enabled: bool,
     compress_manpages_enabled: bool,
+    services: []const recipe.ServiceDef,
 ) PackageError!void {
     const etc_path = std.fs.path.join(allocator, &.{ staging_dir, "etc" }) catch {
         return ctx.fail(error.OutOfMemory, staging_dir, "failed to build etc path");
@@ -254,6 +255,10 @@ fn prepareArtifactStaging(
             ctx.debug("etc relocation skipped: {s}", .{@errorName(err)});
         }
     };
+
+    for (services) |*svc| {
+        try generateServiceSourceDir(allocator, ctx, staging_dir, svc);
+    }
 
     if (compress_manpages_enabled) {
         if (manpage_compress.compressDirectory(ctx, staging_dir)) |cr| {
@@ -300,6 +305,161 @@ fn prepareArtifactStaging(
             error.FileSystem => ctx.fail(error.FileSystem, staging_dir, "failed to strip staged package outputs"),
         };
     }
+}
+
+
+fn generateServiceSourceDir(
+    allocator: std.mem.Allocator,
+    ctx: *mere.Context,
+    staging_dir: []const u8,
+    svc: *const recipe.ServiceDef,
+) PackageError!void {
+    const io = path_mod.currentIo();
+
+    const svc_dir = std.fs.path.join(allocator, &.{ staging_dir, "usr", "share", "s6-rc", "sources", svc.name }) catch
+        return ctx.fail(error.OutOfMemory, staging_dir, "failed to build service source path");
+    defer allocator.free(svc_dir);
+    path_mod.ensureDirExists(svc_dir) catch |err|
+        return ctx.fail(mapPackageFsError(err), svc_dir, "failed to create service source directory");
+
+    var dir = std.Io.Dir.openDirAbsolute(io, svc_dir, .{}) catch |err|
+        return ctx.fail(mapPackageFsError(err), svc_dir, "failed to open service source directory");
+    defer dir.close(io);
+
+    // type
+    writeServiceFile(ctx, dir, io, "type", if (svc.service_type == .daemon) "longrun\n" else "oneshot\n") catch |err|
+        return ctx.fail(err, svc_dir, "failed to write service type file");
+
+    switch (svc.service_type) {
+        .daemon => {
+            var run_buf: std.ArrayList(u8) = .empty;
+            defer run_buf.deinit(allocator);
+            run_buf.appendSlice(allocator, "#!/bin/execlineb -P\nfdmove -c 2 1\n") catch return error.OutOfMemory;
+            for (svc.command.items) |arg| {
+                run_buf.appendSlice(allocator, arg) catch return error.OutOfMemory;
+                run_buf.append(allocator, ' ') catch return error.OutOfMemory;
+            }
+            run_buf.append(allocator, '\n') catch return error.OutOfMemory;
+            writeServiceFile(ctx, dir, io, "run", run_buf.items) catch |err|
+                return ctx.fail(err, svc_dir, "failed to write service run script");
+
+            const log_name = std.fmt.allocPrint(allocator, "{s}-log\n", .{svc.name}) catch return error.OutOfMemory;
+            defer allocator.free(log_name);
+            writeServiceFile(ctx, dir, io, "producer-for", log_name) catch |err|
+                return ctx.fail(err, svc_dir, "failed to write producer-for");
+
+            if (svc.ready_notification) |fd| {
+                var fd_buf: [20]u8 = undefined;
+                const fd_str = std.fmt.bufPrint(&fd_buf, "{d}\n", .{fd}) catch return error.OutOfMemory;
+                writeServiceFile(ctx, dir, io, "notification-fd", fd_str) catch |err|
+                    return ctx.fail(err, svc_dir, "failed to write notification-fd");
+            }
+
+            try generateLogServiceDir(allocator, ctx, staging_dir, svc.name);
+        },
+        .oneshot => {
+            if (svc.up.items.len > 0) {
+                var buf: std.ArrayList(u8) = .empty;
+                defer buf.deinit(allocator);
+                buf.appendSlice(allocator, "#!/bin/execlineb -P\n") catch return error.OutOfMemory;
+                for (svc.up.items) |arg| {
+                    buf.appendSlice(allocator, arg) catch return error.OutOfMemory;
+                    buf.append(allocator, ' ') catch return error.OutOfMemory;
+                }
+                buf.append(allocator, '\n') catch return error.OutOfMemory;
+                writeServiceFile(ctx, dir, io, "up", buf.items) catch |err|
+                    return ctx.fail(err, svc_dir, "failed to write oneshot up script");
+            }
+            if (svc.down.items.len > 0) {
+                var buf: std.ArrayList(u8) = .empty;
+                defer buf.deinit(allocator);
+                buf.appendSlice(allocator, "#!/bin/execlineb -P\n") catch return error.OutOfMemory;
+                for (svc.down.items) |arg| {
+                    buf.appendSlice(allocator, arg) catch return error.OutOfMemory;
+                    buf.append(allocator, ' ') catch return error.OutOfMemory;
+                }
+                buf.append(allocator, '\n') catch return error.OutOfMemory;
+                writeServiceFile(ctx, dir, io, "down", buf.items) catch |err|
+                    return ctx.fail(err, svc_dir, "failed to write oneshot down script");
+            }
+        },
+    }
+
+    if (svc.depends_on.items.len > 0) {
+        const deps_dir = std.fs.path.join(allocator, &.{ svc_dir, "dependencies.d" }) catch return error.OutOfMemory;
+        defer allocator.free(deps_dir);
+        path_mod.ensureDirExists(deps_dir) catch |err|
+            return ctx.fail(mapPackageFsError(err), deps_dir, "failed to create dependencies.d");
+        var deps_handle = std.Io.Dir.openDirAbsolute(io, deps_dir, .{}) catch |err|
+            return ctx.fail(mapPackageFsError(err), deps_dir, "failed to open dependencies.d");
+        defer deps_handle.close(io);
+        for (svc.depends_on.items) |dep| {
+            var f = deps_handle.createFile(io, dep, .{}) catch |err|
+                return ctx.fail(mapPackageFsError(err), deps_dir, "failed to create dependency file");
+            f.close(io);
+        }
+    }
+
+    if (svc.essential) {
+        writeServiceFile(ctx, dir, io, "flag-essential", "") catch |err|
+            return ctx.fail(err, svc_dir, "failed to write flag-essential");
+    }
+
+    ctx.debug("generated s6-rc source: {s}", .{svc.name});
+}
+
+fn generateLogServiceDir(
+    allocator: std.mem.Allocator,
+    ctx: *mere.Context,
+    staging_dir: []const u8,
+    service_name: []const u8,
+) PackageError!void {
+    const io = path_mod.currentIo();
+
+    const log_name = std.fmt.allocPrint(allocator, "{s}-log", .{service_name}) catch return error.OutOfMemory;
+    defer allocator.free(log_name);
+
+    const log_dir = std.fs.path.join(allocator, &.{ staging_dir, "usr", "share", "s6-rc", "sources", log_name }) catch return error.OutOfMemory;
+    defer allocator.free(log_dir);
+    path_mod.ensureDirExists(log_dir) catch |err|
+        return ctx.fail(mapPackageFsError(err), log_dir, "failed to create log service directory");
+
+    var dir = std.Io.Dir.openDirAbsolute(io, log_dir, .{}) catch |err|
+        return ctx.fail(mapPackageFsError(err), log_dir, "failed to open log service directory");
+    defer dir.close(io);
+
+    writeServiceFile(ctx, dir, io, "type", "longrun\n") catch |err|
+        return ctx.fail(err, log_dir, "failed to write log type");
+
+    const consumer_for = std.fmt.allocPrint(allocator, "{s}\n", .{service_name}) catch return error.OutOfMemory;
+    defer allocator.free(consumer_for);
+    writeServiceFile(ctx, dir, io, "consumer-for", consumer_for) catch |err|
+        return ctx.fail(err, log_dir, "failed to write consumer-for");
+
+    const pipeline_name = std.fmt.allocPrint(allocator, "{s}-pipeline\n", .{service_name}) catch return error.OutOfMemory;
+    defer allocator.free(pipeline_name);
+    writeServiceFile(ctx, dir, io, "pipeline-name", pipeline_name) catch |err|
+        return ctx.fail(err, log_dir, "failed to write pipeline-name");
+
+    const run_script = std.fmt.allocPrint(allocator, "#!/bin/execlineb -P\ns6-log -d3 t /var/log/{s}\n", .{service_name}) catch return error.OutOfMemory;
+    defer allocator.free(run_script);
+    writeServiceFile(ctx, dir, io, "run", run_script) catch |err|
+        return ctx.fail(err, log_dir, "failed to write log run script");
+}
+
+fn writeServiceFile(ctx: *mere.Context, dir: std.Io.Dir, io: std.Io, name: []const u8, content: []const u8) PackageError!void {
+    _ = ctx;
+    var f = dir.createFile(io, name, .{}) catch |err| return mapPackageFsError(err);
+    defer f.close(io);
+    f.writeStreamingAll(io, content) catch |err| return mapPackageFsError(err);
+}
+
+fn mapPackageFsError(err: anyerror) PackageError {
+    return switch (err) {
+        error.OutOfMemory => error.OutOfMemory,
+        error.AccessDenied => error.PermissionDenied,
+        else => error.FileSystem,
+    };
 }
 
 fn packageStagedPackage(
@@ -1638,4 +1798,204 @@ test "buildInjectedDependenciesForSplit rejects ambiguous sibling runtime owners
             &staged_packages,
         ),
     );
+}
+
+test "generateServiceSourceDir creates daemon longrun with logging pipeline" {
+    const th = @import("../test_helpers.zig");
+    var test_env = try th.createTestEnv();
+    defer {
+        test_env.cleanup();
+        std.testing.allocator.destroy(test_env);
+    }
+
+    const allocator = test_env.ctx.allocator;
+    const io = path_mod.currentIo();
+
+    const staging_dir = try std.fs.path.join(allocator, &.{ test_env.path, "staging" });
+    defer allocator.free(staging_dir);
+    {
+        var dir = try path_mod.makePathAndOpenDir(staging_dir);
+        dir.close(io);
+    }
+
+    var svc = try recipe.ServiceDef.init(allocator);
+    defer svc.deinit(allocator);
+    svc.name = try allocator.dupe(u8, "ntpd");
+    svc.service_type = .daemon;
+    try svc.command.append(allocator, try allocator.dupe(u8, "/usr/bin/ntpd"));
+    try svc.command.append(allocator, try allocator.dupe(u8, "-n"));
+    try svc.command.append(allocator, try allocator.dupe(u8, "-d"));
+    try svc.depends_on.append(allocator, try allocator.dupe(u8, "network"));
+
+    try generateServiceSourceDir(allocator, &test_env.ctx, staging_dir, &svc);
+
+    // Verify main service dir
+    const svc_dir = try std.fs.path.join(allocator, &.{ staging_dir, "usr", "share", "s6-rc", "sources", "ntpd" });
+    defer allocator.free(svc_dir);
+
+    // type file
+    const type_path = try std.fs.path.join(allocator, &.{ svc_dir, "type" });
+    defer allocator.free(type_path);
+    const type_content = try readTestFile(allocator, io, type_path);
+    defer allocator.free(type_content);
+    try std.testing.expectEqualStrings("longrun\n", type_content);
+
+    // run script contains shebang and command
+    const run_path = try std.fs.path.join(allocator, &.{ svc_dir, "run" });
+    defer allocator.free(run_path);
+    const run_content = try readTestFile(allocator, io, run_path);
+    defer allocator.free(run_content);
+    try std.testing.expect(std.mem.startsWith(u8, run_content, "#!/bin/execlineb -P\n"));
+    try std.testing.expect(std.mem.indexOf(u8, run_content, "fdmove -c 2 1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, run_content, "/usr/bin/ntpd") != null);
+
+    // producer-for links to log service
+    const pf_path = try std.fs.path.join(allocator, &.{ svc_dir, "producer-for" });
+    defer allocator.free(pf_path);
+    const pf_content = try readTestFile(allocator, io, pf_path);
+    defer allocator.free(pf_content);
+    try std.testing.expectEqualStrings("ntpd-log\n", pf_content);
+
+    // dependency file exists
+    const dep_path = try std.fs.path.join(allocator, &.{ svc_dir, "dependencies.d", "network" });
+    defer allocator.free(dep_path);
+    std.Io.Dir.accessAbsolute(io, dep_path, .{}) catch
+        return error.TestUnexpectedResult;
+
+    // Verify log service dir
+    const log_dir = try std.fs.path.join(allocator, &.{ staging_dir, "usr", "share", "s6-rc", "sources", "ntpd-log" });
+    defer allocator.free(log_dir);
+
+    const log_type_path = try std.fs.path.join(allocator, &.{ log_dir, "type" });
+    defer allocator.free(log_type_path);
+    const log_type = try readTestFile(allocator, io, log_type_path);
+    defer allocator.free(log_type);
+    try std.testing.expectEqualStrings("longrun\n", log_type);
+
+    const cf_path = try std.fs.path.join(allocator, &.{ log_dir, "consumer-for" });
+    defer allocator.free(cf_path);
+    const cf_content = try readTestFile(allocator, io, cf_path);
+    defer allocator.free(cf_content);
+    try std.testing.expectEqualStrings("ntpd\n", cf_content);
+
+    const pn_path = try std.fs.path.join(allocator, &.{ log_dir, "pipeline-name" });
+    defer allocator.free(pn_path);
+    const pn_content = try readTestFile(allocator, io, pn_path);
+    defer allocator.free(pn_content);
+    try std.testing.expectEqualStrings("ntpd-pipeline\n", pn_content);
+
+    // log run script references s6-log and the service name
+    const log_run_path = try std.fs.path.join(allocator, &.{ log_dir, "run" });
+    defer allocator.free(log_run_path);
+    const log_run = try readTestFile(allocator, io, log_run_path);
+    defer allocator.free(log_run);
+    try std.testing.expect(std.mem.indexOf(u8, log_run, "s6-log") != null);
+    try std.testing.expect(std.mem.indexOf(u8, log_run, "/var/log/ntpd") != null);
+}
+
+test "generateServiceSourceDir creates oneshot with up script" {
+    const th = @import("../test_helpers.zig");
+    var test_env = try th.createTestEnv();
+    defer {
+        test_env.cleanup();
+        std.testing.allocator.destroy(test_env);
+    }
+
+    const allocator = test_env.ctx.allocator;
+    const io = path_mod.currentIo();
+
+    const staging_dir = try std.fs.path.join(allocator, &.{ test_env.path, "staging" });
+    defer allocator.free(staging_dir);
+    {
+        var dir = try path_mod.makePathAndOpenDir(staging_dir);
+        dir.close(io);
+    }
+
+    var svc = try recipe.ServiceDef.init(allocator);
+    defer svc.deinit(allocator);
+    svc.name = try allocator.dupe(u8, "hostname");
+    svc.service_type = .oneshot;
+    try svc.up.append(allocator, try allocator.dupe(u8, "/usr/bin/hostname"));
+    try svc.up.append(allocator, try allocator.dupe(u8, "-F"));
+    try svc.up.append(allocator, try allocator.dupe(u8, "/etc/hostname"));
+    try svc.depends_on.append(allocator, try allocator.dupe(u8, "mount-rw"));
+
+    try generateServiceSourceDir(allocator, &test_env.ctx, staging_dir, &svc);
+
+    const svc_dir = try std.fs.path.join(allocator, &.{ staging_dir, "usr", "share", "s6-rc", "sources", "hostname" });
+    defer allocator.free(svc_dir);
+
+    // type
+    const type_path = try std.fs.path.join(allocator, &.{ svc_dir, "type" });
+    defer allocator.free(type_path);
+    const type_content = try readTestFile(allocator, io, type_path);
+    defer allocator.free(type_content);
+    try std.testing.expectEqualStrings("oneshot\n", type_content);
+
+    // up script
+    const up_path = try std.fs.path.join(allocator, &.{ svc_dir, "up" });
+    defer allocator.free(up_path);
+    const up_content = try readTestFile(allocator, io, up_path);
+    defer allocator.free(up_content);
+    try std.testing.expect(std.mem.startsWith(u8, up_content, "#!/bin/execlineb -P\n"));
+    try std.testing.expect(std.mem.indexOf(u8, up_content, "/usr/bin/hostname") != null);
+
+    // no log service for oneshots
+    const log_dir = try std.fs.path.join(allocator, &.{ staging_dir, "usr", "share", "s6-rc", "sources", "hostname-log" });
+    defer allocator.free(log_dir);
+    std.Io.Dir.accessAbsolute(io, log_dir, .{}) catch |err| {
+        try std.testing.expectEqual(error.FileNotFound, err);
+        return;
+    };
+    return error.TestUnexpectedResult; // log dir should not exist
+}
+
+test "generateServiceSourceDir creates notification-fd for ready daemons" {
+    const th = @import("../test_helpers.zig");
+    var test_env = try th.createTestEnv();
+    defer {
+        test_env.cleanup();
+        std.testing.allocator.destroy(test_env);
+    }
+
+    const allocator = test_env.ctx.allocator;
+    const io = path_mod.currentIo();
+
+    const staging_dir = try std.fs.path.join(allocator, &.{ test_env.path, "staging" });
+    defer allocator.free(staging_dir);
+    {
+        var dir = try path_mod.makePathAndOpenDir(staging_dir);
+        dir.close(io);
+    }
+
+    var svc = try recipe.ServiceDef.init(allocator);
+    defer svc.deinit(allocator);
+    svc.name = try allocator.dupe(u8, "greetd");
+    svc.service_type = .daemon;
+    try svc.command.append(allocator, try allocator.dupe(u8, "/usr/bin/greetd"));
+    svc.ready_notification = 3;
+
+    try generateServiceSourceDir(allocator, &test_env.ctx, staging_dir, &svc);
+
+    const svc_dir = try std.fs.path.join(allocator, &.{ staging_dir, "usr", "share", "s6-rc", "sources", "greetd" });
+    defer allocator.free(svc_dir);
+
+    const nfd_path = try std.fs.path.join(allocator, &.{ svc_dir, "notification-fd" });
+    defer allocator.free(nfd_path);
+    const nfd_content = try readTestFile(allocator, io, nfd_path);
+    defer allocator.free(nfd_content);
+    try std.testing.expectEqualStrings("3\n", nfd_content);
+}
+
+fn readTestFile(allocator: std.mem.Allocator, io: std.Io, file_path: []const u8) ![]const u8 {
+    var file = try std.Io.Dir.openFileAbsolute(io, file_path, .{});
+    defer file.close(io);
+    const stat = try file.stat(io);
+    const size: usize = @intCast(stat.size);
+    const buf = try allocator.alloc(u8, size);
+    errdefer allocator.free(buf);
+    const read = file.readPositionalAll(io, buf, 0) catch {
+        return error.TestUnexpectedResult;
+    };
+    return buf[0..read];
 }
