@@ -481,11 +481,14 @@ const recipe_source_children = [_]NodeSpec{
 };
 
 const recipe_service_children = [_]NodeSpec{
+    .{ .name = "type", .required = true, .args = .{ .kind = .string, .min = 1, .max = 1, .label = "value" } },
     .{ .name = "command", .args = .{ .kind = .string, .min = 1, .label = "value" } },
     .{ .name = "up", .args = .{ .kind = .string, .min = 1, .label = "value" } },
     .{ .name = "down", .args = .{ .kind = .string, .min = 1, .label = "value" } },
     .{ .name = "depends-on", .args = .{ .kind = .string, .min = 1, .label = "value" } },
     .{ .name = "ready-notification", .args = .{ .kind = .integer, .min = 1, .max = 1, .label = "value" } },
+    .{ .name = "essential", .args = .{ .kind = .boolean, .min = 1, .max = 1, .label = "value" } },
+    .{ .name = "log", .args = .{ .kind = .boolean, .min = 1, .max = 1, .label = "value" } },
     .{ .name = "env", .any_child_args = .{ .kind = .string, .min = 1, .max = 1, .label = "value" } },
 };
 
@@ -498,10 +501,6 @@ const recipe_package_children = [_]NodeSpec{
         .name = "service",
         .repeatable = true,
         .args = .{ .kind = .string, .min = 1, .max = 1, .label = "name" },
-        .properties = .{ .fixed = &[_]PropertySpec{
-            .{ .name = "type", .kind = .string, .required = true },
-            .{ .name = "essential", .kind = .boolean },
-        } },
         .children = &recipe_service_children,
     },
 };

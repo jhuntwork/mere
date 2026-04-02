@@ -339,7 +339,7 @@ fn parseKdlPackageNode(
 
             svc.name = try allocator.dupe(u8, child.getFirstArgString() orelse return RecipeError.MissingKey);
 
-            const type_str = child.getStringProperty("type") orelse return RecipeError.MissingKey;
+            const type_str = child.getChildString("type") orelse return RecipeError.MissingKey;
             if (std.mem.eql(u8, type_str, "daemon")) {
                 svc.service_type = .daemon;
             } else if (std.mem.eql(u8, type_str, "oneshot")) {
@@ -370,8 +370,8 @@ fn parseKdlPackageNode(
             }
             svc.ready_notification = child.getChildInt("ready-notification");
 
-            if (child.getProperty("essential")) |val| {
-                if (val.getBoolean()) |b| svc.essential = b;
+            if (child.getChildBool("essential")) |b| {
+                svc.essential = b;
             }
 
             if (child.getChildBool("log")) |log_val| {
