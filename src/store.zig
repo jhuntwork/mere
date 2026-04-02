@@ -245,7 +245,7 @@ pub fn harden(ctx: *Context, store_path: []const u8) StoreError!HardenResult {
                     return ctx.fail(StoreError.FileSystem, p, "failed to open subdirectory");
                 };
                 defer subdir.close(io);
-                hardenFd(subdir.handle, .directory, &result);
+                hardenDir(io, subdir, &result);
             },
             .file => {
                 var file = dir.openFile(io, entry.path, .{}) catch {
@@ -255,7 +255,7 @@ pub fn harden(ctx: *Context, store_path: []const u8) StoreError!HardenResult {
                     return ctx.fail(StoreError.FileSystem, p, "failed to open file");
                 };
                 defer file.close(io);
-                hardenFd(file.handle, .file, &result);
+                hardenFile(io, file, &result);
             },
             .sym_link => {
                 const entry_path = std.fs.path.join(ctx.allocator, &.{ store_path, entry.path }) catch {
@@ -293,15 +293,28 @@ pub fn harden(ctx: *Context, store_path: []const u8) StoreError!HardenResult {
         }
     }
 
-    hardenFd(dir.handle, .directory, &result);
+    hardenDir(io, dir, &result);
     return result;
 }
 
-fn hardenFd(fd: std.posix.fd_t, kind: std.Io.File.Kind, result: *HardenResult) void {
-    _ = std.os.linux.fchown(fd, 0, 0);
-    const mode: u32 = if (kind == .directory) 0o555 else 0o444;
-    _ = std.os.linux.fchmod(fd, mode);
-    if (!setImmutable(fd)) result.immutable_supported = false;
+fn stripWriteBits(io: std.Io, handle: anytype) void {
+    if (handle.stat(io)) |st| {
+        const new_mode = st.permissions.toMode() & ~@as(std.posix.mode_t, 0o222);
+        handle.setPermissions(io, .fromMode(new_mode)) catch {};
+    } else |_| {}
+}
+
+fn hardenDir(io: std.Io, d: std.Io.Dir, result: *HardenResult) void {
+    _ = std.os.linux.fchown(d.handle, 0, 0);
+    stripWriteBits(io, d);
+    if (!setImmutable(d.handle)) result.immutable_supported = false;
+    result.files_processed += 1;
+}
+
+fn hardenFile(io: std.Io, f: std.Io.File, result: *HardenResult) void {
+    _ = std.os.linux.fchown(f.handle, 0, 0);
+    stripWriteBits(io, f);
+    if (!setImmutable(f.handle)) result.immutable_supported = false;
     result.files_processed += 1;
 }
 

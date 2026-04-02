@@ -335,9 +335,9 @@ fn generateServiceSourceDir(
             var run_buf: std.ArrayList(u8) = .empty;
             defer run_buf.deinit(allocator);
             run_buf.appendSlice(allocator, "#!/bin/execlineb -P\nfdmove -c 2 1\n") catch return error.OutOfMemory;
-            for (svc.command.items) |arg| {
+            for (svc.command.items, 0..) |arg, i| {
+                if (i > 0) run_buf.append(allocator, ' ') catch return error.OutOfMemory;
                 run_buf.appendSlice(allocator, arg) catch return error.OutOfMemory;
-                run_buf.append(allocator, ' ') catch return error.OutOfMemory;
             }
             run_buf.append(allocator, '\n') catch return error.OutOfMemory;
             writeServiceFile(ctx, dir, io, "run", run_buf.items) catch |err|
