@@ -345,8 +345,10 @@ fn generateServiceSourceDir(
 
             const log_name = std.fmt.allocPrint(allocator, "{s}-log\n", .{svc.name}) catch return error.OutOfMemory;
             defer allocator.free(log_name);
-            writeServiceFile(ctx, dir, io, "producer-for", log_name) catch |err|
-                return ctx.fail(err, svc_dir, "failed to write producer-for");
+            if (svc.log) {
+                writeServiceFile(ctx, dir, io, "producer-for", log_name) catch |err|
+                    return ctx.fail(err, svc_dir, "failed to write producer-for");
+            }
 
             if (svc.ready_notification) |fd| {
                 var fd_buf: [20]u8 = undefined;
@@ -355,7 +357,9 @@ fn generateServiceSourceDir(
                     return ctx.fail(err, svc_dir, "failed to write notification-fd");
             }
 
-            try generateLogServiceDir(allocator, ctx, staging_dir, svc.name);
+            if (svc.log) {
+                try generateLogServiceDir(allocator, ctx, staging_dir, svc.name);
+            }
         },
         .oneshot => {
             if (svc.up.items.len > 0) {
