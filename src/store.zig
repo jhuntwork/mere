@@ -129,24 +129,78 @@ pub fn isPrivileged() bool {
     return std.os.linux.geteuid() == 0;
 }
 
-/// Harden a store object for system use by changing ownership and permissions
+/// Check if a store path has already been hardened (root-owned + immutable flag).
+pub fn isHardened(store_path: []const u8) bool {
+    const io = path_mod.currentIo();
+    var dir = std.Io.Dir.openDirAbsolute(io, store_path, .{}) catch return false;
+    defer dir.close(io);
+
+    // Check root ownership
+    const store_path_z = std.posix.toPosixPath(store_path) catch return false;
+    var statx = std.mem.zeroes(std.os.linux.Statx);
+    if (std.os.linux.errno(std.os.linux.statx(
+        std.posix.AT.FDCWD,
+        &store_path_z,
+        0,
+        .{ .UID = true },
+        &statx,
+    )) != .SUCCESS) return false;
+    if (statx.uid != 0) return false;
+
+    // Check immutable flag
+    var flags: u64 = 0;
+    if (std.os.linux.errno(std.os.linux.ioctl(dir.handle, FS_IOC_GETFLAGS, @intFromPtr(&flags))) != .SUCCESS) {
+        // Filesystem doesn't support flags — fall back to ownership + permissions check.
+        // Root-owned + read-only is the hardened state on these filesystems.
+        const stat = dir.stat(path_mod.currentIo()) catch return false;
+        return (stat.permissions.toMode() & 0o222) == 0;
+    }
+    return (flags & FS_IMMUTABLE_FL) != 0;
+}
+
+// --- Store hardening ---
+
+fn ior(typ: u8, nr: u8, comptime T: type) u32 {
+    return (0x80 << 24) | (@as(u32, @sizeOf(T)) << 16) | (@as(u32, typ) << 8) | nr;
+}
+fn iow(typ: u8, nr: u8, comptime T: type) u32 {
+    return (0x40 << 24) | (@as(u32, @sizeOf(T)) << 16) | (@as(u32, typ) << 8) | nr;
+}
+
+const FS_IOC_GETFLAGS = ior('f', 1, c_long);
+const FS_IOC_SETFLAGS = iow('f', 2, c_long);
+const FS_IMMUTABLE_FL: u64 = 0x00000010;
+
+pub const HardenResult = struct {
+    files_processed: usize = 0,
+    immutable_supported: bool = true,
+};
+
+fn setImmutable(fd: std.posix.fd_t) bool {
+    var flags: u64 = 0;
+    if (std.os.linux.errno(std.os.linux.ioctl(fd, FS_IOC_GETFLAGS, @intFromPtr(&flags))) != .SUCCESS) return false;
+    flags |= FS_IMMUTABLE_FL;
+    return std.os.linux.errno(std.os.linux.ioctl(fd, FS_IOC_SETFLAGS, @intFromPtr(&flags))) == .SUCCESS;
+}
+
+fn clearImmutableFlag(fd: std.posix.fd_t) bool {
+    var flags: u64 = 0;
+    if (std.os.linux.errno(std.os.linux.ioctl(fd, FS_IOC_GETFLAGS, @intFromPtr(&flags))) != .SUCCESS) return false;
+    flags &= ~FS_IMMUTABLE_FL;
+    return std.os.linux.errno(std.os.linux.ioctl(fd, FS_IOC_SETFLAGS, @intFromPtr(&flags))) == .SUCCESS;
+}
+
+/// Harden a store object for system use.
 ///
-/// This function:
-/// 1. Validates the store path is within the store boundary
-/// 2. Recursively changes ownership to root:root (0:0)
-/// 3. Sets read-only permissions
-/// 4. Validates all symlinks stay within boundaries
-///
-/// Should only be called when isPrivileged() returns true.
-pub fn hardenStoreObject(
-    ctx: *Context,
-    store_path: []const u8,
-) StoreError!void {
+/// 1. Validates the caller is root
+/// 2. Validates the store path is within the store boundary
+/// 3. Recursively: chown root:root, chmod read-only, set FS_IMMUTABLE_FL
+/// 4. Validates all symlinks stay within the store path boundary
+pub fn harden(ctx: *Context, store_path: []const u8) StoreError!HardenResult {
     if (!isPrivileged()) {
         return ctx.fail(StoreError.PermissionDenied, store_path, "not running as root");
     }
 
-    // Validate store_path is within /mere/store
     const store_dir = std.fs.path.join(ctx.allocator, &.{ ctx.root_path, "mere", "store" }) catch {
         return ctx.fail(StoreError.OutOfMemory, store_path, "failed to construct store root path");
     };
@@ -170,81 +224,46 @@ pub fn hardenStoreObject(
         return ctx.fail(StoreError.InvalidInput, store_path, "not within store boundary");
     }
 
-    // Open the store object directory
+    const io = path_mod.currentIo();
     var dir = path_mod.openExistingDir(store_path) catch {
         return ctx.fail(StoreError.FileSystem, store_path, "failed to open store directory");
     };
-    defer dir.close(path_mod.currentIo());
+    defer dir.close(io);
 
-    // Walk the directory tree using lstat (don't follow symlinks)
-    try hardenDirectory(ctx, dir, store_path, store_path);
-}
+    var result = HardenResult{};
 
-/// Recursively harden a directory
-fn hardenDirectory(
-    ctx: *Context,
-    dir: std.Io.Dir,
-    dir_path: []const u8,
-    store_root: []const u8,
-) StoreError!void {
-    const io = path_mod.currentIo();
-    const dir_stat = dir.stat(io) catch {
-        return ctx.fail(StoreError.FileSystem, dir_path, "failed to stat directory");
-    };
-    const dir_mode = dir_stat.permissions.toMode() & ~@as(u16, 0o222);
+    var walker = dir.walk(ctx.allocator) catch return StoreError.OutOfMemory;
+    defer walker.deinit();
 
-    // Capture mode before chown. Linux clears setuid/setgid on ownership change,
-    // so we must restore the packaged mode after changing owner.
-    dir.setOwner(io, 0, 0) catch {
-        return ctx.fail(StoreError.PermissionDenied, dir_path, "failed to change ownership of directory");
-    };
-    dir.setPermissions(io, .fromMode(dir_mode)) catch {
-        return ctx.fail(StoreError.PermissionDenied, dir_path, "failed to chmod directory to read-only");
-    };
-
-    // Iterate through directory contents
-    var iter = dir.iterate();
-    while (iter.next(io) catch {
-        return ctx.fail(StoreError.FileSystem, dir_path, "failed to iterate directory");
-    }) |entry| {
-        const entry_path = std.fs.path.join(ctx.allocator, &.{ dir_path, entry.name }) catch {
-            return ctx.fail(StoreError.OutOfMemory, dir_path, "failed to allocate path for directory entry");
-        };
-        defer ctx.allocator.free(entry_path);
-
+    while (walker.next(io) catch return StoreError.FileSystem) |entry| {
         switch (entry.kind) {
             .directory => {
-                // Recursively harden subdirectory
-                var subdir = dir.openDir(io, entry.name, .{ .iterate = true }) catch {
-                    return ctx.fail(StoreError.FileSystem, entry_path, "failed to open subdirectory");
+                var subdir = dir.openDir(io, entry.path, .{ .iterate = true }) catch {
+                    const p = std.fs.path.join(ctx.allocator, &.{ store_path, entry.path }) catch
+                        return ctx.fail(StoreError.OutOfMemory, store_path, "failed to allocate path");
+                    defer ctx.allocator.free(p);
+                    return ctx.fail(StoreError.FileSystem, p, "failed to open subdirectory");
                 };
                 defer subdir.close(io);
-
-                try hardenDirectory(ctx, subdir, entry_path, store_root);
+                hardenFd(subdir.handle, .directory, &result);
             },
             .file => {
-                // Open file to get handle for operations
-                var file = dir.openFile(io, entry.name, .{ .mode = .read_only }) catch {
-                    return ctx.fail(StoreError.FileSystem, entry_path, "failed to open file");
+                var file = dir.openFile(io, entry.path, .{}) catch {
+                    const p = std.fs.path.join(ctx.allocator, &.{ store_path, entry.path }) catch
+                        return ctx.fail(StoreError.OutOfMemory, store_path, "failed to allocate path");
+                    defer ctx.allocator.free(p);
+                    return ctx.fail(StoreError.FileSystem, p, "failed to open file");
                 };
                 defer file.close(io);
-
-                const stat = file.stat(io) catch {
-                    return ctx.fail(StoreError.FileSystem, entry_path, "failed to stat file");
-                };
-                const new_mode = stat.permissions.toMode() & ~@as(u16, 0o222);
-
-                // Capture mode before chown. Linux clears setuid/setgid on
-                // ownership change, so restore the packaged mode afterward.
-                file.setOwner(io, 0, 0) catch {
-                    return ctx.fail(StoreError.PermissionDenied, entry_path, "failed to change file ownership");
-                };
-                file.setPermissions(io, .fromMode(new_mode)) catch {
-                    return ctx.fail(StoreError.PermissionDenied, entry_path, "failed to chmod file");
-                };
+                hardenFd(file.handle, .file, &result);
             },
             .sym_link => {
-                const result = path_safety.resolveWithinBoundary(ctx.allocator, entry_path, store_root) catch |err| {
+                const entry_path = std.fs.path.join(ctx.allocator, &.{ store_path, entry.path }) catch {
+                    return ctx.fail(StoreError.OutOfMemory, store_path, "failed to allocate symlink path");
+                };
+                defer ctx.allocator.free(entry_path);
+
+                const symlink_result = path_safety.resolveWithinBoundary(ctx.allocator, entry_path, store_path) catch |err| {
                     const detail = switch (err) {
                         path_safety.PathSafetyError.EscapesBoundary => "symlink escapes store boundary",
                         path_safety.PathSafetyError.SymlinkLoop => "symlink loop detected",
@@ -265,19 +284,64 @@ fn hardenDirectory(
                         path_safety.PathSafetyError.OutOfMemory => StoreError.OutOfMemory,
                     }, entry_path, detail);
                 };
-                ctx.allocator.free(result.path);
+                ctx.allocator.free(symlink_result.path);
 
-                // Note: We don't change symlink ownership itself because:
-                // 1. The symlink target is validated to be within store_root
-                // 2. The target files/dirs are already hardened above
-                // 3. Symlink ownership doesn't affect security of the target
-                // If needed in future, can use openat with O_PATH|O_NOFOLLOW and fchown
+                const path_z = std.posix.toPosixPath(entry.path) catch continue;
+                _ = std.os.linux.fchownat(dir.handle, &path_z, 0, 0, std.os.linux.AT.SYMLINK_NOFOLLOW);
             },
-            else => {
-                // Ignore other types
-            },
+            else => {},
         }
     }
+
+    hardenFd(dir.handle, .directory, &result);
+    return result;
+}
+
+fn hardenFd(fd: std.posix.fd_t, kind: std.Io.File.Kind, result: *HardenResult) void {
+    _ = std.os.linux.fchown(fd, 0, 0);
+    const mode: u32 = if (kind == .directory) 0o555 else 0o444;
+    _ = std.os.linux.fchmod(fd, mode);
+    if (!setImmutable(fd)) result.immutable_supported = false;
+    result.files_processed += 1;
+}
+
+/// Recursively clear filesystem immutable flags on a store path.
+/// Must be called before deletion (GC).
+pub fn clearImmutable(allocator: std.mem.Allocator, store_path: []const u8) HardenResult {
+    const io = path_mod.currentIo();
+    var result = HardenResult{};
+
+    {
+        var top = std.Io.Dir.openDirAbsolute(io, store_path, .{ .iterate = true }) catch return result;
+        _ = clearImmutableFlag(top.handle);
+        top.close(io);
+    }
+
+    var dir = std.Io.Dir.openDirAbsolute(io, store_path, .{ .iterate = true }) catch return result;
+    defer dir.close(io);
+
+    var walker = dir.walk(allocator) catch return result;
+    defer walker.deinit();
+
+    while (walker.next(io) catch null) |entry| {
+        switch (entry.kind) {
+            .directory => {
+                var subdir = dir.openDir(io, entry.path, .{ .iterate = true }) catch continue;
+                defer subdir.close(io);
+                if (!clearImmutableFlag(subdir.handle)) result.immutable_supported = false;
+                result.files_processed += 1;
+            },
+            .file => {
+                var file = dir.openFile(io, entry.path, .{}) catch continue;
+                defer file.close(io);
+                if (!clearImmutableFlag(file.handle)) result.immutable_supported = false;
+                result.files_processed += 1;
+            },
+            else => {},
+        }
+    }
+
+    return result;
 }
 
 // Tests
@@ -406,82 +470,6 @@ test "isPrivileged detects root" {
     _ = is_root;
 }
 
-// Spec #4.1: Store hardening validates store boundary
-test "hardenStoreObject validates store boundary" {
-    const th = @import("test_helpers.zig");
-    var test_env = try th.createTestEnv();
-    defer {
-        test_env.cleanup();
-        std.testing.allocator.destroy(test_env);
-    }
-
-    const ctx = &test_env.ctx;
-
-    // Create a path outside the store
-    const outside_path = try std.fs.path.join(ctx.allocator, &.{ test_env.path, "not-store" });
-    defer ctx.allocator.free(outside_path);
-    try path_mod.ensureDirExists(outside_path);
-
-    // Should reject paths outside store
-    if (isPrivileged()) {
-        try std.testing.expectError(StoreError.InvalidInput, hardenStoreObject(ctx, outside_path));
-    }
-    // If not privileged, expect PermissionDenied
-    else {
-        try std.testing.expectError(StoreError.PermissionDenied, hardenStoreObject(ctx, outside_path));
-    }
-}
-
-test "hardenStoreObject rejects sibling-prefix path" {
-    const th = @import("test_helpers.zig");
-    var test_env = try th.createTestEnv();
-    defer {
-        test_env.cleanup();
-        std.testing.allocator.destroy(test_env);
-    }
-
-    const ctx = &test_env.ctx;
-
-    const sibling_path = try std.fs.path.join(ctx.allocator, &.{
-        test_env.path,
-        "mere",
-        "store-evil",
-        "a" ** 64 ++ "-pkg-1.0.0",
-    });
-    defer ctx.allocator.free(sibling_path);
-    try path_mod.ensureDirExists(sibling_path);
-
-    if (isPrivileged()) {
-        try std.testing.expectError(StoreError.InvalidInput, hardenStoreObject(ctx, sibling_path));
-    } else {
-        try std.testing.expectError(StoreError.PermissionDenied, hardenStoreObject(ctx, sibling_path));
-    }
-}
-
-// Spec #4.1: Store hardening requires root privileges
-test "hardenStoreObject requires privilege" {
-    const th = @import("test_helpers.zig");
-    var test_env = try th.createTestEnv();
-    defer {
-        test_env.cleanup();
-        std.testing.allocator.destroy(test_env);
-    }
-
-    const ctx = &test_env.ctx;
-
-    // Create a valid store path
-    const hash = "a" ** 64;
-    const store_path = try std.fs.path.join(ctx.allocator, &.{ test_env.path, "mere", "store", hash ++ "-test-1.0" });
-    defer ctx.allocator.free(store_path);
-    try path_mod.ensureDirExists(store_path);
-
-    if (!isPrivileged()) {
-        // Non-root should get PermissionDenied
-        try std.testing.expectError(StoreError.PermissionDenied, hardenStoreObject(ctx, store_path));
-    }
-    // Can't fully test root behavior in unprivileged test
-}
-
 // Spec #7: Symlink validation (max depth, loop detection, boundary checking)
 test "path safety rejects escapes, loops, and deep chains" {
     const th = @import("test_helpers.zig");
@@ -586,40 +574,6 @@ test "path safety rejects escapes, loops, and deep chains" {
     }
 }
 
-// Spec #7: Symlink validation (escaping store root boundary)
-// Spec #4.1: Store hardening validates symlinks
-test "hardenStoreObject detects escaping symlinks" {
-    const th = @import("test_helpers.zig");
-    var test_env = try th.createTestEnv();
-    defer {
-        test_env.cleanup();
-        std.testing.allocator.destroy(test_env);
-    }
-
-    const ctx = &test_env.ctx;
-
-    if (!isPrivileged()) {
-        // Skip test if not root
-        return error.SkipZigTest;
-    }
-
-    // Create store path with escaping symlink
-    const hash = "b" ** 64;
-    const store_path = try std.fs.path.join(ctx.allocator, &.{ test_env.path, "mere", "store", hash ++ "-escape-1.0" });
-    defer ctx.allocator.free(store_path);
-    try path_mod.ensureDirExists(store_path);
-
-    // Create a symlink that escapes
-    const link_path = try std.fs.path.join(ctx.allocator, &.{ store_path, "escape_link" });
-    defer ctx.allocator.free(link_path);
-
-    const outside_target = "/etc/passwd";
-    try std.Io.Dir.symLinkAbsolute(path_mod.currentIo(), outside_target, link_path, .{});
-
-    // Should detect escape
-    try std.testing.expectError(StoreError.SymlinkEscapesBoundary, hardenStoreObject(ctx, store_path));
-}
-
 // Spec #4.1: Store admission idempotence (collision handling)
 test "store admission handles existing path idempotently" {
     const th = @import("test_helpers.zig");
@@ -721,4 +675,178 @@ test "resolveWithinBoundary accepts relative symlink within store" {
 
     // The resolved path should be within the store boundary
     try std.testing.expect(path_safety.isWithinBoundary(result.path, store_path));
+}
+
+test "harden validates store boundary" {
+    const th = @import("test_helpers.zig");
+    var test_env = try th.createTestEnv();
+    defer {
+        test_env.cleanup();
+        std.testing.allocator.destroy(test_env);
+    }
+
+    const ctx = &test_env.ctx;
+
+    const outside_path = try std.fs.path.join(ctx.allocator, &.{ test_env.path, "not-store" });
+    defer ctx.allocator.free(outside_path);
+    try path_mod.ensureDirExists(outside_path);
+
+    if (isPrivileged()) {
+        try std.testing.expectError(StoreError.InvalidInput, harden(ctx, outside_path));
+    } else {
+        try std.testing.expectError(StoreError.PermissionDenied, harden(ctx, outside_path));
+    }
+}
+
+test "harden rejects sibling-prefix path" {
+    const th = @import("test_helpers.zig");
+    var test_env = try th.createTestEnv();
+    defer {
+        test_env.cleanup();
+        std.testing.allocator.destroy(test_env);
+    }
+
+    const ctx = &test_env.ctx;
+
+    const sibling_path = try std.fs.path.join(ctx.allocator, &.{
+        test_env.path,
+        "mere",
+        "store-evil",
+        "a" ** 64 ++ "-pkg-1.0.0",
+    });
+    defer ctx.allocator.free(sibling_path);
+    try path_mod.ensureDirExists(sibling_path);
+
+    if (isPrivileged()) {
+        try std.testing.expectError(StoreError.InvalidInput, harden(ctx, sibling_path));
+    } else {
+        try std.testing.expectError(StoreError.PermissionDenied, harden(ctx, sibling_path));
+    }
+}
+
+test "harden requires privilege" {
+    const th = @import("test_helpers.zig");
+    var test_env = try th.createTestEnv();
+    defer {
+        test_env.cleanup();
+        std.testing.allocator.destroy(test_env);
+    }
+
+    const ctx = &test_env.ctx;
+    const hash_val = "a" ** 64;
+    const store_path = try std.fs.path.join(ctx.allocator, &.{ test_env.path, "mere", "store", hash_val ++ "-test-1.0" });
+    defer ctx.allocator.free(store_path);
+    try path_mod.ensureDirExists(store_path);
+
+    if (!isPrivileged()) {
+        try std.testing.expectError(StoreError.PermissionDenied, harden(ctx, store_path));
+    }
+}
+
+test "harden detects escaping symlinks" {
+    const th = @import("test_helpers.zig");
+    var test_env = try th.createTestEnv();
+    defer {
+        test_env.cleanup();
+        std.testing.allocator.destroy(test_env);
+    }
+
+    const ctx = &test_env.ctx;
+    if (!isPrivileged()) return error.SkipZigTest;
+
+    const hash_val = "b" ** 64;
+    const store_path = try std.fs.path.join(ctx.allocator, &.{ test_env.path, "mere", "store", hash_val ++ "-escape-1.0" });
+    defer ctx.allocator.free(store_path);
+    try path_mod.ensureDirExists(store_path);
+
+    const link_path = try std.fs.path.join(ctx.allocator, &.{ store_path, "escape_link" });
+    defer ctx.allocator.free(link_path);
+    try std.Io.Dir.symLinkAbsolute(path_mod.currentIo(), "/etc/passwd", link_path, .{});
+
+    try std.testing.expectError(StoreError.SymlinkEscapesBoundary, harden(ctx, store_path));
+}
+
+test "clearImmutable allows modification after clearing" {
+    const th = @import("test_helpers.zig");
+    var test_env = try th.createTestEnv();
+    defer {
+        test_env.cleanup();
+        std.testing.allocator.destroy(test_env);
+    }
+
+    const allocator = test_env.ctx.allocator;
+    const io = path_mod.currentIo();
+
+    const store_path = try std.fs.path.join(allocator, &.{ test_env.path, "mere", "store", "def-pkg-2.0" });
+    defer allocator.free(store_path);
+    {
+        var dir = try path_mod.makePathAndOpenDir(store_path);
+        dir.close(io);
+    }
+
+    const file_path = try std.fs.path.join(allocator, &.{ store_path, "file.txt" });
+    defer allocator.free(file_path);
+    {
+        var f = try std.Io.Dir.createFileAbsolute(io, file_path, .{});
+        defer f.close(io);
+        try f.writeStreamingAll(io, "content\n");
+    }
+
+    _ = clearImmutable(allocator, store_path);
+
+    {
+        var f = try std.Io.Dir.openFileAbsolute(io, file_path, .{});
+        defer f.close(io);
+        try f.setPermissions(io, .fromMode(0o644));
+    }
+}
+
+test "clearImmutable handles empty directory" {
+    const th = @import("test_helpers.zig");
+    var test_env = try th.createTestEnv();
+    defer {
+        test_env.cleanup();
+        std.testing.allocator.destroy(test_env);
+    }
+
+    const allocator = test_env.ctx.allocator;
+    const io = path_mod.currentIo();
+
+    const store_path = try std.fs.path.join(allocator, &.{ test_env.path, "mere", "store", "empty-pkg-1.0" });
+    defer allocator.free(store_path);
+    {
+        var dir = try path_mod.makePathAndOpenDir(store_path);
+        dir.close(io);
+    }
+
+    const result = clearImmutable(allocator, store_path);
+    try std.testing.expectEqual(@as(usize, 0), result.files_processed);
+}
+
+test "isHardened returns false for user-owned store path" {
+    if (isPrivileged()) return error.SkipZigTest;
+
+    const th = @import("test_helpers.zig");
+    var test_env = try th.createTestEnv();
+    defer {
+        test_env.cleanup();
+        std.testing.allocator.destroy(test_env);
+    }
+
+    const allocator = test_env.ctx.allocator;
+    const io = path_mod.currentIo();
+
+    const hash_val = "c" ** 64;
+    const store_path = try std.fs.path.join(allocator, &.{ test_env.path, "mere", "store", hash_val ++ "-pkg-1.0" });
+    defer allocator.free(store_path);
+    {
+        var dir = try path_mod.makePathAndOpenDir(store_path);
+        dir.close(io);
+    }
+
+    try std.testing.expect(!isHardened(store_path));
+}
+
+test "isHardened returns false for nonexistent path" {
+    try std.testing.expect(!isHardened("/mere/store/nonexistent-pkg-1.0"));
 }

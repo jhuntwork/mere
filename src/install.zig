@@ -1760,7 +1760,15 @@ fn finalizeAdmittedStoreObject(
 ) !void {
     _ = existing_only;
     if (store.isPrivileged()) {
-        try store.hardenStoreObject(ctx, install_dir);
+        _ = store.harden(ctx, install_dir) catch |err| {
+            return switch (err) {
+                store.StoreError.OutOfMemory => error.OutOfMemory,
+                store.StoreError.PermissionDenied => error.PermissionDenied,
+                store.StoreError.SymlinkEscapesBoundary => error.SymlinkEscapesBoundary,
+                store.StoreError.InvalidInput => error.InvalidInput,
+                else => error.FileSystem,
+            };
+        };
         ctx.debug("store object hardened (root ownership)", .{});
     } else {
         // Unprivileged install - set read-only (best-effort)
