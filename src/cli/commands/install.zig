@@ -110,7 +110,7 @@ fn performInstallation(
     // Perform installation (no logging - errors propagate)
     const outcome = try mere.install.installPackagesFromConfig(ctx, package_names, client, false, verify_store, force_sync, profile_name);
     return switch (outcome) {
-        .completed => "Package installed successfully",
+        .completed => null,
         .store_only_system_activation_deferred => null,
     };
 }

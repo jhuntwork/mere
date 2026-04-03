@@ -26,7 +26,8 @@ const activation = @import("activation.zig");
 const gcroots = @import("gcroots.zig");
 const version_mod = @import("version.zig");
 const version_constraint = @import("version_constraint.zig");
-const emit = mere.ui.emit;
+const ui = mere.ui;
+const emit = ui.emit;
 
 const InstallRootRequirement = struct {
     name: []const u8,
@@ -51,11 +52,12 @@ const InstallTargetBehavior = enum {
     activate_profile,
 };
 
-fn emitInstallGenerationStatus(
+fn emitGenerationStatus(
     ctx: *Context,
     action: []const u8,
     gen_num: usize,
     profile_name: ?[]const u8,
+    phase: ui.Phase,
 ) void {
     var gen_buf: [32]u8 = undefined;
     const gen_text = std.fmt.bufPrint(&gen_buf, "{d}", .{gen_num}) catch return;
@@ -69,7 +71,7 @@ fn emitInstallGenerationStatus(
             .{ .text = prof_name, .kind = .detail },
             .{ .text = "'", .kind = .normal },
         };
-        emit.logSegmentsSeverity(ctx, .install, .info, &segments);
+        emit.logSegmentsSeverity(ctx, phase, .info, &segments);
         return;
     }
 
@@ -79,7 +81,7 @@ fn emitInstallGenerationStatus(
         .{ .text = ": ", .kind = .normal },
         .{ .text = gen_text, .kind = .detail },
     };
-    emit.logSegmentsSeverity(ctx, .install, .info, &segments);
+    emit.logSegmentsSeverity(ctx, phase, .info, &segments);
 }
 
 fn determineInstallTargetBehavior(
@@ -95,6 +97,248 @@ fn determineInstallTargetBehavior(
         return .activate_profile;
     }
     return .store_only_requested;
+}
+
+/// Find all packages that transitively depend on `target_name` by walking
+/// reverse dependency edges. Returns the set of ancestor package names.
+fn findTransitiveDependents(
+    allocator: std.mem.Allocator,
+    sorted: []const resolver.ResolvedPackage,
+    target_name: []const u8,
+) std.StringHashMap(void) {
+    // Build reverse map: package name -> list of packages that depend on it
+    var rdeps = std.StringHashMap(std.ArrayList([]const u8)).init(allocator);
+    defer {
+        var it = rdeps.valueIterator();
+        while (it.next()) |list| list.deinit(allocator);
+        rdeps.deinit();
+    }
+
+    for (sorted) |resolved| {
+        const pkg_name = resolved.pkg.name orelse continue;
+        for (resolved.dependency_names) |dep_name| {
+            var entry = rdeps.getOrPut(dep_name) catch continue;
+            if (!entry.found_existing) entry.value_ptr.* = .empty;
+            entry.value_ptr.append(allocator, pkg_name) catch continue;
+        }
+    }
+
+    // BFS upward from target
+    var result = std.StringHashMap(void).init(allocator);
+    var queue: std.ArrayList([]const u8) = .empty;
+    defer queue.deinit(allocator);
+    queue.append(allocator, target_name) catch return result;
+
+    while (queue.items.len > 0) {
+        const name = queue.orderedRemove(0);
+        if (rdeps.get(name)) |parents| {
+            for (parents.items) |parent| {
+                if (!result.contains(parent)) {
+                    result.put(parent, {}) catch continue;
+                    queue.append(allocator, parent) catch continue;
+                }
+            }
+        }
+    }
+
+    return result;
+}
+
+fn profileMatchesResolution(ctx: *Context, profile_name: []const u8, sorted: []const resolver.ResolvedPackage) bool {
+    const profile_dir = getProfileDir(ctx, profile_name) catch return false;
+    defer ctx.allocator.free(profile_dir);
+
+    const current = loadCurrentManifest(ctx, profile_name, profile_dir) orelse return false;
+    defer {
+        var m = current;
+        m.deinit();
+    }
+
+    if (current.packages.items.len != sorted.len) return false;
+
+    var current_hashes = std.StringHashMap(void).init(ctx.allocator);
+    defer current_hashes.deinit();
+    for (current.packages.items) |pkg| {
+        current_hashes.put(pkg.content_hash, {}) catch return false;
+    }
+
+    for (sorted) |resolved| {
+        if (!current_hashes.contains(resolved.pkg.content_hash)) return false;
+    }
+
+    return true;
+}
+
+fn emitResolutionDiff(
+    ctx: *Context,
+    profile_name: []const u8,
+    sorted: []const resolver.ResolvedPackage,
+    phase: ui.Phase,
+) void {
+    const profile_dir = getProfileDir(ctx, profile_name) catch return;
+    defer ctx.allocator.free(profile_dir);
+
+    const current = loadCurrentManifest(ctx, profile_name, profile_dir) orelse {
+        var buf: [32]u8 = undefined;
+        const count_text = std.fmt.bufPrint(&buf, "{d}", .{sorted.len}) catch return;
+        const segments = [_]mere.ui.Segment{
+            .{ .text = count_text, .kind = .detail },
+            .{ .text = " packages added", .kind = .success },
+        };
+        emit.logSegmentsSeverity(ctx, phase, .info, &segments);
+        return;
+    };
+    defer {
+        var m = current;
+        m.deinit();
+    }
+
+    var current_by_name = std.StringHashMap([]const u8).init(ctx.allocator);
+    defer current_by_name.deinit();
+    for (current.packages.items) |pkg| {
+        current_by_name.put(pkg.name, pkg.content_hash) catch return;
+    }
+
+    var new_by_name = std.StringHashMap(void).init(ctx.allocator);
+    defer new_by_name.deinit();
+    for (sorted) |resolved| {
+        if (resolved.pkg.name) |name| new_by_name.put(name, {}) catch return;
+    }
+
+    var installed: std.ArrayList([]const u8) = .empty;
+    defer installed.deinit(ctx.allocator);
+    var uninstalled: std.ArrayList([]const u8) = .empty;
+    defer uninstalled.deinit(ctx.allocator);
+    var upgraded: std.ArrayList([]const u8) = .empty;
+    defer upgraded.deinit(ctx.allocator);
+    var unchanged: usize = 0;
+
+    for (sorted) |resolved| {
+        const name = resolved.pkg.name orelse continue;
+        if (current_by_name.get(name)) |old_hash| {
+            if (std.mem.eql(u8, old_hash, resolved.pkg.content_hash)) {
+                unchanged += 1;
+            } else {
+                upgraded.append(ctx.allocator, name) catch return;
+            }
+        } else {
+            installed.append(ctx.allocator, name) catch return;
+        }
+    }
+
+    for (current.packages.items) |pkg| {
+        if (!new_by_name.contains(pkg.name)) {
+            uninstalled.append(ctx.allocator, pkg.name) catch return;
+        }
+    }
+
+    emitDiffCounts(ctx, phase, installed.items, uninstalled.items, upgraded.items, unchanged);
+}
+
+fn emitProfileDiff(
+    ctx: *Context,
+    profile_name: []const u8,
+    new_packages: []const generation.PackageEntry,
+    phase: ui.Phase,
+) void {
+    const profile_dir = getProfileDir(ctx, profile_name) catch return;
+    defer ctx.allocator.free(profile_dir);
+
+    const current = loadCurrentManifest(ctx, profile_name, profile_dir) orelse {
+        var buf: [32]u8 = undefined;
+        const count_text = std.fmt.bufPrint(&buf, "{d}", .{new_packages.len}) catch return;
+        const segments = [_]mere.ui.Segment{
+            .{ .text = count_text, .kind = .detail },
+            .{ .text = " packages added", .kind = .success },
+        };
+        emit.logSegmentsSeverity(ctx, phase, .info, &segments);
+        return;
+    };
+    defer {
+        var m = current;
+        m.deinit();
+    }
+
+    var current_by_name = std.StringHashMap(generation.PackageEntry).init(ctx.allocator);
+    defer current_by_name.deinit();
+    for (current.packages.items) |pkg| {
+        current_by_name.put(pkg.name, pkg) catch return;
+    }
+
+    var new_by_name = std.StringHashMap(void).init(ctx.allocator);
+    defer new_by_name.deinit();
+    for (new_packages) |pkg| {
+        new_by_name.put(pkg.name, {}) catch return;
+    }
+
+    var installed: std.ArrayList([]const u8) = .empty;
+    defer installed.deinit(ctx.allocator);
+    var uninstalled: std.ArrayList([]const u8) = .empty;
+    defer uninstalled.deinit(ctx.allocator);
+    var upgraded: std.ArrayList([]const u8) = .empty;
+    defer upgraded.deinit(ctx.allocator);
+    var unchanged: usize = 0;
+
+    for (new_packages) |pkg| {
+        if (current_by_name.get(pkg.name)) |old| {
+            if (std.mem.eql(u8, old.content_hash, pkg.content_hash)) {
+                unchanged += 1;
+            } else {
+                upgraded.append(ctx.allocator, pkg.name) catch return;
+            }
+        } else {
+            installed.append(ctx.allocator, pkg.name) catch return;
+        }
+    }
+
+    for (current.packages.items) |pkg| {
+        if (!new_by_name.contains(pkg.name)) {
+            uninstalled.append(ctx.allocator, pkg.name) catch return;
+        }
+    }
+
+    emitDiffCounts(ctx, phase, installed.items, uninstalled.items, upgraded.items, unchanged);
+}
+
+fn emitDiffCounts(
+    ctx: *Context,
+    phase: ui.Phase,
+    installed_names: []const []const u8,
+    uninstalled_names: []const []const u8,
+    upgraded_names: []const []const u8,
+    unchanged: usize,
+) void {
+    if (installed_names.len > 0) {
+        emitNamedDiffLine(ctx, phase, "installed: ", .success, installed_names);
+    }
+    if (uninstalled_names.len > 0) {
+        emitNamedDiffLine(ctx, phase, "uninstalled: ", .warn, uninstalled_names);
+    }
+    if (upgraded_names.len > 0) {
+        emitNamedDiffLine(ctx, phase, "upgraded: ", .detail, upgraded_names);
+    }
+    if (unchanged > 0) {
+        var buf: [32]u8 = undefined;
+        const text = std.fmt.bufPrint(&buf, "{d} unchanged", .{unchanged}) catch return;
+        const segments = [_]mere.ui.Segment{
+            .{ .text = text, .kind = .normal },
+        };
+        emit.logSegmentsSeverity(ctx, phase, .info, &segments);
+    }
+}
+
+fn emitNamedDiffLine(ctx: *Context, phase: ui.Phase, label: []const u8, kind: mere.ui.SegmentKind, names: []const []const u8) void {
+    var line: std.ArrayList(u8) = .empty;
+    defer line.deinit(ctx.allocator);
+    for (names, 0..) |name, i| {
+        if (i > 0) line.appendSlice(ctx.allocator, ", ") catch return;
+        line.appendSlice(ctx.allocator, name) catch return;
+    }
+    const segments = [_]mere.ui.Segment{
+        .{ .text = label, .kind = .normal },
+        .{ .text = line.items, .kind = kind },
+    };
+    emit.logSegmentsSeverity(ctx, phase, .info, &segments);
 }
 
 pub fn installPackagesFromConfig(
@@ -117,16 +361,12 @@ pub fn installPackagesFromConfig(
         return ctx.fail(error.InvalidConfig, "configuration", "invalid repository configuration");
     };
 
-    const target_behavior = determineInstallTargetBehavior(profile_name, null, store.isPrivileged());
-
     const phase_name: []const u8 = if (pkg_names.len == 1) pkg_names[0] else "multiple";
     emit.phaseStart(ctx, .install, .{ .name = phase_name });
     errdefer emit.phaseEnd(ctx, .install, false);
 
-    // Create RepoCaches from the configuration
     var repocaches = try repo_sources.createCaches(ctx, &config);
     defer {
-        // Ensure each RepoCache is deinitialized before freeing its container.
         for (repocaches.items) |rc| {
             rc.deinit();
             ctx.allocator.destroy(rc);
@@ -134,9 +374,46 @@ pub fn installPackagesFromConfig(
         repocaches.deinit(ctx.allocator);
     }
 
-    try installPackagesToProfile(ctx, repocaches.items, pkg_names, client, reinstall, verify_store, force_sync, profile_name, null);
+    // Build resolver requirements from requested roots
+    var input_requirements = try parseInstallRootRequirements(ctx.allocator, pkg_names);
+    defer deinitInstallRootRequirements(ctx.allocator, &input_requirements);
+
+    var resolver_requirements: []resolver.Requirement = &.{};
+    var owned_resolver_requirements: ?[]resolver.Requirement = null;
+    defer if (owned_resolver_requirements) |items| ctx.allocator.free(items);
+    var preferred_selections_state: ?PreferredSelectionsState = null;
+    defer if (preferred_selections_state) |*state| state.deinit();
+    var preferred_selections: []const resolver.PreferredSelection = &.{};
+
+    var requested_state: ?RequestedRootsState = null;
+    defer if (requested_state) |*state| state.deinit(ctx.allocator);
+
+    const target_behavior = determineInstallTargetBehavior(profile_name, null, store.isPrivileged());
+
+    if (target_behavior == .activate_profile and profile_name != null) {
+        requested_state = try buildRequestedRootsAfterAdd(ctx, profile_name.?, input_requirements.items);
+        owned_resolver_requirements = try buildProfileResolverRequirements(
+            ctx.allocator,
+            input_requirements.items,
+            requested_state.?.packages.items,
+        );
+        resolver_requirements = owned_resolver_requirements.?;
+        preferred_selections_state = try loadCurrentGenerationPreferences(ctx, profile_name.?);
+        preferred_selections = preferred_selections_state.?.selections;
+    } else {
+        owned_resolver_requirements = try installRequirementsToResolverRequirements(ctx.allocator, input_requirements.items);
+        resolver_requirements = owned_resolver_requirements.?;
+    }
+
+    // Resolve
+    var resolution = try resolveProfile(ctx, repocaches.items, resolver_requirements, preferred_selections, client, force_sync, true);
+    defer resolution.deinit();
+
+    // Realize
+    const result_behavior = try realizeProfile(ctx, &resolution, client, reinstall, verify_store, profile_name, null, .install);
+
     emit.phaseEnd(ctx, .install, true);
-    return switch (target_behavior) {
+    return switch (result_behavior) {
         .store_only_system_deferred => .store_only_system_activation_deferred,
         .store_only_requested, .activate_profile => .completed,
     };
@@ -157,19 +434,12 @@ pub fn installPackageSpecsFromConfig(
         return ctx.fail(error.InvalidInput, "package", "no package specs provided");
     }
 
-    // Extract names for the existing pipeline
-    const pkg_names = try ctx.allocator.alloc([]const u8, specs.len);
-    defer ctx.allocator.free(pkg_names);
-    for (specs, 0..) |s, i| pkg_names[i] = s.name;
-
     const config = ctx.configuration orelse {
         return ctx.fail(error.InvalidConfig, "configuration", "no configuration loaded");
     };
     config.validate() catch {
         return ctx.fail(error.InvalidConfig, "configuration", "invalid repository configuration");
     };
-
-    const target_behavior = determineInstallTargetBehavior(profile_name, null, store.isPrivileged());
 
     const phase_name: []const u8 = if (specs.len == 1) specs[0].name else "multiple";
     emit.phaseStart(ctx, .install, .{ .name = phase_name });
@@ -198,6 +468,8 @@ pub fn installPackageSpecsFromConfig(
     var requested_state: ?RequestedRootsState = null;
     defer if (requested_state) |*state| state.deinit(ctx.allocator);
 
+    const target_behavior = determineInstallTargetBehavior(profile_name, null, store.isPrivileged());
+
     if (target_behavior == .activate_profile and profile_name != null) {
         requested_state = try buildRequestedRootsAfterAdd(ctx, profile_name.?, input_requirements.items);
         owned_resolver_requirements = try buildProfileResolverRequirements(
@@ -213,52 +485,15 @@ pub fn installPackageSpecsFromConfig(
         resolver_requirements = owned_resolver_requirements.?;
     }
 
-    var loaded_keys = try sign.loadAllKeys(ctx);
-    defer {
-        for (loaded_keys.items) |*key| key.deinit(ctx.allocator);
-        loaded_keys.deinit(ctx.allocator);
-    }
+    // Resolve
+    var resolution = try resolveProfile(ctx, repocaches.items, resolver_requirements, preferred_selections, client, force_sync, true);
+    defer resolution.deinit();
 
-    try syncRepoCaches(ctx, repocaches.items, client, force_sync, loaded_keys.items);
-
-    var arena = std.heap.ArenaAllocator.init(ctx.allocator);
-    defer arena.deinit();
-
-    var plan = try resolveInstallPlan(ctx, repocaches.items, resolver_requirements, preferred_selections, arena.allocator());
-    defer plan.resolution.deinit();
-
-    const has_target_step = target_behavior == .activate_profile;
-    emit.stepStartLast(ctx, .install, "store admission", !has_target_step);
-    var store_step_open = true;
-    errdefer if (store_step_open) emit.stepEnd(ctx, .install, "store admission", false);
-
-    var installed_packages = try installResolvedPackages(ctx, plan.sorted, client, reinstall, loaded_keys.items);
-    emit.stepEnd(ctx, .install, "store admission", true);
-    store_step_open = false;
-
-    defer {
-        for (installed_packages.items) |*pkg_info| {
-            pkg_info.deinit(ctx.allocator);
-        }
-        installed_packages.deinit(ctx.allocator);
-    }
-
-    switch (target_behavior) {
-        .activate_profile => {
-            const target_step_name = "activation";
-            emit.stepStartLast(ctx, .install, target_step_name, true);
-            var target_step_open = true;
-            errdefer if (target_step_open) emit.stepEnd(ctx, .install, target_step_name, false);
-            try applyInstallTargets(ctx, installed_packages.items, profile_name, null, verify_store);
-            emit.stepEnd(ctx, .install, target_step_name, true);
-            target_step_open = false;
-        },
-        .store_only_system_deferred => {},
-        .store_only_requested => {},
-    }
+    // Realize
+    const result_behavior = try realizeProfile(ctx, &resolution, client, reinstall, verify_store, profile_name, null, .install);
 
     emit.phaseEnd(ctx, .install, true);
-    return switch (target_behavior) {
+    return switch (result_behavior) {
         .store_only_system_deferred => .store_only_system_activation_deferred,
         .store_only_requested, .activate_profile => .completed,
     };
@@ -271,6 +506,8 @@ pub fn uninstallPackagesFromConfig(
     verify_store: bool,
     force_sync: bool,
     profile_name: []const u8,
+    cascade: bool,
+    dry_run: bool,
 ) !?[]const u8 {
     if (pkg_names.len == 0) return "No package names provided";
 
@@ -278,8 +515,8 @@ pub fn uninstallPackagesFromConfig(
     config.validate() catch return "Invalid repository configuration";
 
     const phase_name: []const u8 = if (pkg_names.len == 1) pkg_names[0] else "multiple";
-    emit.phaseStart(ctx, .install, .{ .name = phase_name });
-    errdefer emit.phaseEnd(ctx, .install, false);
+    emit.phaseStart(ctx, .uninstall, .{ .name = phase_name });
+    errdefer emit.phaseEnd(ctx, .uninstall, false);
 
     var repocaches = try repo_sources.createCaches(ctx, &config);
     defer {
@@ -298,49 +535,124 @@ pub fn uninstallPackagesFromConfig(
     }
 
     if (requested_state.packages.items.len > 0) {
-        var requested_tokens: std.ArrayList([]const u8) = .empty;
-        defer {
-            for (requested_tokens.items) |token| ctx.allocator.free(token);
-            requested_tokens.deinit(ctx.allocator);
+        // Build resolver requirements from remaining roots
+        var resolver_requirements = try ctx.allocator.alloc(resolver.Requirement, requested_state.packages.items.len);
+        defer ctx.allocator.free(resolver_requirements);
+        for (requested_state.packages.items, 0..) |pkg, i| {
+            resolver_requirements[i] = .{
+                .name = pkg.name,
+                .constraint_expr = pkg.version,
+            };
         }
 
-        for (requested_state.packages.items) |pkg| {
-            const token = if (pkg.version) |version_expr|
-                try std.fmt.allocPrint(ctx.allocator, "{s}{s}", .{ pkg.name, version_expr })
-            else
-                try ctx.allocator.dupe(u8, pkg.name);
-            try requested_tokens.append(ctx.allocator, token);
+        var preferred_selections_state = try loadCurrentGenerationPreferences(ctx, profile_name);
+        defer preferred_selections_state.deinit();
+
+        // Resolve
+        var resolution = try resolveProfile(ctx, repocaches.items, resolver_requirements, preferred_selections_state.selections, client, force_sync, false);
+        defer resolution.deinit();
+
+        // Check if removed packages are still in the resolved set as transitive deps
+        for (pkg_names) |removed_name| {
+            if (resolution.containsPackage(removed_name)) {
+                // Find which resolved packages directly depend on the removed one
+                var dependents: std.ArrayList(u8) = .empty;
+                defer dependents.deinit(ctx.allocator);
+                for (resolution.plan.sorted) |resolved| {
+                    for (resolved.dependency_names) |dep_name| {
+                        if (std.mem.eql(u8, dep_name, removed_name)) {
+                            if (dependents.items.len > 0) try dependents.appendSlice(ctx.allocator, ", ");
+                            try dependents.appendSlice(ctx.allocator, resolved.pkg.name orelse "unknown");
+                            break;
+                        }
+                    }
+                }
+
+                if (!cascade) {
+                    const msg = try std.fmt.allocPrint(
+                        ctx.allocator,
+                        "cannot uninstall '{s}': it is required by {s}. Use --cascade to remove dependent packages.",
+                        .{ removed_name, dependents.items },
+                    );
+                    emit.phaseEnd(ctx, .uninstall, false);
+                    return msg;
+                }
+
+                // Cascade: find requested roots that transitively depend on the removed package
+                var all_dependents = findTransitiveDependents(ctx.allocator, resolution.plan.sorted, removed_name);
+                defer all_dependents.deinit();
+
+                var roots_to_remove = std.StringHashMap(void).init(ctx.allocator);
+                defer roots_to_remove.deinit();
+                for (pkg_names) |name| try roots_to_remove.put(name, {});
+
+                for (requested_state.packages.items) |root_pkg| {
+                    if (all_dependents.contains(root_pkg.name)) {
+                        try roots_to_remove.put(root_pkg.name, {});
+                    }
+                }
+
+                // Rebuild requested state without cascaded roots
+                var i: usize = 0;
+                while (i < requested_state.packages.items.len) {
+                    if (roots_to_remove.contains(requested_state.packages.items[i].name)) {
+                        var removed = requested_state.packages.orderedRemove(i);
+                        removed.deinit(ctx.allocator);
+                        continue;
+                    }
+                    i += 1;
+                }
+
+                // Re-resolve with reduced roots
+                resolution.deinit();
+                if (requested_state.packages.items.len > 0) {
+                    const new_reqs = try ctx.allocator.alloc(resolver.Requirement, requested_state.packages.items.len);
+                    defer ctx.allocator.free(new_reqs);
+                    for (requested_state.packages.items, 0..) |pkg, ri| {
+                        new_reqs[ri] = .{ .name = pkg.name, .constraint_expr = pkg.version };
+                    }
+                    resolution = try resolveProfile(ctx, repocaches.items, new_reqs, preferred_selections_state.selections, client, force_sync, false);
+                } else {
+                    // All roots removed
+                    if (dry_run) {
+                        emitResolutionDiff(ctx, profile_name, &.{}, .uninstall);
+                        emit.logLineSeverity(ctx, .uninstall, .info, "dry run: no changes made");
+                    } else {
+                        const empty: [0]generation.PackageEntry = .{};
+                        try applyProfileRealization(ctx, profile_name, &empty, verify_store, .uninstall);
+                    }
+                    emit.phaseEnd(ctx, .uninstall, true);
+                    return null;
+                }
+
+                break;
+            }
         }
 
-        try installPackagesToProfile(
-            ctx,
-            repocaches.items,
-            requested_tokens.items,
-            client,
-            false,
-            verify_store,
-            force_sync,
-            profile_name,
-            null,
-        );
+        // Realize
+        if (dry_run) {
+            emitResolutionDiff(ctx, profile_name, resolution.plan.sorted, .uninstall);
+            emit.logLineSeverity(ctx, .uninstall, .info, "dry run: no changes made");
+        } else {
+            _ = try realizeProfile(ctx, &resolution, client, false, verify_store, profile_name, null, .uninstall);
+        }
     } else {
-        emit.stepStartLast(ctx, .install, "activation", true);
-        var target_step_open = true;
-        errdefer if (target_step_open) emit.stepEnd(ctx, .install, "activation", false);
-        const empty: [0]generation.PackageEntry = .{};
-        try applyProfileRealization(ctx, profile_name, &empty, verify_store);
-        emit.stepEnd(ctx, .install, "activation", true);
-        target_step_open = false;
+        // All roots removed
+        if (dry_run) {
+            emitResolutionDiff(ctx, profile_name, &.{}, .uninstall);
+            emit.logLineSeverity(ctx, .uninstall, .info, "dry run: no changes made");
+        } else {
+            const empty: [0]generation.PackageEntry = .{};
+            try applyProfileRealization(ctx, profile_name, &empty, verify_store, .uninstall);
+        }
     }
 
-    emit.phaseEnd(ctx, .install, true);
+    emit.phaseEnd(ctx, .uninstall, true);
     return null;
 }
 
-/// Install a package by name, resolving all transitive dependencies.
-/// If profile_name is provided, creates a new generation in the specified profile.
-/// If profile_name is null, packages are only installed to the store.
-/// If target_profile_path is provided, symlinks packages to that profile instead of creating a generation.
+/// Install packages to a profile or build target.
+/// Used by the build orchestrator for dependency installation into build profiles.
 pub fn installPackagesToProfile(
     ctx: *Context,
     repocaches: []*RepoCache,
@@ -353,7 +665,6 @@ pub fn installPackagesToProfile(
     target_profile_path: ?[]const u8,
 ) !void {
     if (pkg_names.len == 0) return;
-    const target_behavior = determineInstallTargetBehavior(profile_name, target_profile_path, store.isPrivileged());
 
     var input_requirements = try parseInstallRootRequirements(ctx.allocator, pkg_names);
     defer deinitInstallRootRequirements(ctx.allocator, &input_requirements);
@@ -367,6 +678,8 @@ pub fn installPackagesToProfile(
 
     var requested_state: ?RequestedRootsState = null;
     defer if (requested_state) |*state| state.deinit(ctx.allocator);
+
+    const target_behavior = determineInstallTargetBehavior(profile_name, target_profile_path, store.isPrivileged());
 
     if (target_behavior == .activate_profile and target_profile_path == null and profile_name != null) {
         requested_state = try buildRequestedRootsAfterAdd(ctx, profile_name.?, input_requirements.items);
@@ -383,59 +696,12 @@ pub fn installPackagesToProfile(
         resolver_requirements = owned_resolver_requirements.?;
     }
 
-    if (pkg_names.len == 1) {
-        ctx.debug("installPackage called for: {s}", .{pkg_names[0]});
-    } else {
-        ctx.debug("installPackages called for {d} roots", .{pkg_names.len});
-    }
+    // Resolve
+    var resolution = try resolveProfile(ctx, repocaches, resolver_requirements, preferred_selections, client, force_sync, true);
+    defer resolution.deinit();
 
-    var loaded_keys = try sign.loadAllKeys(ctx);
-    defer {
-        for (loaded_keys.items) |*key| key.deinit(ctx.allocator);
-        loaded_keys.deinit(ctx.allocator);
-    }
-
-    try syncRepoCaches(ctx, repocaches, client, force_sync, loaded_keys.items);
-
-    // Arena allocator for all temporary package allocations
-    var arena = std.heap.ArenaAllocator.init(ctx.allocator);
-    defer arena.deinit();
-    const arena_allocator = arena.allocator();
-
-    var plan = try resolveInstallPlan(ctx, repocaches, resolver_requirements, preferred_selections, arena_allocator);
-    defer plan.resolution.deinit();
-
-    const has_target_step = target_behavior == .activate_profile;
-    emit.stepStartLast(ctx, .install, "store admission", !has_target_step);
-    var store_step_open = true;
-    errdefer if (store_step_open) emit.stepEnd(ctx, .install, "store admission", false);
-
-    var installed_packages = try installResolvedPackages(ctx, plan.sorted, client, reinstall, loaded_keys.items);
-    emit.stepEnd(ctx, .install, "store admission", true);
-    store_step_open = false;
-
-    defer {
-        for (installed_packages.items) |*pkg_info| {
-            pkg_info.deinit(ctx.allocator);
-        }
-        installed_packages.deinit(ctx.allocator);
-    }
-
-    switch (target_behavior) {
-        .activate_profile => {
-            const target_step_name: []const u8 = if (target_profile_path != null) "profile link" else "activation";
-            emit.stepStartLast(ctx, .install, target_step_name, true);
-            var target_step_open = true;
-            errdefer if (target_step_open) emit.stepEnd(ctx, .install, target_step_name, false);
-            try applyInstallTargets(ctx, installed_packages.items, profile_name, target_profile_path, verify_store);
-            emit.stepEnd(ctx, .install, target_step_name, true);
-            target_step_open = false;
-        },
-        .store_only_system_deferred => {
-            emit.logLineSeverity(ctx, .install, .warn, "system activation deferred: packages were installed to the store; rerun as root to finalize and activate");
-        },
-        .store_only_requested => {},
-    }
+    // Realize
+    _ = try realizeProfile(ctx, &resolution, client, reinstall, verify_store, profile_name, target_profile_path, .install);
 }
 
 const RequestedRootsState = struct {
@@ -862,6 +1128,133 @@ const InstallPlan = struct {
     sorted: []resolver.ResolvedPackage,
 };
 
+/// Result of resolving a profile to a concrete package set.
+/// Owns the resolution and arena; caller must deinit.
+pub const ProfileResolution = struct {
+    plan: InstallPlan,
+    arena: std.heap.ArenaAllocator,
+    loaded_keys: std.ArrayList(sign.LoadedKey),
+    allocator: std.mem.Allocator,
+
+    pub fn deinit(self: *ProfileResolution) void {
+        // Free package strings (owned by ctx.allocator), then tear down the arena.
+        for (self.plan.resolution.packages) |*resolved| {
+            resolved.pkg.deinit();
+        }
+        for (self.loaded_keys.items) |*key| key.deinit(self.allocator);
+        self.loaded_keys.deinit(self.allocator);
+        self.arena.deinit();
+    }
+
+    /// Check whether a package name appears in the resolved set.
+    pub fn containsPackage(self: *const ProfileResolution, name: []const u8) bool {
+        for (self.plan.sorted) |resolved| {
+            if (resolved.pkg.name) |n| {
+                if (std.mem.eql(u8, n, name)) return true;
+            }
+        }
+        return false;
+    }
+};
+
+/// Resolve a profile: sync repos, resolve dependencies, return the resolved package set.
+/// No side effects on the store or profile — purely computes the resolution.
+pub fn resolveProfile(
+    ctx: *Context,
+    repocaches: []*RepoCache,
+    requirements: []const resolver.Requirement,
+    preferred_selections: []const resolver.PreferredSelection,
+    client: download.TransferClient,
+    force_sync: bool,
+    sync: bool,
+) !ProfileResolution {
+    var loaded_keys = try sign.loadAllKeys(ctx);
+    errdefer {
+        for (loaded_keys.items) |*key| key.deinit(ctx.allocator);
+        loaded_keys.deinit(ctx.allocator);
+    }
+
+    if (sync) {
+        try syncRepoCaches(ctx, repocaches, client, force_sync, loaded_keys.items);
+    } else {
+        for (repocaches) |repo_cache| {
+            try repo_cache.ensureRepository();
+        }
+    }
+
+    var arena = std.heap.ArenaAllocator.init(ctx.allocator);
+    errdefer arena.deinit();
+
+    var plan = try resolveInstallPlan(ctx, repocaches, requirements, preferred_selections, arena.allocator());
+    errdefer plan.resolution.deinit();
+
+    return ProfileResolution{
+        .plan = plan,
+        .arena = arena,
+        .loaded_keys = loaded_keys,
+        .allocator = ctx.allocator,
+    };
+}
+
+/// Realize a resolved profile: admit packages to store, create generation, activate.
+/// The phase parameter controls how UI output is labeled.
+pub fn realizeProfile(
+    ctx: *Context,
+    resolution: *ProfileResolution,
+    client: download.TransferClient,
+    reinstall: bool,
+    verify_store: bool,
+    profile_name: ?[]const u8,
+    target_profile_path: ?[]const u8,
+    phase: ui.Phase,
+) !InstallTargetBehavior {
+    const target_behavior = determineInstallTargetBehavior(profile_name, target_profile_path, store.isPrivileged());
+
+    // Check if the resolved set matches the current profile — skip everything if unchanged
+    if (!reinstall and target_profile_path == null) {
+        if (profile_name) |prof_name| {
+            if (profileMatchesResolution(ctx, prof_name, resolution.plan.sorted)) {
+                emit.logLineSeverity(ctx, phase, .info, "profile is already up to date");
+                return target_behavior;
+            }
+        }
+    }
+
+    var installed_packages = try installResolvedPackages(ctx, resolution.plan.sorted, client, reinstall, resolution.loaded_keys.items);
+
+    defer {
+        for (installed_packages.items) |*pkg_info| {
+            pkg_info.deinit(ctx.allocator);
+        }
+        installed_packages.deinit(ctx.allocator);
+    }
+
+    // Emit profile diff summary
+    if (profile_name) |prof_name| {
+        if (target_profile_path == null) {
+            emitProfileDiff(ctx, prof_name, installed_packages.items, phase);
+        }
+    }
+
+    switch (target_behavior) {
+        .activate_profile => {
+            const target_step_name: []const u8 = if (target_profile_path != null) "profile link" else "activation";
+            emit.stepStartLast(ctx, phase, target_step_name, true);
+            var target_step_open = true;
+            errdefer if (target_step_open) emit.stepEnd(ctx, phase, target_step_name, false);
+            try applyInstallTargets(ctx, installed_packages.items, profile_name, target_profile_path, verify_store, phase);
+            emit.stepEnd(ctx, phase, target_step_name, true);
+            target_step_open = false;
+        },
+        .store_only_system_deferred => {
+            emit.logLineSeverity(ctx, phase, .warn, "system activation deferred: packages were installed to the store; rerun as root to finalize and activate");
+        },
+        .store_only_requested => {},
+    }
+
+    return target_behavior;
+}
+
 fn syncRepoCaches(
     ctx: *Context,
     repocaches: []*RepoCache,
@@ -975,15 +1368,6 @@ fn installResolvedPackages(
         if (cache_path.len == 0) {
             const store_path = try store.constructStorePath(ctx, resolved.pkg.content_hash, resolved.pkg.name.?, resolved.pkg.version.?);
 
-            const pkg_label = try std.fmt.allocPrint(ctx.allocator, "{s}-{s}-{d}", .{ resolved.pkg.name.?, resolved.pkg.version.?, resolved.pkg.release.? });
-            defer ctx.allocator.free(pkg_label);
-            const segments = [_]mere.ui.Segment{
-                .{ .text = pkg_label, .kind = .normal },
-                .{ .text = " verified", .kind = .success },
-                .{ .text = " in store", .kind = .detail },
-            };
-            emit.logSegmentsSeverity(ctx, .install, .info, &segments);
-
             try installed_packages.append(ctx.allocator, generation.PackageEntry{
                 .name = try ctx.allocator.dupe(u8, resolved.pkg.name.?),
                 .version = try ctx.allocator.dupe(u8, resolved.pkg.version.?),
@@ -1093,19 +1477,20 @@ fn applyInstallTargets(
     profile_name: ?[]const u8,
     target_profile_path: ?[]const u8,
     verify_store: bool,
+    phase: ui.Phase,
 ) !void {
     // 3. Create or publish the target profile realization, or symlink to a build profile
     if (target_profile_path) |profile_path| {
         // Symlink packages directly to the target profile (for build profiles)
-        try symlinkPackagesToProfile(ctx, profile_path, installed_packages);
+        try symlinkPackagesToProfile(ctx, profile_path, installed_packages, phase);
     } else if (profile_name) |prof_name| {
-        try applyProfileRealization(ctx, prof_name, installed_packages, verify_store);
+        try applyProfileRealization(ctx, prof_name, installed_packages, verify_store, phase);
     }
 }
 
 /// Symlink packages directly to a target profile directory
 /// This is used for build profiles where we don't create generations
-fn symlinkPackagesToProfile(ctx: *Context, profile_path: []const u8, installed_packages: []const generation.PackageEntry) !void {
+fn symlinkPackagesToProfile(ctx: *Context, profile_path: []const u8, installed_packages: []const generation.PackageEntry, phase: ui.Phase) !void {
     ctx.debug("symlinking {d} packages to profile: {s}", .{ installed_packages.len, profile_path });
 
     const store_root = try std.fs.path.join(ctx.allocator, &.{ ctx.root_path, "mere", "store" });
@@ -1160,12 +1545,12 @@ fn symlinkPackagesToProfile(ctx: *Context, profile_path: []const u8, installed_p
         .{ .text = ": ", .kind = .normal },
         .{ .text = details, .kind = .detail },
     };
-    emit.logSegmentsSeverity(ctx, .install, .info, &segments);
+    emit.logSegmentsSeverity(ctx, phase, .info, &segments);
 }
 
 /// Apply installed packages to the requested profile target.
 /// System profiles create and activate generations; named profiles publish a single root.
-fn applyProfileRealization(ctx: *Context, prof_name: []const u8, installed_packages: []const generation.PackageEntry, verify_store: bool) !void {
+fn applyProfileRealization(ctx: *Context, prof_name: []const u8, installed_packages: []const generation.PackageEntry, verify_store: bool, phase: ui.Phase) !void {
     const profile_dir = try std.fs.path.join(ctx.allocator, &.{ ctx.root_path, "mere", "profiles", prof_name });
     defer ctx.allocator.free(profile_dir);
 
@@ -1205,7 +1590,7 @@ fn applyProfileRealization(ctx: *Context, prof_name: []const u8, installed_packa
             };
         };
 
-        emitInstallGenerationStatus(ctx, "created", gen_num, prof_name);
+        emitGenerationStatus(ctx, "created", gen_num, prof_name, phase);
 
         const result = activation.activateSystemGeneration(
             ctx,
@@ -1237,7 +1622,7 @@ fn applyProfileRealization(ctx: *Context, prof_name: []const u8, installed_packa
             .{ .text = differing_text, .kind = .detail },
             .{ .text = " differing; run 'mere etc status')", .kind = .normal },
         };
-        emit.logSegmentsSeverity(ctx, .install, .info, &segments);
+        emit.logSegmentsSeverity(ctx, phase, .info, &segments);
     } else {
         const stats = profile.publishProfileRoot(
             ctx,
@@ -1279,7 +1664,7 @@ fn applyProfileRealization(ctx: *Context, prof_name: []const u8, installed_packa
             .{ .text = "': ", .kind = .normal },
             .{ .text = details, .kind = .detail },
         };
-        emit.logSegmentsSeverity(ctx, .install, .info, &segments);
+        emit.logSegmentsSeverity(ctx, phase, .info, &segments);
     }
 }
 
@@ -1303,9 +1688,6 @@ fn installSinglePackageToStore(
 ) !generation.PackageEntry {
     const pkg_label = try std.fmt.allocPrint(ctx.allocator, "{s}-{s}-{d}", .{ pkg.name.?, pkg.version.?, pkg.release.? });
     defer ctx.allocator.free(pkg_label);
-
-    const install_id = emit.installStart(ctx, pkg_label);
-    errdefer emit.installError(ctx, install_id, pkg_label);
 
     const pkg_id = try std.fmt.allocPrint(ctx.allocator, "{s}-{s}", .{ pkg.name.?, pkg.version.? });
     defer ctx.allocator.free(pkg_id);
@@ -1346,7 +1728,6 @@ fn installSinglePackageToStore(
             try finalizeAdmittedStoreObject(ctx, repo_cache, preverify_install_dir, &preverify, true);
         }
 
-        emit.installComplete(ctx, install_id, pkg_label);
         keep_preverify_install_dir = true;
 
         return generation.PackageEntry{
@@ -1369,8 +1750,6 @@ fn installSinglePackageToStore(
 
         try finalizeAdmittedStoreObject(ctx, repo_cache, staging.install_dir, &preverify, true);
 
-        emit.installComplete(ctx, install_id, pkg_label);
-
         return generation.PackageEntry{
             .name = try ctx.allocator.dupe(u8, pkg.name.?),
             .version = try ctx.allocator.dupe(u8, pkg.version.?),
@@ -1380,6 +1759,9 @@ fn installSinglePackageToStore(
             .content_hash = staging.content_hash,
         };
     }
+
+    const install_id = emit.installStart(ctx, pkg_label);
+    errdefer emit.installError(ctx, install_id, pkg_label);
 
     if (reinstall and staging.content_exists) {
         ctx.debug("reinstall requested, removing existing store dir: {s}", .{staging.install_dir});
@@ -3732,7 +4114,7 @@ test "installPackageToProfile symlinks to target profile" {
     };
 
     // Call symlinkPackagesToProfile directly
-    try symlinkPackagesToProfile(ctx, target_profile, &installed_packages);
+    try symlinkPackagesToProfile(ctx, target_profile, &installed_packages, .install);
 
     // Verify symlink exists in the profile
     const profile_tool = try std.fs.path.join(ctx.allocator, &.{ target_profile, "usr", "bin", "test-tool" });

@@ -25,6 +25,16 @@ const uninstall_meta = command.CommandMeta{
             .flag_type = .string,
         },
         .{
+            .name = "cascade",
+            .description = "Also remove packages that depend on the uninstalled package",
+            .flag_type = .bool,
+        },
+        .{
+            .name = "dry-run",
+            .description = "Show what would be removed without making changes",
+            .flag_type = .bool,
+        },
+        .{
             .name = "verify-store",
             .description = "Verify store content hashes during activation (slow)",
             .flag_type = .bool,
@@ -46,12 +56,14 @@ fn handleUninstall(ctx: *mere.Context, args: *const types.ParsedArgs) MereError!
     const profile_name = args.getString("profile") orelse "system";
     const verify_store = args.getBool("verify-store");
     const force_sync = args.getBool("sync");
+    const cascade = args.getBool("cascade");
+    const dry_run = args.getBool("dry-run");
 
     const diagnostic_ctx = mere.errors.DiagnosticContext.init()
         .withSubject(package_names[0]);
     ctx.withDiagnosticContext(diagnostic_ctx);
 
-    performUninstall(ctx, package_names, profile_name, verify_store, force_sync) catch |err| {
+    const result = performUninstall(ctx, package_names, profile_name, verify_store, force_sync, cascade, dry_run) catch |err| {
         const mapped_error = mere.errors.ErrorMapping.mapZigError(err);
         const current_diag_ctx = ctx.getDiagnosticContext();
         const user_message = mere.errors.getUserFriendlyMessage(err);
@@ -68,9 +80,17 @@ fn handleUninstall(ctx: *mere.Context, args: *const types.ParsedArgs) MereError!
         };
     };
 
+    if (result) |msg| {
+        return types.CommandResult{
+            .success = false,
+            .exit_code = 1,
+            .message = msg,
+        };
+    }
+
     return types.CommandResult{
         .success = true,
-        .message = "Package(s) uninstalled successfully",
+        .message = null,
     };
 }
 
@@ -80,24 +100,25 @@ fn performUninstall(
     profile_name: []const u8,
     verify_store: bool,
     force_sync: bool,
-) !void {
+    cascade: bool,
+    dry_run: bool,
+) !?[]const u8 {
     _ = try ctx.getConfig();
 
     var curl_client = try download.CurlTransferClient.init(ctx);
     defer download.CurlTransferClient.cleanupFn(ctx, curl_client);
     const client = curl_client.client();
 
-    const result = try mere.install.uninstallPackagesFromConfig(
+    return try mere.install.uninstallPackagesFromConfig(
         ctx,
         package_names,
         client,
         verify_store,
         force_sync,
         profile_name,
+        cascade,
+        dry_run,
     );
-    if (result) |msg| {
-        return ctx.fail(error.InvalidInput, "configuration", msg);
-    }
 }
 
 pub fn createCommand(allocator: std.mem.Allocator) !*command.Command {

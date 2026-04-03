@@ -355,6 +355,7 @@ fn phaseName(phase: ?ui.Phase) ?[]const u8 {
         .prepare => "prepare",
         .build => "build",
         .install => "install",
+        .uninstall => "uninstall",
         .verify => "verify",
         .gc => "gc",
         .import => "import",
