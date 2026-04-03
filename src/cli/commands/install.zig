@@ -103,7 +103,7 @@ fn performInstallation(
     _ = try ctx.getConfig();
 
     // Create curl-backed TransferClient (no logging - errors propagate)
-    var curl_client = try download.CurlTransferClient.init(ctx);
+    var curl_client = try download.CurlTransferClient.init(ctx, command.user_agent);
     defer download.CurlTransferClient.cleanupFn(ctx, curl_client);
     const client = curl_client.client();
 

@@ -65,7 +65,7 @@ fn handleBuild(ctx: *mere.Context, args: *const types.ParsedArgs) MereError!type
     };
 
     // Initialize real curl-backed transfer client for the build request.
-    var curl_client = download.CurlTransferClient.init(ctx) catch |err| {
+    var curl_client = download.CurlTransferClient.init(ctx, command.user_agent) catch |err| {
         // Add diagnostic context for download initialization failures
         ctx.setDiagnosticContext(recipe_path, "failed to initialize download client");
         // Get user-friendly error message and format with context

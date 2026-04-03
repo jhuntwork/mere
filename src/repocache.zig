@@ -1124,7 +1124,7 @@ test "RepoCache.sync downloads and verifies DB and signature" {
     try std.testing.expectEqualStrings(remote_dir, repocache.cacheDir());
 
     // Run sync (for local repos, this verifies the signature in-place)
-    var curl_client = try download.CurlTransferClient.init(ctx);
+    var curl_client = try download.CurlTransferClient.init(ctx, "mere");
     defer download.CurlTransferClient.cleanupFn(ctx, curl_client);
     const client = curl_client.client();
     var loaded_keys = try sign.loadAllKeys(ctx);
