@@ -24,6 +24,8 @@ pub const ResolvedPackage = struct {
     scc_id: usize,
     from_pin: bool = false,
     pinned_store_path: ?[]const u8 = null,
+    /// Package names this package directly depends on (extracted from the dependency graph).
+    dependency_names: []const []const u8 = &.{},
 };
 
 pub const ResolutionResult = struct {
@@ -33,6 +35,8 @@ pub const ResolutionResult = struct {
 
     pub fn deinit(self: *ResolutionResult) void {
         for (self.packages) |*resolved| {
+            for (resolved.dependency_names) |name| self.allocator.free(name);
+            if (resolved.dependency_names.len > 0) self.allocator.free(resolved.dependency_names);
             resolved.pkg.deinit();
         }
         self.allocator.free(self.packages);
@@ -883,7 +887,7 @@ fn collectAndRankCandidates(
     }
 
     if (candidates.items.len == 0) {
-        return ctx.fail(ResolverError.PackageNotFound, pkg_name, "package not found in any repository");
+        return ctx.fail(ResolverError.PackageNotFound, pkg_name, null);
     }
 
     // Sort candidates by version, release, and priority
@@ -1479,11 +1483,24 @@ pub fn withRequirements(
         if (node.pkg == null) {
             return ctx.fail(ResolverError.InvalidInput, node.pkg_key, "resolver lost package ownership");
         }
+
+        // Extract package names from dependency keys (format: "name|version|release|arch")
+        const dep_names = allocator.alloc([]const u8, node.dependencies.items.len) catch {
+            return ResolverError.OutOfMemory;
+        };
+        for (node.dependencies.items, 0..) |dep_key, di| {
+            const sep = std.mem.indexOfScalar(u8, dep_key, '|') orelse dep_key.len;
+            dep_names[di] = allocator.dupe(u8, dep_key[0..sep]) catch {
+                return ResolverError.OutOfMemory;
+            };
+        }
+
         packages[idx] = .{
             .pkg = node.pkg.?,
             .repocache = node.repocache,
             .install_order = order,
             .scc_id = scc_id,
+            .dependency_names = dep_names,
         };
         node.pkg = null;
         idx += 1;

@@ -24,6 +24,7 @@ pub const Phase = enum {
     prepare,
     build,
     install,
+    uninstall,
     verify,
     gc,
     import,
