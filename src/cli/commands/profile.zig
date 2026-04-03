@@ -499,7 +499,7 @@ fn performApply(ctx: *mere.Context, file_path: []const u8, profile_name: []const
     if (specs.len == 0) return error.InvalidInput;
 
     _ = try ctx.getConfig();
-    var curl_client = try mere.download.CurlTransferClient.init(ctx);
+    var curl_client = try mere.download.CurlTransferClient.init(ctx, command.user_agent);
     defer mere.download.CurlTransferClient.cleanupFn(ctx, curl_client);
     const client = curl_client.client();
 

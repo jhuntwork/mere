@@ -2468,7 +2468,7 @@ test "multi-repository install uses priority and resolves dependencies across re
     // Create RepoCache objects from the repo configs
     var repocache1 = try RepoCache.fromConfig(ctx, &ctx.configuration.?.repos.items[0]);
     defer repocache1.deinit();
-    var curl_client = try download.CurlTransferClient.init(ctx);
+    var curl_client = try download.CurlTransferClient.init(ctx, "mere");
     defer download.CurlTransferClient.cleanupFn(ctx, curl_client);
     const client = curl_client.client();
     var loaded_keys = try sign.loadAllKeys(ctx);
@@ -2856,7 +2856,7 @@ test "integration: full install pipeline publishes named profile root" {
     // Create RepoCache and sync
     var repocache = try RepoCache.fromConfig(ctx, &ctx.configuration.?.repos.items[0]);
     defer repocache.deinit();
-    var curl_client = try download.CurlTransferClient.init(ctx);
+    var curl_client = try download.CurlTransferClient.init(ctx, "mere");
     defer download.CurlTransferClient.cleanupFn(ctx, curl_client);
     const client = curl_client.client();
     var loaded_keys = try sign.loadAllKeys(ctx);
@@ -3150,7 +3150,7 @@ test "integration: named profile lifecycle replaces root atomically and additive
     // Create RepoCache and sync
     var repocache = try RepoCache.fromConfig(ctx, &ctx.configuration.?.repos.items[0]);
     defer repocache.deinit();
-    var curl_client = try download.CurlTransferClient.init(ctx);
+    var curl_client = try download.CurlTransferClient.init(ctx, "mere");
     defer download.CurlTransferClient.cleanupFn(ctx, curl_client);
     const client = curl_client.client();
     var loaded_keys = try sign.loadAllKeys(ctx);
@@ -3470,7 +3470,7 @@ test "integration: symlink tree conflict detection" {
 
     var repocache = try RepoCache.fromConfig(ctx, &ctx.configuration.?.repos.items[0]);
     defer repocache.deinit();
-    var curl_client = try download.CurlTransferClient.init(ctx);
+    var curl_client = try download.CurlTransferClient.init(ctx, "mere");
     defer download.CurlTransferClient.cleanupFn(ctx, curl_client);
     const client = curl_client.client();
     var loaded_keys = try sign.loadAllKeys(ctx);
@@ -3750,7 +3750,7 @@ test "integration: multi-repository priority selection" {
     var repocache_low = try RepoCache.fromConfig(ctx, &ctx.configuration.?.repos.items[1]);
     defer repocache_low.deinit();
 
-    var curl_client = try download.CurlTransferClient.init(ctx);
+    var curl_client = try download.CurlTransferClient.init(ctx, "mere");
     defer download.CurlTransferClient.cleanupFn(ctx, curl_client);
     const client = curl_client.client();
 
@@ -3975,7 +3975,7 @@ test "integration: garbage collection removes unreferenced store paths" {
 
     var repocache = try RepoCache.fromConfig(ctx, &ctx.configuration.?.repos.items[0]);
     defer repocache.deinit();
-    var curl_client = try download.CurlTransferClient.init(ctx);
+    var curl_client = try download.CurlTransferClient.init(ctx, "mere");
     defer download.CurlTransferClient.cleanupFn(ctx, curl_client);
     const client = curl_client.client();
     var loaded_keys = try sign.loadAllKeys(ctx);

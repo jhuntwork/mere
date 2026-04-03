@@ -73,10 +73,11 @@ pub const CurlTransferClient = struct {
     curl: ?*c.CURL,
     error_buffer: [c.CURL_ERROR_SIZE]u8,
 
-    pub fn init(ctx: *Context) !*CurlTransferClient {
+    pub fn init(ctx: *Context, user_agent: [*:0]const u8) !*CurlTransferClient {
         const curl = c.curl_easy_init() orelse {
             return error.FileSystem;
         };
+        _ = c.curl_easy_setopt(curl, c.CURLOPT_USERAGENT, user_agent);
 
         const http_client = try ctx.allocator.create(CurlTransferClient);
         http_client.* = CurlTransferClient{
@@ -1152,7 +1153,7 @@ test "downloadFile works with file:// scheme using CurlTransferClient" {
     defer ctx.allocator.free(url_buf);
 
     // Use CurlTransferClient to download
-    var curl_client = try CurlTransferClient.init(ctx);
+    var curl_client = try CurlTransferClient.init(ctx, "mere");
     const client = curl_client.client();
     try downloadFile(client, ctx, url_buf[0.. :0], dest_file_path, DownloadOptions{});
 

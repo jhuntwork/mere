@@ -105,7 +105,7 @@ fn performUninstall(
 ) !?[]const u8 {
     _ = try ctx.getConfig();
 
-    var curl_client = try download.CurlTransferClient.init(ctx);
+    var curl_client = try download.CurlTransferClient.init(ctx, command.user_agent);
     defer download.CurlTransferClient.cleanupFn(ctx, curl_client);
     const client = curl_client.client();
 

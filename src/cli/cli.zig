@@ -435,16 +435,9 @@ pub const CLI = struct {
     /// Handle version requests
     fn handleVersionRequest(self: *CLI) u8 {
         _ = self;
-        const build_zon: struct {
-            name: enum { mere },
-            version: []const u8,
-            fingerprint: u64,
-            minimum_zig_version: []const u8,
-            paths: []const []const u8,
-        } = @import("build_zon");
 
         var version_buffer: [256]u8 = undefined;
-        const version_str = std.fmt.bufPrint(&version_buffer, "mere {s}\n", .{build_zon.version}) catch return 1;
+        const version_str = std.fmt.bufPrint(&version_buffer, "mere {s}\n", .{command.build_zon.version}) catch return 1;
 
         var stdout_buffer: [1024]u8 = undefined;
         var stdout_writer = std.Io.File.stdout().writer(path.currentIo(), &stdout_buffer);
