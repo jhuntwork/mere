@@ -3,6 +3,10 @@
 /// Delegates to s6-rc repo commands for prescription management,
 /// compilation, and live database installation.
 ///
+/// Stores (source definition directories) are registered with the
+/// repository via s6-rc-repo-init; the repo commands handle merging,
+/// compilation, and conflict detection internally.
+///
 /// If the init system changes, this module is replaced.
 const std = @import("std");
 const path_mod = @import("path.zig");
@@ -14,78 +18,31 @@ fn io() std.Io {
 pub const paths = struct {
     pub const pkg_sources = "/usr/share/s6-rc/sources";
     pub const admin_sources = "/etc/s6-rc/sources";
-    pub const store = "/var/lib/s6-rc/store";
     pub const repository = "/var/lib/s6-rc/repository";
     pub const live_dir = "/run/s6-rc";
     pub const log_root = "/var/log";
 };
 
-// ── Store assembly ────────────────────────────────────────────────
-
-/// Scan both source paths, resolve conflicts, and assemble the store.
-/// Admin sources override package sources on name conflict.
-pub fn assembleStore(allocator: std.mem.Allocator) !void {
-    var entries = std.StringHashMap([]const u8).init(allocator);
-    defer entries.deinit();
-
-    // Scan package sources first, then admin (admin wins conflicts)
-    scanSourceDirs(allocator, paths.pkg_sources, &entries);
-    scanSourceDirs(allocator, paths.admin_sources, &entries);
-
-    // Clear the store and rebuild
-    clearDir(paths.store);
-
-    var it = entries.iterator();
-    while (it.next()) |kv| {
-        try copyDir(allocator, kv.value_ptr.*, paths.store, kv.key_ptr.*);
-    }
-}
-
-fn scanSourceDirs(allocator: std.mem.Allocator, base: []const u8, entries: *std.StringHashMap([]const u8)) void {
-    var dir = std.Io.Dir.cwd().openDir(io(), base, .{ .iterate = true }) catch return;
-    defer dir.close(io());
-
-    var iter = dir.iterate();
-    while (iter.next(io()) catch null) |entry| {
-        if (entry.name[0] == '.') continue;
-        if (entry.kind != .directory) continue;
-        const name = allocator.dupe(u8, entry.name) catch continue;
-        const full = std.fs.path.join(allocator, &.{ base, entry.name }) catch continue;
-        entries.put(name, full) catch continue;
-    }
-}
-
-fn clearDir(path: []const u8) void {
-    var dir = std.Io.Dir.cwd().openDir(io(), path, .{ .iterate = true }) catch return;
-    defer dir.close(io());
-    var iter = dir.iterate();
-    while (iter.next(io()) catch null) |entry| {
-        if (entry.kind == .directory) {
-            std.Io.Dir.cwd().deleteTree(io(), std.fs.path.join(std.heap.page_allocator, &.{ path, entry.name }) catch continue) catch {};
-        } else {
-            dir.deleteFile(io(), entry.name) catch {};
-        }
-    }
-}
-
-fn copyDir(allocator: std.mem.Allocator, src_path: []const u8, dest_base: []const u8, name: []const u8) !void {
-    const dest = try std.fs.path.join(allocator, &.{ dest_base, name });
-    defer allocator.free(dest);
-    try exec(allocator, &.{ "cp", "-a", src_path, dest });
-}
-
 // ── Repo commands ─────────────────────────────────────────────────
 
-/// Initialize the repo if it doesn't exist.
+/// Ensure the repository exists and its store list is current.
+/// Creates the repo if missing, updates stores if it already exists.
 pub fn ensureRepo(allocator: std.mem.Allocator) !void {
-    const result = run(allocator, &.{ "s6-rc-repo-list", "-r", paths.repository }) catch return try initRepo(allocator);
+    const result = run(allocator, &.{ "s6-rc-repo-list", "-r", paths.repository }) catch
+        return try initRepo(allocator);
     if (result.term != .exited or result.term.exited != 0)
         return try initRepo(allocator);
+    // Repo exists — ensure store list is up to date.
+    try updateStores(allocator);
 }
 
 fn initRepo(allocator: std.mem.Allocator) !void {
-    try exec(allocator, &.{ "s6-rc-repo-init", "-r", paths.repository, paths.store });
+    try exec(allocator, &.{ "s6-rc-repo-init", "-r", paths.repository, paths.pkg_sources, paths.admin_sources });
     try exec(allocator, &.{ "s6-rc-set-new", "-r", paths.repository, "current" });
+}
+
+fn updateStores(allocator: std.mem.Allocator) !void {
+    try exec(allocator, &.{ "s6-rc-repo-init", "-U", "-r", paths.repository, paths.pkg_sources, paths.admin_sources });
 }
 
 pub fn repoSync(allocator: std.mem.Allocator) !void {
@@ -106,7 +63,6 @@ pub fn setInstall(allocator: std.mem.Allocator) !void {
 
 /// Ensure the live database is up to date. Called lazily by start/stop.
 pub fn ensureInstalled(allocator: std.mem.Allocator) !void {
-    assembleStore(allocator) catch {};
     ensureRepo(allocator) catch {};
     repoSync(allocator) catch {};
     try setCommit(allocator);

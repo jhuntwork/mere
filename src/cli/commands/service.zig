@@ -109,8 +109,6 @@ fn handleRestart(ctx: *mere.Context, args: *const types.ParsedArgs) MereError!ty
 fn handleEnable(ctx: *mere.Context, args: *const types.ParsedArgs) MereError!types.CommandResult {
     const name = try requireName(args);
     const allocator = ctx.allocator;
-    s6rc.assembleStore(allocator) catch
-        return .{ .success = false, .exit_code = 1, .message = "failed to assemble service store" };
     s6rc.ensureRepo(allocator) catch
         return .{ .success = false, .exit_code = 1, .message = "failed to initialize service repository" };
     s6rc.repoSync(allocator) catch
