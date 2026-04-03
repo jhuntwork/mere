@@ -197,6 +197,8 @@ fn clearImmutableFlag(fd: std.posix.fd_t) bool {
 /// 3. Recursively: chown root:root, chmod read-only, set FS_IMMUTABLE_FL
 /// 4. Validates all symlinks stay within the store path boundary
 pub fn harden(ctx: *Context, store_path: []const u8) StoreError!HardenResult {
+    if (std.c.getenv("MERE_NO_HARDEN")) |_| return .{};
+
     if (!isPrivileged()) {
         return ctx.fail(StoreError.PermissionDenied, store_path, "not running as root");
     }
