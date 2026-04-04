@@ -817,6 +817,14 @@ fn setupMinimalDev(allocator: std.mem.Allocator, dev_path: []const u8) EnvError!
     dev_dir.symLink(io, "/proc/self/fd/0", "stdin", .{}) catch {};
     dev_dir.symLink(io, "/proc/self/fd/1", "stdout", .{}) catch {};
     dev_dir.symLink(io, "/proc/self/fd/2", "stderr", .{}) catch {};
+
+    // Mount /dev/shm for POSIX semaphores
+    const shm_path = std.fs.path.join(allocator, &.{ dev_path, "shm" }) catch {
+        return EnvError.OutOfMemory;
+    };
+    defer allocator.free(shm_path);
+    std.Io.Dir.cwd().createDirPath(io, shm_path) catch return EnvError.DeviceSetupError;
+    try mountTmpfs(shm_path, null);
 }
 
 fn bindDeviceNode(target: []const u8, name: []const u8) EnvError!void {
