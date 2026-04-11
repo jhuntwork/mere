@@ -314,8 +314,13 @@ fn hardenDir(io: std.Io, d: std.Io.Dir, result: *HardenResult) void {
 }
 
 fn hardenFile(io: std.Io, f: std.Io.File, result: *HardenResult) void {
+    // Capture mode before fchown — chown clears setuid/setgid bits.
+    const mode = if (f.stat(io)) |st| st.permissions.toMode() else |_| {
+        result.files_processed += 1;
+        return;
+    };
     _ = std.os.linux.fchown(f.handle, 0, 0);
-    stripWriteBits(io, f);
+    f.setPermissions(io, .fromMode(mode & ~@as(std.posix.mode_t, 0o222))) catch {};
     if (!setImmutable(f.handle)) result.immutable_supported = false;
     result.files_processed += 1;
 }

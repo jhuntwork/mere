@@ -7,6 +7,7 @@ test {
     _ = @import("archive.zig");
     _ = @import("build_orchestrator/artifact_model.zig");
     _ = @import("build_cache.zig");
+    _ = @import("cmake_fixup.zig");
     _ = @import("build_orchestrator/cache_solver.zig");
     _ = @import("package_staging.zig");
     _ = @import("build_orchestrator/environment.zig");

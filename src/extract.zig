@@ -202,8 +202,11 @@ fn extractWithLibarchive(
     while (true) {
         const result = c.archive_read_next_header(reader, &entry);
         if (result == c.ARCHIVE_EOF) break;
-        if (result != c.ARCHIVE_OK) {
-            return ctx.fail(ExtractError.PackageExtractFailed, archive_path, "failed to read archive entry header");
+        switch (classifyLibarchiveResult(result, reader, null)) {
+            .ok => {},
+            .warn => |msg| ctx.debug("archive header warning: {s}", .{msg}),
+            .skip_missing_hardlink => unreachable,
+            .fail => |failure| return ctx.fail(failure.err, archive_path, failure.msg),
         }
 
         if (entry == null) continue;
@@ -245,40 +248,82 @@ fn extractWithLibarchive(
 
         // Use libarchive's built-in extract function with disk writer
         const extract_result = c.archive_read_extract2(reader, archive_entry, writer);
-        if (extract_result != c.ARCHIVE_OK) {
-            const error_string = c.archive_error_string(reader);
-            if (error_string != null) {
-                const error_msg = std.mem.span(error_string);
-
-                // Map security errors to InvalidArgument
-                if (std.mem.indexOf(u8, error_msg, "Path contains") != null or
-                    std.mem.indexOf(u8, error_msg, "Absolute path") != null or
-                    std.mem.indexOf(u8, error_msg, "Bad path") != null)
-                {
-                    return ctx.fail(ExtractError.InvalidInput, archive_path, error_msg);
-                }
-                // Map hardlink target not found errors differently based on context
-                if (std.mem.indexOf(u8, error_msg, "Hard-link target") != null and
-                    std.mem.indexOf(u8, error_msg, "does not exist") != null)
-                {
-                    // For single file extraction, skip hardlinks that can't be created
-                    if (target_file != null) {
-                        // Skip this entry and continue with next entry
-                        continue;
-                    }
-                    return ctx.fail(ExtractError.FileSystem, archive_path, error_msg);
-                }
-                ctx.setDiagnosticContext(archive_path, error_msg);
-            }
-            if (extract_result == c.ARCHIVE_FATAL) {
-                return ctx.fail(ExtractError.InvalidInput, archive_path, "fatal archive extraction error");
-            }
-            return ctx.fail(ExtractError.FileSystem, archive_path, "archive extraction failed");
+        switch (classifyLibarchiveResult(extract_result, reader, writer)) {
+            .ok => {},
+            .warn => |msg| ctx.debug("archive warning for {s}: {s}", .{ name, msg }),
+            .skip_missing_hardlink => {
+                if (target_file != null) continue;
+                return ctx.fail(ExtractError.FileSystem, archive_path, "hard-link target does not exist");
+            },
+            .fail => |failure| return ctx.fail(failure.err, archive_path, failure.msg),
         }
         try recordArchivedSpecialBits(ctx, special_bit_policy, pending_special_bits, rel_path, archive_entry);
 
         if (target_file != null) break; // Found our target file
     }
+}
+
+const LibarchiveFailure = struct {
+    err: ExtractError,
+    msg: []const u8,
+};
+
+const LibarchiveAction = union(enum) {
+    ok,
+    warn: []const u8,
+    skip_missing_hardlink,
+    fail: LibarchiveFailure,
+};
+
+fn classifyLibarchiveResult(status: c_int, reader: ?*c.struct_archive, writer: ?*c.struct_archive) LibarchiveAction {
+    if (status == c.ARCHIVE_OK) return .ok;
+
+    const msg = libarchiveMessage(reader, writer);
+    if (status == c.ARCHIVE_WARN) {
+        return switch (classifyLibarchiveMessage(msg)) {
+            .security_path_violation => .{ .fail = .{ .err = ExtractError.InvalidInput, .msg = msg } },
+            .missing_hardlink_target => .skip_missing_hardlink,
+            .other => .{ .warn = msg },
+        };
+    }
+
+    return switch (classifyLibarchiveMessage(msg)) {
+        .security_path_violation => .{ .fail = .{ .err = ExtractError.InvalidInput, .msg = msg } },
+        .missing_hardlink_target => .skip_missing_hardlink,
+        .other => if (status == c.ARCHIVE_FATAL)
+            .{ .fail = .{ .err = ExtractError.InvalidInput, .msg = msg } }
+        else if (status == c.ARCHIVE_FAILED)
+            .{ .fail = .{ .err = ExtractError.PackageExtractFailed, .msg = msg } }
+        else
+            .{ .fail = .{ .err = ExtractError.FileSystem, .msg = msg } },
+    };
+}
+
+fn libarchiveMessage(reader: ?*c.struct_archive, writer: ?*c.struct_archive) []const u8 {
+    const writer_err = if (writer) |w| c.archive_error_string(w) else null;
+    const reader_err = if (reader) |r| c.archive_error_string(r) else null;
+    return if (writer_err != null) std.mem.span(writer_err) else if (reader_err != null) std.mem.span(reader_err) else "unknown archive error";
+}
+
+const LibarchiveMessageClass = enum {
+    security_path_violation,
+    missing_hardlink_target,
+    other,
+};
+
+fn classifyLibarchiveMessage(msg: []const u8) LibarchiveMessageClass {
+    if (std.mem.indexOf(u8, msg, "Path contains") != null or
+        std.mem.indexOf(u8, msg, "Absolute path") != null or
+        std.mem.indexOf(u8, msg, "Bad path") != null)
+    {
+        return .security_path_violation;
+    }
+    if (std.mem.indexOf(u8, msg, "Hard-link target") != null and
+        std.mem.indexOf(u8, msg, "does not exist") != null)
+    {
+        return .missing_hardlink_target;
+    }
+    return .other;
 }
 
 fn mapPathError(err: anyerror) ExtractError {
