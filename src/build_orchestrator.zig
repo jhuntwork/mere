@@ -1194,7 +1194,9 @@ fn unpackSources(state: *BuildExecutionState, parsed_recipe: *const recipe.Recip
         if (err == source_unpacker.UnpackError.NoSources) {
             return;
         }
-        ctx.setDiagnosticContext(workspace.src_dir, "failed to unpack first source");
+        if (ctx.diagnostic_context == null) {
+            ctx.setDiagnosticContext(workspace.src_dir, "failed to unpack first source");
+        }
         return switch (err) {
             error.OutOfMemory => BuildError.OutOfMemory,
             error.PermissionDenied => BuildError.PermissionDenied,

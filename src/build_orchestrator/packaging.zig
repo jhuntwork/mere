@@ -9,6 +9,7 @@ const path_mod = @import("../path.zig");
 const recipe = @import("../recipe.zig");
 const packaging = @import("../packaging.zig");
 const strip = @import("../strip.zig");
+const cmake_fixup = @import("../cmake_fixup.zig");
 const split_staging = @import("split_staging.zig");
 
 const ui = mere.ui;
@@ -277,6 +278,17 @@ fn prepareArtifactStaging(
         }
     }
 
+    if (cmake_fixup.fixupStagingDir(allocator, staging_dir)) |cr| {
+        if (cr.files_fixed > 0) {
+            ctx.debug("fixed cmake store paths in {d} files in {s}", .{ cr.files_fixed, staging_dir });
+        }
+    } else |err| {
+        return switch (err) {
+            error.OutOfMemory => ctx.fail(error.OutOfMemory, staging_dir, "failed to fix cmake store paths"),
+            error.FileSystem => ctx.fail(error.FileSystem, staging_dir, "failed to fix cmake store paths"),
+        };
+    }
+
     if (!strip_enabled) return;
     if (strip.stripDirectory(ctx, staging_dir, null)) |sr| {
         if (sr.files_stripped > 0) {
@@ -306,7 +318,6 @@ fn prepareArtifactStaging(
         };
     }
 }
-
 
 fn generateServiceSourceDir(
     allocator: std.mem.Allocator,
@@ -445,7 +456,7 @@ fn generateLogServiceDir(
     writeServiceFile(ctx, dir, io, "pipeline-name", pipeline_name) catch |err|
         return ctx.fail(err, log_dir, "failed to write pipeline-name");
 
-    const run_script = std.fmt.allocPrint(allocator, "#!/bin/execlineb -P\ns6-log -d3 t /var/log/{s}\n", .{service_name}) catch return error.OutOfMemory;
+    const run_script = std.fmt.allocPrint(allocator, "#!/bin/execlineb -P\ns6-log -b -- t /var/log/{s}\n", .{service_name}) catch return error.OutOfMemory;
     defer allocator.free(run_script);
     writeServiceFile(ctx, dir, io, "run", run_script) catch |err|
         return ctx.fail(err, log_dir, "failed to write log run script");

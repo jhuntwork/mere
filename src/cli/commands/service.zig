@@ -117,6 +117,8 @@ fn handleEnable(ctx: *mere.Context, args: *const types.ParsedArgs) MereError!typ
         return .{ .success = false, .exit_code = 1, .message = "failed to enable service" };
     s6rc.setCommit(allocator) catch
         return .{ .success = false, .exit_code = 1, .message = "failed to commit service changes" };
+    s6rc.setInstall(allocator) catch
+        return .{ .success = false, .exit_code = 1, .message = "failed to install service changes" };
     emit.logLineSeverity(ctx, .service, .info, name);
     return .{ .success = true, .message = "enabled" };
 }
@@ -127,6 +129,8 @@ fn handleDisable(ctx: *mere.Context, args: *const types.ParsedArgs) MereError!ty
         return .{ .success = false, .exit_code = 1, .message = "failed to disable service" };
     s6rc.setCommit(ctx.allocator) catch
         return .{ .success = false, .exit_code = 1, .message = "failed to commit service changes" };
+    s6rc.setInstall(ctx.allocator) catch
+        return .{ .success = false, .exit_code = 1, .message = "failed to install service changes" };
     emit.logLineSeverity(ctx, .service, .info, name);
     return .{ .success = true, .message = "disabled" };
 }
@@ -171,7 +175,10 @@ fn handleStatus(ctx: *mere.Context, args: *const types.ParsedArgs) MereError!typ
     if (s6rc.run(allocator, &.{ "s6-rc", "-l", s6rc.paths.live_dir, "-a", "list" })) |r| {
         var iter = std.mem.splitScalar(u8, r.stdout, '\n');
         while (iter.next()) |line| {
-            if (std.mem.eql(u8, line, name)) { is_up = true; break; }
+            if (std.mem.eql(u8, line, name)) {
+                is_up = true;
+                break;
+            }
         }
     } else |_| {}
 
