@@ -779,6 +779,12 @@ pub fn inferArch(ctx: *Context, dir_path: []const u8) ![]const u8 {
             elf.readElfMachineFromArArchive(abs_path)
         else blk: {
             const header = elf.readElfHeaderInfo(abs_path) catch break :blk null;
+            // Skip relocatable objects (ET_REL) — they are link-time inputs
+            // that may legitimately target foreign architectures (e.g. Go's
+            // cross-compilation .syso files). Only executables and shared
+            // libraries determine the package's host architecture.
+            const et_rel = @intFromEnum(std.elf.ET.REL);
+            if (header.elf_type == et_rel) break :blk null;
             break :blk header.machine;
         };
 
