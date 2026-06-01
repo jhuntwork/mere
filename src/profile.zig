@@ -515,6 +515,10 @@ fn addDeltaPackageProjectionToRealization(
     for (projection.paths.items) |projected_path| {
         if (lookupRetainedPathOwner(parent_state, retained_parent_owners, projected_path)) |retained_owner_index| {
             const retained_pkg = packages[retained_owner_index];
+            // If the retained entry's store path matches the current package's store path,
+            // the path was already seeded correctly (or was misattributed in the parent
+            // realization but points to this same store path). Either way, not a conflict.
+            if (std.mem.eql(u8, retained_pkg.store_path, store_path)) continue;
             detector.recordConflict(projected_path, retained_pkg.name, retained_pkg.store_path, pkg_name, store_path) catch {
                 return ctx.fail(ProfileError.OutOfMemory, projected_path, "failed to record retained path conflict");
             };
@@ -2052,4 +2056,110 @@ test "PathConflict format message" {
     try std.testing.expect(std.mem.indexOf(u8, msg, "/usr/bin/foo") != null);
     try std.testing.expect(std.mem.indexOf(u8, msg, "pkg1") != null);
     try std.testing.expect(std.mem.indexOf(u8, msg, "pkg2") != null);
+}
+
+test "createGeneration no false conflict when parent realization misattributes paths to retained package" {
+    // Regression test: if a parent realization incorrectly attributes package B's
+    // paths to package A's owner index, and a new generation adds package B while
+    // retaining package A, the delta build must not report a false conflict.
+    // This mirrors a real corruption scenario where iptables files were attributed
+    // to s6's index across many generations.
+    const th = @import("test_helpers.zig");
+    var test_env = try th.createTestEnv();
+    defer {
+        test_env.cleanup();
+        std.testing.allocator.destroy(test_env);
+    }
+
+    const allocator = test_env.ctx.allocator;
+    const store_root = try std.fs.path.join(allocator, &.{ test_env.path, "mere", "store" });
+    defer allocator.free(store_root);
+    try path.ensureDirExists(store_root);
+
+    const profile_dir = try std.fs.path.join(allocator, &.{ test_env.path, "profiles", "test" });
+    defer allocator.free(profile_dir);
+    try path.ensureDirExists(profile_dir);
+
+    // pkg-a: retained across both generations, owns bin/atool
+    const pkg_a_hash = "aaaa000000000000000000000000000000000000000000000000000000000000";
+    const pkg_a_path = try std.fs.path.join(allocator, &.{ store_root, pkg_a_hash ++ "-pkg-a-1.0" });
+    defer allocator.free(pkg_a_path);
+    {
+        const bin = try std.fs.path.join(allocator, &.{ pkg_a_path, "bin" });
+        defer allocator.free(bin);
+        try path.ensureDirExists(bin);
+        const f_path = try std.fs.path.join(allocator, &.{ bin, "atool" });
+        defer allocator.free(f_path);
+        var f = try std.Io.Dir.createFileAbsolute(path.currentIo(), f_path, .{});
+        defer f.close(path.currentIo());
+        try f.writeStreamingAll(path.currentIo(), "a");
+    }
+    try writeProjectionForTestPackage(allocator, pkg_a_path);
+
+    // pkg-b: new in gen2, owns bin/btool
+    const pkg_b_hash = "bbbb000000000000000000000000000000000000000000000000000000000000";
+    const pkg_b_path = try std.fs.path.join(allocator, &.{ store_root, pkg_b_hash ++ "-pkg-b-1.0" });
+    defer allocator.free(pkg_b_path);
+    {
+        const bin = try std.fs.path.join(allocator, &.{ pkg_b_path, "bin" });
+        defer allocator.free(bin);
+        try path.ensureDirExists(bin);
+        const f_path = try std.fs.path.join(allocator, &.{ bin, "btool" });
+        defer allocator.free(f_path);
+        var f = try std.Io.Dir.createFileAbsolute(path.currentIo(), f_path, .{});
+        defer f.close(path.currentIo());
+        try f.writeStreamingAll(path.currentIo(), "b");
+    }
+    try writeProjectionForTestPackage(allocator, pkg_b_path);
+
+    // Build gen1 with only pkg-a
+    const gen1_packages = [_]generation.PackageEntry{
+        testPackageEntry("pkg-a", pkg_a_path),
+    };
+    const gen1 = try createGeneration(&test_env.ctx, profile_dir, store_root, &gen1_packages, null);
+    try std.testing.expectEqual(@as(u32, 1), gen1);
+
+    // Corrupt gen1's realization: overwrite it so bin/btool is attributed to
+    // pkg-a's index (0) instead of not existing — simulating the real-world bug.
+    const gen1_path = try std.fs.path.join(allocator, &.{ profile_dir, "gen-1" });
+    defer allocator.free(gen1_path);
+    {
+        var corrupt = generation.RealizationData.init(allocator);
+        defer corrupt.deinit();
+        try corrupt.addEntry("bin/atool", 0); // correct
+        try corrupt.addEntry("bin/btool", 0); // misattributed: belongs to pkg-b but tagged as pkg-a
+        try corrupt.canonicalize();
+        const encoded = try corrupt.encode(allocator);
+        defer allocator.free(encoded);
+        const rlz_path = try std.fs.path.join(allocator, &.{ gen1_path, "realization.v1" });
+        defer allocator.free(rlz_path);
+        var rlz_file = try std.Io.Dir.createFileAbsolute(path.currentIo(), rlz_path, .{});
+        defer rlz_file.close(path.currentIo());
+        try rlz_file.writeStreamingAll(path.currentIo(), encoded);
+    }
+
+    // Build gen2: retain pkg-a, add pkg-b. Without the fix this would false-conflict
+    // on bin/btool (retained under pkg-a's index vs new pkg-b claiming it).
+    const gen2_packages = [_]generation.PackageEntry{
+        testPackageEntry("pkg-a", pkg_a_path),
+        testPackageEntry("pkg-b", pkg_b_path),
+    };
+    const gen2 = try createGeneration(&test_env.ctx, profile_dir, store_root, &gen2_packages, gen1);
+    try std.testing.expectEqual(@as(u32, 2), gen2);
+
+    // Verify gen2 realization has bin/btool attributed to pkg-b (index 1 in sorted order)
+    const gen2_path = try std.fs.path.join(allocator, &.{ profile_dir, "gen-2" });
+    defer allocator.free(gen2_path);
+    const gen2_realization = try generation.readRealization(allocator, gen2_path);
+    defer @constCast(&gen2_realization).deinit();
+
+    var btool_owner: ?u32 = null;
+    for (gen2_realization.entries.items) |entry| {
+        if (std.mem.eql(u8, entry.path, "bin/btool")) {
+            btool_owner = entry.owner_package_index;
+            break;
+        }
+    }
+    // pkg-a sorts before pkg-b, so pkg-b is at index 1
+    try std.testing.expectEqual(@as(?u32, 1), btool_owner);
 }
