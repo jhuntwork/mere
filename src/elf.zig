@@ -268,9 +268,15 @@ pub fn scanElfMetadata(ctx: *Context, path: []const u8) !ElfScanResult {
     var saw_soname = false;
     var entry_offset: usize = 0;
     while (entry_offset + @sizeOf(std.elf.Elf64_Dyn) <= dynamic_section.len) : (entry_offset += @sizeOf(std.elf.Elf64_Dyn)) {
-        const dyn = @as(*const std.elf.Elf64_Dyn, @ptrCast(@alignCast(dynamic_section.ptr + entry_offset)));
-        if (dyn.d_tag == std.elf.DT_NEEDED or dyn.d_tag == std.elf.DT_SONAME) {
-            const str_offset = @as(usize, @intCast(dyn.d_val));
+        // Read fields by offset rather than pointer-casting: dynamic_section is a
+        // byte buffer from allocator.alloc (1-byte aligned), so @alignCast to
+        // *Elf64_Dyn panics in safe builds when the buffer base isn't 8-byte
+        // aligned. The .dynamic entry is { d_tag: i64, d_val/d_ptr: u64 }.
+        // Endianness matches native_endian (guaranteed by the scan's earlier guard).
+        const d_tag = std.mem.readInt(i64, dynamic_section[entry_offset..][0..8], native_endian);
+        const d_val = std.mem.readInt(u64, dynamic_section[entry_offset + 8 ..][0..8], native_endian);
+        if (d_tag == std.elf.DT_NEEDED or d_tag == std.elf.DT_SONAME) {
+            const str_offset = @as(usize, @intCast(d_val));
             if (str_offset >= dynstr.len) continue;
 
             var end = str_offset;
@@ -278,7 +284,7 @@ pub fn scanElfMetadata(ctx: *Context, path: []const u8) !ElfScanResult {
             if (end > str_offset) {
                 const str = dynstr[str_offset..end];
                 const resource = try allocator.dupe(u8, str);
-                if (dyn.d_tag == std.elf.DT_NEEDED) {
+                if (d_tag == std.elf.DT_NEEDED) {
                     ctx.debug("dependency: {s} (type: {s})", .{ resource, pkg.DependencyType.elf_needed.toString() });
                     errdefer allocator.free(resource);
                     try deps.append(.{ .resource = resource, .dep_type = .elf_needed });

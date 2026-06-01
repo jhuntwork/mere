@@ -2011,6 +2011,14 @@ fn enforceRollbackProtection(ctx: *Context, repo_cache: *RepoCache, preverify: *
     // directory directly via `mere import`, so rollback protection is not meaningful.
     if (repo_cache.is_local) return;
 
+    // Rollback protection guards the system against downgrade attacks. Unprivileged
+    // installs only ever produce user-owned store objects, which are not eligible
+    // for system profiles, so there is no privilege boundary to protect — and the
+    // rollback-state cache (/mere/cache/repos, root-owned) is not writable anyway.
+    // Per the spec's Unprivileged Admission Steps, rollback is not part of the
+    // unprivileged path.
+    if (!store.isPrivileged()) return;
+
     repo_cache.checkRollbackState(
         preverify.verifying_fingerprint,
         preverify.parsed.manifest.name,
@@ -2160,7 +2168,10 @@ fn finalizeAdmittedStoreObject(
     }
 
     // Skip rollback state tracking for local repos (no client-side state in source dir)
-    if (!repo_cache.is_local) {
+    // and for unprivileged installs (the rollback-state cache is root-owned and
+    // rollback protection only guards system profiles, which unprivileged installs
+    // cannot affect). See the matching guard in enforceRollbackProtection.
+    if (!repo_cache.is_local and store.isPrivileged()) {
         repo_cache.updateRollbackState(
             preverify.verifying_fingerprint,
             preverify.parsed.manifest.name,
