@@ -10,7 +10,7 @@ jobs:
   detect:
     runs-on: docker
     container:
-      image: mere/ci:v0.10.0
+      image: mere/ci:v0.13.2
     outputs:
       version_changed: ${{ steps.meta.outputs.version_changed }}
       version: ${{ steps.meta.outputs.version }}
@@ -62,7 +62,7 @@ jobs:
     if: needs.detect.outputs.version_changed == 'true'
     runs-on: docker
     container:
-      image: mere/ci:v0.10.0
+      image: mere/ci:v0.13.2
     outputs:
       checksum: ${{ steps.build.outputs.checksum }}
     steps:
@@ -205,7 +205,7 @@ jobs:
     if: needs.detect.outputs.version_changed == 'true'
     runs-on: docker-aarch64
     container:
-      image: mere/ci:v0.10.0
+      image: mere/ci:v0.13.2
     outputs:
       checksum: ${{ steps.build.outputs.checksum }}
     steps:
@@ -296,7 +296,7 @@ jobs:
     if: needs.detect.outputs.version_changed == 'true'
     runs-on: docker
     container:
-      image: mere/ci:v0.10.0
+      image: mere/ci:v0.13.2
     steps:
       - name: Upload SHA256SUMS
         run: |
