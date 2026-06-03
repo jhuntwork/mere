@@ -87,9 +87,9 @@ pub fn handleVerify(ctx: *mere.Context, args: *const types.ParsedArgs) MereError
 
     emit.phaseStart(ctx, .verify, null);
     const step_count: u8 =
-        @intFromBool(opts.verify_store) +
-        @intFromBool(opts.verify_profiles) +
-        @intFromBool(opts.verify_gc_roots);
+        @as(u8, @intFromBool(opts.verify_store)) +
+        @as(u8, @intFromBool(opts.verify_profiles)) +
+        @as(u8, @intFromBool(opts.verify_gc_roots));
     var step_index: u8 = 0;
     if (opts.verify_store) {
         step_index += 1;

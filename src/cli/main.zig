@@ -36,6 +36,13 @@ const global_flags = [_]types.Flag{
         .description = "Show version information",
         .flag_type = .bool,
     },
+    .{
+        .name = "root",
+        .short = 'r',
+        .description = "Set the root prefix path (default: /, env: MERE_ROOT)",
+        .flag_type = .string,
+        .value_name = "PATH",
+    },
 };
 
 /// Root command handler - shows help when no subcommand is given
@@ -54,7 +61,10 @@ pub fn main(init: std.process.Init) !void {
     var cli_system = cli.CLI.init(allocator, "mere", &global_flags);
     defer cli_system.deinit();
 
-    var ctx = mere.Context.init(allocator, null);
+    // Determine root path: --root flag > MERE_ROOT env > default (/)
+    // We initialize with null (default) here; the flag override happens after prescan.
+    const env_root = init.environ_map.get("MERE_ROOT");
+    var ctx = mere.Context.init(allocator, env_root);
     defer ctx.deinit();
 
     // Set home directory from environment
@@ -74,10 +84,19 @@ pub fn main(init: std.process.Init) !void {
     var global_options = cli.CLI.prescanGlobalFlags(allocator, args[1..], &global_flags) catch cli.CLI.PrescanResult{
         .verbose = false,
         .no_color = false,
+        .root = null,
         .filtered_args = &[_][]const u8{},
         .allocator = allocator,
     };
     defer if (global_options.filtered_args.len > 0) global_options.deinit(allocator);
+
+    // Apply --root flag override (takes precedence over MERE_ROOT env)
+    if (global_options.root) |root_path| {
+        ctx.setRoot(root_path) catch {
+            std.process.exit(1);
+        };
+    }
+
     const config_color = mere.config.loadSystemColorSetting(&ctx) catch null;
     var ui_emitter = mere.ui.ProgressEmitter.init(allocator, &stdout_writer, &stderr_writer, .{
         .tty = stdout_tty,
