@@ -4474,7 +4474,7 @@ test "setDirectoryReadOnly reports traversal permission failures" {
 }
 
 test "finalizeAdmittedStoreObject fails hard on rollback-state update after admission" {
-    if (std.os.linux.geteuid() == 0) return error.SkipZigTest;
+    if (store.isPrivileged()) return error.SkipZigTest;
 
     const th = @import("test_helpers.zig");
     var test_env = try th.createTestEnv();
