@@ -137,6 +137,7 @@ pub const CLI = struct {
     pub const PrescanResult = struct {
         verbose: bool,
         no_color: bool,
+        root: ?[]const u8,
         filtered_args: []const []const u8,
         allocator: std.mem.Allocator,
 
@@ -155,6 +156,7 @@ pub const CLI = struct {
     ) MereError!PrescanResult {
         var verbose = false;
         var no_color = false;
+        var root: ?[]const u8 = null;
         var filtered = std.ArrayList([]const u8).empty;
         defer filtered.deinit(allocator);
 
@@ -174,12 +176,49 @@ pub const CLI = struct {
                 break;
             }
 
+            // Check for --flag=value style for global flags
+            if (std.mem.startsWith(u8, arg, "--")) {
+                if (std.mem.indexOfScalar(u8, arg, '=')) |eq_pos| {
+                    const flag_name = arg[2..eq_pos];
+                    const value = arg[eq_pos + 1 ..];
+                    if (findGlobalFlagByName(global_flags, flag_name)) |flag| {
+                        if (flag.flag_type == .string) {
+                            if (std.mem.eql(u8, flag.name, "root")) root = value;
+                            i += 1;
+                            continue;
+                        }
+                    }
+                }
+            }
+
             if (findGlobalFlag(global_flags, arg)) |flag| {
-                if (flag.flag_type != .bool) return MereError.InvalidInput;
-                if (std.mem.eql(u8, flag.name, "verbose")) verbose = true;
-                if (std.mem.eql(u8, flag.name, "no-color")) no_color = true;
-                i += 1;
-                continue;
+                if (flag.flag_type == .bool) {
+                    if (std.mem.eql(u8, flag.name, "verbose")) verbose = true;
+                    if (std.mem.eql(u8, flag.name, "no-color")) no_color = true;
+                    i += 1;
+                    continue;
+                }
+                // String-valued global flag: consume next argument as value
+                if (flag.flag_type == .string) {
+                    i += 1;
+                    if (i >= args.len) return MereError.MissingArgument;
+                    if (std.mem.eql(u8, flag.name, "root")) root = args[i];
+                    i += 1;
+                    continue;
+                }
+                return MereError.InvalidInput;
+            }
+
+            // Check for short flag with value: -r/path
+            if (arg.len > 2 and arg[0] == '-' and arg[1] != '-') {
+                const short = arg[1];
+                if (findGlobalFlagByShort(global_flags, short)) |flag| {
+                    if (flag.flag_type == .string) {
+                        if (std.mem.eql(u8, flag.name, "root")) root = arg[2..];
+                        i += 1;
+                        continue;
+                    }
+                }
             }
 
             // Check for unknown global flags (only before first command token)
@@ -200,6 +239,7 @@ pub const CLI = struct {
         return PrescanResult{
             .verbose = verbose,
             .no_color = no_color,
+            .root = root,
             .filtered_args = try allocator.dupe([]const u8, filtered.items),
             .allocator = allocator,
         };
@@ -552,6 +592,20 @@ pub const CLI = struct {
         return null;
     }
 
+    fn findGlobalFlagByName(global_flags: []const types.Flag, name: []const u8) ?types.Flag {
+        for (global_flags) |flag| {
+            if (std.mem.eql(u8, flag.name, name)) return flag;
+        }
+        return null;
+    }
+
+    fn findGlobalFlagByShort(global_flags: []const types.Flag, short: u8) ?types.Flag {
+        for (global_flags) |flag| {
+            if (flag.short != null and flag.short.? == short) return flag;
+        }
+        return null;
+    }
+
     fn findUnknownGlobalFlag(args: []const []const u8, global_flags: []const types.Flag) ?[]const u8 {
         var seen_command_token = false;
         var i: usize = 0;
@@ -561,7 +615,19 @@ pub const CLI = struct {
             if (std.mem.eql(u8, arg, "--")) break;
             if (!seen_command_token and std.mem.startsWith(u8, arg, "-")) {
                 if (findGlobalFlag(global_flags, arg) != null) {
+                    // Known bool or exact short flag — skip (value-taking flags
+                    // consume the next arg, but this function only checks names).
                     continue;
+                }
+                // Check --flag=value form
+                if (std.mem.startsWith(u8, arg, "--")) {
+                    if (std.mem.indexOfScalar(u8, arg, '=')) |eq_pos| {
+                        if (findGlobalFlagByName(global_flags, arg[2..eq_pos]) != null) continue;
+                    }
+                }
+                // Check -Xvalue form (short flag with inline value)
+                if (arg.len > 2 and arg[0] == '-' and arg[1] != '-') {
+                    if (findGlobalFlagByShort(global_flags, arg[1]) != null) continue;
                 }
                 return arg;
             }
