@@ -4473,7 +4473,7 @@ test "setDirectoryReadOnly reports traversal permission failures" {
     try std.testing.expectError(error.AccessDenied, result);
 }
 
-test "finalizeAdmittedStoreObject fails hard on rollback-state update after admission" {
+test "finalizeAdmittedStoreObject skips rollback-state and hardening when unprivileged" {
     if (store.isPrivileged()) return error.SkipZigTest;
 
     const th = @import("test_helpers.zig");
@@ -4488,16 +4488,9 @@ test "finalizeAdmittedStoreObject fails hard on rollback-state update after admi
     defer ctx.allocator.free(install_dir);
     try path.ensureDirExists(install_dir);
 
-    // Non-local repo cache so rollback-state update path is exercised.
     var repo_cache = try RepoCache.init(ctx, "remote-finalize-test", "https://example.invalid/repo", &[_][]const u8{}, 100);
     defer repo_cache.deinit();
     try path.ensureDirExists(repo_cache.cache_dir);
-
-    // Force rollback-state write failure while leaving admitted store object intact.
-    var cache_dir_handle = try path.openExistingDir(repo_cache.cache_dir);
-    defer cache_dir_handle.close(path.currentIo());
-    try cache_dir_handle.setPermissions(path.currentIo(), .fromMode(0o555));
-    defer cache_dir_handle.setPermissions(path.currentIo(), .fromMode(0o755)) catch {};
 
     var content_hash_bytes: [32]u8 = undefined;
     _ = try std.fmt.hexToBytes(&content_hash_bytes, "d" ** 64);
@@ -4521,13 +4514,17 @@ test "finalizeAdmittedStoreObject fails hard on rollback-state update after admi
     };
     defer preverify.deinit(ctx.allocator);
 
-    try std.testing.expectError(
-        error.PermissionDenied,
-        finalizeAdmittedStoreObject(ctx, &repo_cache, install_dir, &preverify, false),
-    );
-    ctx.resetDiagnostics();
+    // Unprivileged: function succeeds, skipping both hardening and rollback-state
+    // updates. These features are only meaningful for privileged system installs;
+    // see the matching guards in finalizeAdmittedStoreObject and
+    // enforceRollbackProtection.
+    try finalizeAdmittedStoreObject(ctx, &repo_cache, install_dir, &preverify, false);
 
-    // Store object remains admitted; post-admission finalization failure does not
-    // remove the object.
+    // Verify rollback state file was NOT created.
+    const rollback_path = try std.fs.path.join(ctx.allocator, &.{ repo_cache.cache_dir, "rollback-state.json" });
+    defer ctx.allocator.free(rollback_path);
+    try std.testing.expectError(error.FileNotFound, std.Io.Dir.accessAbsolute(path.currentIo(), rollback_path, .{}));
+
+    // Store object remains admitted.
     try std.Io.Dir.accessAbsolute(path.currentIo(), install_dir, .{});
 }
