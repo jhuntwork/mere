@@ -508,9 +508,10 @@ fn packageStagedPackage(
     ) catch |err| {
         packaging_errors_encountered.* = true;
         return switch (err) {
-            error.OutOfMemory => ctx.fail(error.OutOfMemory, artifact.name, "failed to resolve package cache"),
-            error.PermissionDenied => ctx.fail(error.PermissionDenied, artifact.name, "failed to resolve package cache"),
-            else => ctx.fail(error.PackageCreationFailed, artifact.name, "failed to resolve package cache"),
+            error.OutOfMemory => ctx.fail(error.OutOfMemory, artifact.name, "failed to resolve package cache; out of memory"),
+            error.PermissionDenied => ctx.fail(error.PermissionDenied, artifact.name, "failed to resolve package cache; permission denied on staging_dir or output_dir"),
+            error.FileSystem => ctx.fail(error.PackageCreationFailed, artifact.name, "failed to resolve package cache; filesystem error reading staging or output directory"),
+            error.InvalidInput => ctx.fail(error.PackageCreationFailed, artifact.name, "failed to resolve package cache; invalid input computing archive key"),
         };
     };
     if (restored) |*result| {
