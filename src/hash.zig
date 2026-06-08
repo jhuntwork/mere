@@ -1,4 +1,5 @@
 const std = @import("std");
+const mere = @import("mere.zig");
 const path = @import("path.zig");
 const errors = @import("errors.zig");
 
@@ -49,7 +50,7 @@ pub fn calculateBytesHash(allocator: std.mem.Allocator, bytes: []const u8) HashE
     };
 }
 
-pub fn calculateFileHash(allocator: std.mem.Allocator, file_path: []const u8) HashError![]const u8 {
+pub fn calculateFileHash(ctx: *mere.Context, file_path: []const u8) HashError![]const u8 {
     if (!path.isValidInputPath(file_path)) {
         return HashError.InvalidInput;
     }
@@ -58,6 +59,7 @@ pub fn calculateFileHash(allocator: std.mem.Allocator, file_path: []const u8) Ha
 
     if (std.fs.path.isAbsolute(file_path)) {
         archive_file = std.Io.Dir.openFileAbsolute(io, file_path, .{}) catch |err| {
+            ctx.setDiagnosticContext(file_path, @errorName(err));
             return switch (err) {
                 error.FileNotFound => HashError.FileSystem,
                 else => mapHashFsError(err),
@@ -65,6 +67,7 @@ pub fn calculateFileHash(allocator: std.mem.Allocator, file_path: []const u8) Ha
         };
     } else {
         archive_file = std.Io.Dir.cwd().openFile(io, file_path, .{}) catch |err| {
+            ctx.setDiagnosticContext(file_path, @errorName(err));
             return switch (err) {
                 error.FileNotFound => HashError.FileSystem,
                 else => mapHashFsError(err),
@@ -81,6 +84,7 @@ pub fn calculateFileHash(allocator: std.mem.Allocator, file_path: []const u8) Ha
         var offset: u64 = 0;
         while (true) {
             const bytes_read = archive_file.readPositionalAll(io, &buf, offset) catch |err| {
+                ctx.setDiagnosticContext(file_path, @errorName(err));
                 return mapHashFsError(err);
             };
             if (bytes_read == 0) break;
@@ -91,7 +95,7 @@ pub fn calculateFileHash(allocator: std.mem.Allocator, file_path: []const u8) Ha
 
     hasher.final(&hash_buffer);
 
-    return std.fmt.allocPrint(allocator, "{x}", .{hash_buffer}) catch {
+    return std.fmt.allocPrint(ctx.allocator, "{x}", .{hash_buffer}) catch {
         return HashError.OutOfMemory;
     };
 }
@@ -521,7 +525,7 @@ test "calculateFileHash" {
     test_file.close(path.currentIo());
 
     // Calculate hash
-    const hash = try calculateFileHash(test_env.ctx.allocator, test_file_path);
+    const hash = try calculateFileHash(&test_env.ctx, test_file_path);
     defer test_env.ctx.allocator.free(hash);
 
     // Verify hash is not null and has expected length
@@ -573,11 +577,11 @@ test "calculateFileHash with relative path" {
     try std.Io.Threaded.chdir(test_env.path);
 
     // Calculate hash using relative path
-    const hash_relative = try calculateFileHash(test_env.ctx.allocator, test_file_name);
+    const hash_relative = try calculateFileHash(&test_env.ctx, test_file_name);
     defer test_env.ctx.allocator.free(hash_relative);
 
     // Calculate hash using absolute path for comparison
-    const hash_absolute = try calculateFileHash(test_env.ctx.allocator, test_file_path);
+    const hash_absolute = try calculateFileHash(&test_env.ctx, test_file_path);
     defer test_env.ctx.allocator.free(hash_absolute);
 
     // Verify both hashes are the same

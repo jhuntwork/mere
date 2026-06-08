@@ -152,7 +152,7 @@ pub fn computeSourceFetchKey(
     out.writeAll("source-fetch-v1\n") catch return error.OutOfMemory;
     try appendRecipeVars(out, parsed_recipe);
     try appendSourceInputs(allocator, ctx, out, recipe_dir, parsed_recipe);
-    try appendRecipeCompanionInputs(allocator, out, recipe_dir);
+    try appendRecipeCompanionInputs(ctx, out, recipe_dir);
 
     buf = out_buf.toArrayList();
     return hash.calculateBytesHash(allocator, buf.items) catch |err| mapHashError(err);
@@ -272,8 +272,8 @@ pub fn computePackageArchiveKey(
     out.print("release={d}\n", .{parsed_recipe.release}) catch return error.OutOfMemory;
     out.print("arch={s}\n", .{parsed_recipe.arch orelse "any"}) catch return error.OutOfMemory;
 
-    const signing_key_hash = try computeSigningKeyHash(allocator, ctx);
-    defer allocator.free(signing_key_hash);
+    const signing_key_hash = try computeSigningKeyHash(ctx);
+    defer ctx.allocator.free(signing_key_hash);
     out.print("signing_key={s}\n", .{signing_key_hash}) catch return error.OutOfMemory;
 
     for (injected_dependencies) |dep| {
@@ -785,7 +785,7 @@ pub fn storePackageArchiveForKey(
     try ensurePath(artifacts_root);
     try ensurePath(keys_root);
 
-    const artifact_digest_hex = hash.calculateFileHash(allocator, archive_path) catch |err| return mapHashError(err);
+    const artifact_digest_hex = hash.calculateFileHash(ctx, archive_path) catch |err| return mapHashError(err);
     errdefer allocator.free(artifact_digest_hex);
     if (!std.mem.eql(u8, artifact_digest_hex, archive_hash)) {
         return error.InvalidInput;
@@ -924,7 +924,7 @@ fn appendSourceInputs(
         if (std.mem.indexOf(u8, expanded, "://") == null and recipe_dir.len > 0) {
             const local_path = try std.fs.path.join(allocator, &.{ recipe_dir, expanded });
             defer allocator.free(local_path);
-            const file_hash = hash.calculateFileHash(allocator, local_path) catch |err| {
+            const file_hash = hash.calculateFileHash(ctx, local_path) catch |err| {
                 return mapHashError(err);
             };
             defer allocator.free(file_hash);
@@ -934,7 +934,7 @@ fn appendSourceInputs(
 }
 
 fn appendRecipeCompanionInputs(
-    allocator: std.mem.Allocator,
+    ctx: *mere.Context,
     writer: *std.Io.Writer,
     recipe_dir: []const u8,
 ) CacheError!void {
@@ -951,8 +951,8 @@ fn appendRecipeCompanionInputs(
 
     var names: std.ArrayList([]const u8) = .empty;
     defer {
-        for (names.items) |name| allocator.free(name);
-        names.deinit(allocator);
+        for (names.items) |name| ctx.allocator.free(name);
+        names.deinit(ctx.allocator);
     }
 
     var iter = dir.iterate();
@@ -966,25 +966,25 @@ fn appendRecipeCompanionInputs(
             else => continue,
         }
         if (std.mem.eql(u8, entry.name, "recipe.kdl")) continue;
-        try names.append(allocator, try allocator.dupe(u8, entry.name));
+        try names.append(ctx.allocator, try ctx.allocator.dupe(u8, entry.name));
     }
 
     std.mem.sort([]const u8, names.items, {}, lessThan);
 
     var target_buf: [std.fs.max_path_bytes]u8 = undefined;
     for (names.items) |name| {
-        const abs_path = try std.fs.path.join(allocator, &.{ recipe_dir, name });
-        defer allocator.free(abs_path);
+        const abs_path = try std.fs.path.join(ctx.allocator, &.{ recipe_dir, name });
+        defer ctx.allocator.free(abs_path);
 
         if (std.Io.Dir.readLinkAbsolute(io, abs_path, &target_buf)) |target_len| {
             writer.print("companion.symlink.{s}={s}\n", .{ name, target_buf[0..target_len] }) catch return error.OutOfMemory;
             continue;
         } else |_| {}
 
-        const file_hash = hash.calculateFileHash(allocator, abs_path) catch |err| {
+        const file_hash = hash.calculateFileHash(ctx, abs_path) catch |err| {
             return mapHashError(err);
         };
-        defer allocator.free(file_hash);
+        defer ctx.allocator.free(file_hash);
         writer.print("companion.file.{s}={s}\n", .{ name, file_hash }) catch return error.OutOfMemory;
     }
 }
@@ -1367,14 +1367,14 @@ fn freeCopiedFileList(allocator: std.mem.Allocator, copied: *std.ArrayList([]con
     copied.clearRetainingCapacity();
 }
 
-fn computeSigningKeyHash(allocator: std.mem.Allocator, ctx: *mere.Context) CacheError![]const u8 {
+fn computeSigningKeyHash(ctx: *mere.Context) CacheError![]const u8 {
     const key_path = ctx.signing_key_path orelse blk: {
         const home = ctx.home_dir orelse return error.InvalidInput;
-        break :blk try std.fmt.allocPrint(allocator, "{s}/.mere/keys/mere.key", .{home});
+        break :blk try std.fmt.allocPrint(ctx.allocator, "{s}/.mere/keys/mere.key", .{home});
     };
     const owns_key_path = ctx.signing_key_path == null;
-    defer if (owns_key_path) allocator.free(key_path);
-    return hash.calculateFileHash(allocator, key_path) catch |err| {
+    defer if (owns_key_path) ctx.allocator.free(key_path);
+    return hash.calculateFileHash(ctx, key_path) catch |err| {
         return mapHashError(err);
     };
 }

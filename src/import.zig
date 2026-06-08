@@ -544,7 +544,7 @@ fn prepareVerifiedImport(ctx: *Context, final_pkg_path: []const u8) !PreparedImp
     try validateProjectionIndex(ctx, extract_res.temp_dir);
 
     try attachManifestSignature(ctx, extract_res.temp_dir, &manifest_res.pkg);
-    manifest_res.pkg.archive_hash = hash.calculateFileHash(ctx.allocator, final_pkg_path) catch |err| {
+    manifest_res.pkg.archive_hash = hash.calculateFileHash(ctx, final_pkg_path) catch |err| {
         return ctx.fail(err, final_pkg_path, "failed to compute package archive hash");
     };
 

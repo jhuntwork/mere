@@ -231,7 +231,7 @@ fn getFileHash(ctx: *Context, file_path: []const u8) SignError![32]u8 {
         return SignError.FileSystem;
     };
 
-    const hex_hash = hash.calculateFileHash(ctx.allocator, file_path_abs) catch |err| {
+    const hex_hash = hash.calculateFileHash(ctx, file_path_abs) catch |err| {
         if (err == error.FileNotFound or err == error.AccessDenied) {
             return SignError.FileSystem;
         } else if (err == error.OutOfMemory or err == error.EndOfStream or err == error.Unexpected) {
@@ -659,7 +659,7 @@ test "generateKeyPair, signFile and verifySignature" {
         std.testing.allocator.destroy(test_env);
     }
 
-    var ctx = test_env.ctx;
+    const ctx = &test_env.ctx;
     ctx.debug("test: assign ctx", .{});
 
     ctx.debug("test: libsodium init", .{});
@@ -700,7 +700,7 @@ test "generateKeyPair, signFile and verifySignature" {
     ctx.debug("attempting to sign file: {s}", .{test_file_path});
     const sig_path = try std.fmt.allocPrint(testing.allocator, "{s}.sig", .{test_file_path});
     defer testing.allocator.free(sig_path);
-    _ = try writeSignatureFileWithResolver(&ctx, test_file_path, sig_path, null, null);
+    _ = try writeSignatureFileWithResolver(ctx, test_file_path, sig_path, null, null);
 
     ctx.debug("test: verify signature exists", .{});
     const sig_file = try std.Io.Dir.openFileAbsolute(path_mod.currentIo(), sig_path, .{});
@@ -708,31 +708,31 @@ test "generateKeyPair, signFile and verifySignature" {
 
     ctx.debug("test: verifySignature", .{});
     ctx.debug("attempting to verify signature...", .{});
-    try verifySignature(&ctx, test_file_path, public_key_path, null);
+    try verifySignature(ctx, test_file_path, public_key_path, null);
 
     ctx.debug("test: explicit signature path", .{});
     const custom_sig_path = try std.fs.path.join(testing.allocator, &.{ test_env.path, "custom.sig" });
     defer testing.allocator.free(custom_sig_path);
 
     ctx.debug("testing with custom signature path: {s}", .{custom_sig_path});
-    _ = try writeSignatureFileWithResolver(&ctx, test_file_path, custom_sig_path, null, null);
+    _ = try writeSignatureFileWithResolver(ctx, test_file_path, custom_sig_path, null, null);
 
-    try verifySignature(&ctx, test_file_path, public_key_path, custom_sig_path);
+    try verifySignature(ctx, test_file_path, public_key_path, custom_sig_path);
 
     ctx.debug("test: error cases", .{});
     const nonexistent_file = try std.fs.path.join(testing.allocator, &.{ test_env.path, "nonexistent.txt" });
     defer testing.allocator.free(nonexistent_file);
 
-    try testing.expectError(SignError.FileSystem, signWithResolvedKey(&ctx, nonexistent_file, null, null));
-    try testing.expectError(SignError.FileSystem, verifySignature(&ctx, nonexistent_file, public_key_path, null));
+    try testing.expectError(SignError.FileSystem, signWithResolvedKey(ctx, nonexistent_file, null, null));
+    try testing.expectError(SignError.FileSystem, verifySignature(ctx, nonexistent_file, public_key_path, null));
 
     const nonexistent_key = try std.fs.path.join(testing.allocator, &.{ test_env.path, "nonexistent.key" });
     defer testing.allocator.free(nonexistent_key);
 
     // Set the signing key path to a nonexistent key to trigger the error
     ctx.signing_key_path = nonexistent_key;
-    try testing.expectError(SignError.FileSystem, signWithResolvedKey(&ctx, test_file_path, null, null));
-    try testing.expectError(SignError.FileSystem, verifySignature(&ctx, test_file_path, nonexistent_key, null));
+    try testing.expectError(SignError.FileSystem, signWithResolvedKey(ctx, test_file_path, null, null));
+    try testing.expectError(SignError.FileSystem, verifySignature(ctx, test_file_path, nonexistent_key, null));
     ctx.debug("test: end", .{});
 }
 

@@ -362,7 +362,7 @@ pub const Packager = struct {
             return self.fail(config.staging_dir, "failed to create package artifact", PackagingError.CreationFailed);
         };
 
-        const archive_hash = hash.calculateFileHash(self.ctx.allocator, archive_temp) catch {
+        const archive_hash = hash.calculateFileHash(self.ctx, archive_temp) catch {
             self.ctx.allocator.free(content_hash);
             return self.fail(archive_temp, "failed to compute archive hash", PackagingError.CreationFailed);
         };

@@ -1970,7 +1970,7 @@ fn preVerifyManifest(
     errdefer parsed_manifest.deinit(ctx.allocator);
 
     const manifest_content_hash = try parsed_manifest.manifest.contentHashHex(ctx.allocator);
-    const archive_hash = try hash.calculateFileHash(ctx.allocator, cache_path);
+    const archive_hash = try hash.calculateFileHash(ctx, cache_path);
     ctx.debug("content hash from manifest: {s}", .{manifest_content_hash});
     ctx.debug("archive hash from package file: {s}", .{archive_hash});
 
@@ -4412,7 +4412,7 @@ fn finalizeTestPackageArchive(
 
     try archive.createPackageArchive(ctx, staging_dir, archive_temp);
 
-    const archive_hash = try hash.calculateFileHash(ctx.allocator, archive_temp);
+    const archive_hash = try hash.calculateFileHash(ctx, archive_temp);
     defer ctx.allocator.free(archive_hash);
 
     if (pkg.archive_hash.len > 0) {

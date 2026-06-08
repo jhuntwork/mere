@@ -165,7 +165,7 @@ fn handleHash(ctx: *mere.Context, args: *const types.ParsedArgs) MereError!types
     ctx.withDiagnosticContext(diag_ctx);
 
     // Perform hash calculation with error handling at CLI boundary
-    const hash_str = hash.calculateFileHash(ctx.allocator, file_path) catch |err| {
+    const hash_str = hash.calculateFileHash(ctx, file_path) catch |err| {
         // Get user-friendly error message and format with context
         const user_message = getUserFriendlyMessage(err);
         const error_ctx = ctx.getDiagnosticContext().toErrorContext();

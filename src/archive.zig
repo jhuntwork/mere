@@ -110,7 +110,7 @@ pub fn deduplicate(ctx: *Context, dir_path: []const u8) ArchiveError!Deduplicati
             return ctx.fail(mapArchiveFsError(err), abs_for_hash, "path escapes directory");
         };
 
-        const h = hash.calculateFileHash(ctx.allocator, abs_for_hash) catch |err| {
+        const h = hash.calculateFileHash(ctx, abs_for_hash) catch |err| {
             return ctx.fail(mapHashError(err), abs_for_hash, "failed to calculate file hash");
         };
         const h_dup = try alloc.dupe(u8, h);

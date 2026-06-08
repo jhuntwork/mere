@@ -1006,7 +1006,7 @@ test "packageArtifacts records archive metadata for staged packages" {
             const archive_path = try std.fs.path.join(ctx.allocator, &.{ cfg.staging_dir, "stub.pkg.tar.zst" });
             try std.Io.Dir.cwd().writeFile(path_mod.currentIo(), .{ .sub_path = archive_path, .data = "archive" });
             const content_hash = try ctx.allocator.dupe(u8, "hash");
-            const archive_hash = try hash.calculateFileHash(ctx.allocator, archive_path);
+            const archive_hash = try hash.calculateFileHash(ctx, archive_path);
             const package_name = try ctx.allocator.dupe(u8, cfg.artifact.name);
             return packaging.PackageArtifactResult{
                 .archive_path = archive_path,
@@ -1178,7 +1178,7 @@ test "packageArtifacts compresses man pages by default before packaging" {
         pub fn create(ctx: *mere.Context, cfg: packaging.PackageArtifactConfig) anyerror!packaging.PackageArtifactResult {
             const archive_path = try std.fs.path.join(ctx.allocator, &.{ cfg.staging_dir, "stub.pkg.tar.zst" });
             try std.Io.Dir.cwd().writeFile(path_mod.currentIo(), .{ .sub_path = archive_path, .data = "archive" });
-            const archive_hash = try hash.calculateFileHash(ctx.allocator, archive_path);
+            const archive_hash = try hash.calculateFileHash(ctx, archive_path);
             return .{
                 .archive_path = archive_path,
                 .content_hash = try ctx.allocator.dupe(u8, "hash"),
@@ -1274,7 +1274,7 @@ test "packageArtifacts respects compress-manpages false" {
         pub fn create(ctx: *mere.Context, cfg: packaging.PackageArtifactConfig) anyerror!packaging.PackageArtifactResult {
             const archive_path = try std.fs.path.join(ctx.allocator, &.{ cfg.staging_dir, "stub.pkg.tar.zst" });
             try std.Io.Dir.cwd().writeFile(path_mod.currentIo(), .{ .sub_path = archive_path, .data = "archive" });
-            const archive_hash = try hash.calculateFileHash(ctx.allocator, archive_path);
+            const archive_hash = try hash.calculateFileHash(ctx, archive_path);
             return .{
                 .archive_path = archive_path,
                 .content_hash = try ctx.allocator.dupe(u8, "hash"),
@@ -1435,7 +1435,7 @@ test "packageArtifacts emits per-package metadata report callback" {
             const archive_path = try std.fs.path.join(ctx_inner.allocator, &.{ cfg.staging_dir, "stub.pkg.tar.zst" });
             try std.Io.Dir.cwd().writeFile(path_mod.currentIo(), .{ .sub_path = archive_path, .data = "archive" });
             const content_hash = try ctx_inner.allocator.dupe(u8, "hash");
-            const archive_hash = try hash.calculateFileHash(ctx_inner.allocator, archive_path);
+            const archive_hash = try hash.calculateFileHash(ctx_inner, archive_path);
             const package_name = try ctx_inner.allocator.dupe(u8, cfg.artifact.name);
             return packaging.PackageArtifactResult{
                 .archive_path = archive_path,
@@ -1577,7 +1577,7 @@ test "packageArtifacts creates package archives concurrently and preserves outpu
 
             const archive_path = try std.fs.path.join(ctx.allocator, &.{ cfg.output_dir, archive_name });
             try std.Io.Dir.cwd().writeFile(path_mod.currentIo(), .{ .sub_path = archive_path, .data = "archive" });
-            const archive_hash = try hash.calculateFileHash(ctx.allocator, archive_path);
+            const archive_hash = try hash.calculateFileHash(ctx, archive_path);
 
             return packaging.PackageArtifactResult{
                 .archive_path = archive_path,

@@ -281,7 +281,7 @@ pub fn dummy_download_file(
     const final_bytes_total = initial_size + body_to_write.len;
 
     if (options.expected_hash) |expected_hash| {
-        const actual_hex = hash.calculateFileHash(ctx.allocator, temp_path) catch |err| {
+        const actual_hex = hash.calculateFileHash(ctx, temp_path) catch |err| {
             return ctx.fail(err, temp_path, "failed to hash downloaded file");
         };
         defer ctx.allocator.free(actual_hex);
@@ -742,7 +742,7 @@ pub fn setupBusyboxRepo(test_env: *TestEnv) !TestRepoSetup {
     defer ctx.allocator.free(tmp_pkg_file);
     try archive.createPackageArchive(ctx, pkg_staging, tmp_pkg_file);
 
-    pkg.archive_hash = try hash.calculateFileHash(ctx.allocator, tmp_pkg_file);
+    pkg.archive_hash = try hash.calculateFileHash(ctx, tmp_pkg_file);
     const pkg_canon = try pkg.canonicalArchiveName();
     defer ctx.allocator.free(pkg_canon);
     const pkg_file = try std.fs.path.join(ctx.allocator, &.{ packages_dir, pkg_canon });
