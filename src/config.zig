@@ -322,7 +322,7 @@ pub const Config = struct {
                 }
                 if (node.getChildString("init-provider")) |provider| {
                     config.init_provider = InitProvider.fromString(provider) catch {
-                        return ctx.fail(error.InvalidConfig, "settings.init-provider", "unknown init provider");
+                        return ctx.failFmt(error.InvalidConfig, "settings.init-provider", "unknown init provider: {s}", .{provider});
                     };
                 }
             }

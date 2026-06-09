@@ -11,6 +11,7 @@ const s6rc = @import("s6rc.zig");
 
 const Std = errors.StandardErrors;
 pub const ServiceError = Std.OutOfMemory || Std.FileSystem || Std.PermissionDenied || error{
+    InvalidConfig,
     InvalidInput,
     ProcessFailed,
     NoLogDirectory,
@@ -211,7 +212,10 @@ pub fn readLogs(ctx: *mere.Context, name: []const u8) ServiceError![]const u8 {
 }
 
 fn requireS6RcProvider(ctx: *mere.Context) ServiceError!void {
-    const cfg = ctx.getConfig() catch return error.InvalidInput;
+    const cfg = ctx.getConfig() catch |err| switch (err) {
+        error.InvalidConfig => return error.InvalidConfig,
+        error.ResourceLimitReached => return error.OutOfMemory,
+    };
     switch (cfg.effectiveInitProvider()) {
         .s6rc => {},
         .dinit => return error.UnsupportedProvider,
@@ -360,4 +364,29 @@ test "service operations reject unimplemented dinit provider" {
     test_env.ctx.configuration = cfg;
 
     try std.testing.expectError(error.UnsupportedProvider, start(&test_env.ctx, "ntpd"));
+}
+
+test "service operations preserve config load diagnostics" {
+    const th = @import("test_helpers.zig");
+    var test_env = try th.createTestEnv();
+    defer {
+        test_env.cleanup();
+        std.testing.allocator.destroy(test_env);
+    }
+
+    const config_path = try mere.config.getSystemConfigPath(&test_env.ctx);
+    defer test_env.ctx.allocator.free(config_path);
+
+    var file = try mere.path.makePathAndOpenFile(config_path);
+    defer file.close(mere.path.currentIo());
+    try file.writeStreamingAll(mere.path.currentIo(),
+        \\settings {
+        \\    init-provider "systemd"
+        \\}
+    );
+
+    try std.testing.expectError(error.InvalidConfig, start(&test_env.ctx, "ntpd"));
+    const diag = test_env.ctx.getDiagnosticContext();
+    try std.testing.expectEqualStrings("settings.init-provider", diag.subject.?);
+    try std.testing.expect(std.mem.indexOf(u8, diag.details.?, "systemd") != null);
 }

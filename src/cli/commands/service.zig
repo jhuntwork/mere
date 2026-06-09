@@ -4,6 +4,7 @@ const mere = @import("mere");
 const types = @import("../types.zig");
 const command = @import("../command.zig");
 const MereError = mere.errors.MereError;
+const getUserFriendlyMessage = mere.errors.getUserFriendlyMessage;
 const ui = mere.ui;
 const emit = ui.emit;
 const services = mere.services;
@@ -83,48 +84,48 @@ fn requireName(args: *const types.ParsedArgs) MereError![]const u8 {
 
 fn handleStart(ctx: *mere.Context, args: *const types.ParsedArgs) MereError!types.CommandResult {
     const name = try requireName(args);
-    services.start(ctx, name) catch
-        return .{ .success = false, .exit_code = 1, .message = "failed to start service" };
+    services.start(ctx, name) catch |err|
+        return serviceFailure(ctx, err, "failed to start service");
     emit.logLineSeverity(ctx, .service, .info, name);
     return .{ .success = true, .message = "started" };
 }
 
 fn handleStop(ctx: *mere.Context, args: *const types.ParsedArgs) MereError!types.CommandResult {
     const name = try requireName(args);
-    services.stop(ctx, name) catch
-        return .{ .success = false, .exit_code = 1, .message = "failed to stop service" };
+    services.stop(ctx, name) catch |err|
+        return serviceFailure(ctx, err, "failed to stop service");
     emit.logLineSeverity(ctx, .service, .info, name);
     return .{ .success = true, .message = "stopped" };
 }
 
 fn handleRestart(ctx: *mere.Context, args: *const types.ParsedArgs) MereError!types.CommandResult {
     const name = try requireName(args);
-    services.restart(ctx, name) catch
-        return .{ .success = false, .exit_code = 1, .message = "failed to restart service" };
+    services.restart(ctx, name) catch |err|
+        return serviceFailure(ctx, err, "failed to restart service");
     emit.logLineSeverity(ctx, .service, .info, name);
     return .{ .success = true, .message = "restarted" };
 }
 
 fn handleEnable(ctx: *mere.Context, args: *const types.ParsedArgs) MereError!types.CommandResult {
     const name = try requireName(args);
-    services.enable(ctx, name) catch
-        return .{ .success = false, .exit_code = 1, .message = "failed to enable service" };
+    services.enable(ctx, name) catch |err|
+        return serviceFailure(ctx, err, "failed to enable service");
     emit.logLineSeverity(ctx, .service, .info, name);
     return .{ .success = true, .message = "enabled" };
 }
 
 fn handleDisable(ctx: *mere.Context, args: *const types.ParsedArgs) MereError!types.CommandResult {
     const name = try requireName(args);
-    services.disable(ctx, name) catch
-        return .{ .success = false, .exit_code = 1, .message = "failed to disable service" };
+    services.disable(ctx, name) catch |err|
+        return serviceFailure(ctx, err, "failed to disable service");
     emit.logLineSeverity(ctx, .service, .info, name);
     return .{ .success = true, .message = "disabled" };
 }
 
 fn handleReload(ctx: *mere.Context, args: *const types.ParsedArgs) MereError!types.CommandResult {
     const name = try requireName(args);
-    services.reload(ctx, name) catch
-        return .{ .success = false, .exit_code = 1, .message = "failed to reload service" };
+    services.reload(ctx, name) catch |err|
+        return serviceFailure(ctx, err, "failed to reload service");
     emit.logLineSeverity(ctx, .service, .info, name);
     return .{ .success = true, .message = "reloaded" };
 }
@@ -132,8 +133,8 @@ fn handleReload(ctx: *mere.Context, args: *const types.ParsedArgs) MereError!typ
 fn handleStatus(ctx: *mere.Context, args: *const types.ParsedArgs) MereError!types.CommandResult {
     if (args.positional.len == 0) return handleList(ctx, args);
     const name = args.positional[0];
-    var detail = services.status(ctx, name) catch
-        return .{ .success = false, .exit_code = 1, .message = "failed to read service status" };
+    var detail = services.status(ctx, name) catch |err|
+        return serviceFailure(ctx, err, "failed to read service status");
     defer detail.deinit(ctx);
 
     const stderr = std.Io.File.stderr();
@@ -169,7 +170,7 @@ fn handleLogs(ctx: *mere.Context, args: *const types.ParsedArgs) MereError!types
         error.NoLogDirectory => return .{ .success = false, .exit_code = 1, .message = "no log directory for service" },
         error.NoLogFile => return .{ .success = false, .exit_code = 1, .message = "no log file for service" },
         error.OutOfMemory => return .{ .success = false, .exit_code = 1, .message = "out of memory" },
-        else => return .{ .success = false, .exit_code = 1, .message = "failed to read logs" },
+        else => return serviceFailure(ctx, err, "failed to read logs"),
     };
     defer ctx.allocator.free(output);
 
@@ -188,8 +189,8 @@ fn handleLogs(ctx: *mere.Context, args: *const types.ParsedArgs) MereError!types
 fn handleList(ctx: *mere.Context, _: *const types.ParsedArgs) MereError!types.CommandResult {
     const sio = mere.path.currentIo();
 
-    const entries = services.list(ctx) catch
-        return .{ .success = false, .exit_code = 1, .message = "failed to scan service sources" };
+    const entries = services.list(ctx) catch |err|
+        return serviceFailure(ctx, err, "failed to scan service sources");
     defer services.freeList(ctx, entries);
 
     const stdout = std.Io.File.stdout();
@@ -204,6 +205,23 @@ fn handleList(ctx: *mere.Context, _: *const types.ParsedArgs) MereError!types.Co
     writer.interface.flush() catch {};
 
     return .{ .success = true };
+}
+
+fn serviceFailure(ctx: *mere.Context, err: services.ServiceError, fallback: []const u8) !types.CommandResult {
+    const message = switch (err) {
+        error.UnsupportedProvider => try ctx.allocator.dupe(u8, "configured init provider is not implemented for service management"),
+        error.InvalidConfig => blk: {
+            const user_message = getUserFriendlyMessage(err);
+            const error_ctx = ctx.getDiagnosticContext().toErrorContext();
+            const formatted = error_ctx.formatWithMessage(ctx.allocator, user_message) catch
+                try ctx.allocator.dupe(u8, user_message);
+            break :blk formatted;
+        },
+        error.OutOfMemory => try ctx.allocator.dupe(u8, "out of memory"),
+        error.PermissionDenied => try ctx.allocator.dupe(u8, "permission denied"),
+        else => try std.fmt.allocPrint(ctx.allocator, "{s}: {s}", .{ fallback, getUserFriendlyMessage(err) }),
+    };
+    return .{ .success = false, .exit_code = 1, .message = message };
 }
 
 // ── Registration ──────────────────────────────────────────────────
