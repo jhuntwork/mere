@@ -257,9 +257,7 @@ fn prepareArtifactStaging(
         }
     };
 
-    for (services) |*svc| {
-        try generateServiceSourceDir(allocator, ctx, staging_dir, svc);
-    }
+    try generateServiceArtifactsForActiveProvider(allocator, ctx, staging_dir, services);
 
     if (compress_manpages_enabled) {
         if (manpage_compress.compressDirectory(ctx, staging_dir)) |cr| {
@@ -319,7 +317,27 @@ fn prepareArtifactStaging(
     }
 }
 
-fn generateServiceSourceDir(
+fn generateServiceArtifactsForActiveProvider(
+    allocator: std.mem.Allocator,
+    ctx: *mere.Context,
+    staging_dir: []const u8,
+    services: []const recipe.ServiceDef,
+) PackageError!void {
+    try generateS6RcServiceArtifacts(allocator, ctx, staging_dir, services);
+}
+
+fn generateS6RcServiceArtifacts(
+    allocator: std.mem.Allocator,
+    ctx: *mere.Context,
+    staging_dir: []const u8,
+    services: []const recipe.ServiceDef,
+) PackageError!void {
+    for (services) |*svc| {
+        try generateS6RcServiceSourceDir(allocator, ctx, staging_dir, svc);
+    }
+}
+
+fn generateS6RcServiceSourceDir(
     allocator: std.mem.Allocator,
     ctx: *mere.Context,
     staging_dir: []const u8,
@@ -369,7 +387,7 @@ fn generateServiceSourceDir(
             }
 
             if (svc.log) {
-                try generateLogServiceDir(allocator, ctx, staging_dir, svc.name);
+                try generateS6RcLogServiceDir(allocator, ctx, staging_dir, svc.name);
             }
         },
         .oneshot => {
@@ -423,7 +441,7 @@ fn generateServiceSourceDir(
     ctx.debug("generated s6-rc source: {s}", .{svc.name});
 }
 
-fn generateLogServiceDir(
+fn generateS6RcLogServiceDir(
     allocator: std.mem.Allocator,
     ctx: *mere.Context,
     staging_dir: []const u8,
@@ -1816,7 +1834,7 @@ test "buildInjectedDependenciesForSplit rejects ambiguous sibling runtime owners
     );
 }
 
-test "generateServiceSourceDir creates daemon longrun with logging pipeline" {
+test "generateS6RcServiceSourceDir creates daemon longrun with logging pipeline" {
     const th = @import("../test_helpers.zig");
     var test_env = try th.createTestEnv();
     defer {
@@ -1843,7 +1861,7 @@ test "generateServiceSourceDir creates daemon longrun with logging pipeline" {
     try svc.command.append(allocator, try allocator.dupe(u8, "-d"));
     try svc.depends_on.append(allocator, try allocator.dupe(u8, "network"));
 
-    try generateServiceSourceDir(allocator, &test_env.ctx, staging_dir, &svc);
+    try generateS6RcServiceSourceDir(allocator, &test_env.ctx, staging_dir, &svc);
 
     // Verify main service dir
     const svc_dir = try std.fs.path.join(allocator, &.{ staging_dir, "usr", "share", "s6-rc", "sources", "ntpd" });
@@ -1909,7 +1927,7 @@ test "generateServiceSourceDir creates daemon longrun with logging pipeline" {
     try std.testing.expect(std.mem.indexOf(u8, log_run, "/var/log/ntpd") != null);
 }
 
-test "generateServiceSourceDir creates oneshot with up script" {
+test "generateS6RcServiceSourceDir creates oneshot with up script" {
     const th = @import("../test_helpers.zig");
     var test_env = try th.createTestEnv();
     defer {
@@ -1936,7 +1954,7 @@ test "generateServiceSourceDir creates oneshot with up script" {
     try svc.up.append(allocator, try allocator.dupe(u8, "/etc/hostname"));
     try svc.depends_on.append(allocator, try allocator.dupe(u8, "mount-rw"));
 
-    try generateServiceSourceDir(allocator, &test_env.ctx, staging_dir, &svc);
+    try generateS6RcServiceSourceDir(allocator, &test_env.ctx, staging_dir, &svc);
 
     const svc_dir = try std.fs.path.join(allocator, &.{ staging_dir, "usr", "share", "s6-rc", "sources", "hostname" });
     defer allocator.free(svc_dir);
@@ -1966,7 +1984,7 @@ test "generateServiceSourceDir creates oneshot with up script" {
     return error.TestUnexpectedResult; // log dir should not exist
 }
 
-test "generateServiceSourceDir creates notification-fd for ready daemons" {
+test "generateS6RcServiceSourceDir creates notification-fd for ready daemons" {
     const th = @import("../test_helpers.zig");
     var test_env = try th.createTestEnv();
     defer {
@@ -1991,7 +2009,7 @@ test "generateServiceSourceDir creates notification-fd for ready daemons" {
     try svc.command.append(allocator, try allocator.dupe(u8, "/usr/bin/greetd"));
     svc.ready_notification = 3;
 
-    try generateServiceSourceDir(allocator, &test_env.ctx, staging_dir, &svc);
+    try generateS6RcServiceSourceDir(allocator, &test_env.ctx, staging_dir, &svc);
 
     const svc_dir = try std.fs.path.join(allocator, &.{ staging_dir, "usr", "share", "s6-rc", "sources", "greetd" });
     defer allocator.free(svc_dir);
