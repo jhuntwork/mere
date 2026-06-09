@@ -26,7 +26,7 @@ fn ensureWorkspaceSourceMatchesCache(
     cache_path: []const u8,
     workspace_source_path: []const u8,
 ) Error!void {
-    const cached_hash = hash_mod.calculateFileHash(ctx.allocator, cache_path) catch |err| {
+    const cached_hash = hash_mod.calculateFileHash(ctx, cache_path) catch |err| {
         ctx.setDiagnosticContext(cache_path, "failed to hash cached source");
         return switch (err) {
             error.OutOfMemory => Error.OutOfMemory,
@@ -35,7 +35,7 @@ fn ensureWorkspaceSourceMatchesCache(
     };
     defer ctx.allocator.free(cached_hash);
 
-    const workspace_hash = hash_mod.calculateFileHash(ctx.allocator, workspace_source_path) catch |err| {
+    const workspace_hash = hash_mod.calculateFileHash(ctx, workspace_source_path) catch |err| {
         ctx.setDiagnosticContext(workspace_source_path, "failed to validate existing workspace source");
         return switch (err) {
             error.OutOfMemory => Error.OutOfMemory,
@@ -225,7 +225,7 @@ pub fn download(ctx: *mere.Context, config: DownloadConfig) !DownloadResult {
                 break :blk true;
             };
             if (file_exists) {
-                const local_hash = hash_mod.calculateFileHash(ctx.allocator, cache_path_owned) catch |err| {
+                const local_hash = hash_mod.calculateFileHash(ctx, cache_path_owned) catch |err| {
                     ctx.setDiagnosticContext(cache_path_owned, "failed to compute local hash");
                     ctx.allocator.free(cache_dir);
                     return switch (err) {

@@ -153,7 +153,7 @@ pub const CurlTransferClient = struct {
         }
 
         if (temp_exists and options.expected_hash != null) {
-            const actual_hex_alloc = hash_mod.calculateFileHash(ctx.allocator, temp_path) catch |err| {
+            const actual_hex_alloc = hash_mod.calculateFileHash(ctx, temp_path) catch |err| {
                 return ctx.fail(err, temp_path, "failed to hash partial download file");
             };
             defer ctx.allocator.free(actual_hex_alloc);
@@ -235,7 +235,7 @@ pub const CurlTransferClient = struct {
         const final_bytes_total = final_stat.size;
 
         if (options.expected_hash != null) {
-            const actual_hex_alloc = hash_mod.calculateFileHash(ctx.allocator, temp_path) catch |err| {
+            const actual_hex_alloc = hash_mod.calculateFileHash(ctx, temp_path) catch |err| {
                 return ctx.fail(err, temp_path, "failed to hash downloaded file");
             };
             defer ctx.allocator.free(actual_hex_alloc);
@@ -554,7 +554,7 @@ pub fn downloadBatch(
         }
 
         if (temp_exists and req.options.expected_hash != null) {
-            const actual_hex_alloc = hash_mod.calculateFileHash(ctx.allocator, temp_path) catch |err| {
+            const actual_hex_alloc = hash_mod.calculateFileHash(ctx, temp_path) catch |err| {
                 return ctx.fail(err, temp_path, "failed to hash partial download file");
             };
             defer ctx.allocator.free(actual_hex_alloc);
@@ -757,7 +757,7 @@ pub fn downloadBatch(
 
                 if (session.expected_hash != null) {
                     var actual_hex_alloc_opt: ?[]const u8 = null;
-                    actual_hex_alloc_opt = hash_mod.calculateFileHash(ctx.allocator, session.temp_path) catch blk: {
+                    actual_hex_alloc_opt = hash_mod.calculateFileHash(ctx, session.temp_path) catch blk: {
                         if (first_error == null) {
                             ctx.setDiagnosticContext(session.temp_path, "failed to hash downloaded file");
                             first_error = error.FileSystem;
