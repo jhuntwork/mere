@@ -2,13 +2,25 @@
 
 ## Overview
 
-Service management is integrated into `mere` as top-level commands. The
-underlying implementation uses s6-rc and is contained in a single replaceable
-module (`s6rc.zig`). If the init system changes, the module is replaced — the
-CLI surface and recipe format stay the same.
+Service management is integrated into `mere` as top-level commands. The CLI
+surface and recipe format are provider-neutral; runtime service operations go
+through `services.zig`, and package-time service metadata is translated by the
+active artifact generator.
 
-Service definitions in recipes are pure KDL metadata. Mere's packager
-translates them into raw s6-rc source directories at build time.
+The default and currently implemented provider is s6-rc. Service definitions
+in recipes are pure KDL metadata. Mere's packager translates them into raw
+s6-rc source directories at build time when the active provider is s6-rc.
+
+The active provider is configured in `/mere/config.kdl`:
+
+```kdl
+settings {
+    init-provider "s6-rc"
+}
+```
+
+`dinit` is a recognized provider name for the provider-selection boundary, but
+its runtime commands and package artifact generator are not implemented yet.
 
 ## Command Semantics
 

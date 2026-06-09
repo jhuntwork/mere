@@ -11,9 +11,11 @@ const s6rc = @import("s6rc.zig");
 
 const Std = errors.StandardErrors;
 pub const ServiceError = Std.OutOfMemory || Std.FileSystem || Std.PermissionDenied || error{
+    InvalidInput,
     ProcessFailed,
     NoLogDirectory,
     NoLogFile,
+    UnsupportedProvider,
 };
 
 pub const ServiceKind = enum {
@@ -82,19 +84,23 @@ pub fn freeList(ctx: *mere.Context, entries: []ListEntry) void {
 }
 
 pub fn start(ctx: *mere.Context, name: []const u8) ServiceError!void {
+    try requireS6RcProvider(ctx);
     try s6rc.startService(ctx.allocator, name);
 }
 
 pub fn stop(ctx: *mere.Context, name: []const u8) ServiceError!void {
+    try requireS6RcProvider(ctx);
     try s6rc.stopService(ctx.allocator, name);
 }
 
 pub fn restart(ctx: *mere.Context, name: []const u8) ServiceError!void {
+    try requireS6RcProvider(ctx);
     s6rc.stopService(ctx.allocator, name) catch {};
     try s6rc.startService(ctx.allocator, name);
 }
 
 pub fn enable(ctx: *mere.Context, name: []const u8) ServiceError!void {
+    try requireS6RcProvider(ctx);
     const allocator = ctx.allocator;
     try s6rc.ensureRepo(allocator);
     try s6rc.repoSync(allocator);
@@ -104,6 +110,7 @@ pub fn enable(ctx: *mere.Context, name: []const u8) ServiceError!void {
 }
 
 pub fn disable(ctx: *mere.Context, name: []const u8) ServiceError!void {
+    try requireS6RcProvider(ctx);
     const allocator = ctx.allocator;
     try s6rc.setChange(allocator, "latent", name);
     try s6rc.setCommit(allocator);
@@ -111,10 +118,12 @@ pub fn disable(ctx: *mere.Context, name: []const u8) ServiceError!void {
 }
 
 pub fn reload(ctx: *mere.Context, name: []const u8) ServiceError!void {
+    try requireS6RcProvider(ctx);
     try s6rc.reloadService(ctx.allocator, name);
 }
 
 pub fn status(ctx: *mere.Context, name: []const u8) ServiceError!StatusDetail {
+    try requireS6RcProvider(ctx);
     const kind = queryKind(ctx, name);
     const is_up = isUp(ctx, name);
 
@@ -139,6 +148,7 @@ pub fn status(ctx: *mere.Context, name: []const u8) ServiceError!StatusDetail {
 
 /// Caller owns the returned slice and each entry name; free with `freeList`.
 pub fn list(ctx: *mere.Context) ServiceError![]ListEntry {
+    try requireS6RcProvider(ctx);
     const allocator = ctx.allocator;
     const all_names = try s6rc.scanSourceNames(allocator);
     defer allocator.free(all_names);
@@ -174,6 +184,7 @@ pub fn list(ctx: *mere.Context) ServiceError![]ListEntry {
 
 /// Caller owns returned log output and must free it with `ctx.allocator`.
 pub fn readLogs(ctx: *mere.Context, name: []const u8) ServiceError![]const u8 {
+    try requireS6RcProvider(ctx);
     const allocator = ctx.allocator;
     const log_dir = try logDirPath(allocator, name);
     defer allocator.free(log_dir);
@@ -197,6 +208,14 @@ pub fn readLogs(ctx: *mere.Context, name: []const u8) ServiceError![]const u8 {
         return error.ProcessFailed;
     }
     return result.stdout;
+}
+
+fn requireS6RcProvider(ctx: *mere.Context) ServiceError!void {
+    const cfg = ctx.getConfig() catch return error.InvalidInput;
+    switch (cfg.effectiveInitProvider()) {
+        .s6rc => {},
+        .dinit => return error.UnsupportedProvider,
+    }
 }
 
 fn queryBootState(ctx: *mere.Context, name: []const u8) BootState {
@@ -326,4 +345,19 @@ fn queryLogDir(ctx: *mere.Context, name: []const u8) ServiceError!?[]const u8 {
 
 fn logDirPath(allocator: std.mem.Allocator, name: []const u8) ![]const u8 {
     return std.fmt.allocPrint(allocator, "{s}/{s}", .{ s6rc.paths.log_root, name });
+}
+
+test "service operations reject unimplemented dinit provider" {
+    const th = @import("test_helpers.zig");
+    var test_env = try th.createTestEnv();
+    defer {
+        test_env.cleanup();
+        std.testing.allocator.destroy(test_env);
+    }
+
+    var cfg = mere.config.Config.init(&test_env.ctx, test_env.ctx.allocator);
+    cfg.init_provider = .dinit;
+    test_env.ctx.configuration = cfg;
+
+    try std.testing.expectError(error.UnsupportedProvider, start(&test_env.ctx, "ntpd"));
 }

@@ -323,7 +323,11 @@ fn generateServiceArtifactsForActiveProvider(
     staging_dir: []const u8,
     services: []const recipe.ServiceDef,
 ) PackageError!void {
-    try generateS6RcServiceArtifacts(allocator, ctx, staging_dir, services);
+    const provider = if (ctx.configuration) |*cfg| cfg.effectiveInitProvider() else .s6rc;
+    switch (provider) {
+        .s6rc => try generateS6RcServiceArtifacts(allocator, ctx, staging_dir, services),
+        .dinit => return ctx.fail(error.PackageCreationFailed, staging_dir, "dinit service artifacts are not implemented"),
+    }
 }
 
 fn generateS6RcServiceArtifacts(
@@ -2019,6 +2023,40 @@ test "generateS6RcServiceSourceDir creates notification-fd for ready daemons" {
     const nfd_content = try readTestFile(allocator, io, nfd_path);
     defer allocator.free(nfd_content);
     try std.testing.expectEqualStrings("3\n", nfd_content);
+}
+
+test "generateServiceArtifactsForActiveProvider rejects unimplemented dinit provider" {
+    const th = @import("../test_helpers.zig");
+    var test_env = try th.createTestEnv();
+    defer {
+        test_env.cleanup();
+        std.testing.allocator.destroy(test_env);
+    }
+
+    const allocator = test_env.ctx.allocator;
+    const io = path_mod.currentIo();
+
+    var cfg = mere.config.Config.init(&test_env.ctx, allocator);
+    cfg.init_provider = .dinit;
+    test_env.ctx.configuration = cfg;
+
+    const staging_dir = try std.fs.path.join(allocator, &.{ test_env.path, "staging" });
+    defer allocator.free(staging_dir);
+    {
+        var dir = try path_mod.makePathAndOpenDir(staging_dir);
+        dir.close(io);
+    }
+
+    var svc = try recipe.ServiceDef.init(allocator);
+    defer svc.deinit(allocator);
+    svc.name = try allocator.dupe(u8, "ntpd");
+    svc.service_type = .daemon;
+    try svc.command.append(allocator, try allocator.dupe(u8, "/usr/bin/ntpd"));
+
+    try std.testing.expectError(
+        error.PackageCreationFailed,
+        generateServiceArtifactsForActiveProvider(allocator, &test_env.ctx, staging_dir, &.{svc}),
+    );
 }
 
 fn readTestFile(allocator: std.mem.Allocator, io: std.Io, file_path: []const u8) ![]const u8 {

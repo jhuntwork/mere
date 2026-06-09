@@ -112,8 +112,8 @@ mere store verify
 
 ## Service Management
 
-On a native Mere system using s6-rc, `mere` provides integrated service
-management as top-level commands:
+On a native Mere system, `mere` provides integrated service management as
+top-level commands. The current implemented provider is s6-rc:
 
 ```sh
 mere status              # show all services with status
@@ -128,9 +128,10 @@ mere logs nginx          # view service logs
 ```
 
 Service definitions are generated at build time from recipe metadata and
-installed as s6-rc source directories. `mere enable` assembles definitions,
-syncs the repository, and updates the boot prescription. `mere start/stop`
-operate on live state only — the two concerns are cleanly separated.
+installed for the configured init provider. The default and currently
+implemented provider is s6-rc. `mere enable` assembles definitions, syncs the
+repository, and updates the boot prescription. `mere start/stop` operate on
+live state only — the two concerns are cleanly separated.
 
 ## Building from Source
 

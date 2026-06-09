@@ -429,6 +429,7 @@ fn formatRootPath(
 
 const config_settings_children = [_]NodeSpec{
     .{ .name = "color", .args = .{ .kind = .boolean, .min = 1, .max = 1, .label = "value" } },
+    .{ .name = "init-provider", .args = .{ .kind = .string, .min = 1, .max = 1, .label = "value" } },
     .{ .name = "sync-ttl", .args = .{ .kind = .integer, .min = 1, .max = 1, .label = "value" } },
     .{ .name = "sync-timeout", .args = .{ .kind = .integer, .min = 1, .max = 1, .label = "value" } },
 };
