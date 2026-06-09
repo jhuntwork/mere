@@ -9,6 +9,24 @@ const kdl_schema = @import("kdl_schema.zig");
 const default_sync_ttl_seconds: u64 = 15 * 60;
 const default_sync_timeout_seconds: u32 = 30;
 
+pub const InitProvider = enum {
+    s6rc,
+    dinit,
+
+    pub fn fromString(value: []const u8) !InitProvider {
+        if (std.mem.eql(u8, value, "s6-rc")) return .s6rc;
+        if (std.mem.eql(u8, value, "dinit")) return .dinit;
+        return error.InvalidConfig;
+    }
+
+    pub fn label(self: InitProvider) []const u8 {
+        return switch (self) {
+            .s6rc => "s6-rc",
+            .dinit => "dinit",
+        };
+    }
+};
+
 /// Repository configuration structure
 pub const RepoConfig = struct {
     name: []const u8,
@@ -208,6 +226,8 @@ pub const Config = struct {
     sync_ttl_seconds: u64 = default_sync_ttl_seconds,
     /// Default sync timeout for remote repos (seconds)
     sync_timeout_seconds: u32 = default_sync_timeout_seconds,
+    /// Init/service provider. Null means use the default provider.
+    init_provider: ?InitProvider = null,
 
     /// Initialize a new empty Config.
     /// `alloc` is the allocator that owns this Config's internal storage.
@@ -220,7 +240,12 @@ pub const Config = struct {
             .color = null,
             .sync_ttl_seconds = default_sync_ttl_seconds,
             .sync_timeout_seconds = default_sync_timeout_seconds,
+            .init_provider = null,
         };
+    }
+
+    pub fn effectiveInitProvider(self: *const Config) InitProvider {
+        return self.init_provider orelse .s6rc;
     }
 
     /// Get filtered and sorted repos
@@ -295,6 +320,11 @@ pub const Config = struct {
                     }
                     config.sync_timeout_seconds = @intCast(timeout);
                 }
+                if (node.getChildString("init-provider")) |provider| {
+                    config.init_provider = InitProvider.fromString(provider) catch {
+                        return ctx.failFmt(error.InvalidConfig, "settings.init-provider", "unknown init provider: {s}", .{provider});
+                    };
+                }
             }
         }
 
@@ -325,10 +355,13 @@ pub const Config = struct {
 
         out.writeAll("// Mere Linux configuration\n\n") catch return error.OutOfMemory;
 
-        if (self.color != null or self.sync_ttl_seconds != default_sync_ttl_seconds or self.sync_timeout_seconds != default_sync_timeout_seconds) {
+        if (self.color != null or self.sync_ttl_seconds != default_sync_ttl_seconds or self.sync_timeout_seconds != default_sync_timeout_seconds or self.init_provider != null) {
             out.writeAll("settings {\n") catch return error.OutOfMemory;
             if (self.color) |color| {
                 out.print("    color {}\n", .{color}) catch return error.OutOfMemory;
+            }
+            if (self.init_provider) |provider| {
+                out.print("    init-provider \"{s}\"\n", .{provider.label()}) catch return error.OutOfMemory;
             }
             if (self.sync_ttl_seconds != default_sync_ttl_seconds) {
                 out.print("    sync-ttl {d}\n", .{self.sync_ttl_seconds}) catch return error.OutOfMemory;
@@ -430,6 +463,9 @@ pub const Config = struct {
         if (other.color) |color| {
             self.color = color;
         }
+        if (other.init_provider) |provider| {
+            self.init_provider = provider;
+        }
         // Use this Config's allocator for merge operations to keep ownership consistent.
         return self.mergeWithAllocator(other, self.alloc);
     }
@@ -451,6 +487,7 @@ pub const Config = struct {
         new_config.color = self.color;
         new_config.sync_ttl_seconds = self.sync_ttl_seconds;
         new_config.sync_timeout_seconds = self.sync_timeout_seconds;
+        new_config.init_provider = self.init_provider;
         errdefer new_config.deinit();
         for (self.repos.items) |repo| {
             const new_repo = try self.copyRepoToAllocator(&repo, allocator);
@@ -703,6 +740,45 @@ test "Config to KDL roundtrip" {
     try std.testing.expectEqualStrings("extra", parsed_config.repos.items[1].name);
     try std.testing.expectEqualStrings("https://example.com/repo/extra", parsed_config.repos.items[1].url);
     try std.testing.expectEqual(@as(u8, 200), parsed_config.repos.items[1].priority);
+}
+
+test "Config parses init provider setting" {
+    var test_env = try @import("test_helpers.zig").createTestEnv();
+    defer {
+        test_env.cleanup();
+        std.testing.allocator.destroy(test_env);
+    }
+
+    const kdl_str =
+        \\settings {
+        \\    init-provider "dinit"
+        \\}
+    ;
+
+    var parsed_config = try Config.fromKdl(&test_env.ctx, kdl_str, test_env.ctx.allocator);
+    defer parsed_config.deinit();
+
+    try std.testing.expectEqual(InitProvider.dinit, parsed_config.effectiveInitProvider());
+
+    const serialized = try parsed_config.toKdl();
+    defer test_env.ctx.allocator.free(serialized);
+    try std.testing.expect(std.mem.indexOf(u8, serialized, "init-provider \"dinit\"") != null);
+}
+
+test "Config rejects unknown init provider" {
+    var test_env = try @import("test_helpers.zig").createTestEnv();
+    defer {
+        test_env.cleanup();
+        std.testing.allocator.destroy(test_env);
+    }
+
+    const kdl_str =
+        \\settings {
+        \\    init-provider "systemd"
+        \\}
+    ;
+
+    try std.testing.expectError(error.InvalidConfig, Config.fromKdl(&test_env.ctx, kdl_str, test_env.ctx.allocator));
 }
 
 test "Config merge" {
