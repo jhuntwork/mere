@@ -1478,7 +1478,6 @@ fn installDependenciesToBuildProfile(
             error.FileSystem, error.SystemResources, error.Unexpected, error.Canceled => BuildError.FileSystem,
             error.SignatureInvalid, error.InvalidKey, error.VerifyFailed, error.SodiumInitFailed => BuildError.InvalidInput,
             error.CorruptData => BuildError.FileSystem,
-            error.RollbackDetected => BuildError.InvalidInput,
             error.InvalidInput => BuildError.InvalidInput,
         };
     };
@@ -1510,7 +1509,6 @@ fn installDependenciesToBuildProfile(
             error.OutOfMemory => BuildError.OutOfMemory,
             error.PermissionDenied => BuildError.PermissionDenied,
             error.CorruptData => BuildError.DependencyInstallFailed,
-            error.RollbackDetected => BuildError.DependencyInstallFailed,
             else => BuildError.DependencyInstallFailed,
         };
     };

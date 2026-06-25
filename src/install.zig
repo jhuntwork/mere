@@ -1698,11 +1698,6 @@ fn installSinglePackageToStore(
 
     try enforceRepoMetadataBinding(ctx, pkg, &preverify, pkg_id);
 
-    // Rollback protection: reject older signed packages for this repo
-    enforceRollbackProtection(ctx, repo_cache, &preverify) catch |err| {
-        return err;
-    };
-
     const preverify_install_dir = store.constructStorePath(ctx, preverify.manifest_content_hash, pkg.name.?, pkg.version.?) catch |err| {
         ctx.setDiagnosticContext(cache_path, "failed to construct store path");
         return switch (err) {
@@ -1725,7 +1720,7 @@ fn installSinglePackageToStore(
         // An unprivileged user may have admitted this object previously; we must
         // ensure it is root-owned and read-only before any system profile uses it.
         if (store.isPrivileged()) {
-            try finalizeAdmittedStoreObject(ctx, repo_cache, preverify_install_dir, &preverify, true);
+            try finalizeAdmittedStoreObject(ctx, preverify_install_dir, true);
         }
 
         keep_preverify_install_dir = true;
@@ -1748,7 +1743,7 @@ fn installSinglePackageToStore(
         ctx.debug("content already exists in store: {s}", .{staging.install_dir});
         path.deleteTreeAbsolute(staging.staging_dir) catch {};
 
-        try finalizeAdmittedStoreObject(ctx, repo_cache, staging.install_dir, &preverify, true);
+        try finalizeAdmittedStoreObject(ctx, staging.install_dir, true);
 
         return generation.PackageEntry{
             .name = try ctx.allocator.dupe(u8, pkg.name.?),
@@ -1798,7 +1793,7 @@ fn installSinglePackageToStore(
     }
     ctx.debug("package admitted to store: {s}", .{staging.install_dir});
 
-    try finalizeAdmittedStoreObject(ctx, repo_cache, staging.install_dir, &preverify, false);
+    try finalizeAdmittedStoreObject(ctx, staging.install_dir, false);
 
     emit.installComplete(ctx, install_id, pkg_label);
 
@@ -2006,38 +2001,6 @@ fn enforceRepoMetadataBinding(
     }
 }
 
-fn enforceRollbackProtection(ctx: *Context, repo_cache: *RepoCache, preverify: *const PreVerifyResult) !void {
-    // Local repos don't track rollback state — the user controls the source
-    // directory directly via `mere import`, so rollback protection is not meaningful.
-    if (repo_cache.is_local) return;
-
-    // Rollback protection guards the system against downgrade attacks. Unprivileged
-    // installs only ever produce user-owned store objects, which are not eligible
-    // for system profiles, so there is no privilege boundary to protect — and the
-    // rollback-state cache (/mere/cache/repos, root-owned) is not writable anyway.
-    // Per the spec's Unprivileged Admission Steps, rollback is not part of the
-    // unprivileged path.
-    if (!store.isPrivileged()) return;
-
-    repo_cache.checkRollbackState(
-        preverify.verifying_fingerprint,
-        preverify.parsed.manifest.name,
-        preverify.parsed.manifest.arch,
-        preverify.parsed.manifest.created_at,
-    ) catch |err| {
-        if (err == repocache_mod.RepoCacheError.RollbackDetected) {
-            return ctx.fail(error.SignatureInvalid, preverify.parsed.manifest.name, "rollback detected - older timestamp");
-        }
-        return switch (err) {
-            repocache_mod.RepoCacheError.OutOfMemory => error.OutOfMemory,
-            repocache_mod.RepoCacheError.Network => error.Network,
-            repocache_mod.RepoCacheError.PermissionDenied => error.PermissionDenied,
-            repocache_mod.RepoCacheError.CorruptData => error.CorruptData,
-            else => error.FileSystem,
-        };
-    };
-}
-
 fn stageAndValidatePayload(
     ctx: *Context,
     pkg: *package.Package,
@@ -2143,9 +2106,7 @@ fn stageAndValidatePayload(
 
 fn finalizeAdmittedStoreObject(
     ctx: *Context,
-    repo_cache: *RepoCache,
     install_dir: []const u8,
-    preverify: *const PreVerifyResult,
     existing_only: bool,
 ) !void {
     _ = existing_only;
@@ -2166,33 +2127,7 @@ fn finalizeAdmittedStoreObject(
             ctx.debug("failed to set read-only permissions: {}", .{err});
         };
     }
-
-    // Skip rollback state tracking for local repos (no client-side state in source dir)
-    // and for unprivileged installs (the rollback-state cache is root-owned and
-    // rollback protection only guards system profiles, which unprivileged installs
-    // cannot affect). See the matching guard in enforceRollbackProtection.
-    if (!repo_cache.is_local and store.isPrivileged()) {
-        repo_cache.updateRollbackState(
-            preverify.verifying_fingerprint,
-            preverify.parsed.manifest.name,
-            preverify.parsed.manifest.arch,
-            preverify.parsed.manifest.created_at,
-        ) catch |err| {
-            const diag = ctx.getDiagnosticContext();
-            if (diag.details == null) {
-                ctx.setDiagnosticContextFmt(install_dir, "failed to update rollback state: {s}", .{@errorName(err)});
-            }
-            return switch (err) {
-                repocache_mod.RepoCacheError.OutOfMemory => error.OutOfMemory,
-                repocache_mod.RepoCacheError.Network => error.Network,
-                repocache_mod.RepoCacheError.PermissionDenied => error.PermissionDenied,
-                repocache_mod.RepoCacheError.CorruptData => error.CorruptData,
-                else => error.FileSystem,
-            };
-        };
-    }
 }
-
 test "multi-repository install uses priority and resolves dependencies across repos" {
     const th = @import("test_helpers.zig");
     var test_env = try th.createTestEnv();
@@ -4473,7 +4408,7 @@ test "setDirectoryReadOnly reports traversal permission failures" {
     try std.testing.expectError(error.AccessDenied, result);
 }
 
-test "finalizeAdmittedStoreObject skips rollback-state and hardening when unprivileged" {
+test "finalizeAdmittedStoreObject skips hardening when unprivileged" {
     if (store.isPrivileged()) return error.SkipZigTest;
 
     const th = @import("test_helpers.zig");
@@ -4488,42 +4423,10 @@ test "finalizeAdmittedStoreObject skips rollback-state and hardening when unpriv
     defer ctx.allocator.free(install_dir);
     try path.ensureDirExists(install_dir);
 
-    var repo_cache = try RepoCache.init(ctx, "remote-finalize-test", "https://example.invalid/repo", &[_][]const u8{}, 100);
-    defer repo_cache.deinit();
-    try path.ensureDirExists(repo_cache.cache_dir);
-
-    var content_hash_bytes: [32]u8 = undefined;
-    _ = try std.fmt.hexToBytes(&content_hash_bytes, "d" ** 64);
-
-    var preverify = PreVerifyResult{
-        .parsed = .{
-            .data = try ctx.allocator.dupe(u8, "x"),
-            .manifest = .{
-                .schema_version = 1,
-                .created_at = 1706745600,
-                .name = "pkg",
-                .version = "1.0.0",
-                .release = 1,
-                .arch = "x86_64",
-                .content_hash = content_hash_bytes,
-            },
-        },
-        .manifest_content_hash = try ctx.allocator.dupe(u8, "d" ** 64),
-        .archive_hash = try ctx.allocator.dupe(u8, "d" ** 64),
-        .verifying_fingerprint = try ctx.allocator.dupe(u8, "e" ** 64),
-    };
-    defer preverify.deinit(ctx.allocator);
-
-    // Unprivileged: function succeeds, skipping both hardening and rollback-state
-    // updates. These features are only meaningful for privileged system installs;
-    // see the matching guards in finalizeAdmittedStoreObject and
-    // enforceRollbackProtection.
-    try finalizeAdmittedStoreObject(ctx, &repo_cache, install_dir, &preverify, false);
-
-    // Verify rollback state file was NOT created.
-    const rollback_path = try std.fs.path.join(ctx.allocator, &.{ repo_cache.cache_dir, "rollback-state.json" });
-    defer ctx.allocator.free(rollback_path);
-    try std.testing.expectError(error.FileNotFound, std.Io.Dir.accessAbsolute(path.currentIo(), rollback_path, .{}));
+    // Unprivileged: function succeeds, skipping the root-ownership hardening.
+    // Hardening is only meaningful for privileged system installs; see the
+    // matching guard in finalizeAdmittedStoreObject.
+    try finalizeAdmittedStoreObject(ctx, install_dir, false);
 
     // Store object remains admitted.
     try std.Io.Dir.accessAbsolute(path.currentIo(), install_dir, .{});

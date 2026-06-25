@@ -109,8 +109,6 @@ Package filenames are `<name>-<version>-<release>-<arch>-<archive_hash>.pkg.tar.
 - `1:1.0 > 2.0` (epoch wins)
 - `1.0-1 < 1.0-2` (release tie-breaker)
 
-**Rollback protection**: Uses signed `created_at` timestamp from package metadata, NOT version comparison. Version ordering is for dependency resolution and user display only.
-
 ---
 
 ### 4. Content Hash and Metadata
@@ -291,7 +289,7 @@ signature = ed25519_sign(secret_key, manifest_bytes)
 **Package manifest signing**:
 - The manifest (`manifest.v1`) carries semantic meaning (name, version, content_hash, created_at)
 - The signature (`manifest.v1.sig`) proves the manifest bytes are intact
-- Together they provide authenticated package metadata with rollback protection
+- Together they provide authenticated package metadata
 
 ---
 
@@ -600,7 +598,6 @@ Mere uses a single system-wide root at `/mere/` (or `${root}/mere/` for alternat
 │   └── repos/
 │       └── <name>-<hash16>/   # Trust-context-scoped cache directory
 │           ├── <name>.db
-│           ├── rollback_state.kdl
 │           ├── last_sync.kdl
 ├── gc-roots/               # GC root symlinks (admin-controlled, NOT world-writable)
 │   ├── profiles/
@@ -764,7 +761,6 @@ Mere separates authoritative artifacts from synced copies:
 - Different trust configurations (same name, different fingerprints) produce isolated cache directories
 - Populated by syncing from remote repository URLs defined in `config.kdl`
 - Read-only from user perspective; managed by repocache
-- Maintains local rollback protection state in `rollback_state.kdl` with per-signer tracking
 - Tracks last successful sync time in `last_sync.kdl`
 - On first sync, any old-format directory (`/mere/cache/repos/<name>/`) is deleted automatically (non-fatal on failure)
 - **Not used for local package storage**: local package archives are stored in `/mere/cache/packages/`, not per-repo cache directories
@@ -775,7 +771,6 @@ Mere separates authoritative artifacts from synced copies:
 - No config entry needed - presence is sufficient
 - Accessed directly by `RepoCache` — the `cache_dir` points at the source directory itself, avoiding data duplication and stale cache issues
 - Signature is verified once on first access; subsequent operations use the already-opened database without re-verification
-- No rollback protection state is tracked — the user controls the source directory directly via `mere import`, so client-side rollback tracking is not meaningful
 
 **Distinction**: A repository source is local because it's a directory you mutate (import writes DB/signature state). A configured remote repo is a URL you sync into cache.
 
@@ -838,7 +833,6 @@ When resolving repositories for operations:
 - No `last_sync.kdl` is written
 - No TTL or timeout applies
 - No old-format cache migration applies
-- No rollback state reconciliation applies
 
 ---
 
@@ -867,8 +861,6 @@ When resolving repositories for operations:
 7. Sign `<name>.db` → `<name>.db.sig` using `--key` or default signing key
 
 **Signature verification is required at import time.** This acts as an authoring quality gate to ensure repository contents are publish-ready.
-
-**No rollback enforcement at import time.** `mere import` is an authoring operation for local repository sources and does not maintain producer-side rollback state.
 
 ---
 
@@ -1863,7 +1855,7 @@ The package manifest is the authoritative source of package metadata, using a de
 - `release`: Release number (positive integer)
 - `arch`: Architecture string (`x86_64`, `aarch64`, `any`)
 - `content_hash`: 32-byte BLAKE3 hash of package payload
-- `created_at`: Unix timestamp when package was built
+- `created_at`: Unix timestamp when package was built (informational; surfaced in metadata for auditing and display)
 
 **Signature file** (`manifest.v1.sig`):
 - Exactly 64 bytes: raw Ed25519 signature
@@ -1879,46 +1871,7 @@ The package manifest is the authoritative source of package metadata, using a de
 
 ---
 
-### 18. Rollback Protection (Client-Side)
-
-Rollback protection prevents replay attacks where an attacker substitutes an older (but validly signed) package for a newer one.
-
-**Scope**: Rollback protection is enforced during repository consumption (install path), with state stored locally per cache.
-
-**Mechanism**: Track the highest `created_at` timestamp seen for each (signer_fingerprint, package_name, arch) tuple within each repository.
-
-**Rules**:
-1. **Signer fingerprint**: The BLAKE3 hash (64 hex chars) of the public key bytes that successfully verified the signature.
-2. **Per-signer tracking**: Different signers have independent timestamp tracks.
-3. During install, after verifying the package manifest signature:
-   - Look up (signer_fingerprint, name, arch) in `rollback_state.kdl`
-   - If entry exists and `manifest.created_at < stored_created_at`: **reject** (rollback attempt)
-   - Otherwise: update stored value (monotonic max)
-
-**Storage**: Stored in the cache directory for remote repos (`/mere/cache/repos/<name>-<hash16>/rollback_state.kdl`). Not tracked for local repository sources.
-
-Format (one entry per package identity):
-```kdl
-rollback signer="abc123...64chars..." name="openssl" arch="x86_64" created_at=1738368000
-```
-
-**Rationale**: Client-side rollback state prevents replay of older signed packages via mirrors or stale caches.
-
-#### 18.1 Time Semantics
-
-**Meaning of `created_at`**: The `created_at` field represents the signer's assertion of creation time. It is used solely for:
-- Rollback protection
-- Temporal ordering within a repository
-
-**Enforcement Model**: Rollback protection enforces monotonicity **per (signer, package, arch)** within a repository database. System clock correctness is assumed but not enforced globally.
-
-**Normative invariant**: Time is advisory; monotonicity is enforced locally and cryptographically bound to the signer.
-
-Clock skew between builders does not invalidate signatures but may affect install acceptance within a repository.
-
----
-
-### 19. Profile Build Algorithm
+### 18. Profile Build Algorithm
 
 A profile realization is a **symlink tree projection** of store contents. System generation directories and named profile `root/` directories contain symlinks into `/mere/store/`, not copied files.
 
@@ -1969,7 +1922,7 @@ for each package in resolved_packages:
 - Deterministic behavior regardless of package order
 - Simpler validation (each symlink is independent)
 
-#### 19.1 External Scaffolding and /usr Structure (No Path Canonicalization)
+#### 18.1 External Scaffolding and /usr Structure (No Path Canonicalization)
 
 The system `/usr` directory and its subtree symlinks are **external scaffolding** - they are NOT managed by Mere. They are established by bootstrap/installer (or base system setup) as stable invariants.
 
@@ -2007,7 +1960,7 @@ Optional: `/bin`, `/sbin`, `/lib` may exist as compatibility symlinks:
 - Both are valid and will be accessible via the external scaffolding symlinks
 - Packages MUST NOT ship any content under `usr/local/` - such packages MUST be rejected
 
-#### 19.2 /etc Path Handling
+#### 18.2 /etc Path Handling
 
 Package-provided configuration MUST NOT be projected directly into the profile realization.
 
@@ -2030,7 +1983,7 @@ Package-provided configuration MUST NOT be projected directly into the profile r
 
 ---
 
-### 20. System Generation Numbering
+### 19. System Generation Numbering
 
 **Rule**: Next system generation number = 1 + max existing `gen-N` directory under `/mere/profiles/system/`.
 
@@ -2056,19 +2009,19 @@ if no matches exist: next_generation = 1
 
 ---
 
-### 21. /usr Structure and /usr/local Preservation
+### 20. /usr Structure and /usr/local Preservation
 
-#### 21.1 Goal
+#### 20.1 Goal
 
 Preserve traditional `/usr/local` semantics (admin-installed, unmanaged, persistent) while keeping Mere's system content generation-switched and fully reproducible.
 
-#### 21.2 Definitions
+#### 20.2 Definitions
 
 **Managed paths**: Filesystem locations whose contents are provided by the active system profile generation.
 
 **Unmanaged paths**: Filesystem locations reserved for the system administrator; Mere MUST NOT write to or manage them.
 
-#### 21.3 /usr MUST be a Real Directory
+#### 20.3 /usr MUST be a Real Directory
 
 On a Mere-managed system:
 
@@ -2077,7 +2030,7 @@ On a Mere-managed system:
 
 **Rationale**: If `/usr` is a symlink, then `/usr/local` becomes implicitly generation-scoped, which violates the intended semantics of `/usr/local`.
 
-#### 21.4 /usr/local MUST be Unmanaged and Persistent
+#### 20.4 /usr/local MUST be Unmanaged and Persistent
 
 `/usr/local` MUST be a real directory on the host filesystem.
 
@@ -2089,7 +2042,7 @@ On a Mere-managed system:
 - GC MUST NOT consider `/usr/local` content as store-reachable state
 - `/usr/local` MUST remain stable across activations and generations
 
-#### 21.5 /usr Subtree Symlinks Define the Managed System View
+#### 20.5 /usr Subtree Symlinks Define the Managed System View
 
 Mere-managed system content under `/usr` MUST be represented via symlinks for each relevant subtree, pointing to the active system profile generation.
 
@@ -2115,7 +2068,7 @@ Mere-managed system content under `/usr` MUST be represented via symlinks for ea
 - If your packaging policy never installs headers, `/usr/include` may remain absent or unmanaged
 - Activation only switches `/mere/profiles/system/current`; it does not rewrite these symlinks
 
-#### 21.6 Packages MUST NOT Install into /usr/local
+#### 20.6 Packages MUST NOT Install into /usr/local
 
 Package builds and activations MUST enforce:
 
@@ -2125,14 +2078,14 @@ Package builds and activations MUST enforce:
 
 This rule applies regardless of whether `/usr/local` exists in the build namespace; `/usr/local` is reserved and out-of-band by definition.
 
-#### 21.7 Activation MUST Treat /usr/local as a Boundary
+#### 20.7 Activation MUST Treat /usr/local as a Boundary
 
 During system activation and profile realization:
 
 - Mere MUST NOT create, remove, or modify `/usr/local`
 - Path conflict detection MUST treat `/usr/local/**` as reserved and non-overridable
 
-#### 21.8 Activation Switches `current` Only
+#### 20.8 Activation Switches `current` Only
 
 System activation consists solely of updating the profile pointer:
 
@@ -2142,7 +2095,7 @@ System activation consists solely of updating the profile pointer:
 
 No other system-global symlinks are required to change during activation. The `/usr` subtree symlinks (`/usr/bin`, `/usr/lib`, etc.) never change after bootstrap.
 
-#### 21.9 Generation Structure Requirements
+#### 20.9 Generation Structure Requirements
 
 **Normative rules**:
 - Generation metadata (e.g., `profile.kdl`) MUST be placed at the generation root, NOT under any package content directories
@@ -2163,7 +2116,7 @@ No other system-global symlinks are required to change during activation. The `/
 └── profile.kdl           # REQUIRED - generation metadata at root
 ```
 
-#### 21.10 Expected State Before Mere Operates
+#### 20.10 Expected State Before Mere Operates
 
 ```
 /usr/                       # Real directory
@@ -2191,7 +2144,7 @@ No other system-global symlinks are required to change during activation. The `/
 
 ---
 
-### 22. Pin System
+### 21. Pin System
 
 Pins are explicit user-controlled GC roots that also influence dependency resolution.
 
@@ -2243,7 +2196,7 @@ When the resolver needs to select a package:
 
 ## System Initialization
 
-### 23. mere store init - System Layout Initialization
+### 22. mere store init - System Layout Initialization
 
 `mere store init` initializes and validates the system-wide Mere filesystem layout and permissions. It is the only supported mechanism for creating and repairing critical `/mere` directories.
 
@@ -2253,7 +2206,7 @@ When the resolver needs to select a package:
 - MUST report all changes made
 - MUST NOT modify user data, packages, or profiles
 
-#### 23.1 Purpose
+#### 22.1 Purpose
 
 `mere store init` exists to:
 - Ensure correct ownership and permissions
@@ -2261,7 +2214,7 @@ When the resolver needs to select a package:
 - Provide a reproducible installation baseline
 - Avoid reliance on manual setup
 
-#### 23.2 Scope
+#### 22.2 Scope
 
 `mere store init` is responsible for:
 - Creating required directories
@@ -2277,7 +2230,7 @@ When the resolver needs to select a package:
 - Perform GC
 - Modify user data
 
-#### 23.3 Required Directory Layout
+#### 22.3 Required Directory Layout
 
 After successful `mere store init`, the following directories MUST exist:
 
@@ -2304,7 +2257,7 @@ After successful `mere store init`, the following directories MUST exist:
 
 If any required directory is missing, `mere store init` MUST create it.
 
-#### 23.4 Ownership and Permissions
+#### 22.4 Ownership and Permissions
 
 `mere store init` MUST enforce the canonical directory ownership and mode requirements defined in **9.0.2 Directory Permissions**.
 This section is intentionally non-duplicative to avoid configuration drift in documentation.
@@ -2314,7 +2267,7 @@ This section is intentionally non-duplicative to avoid configuration drift in do
 - Sticky bit: only owner (or root) can delete/rename entries
 - Enables unprivileged contribution while protecting existing content
 
-#### 23.5 Hardening Rules
+#### 22.5 Hardening Rules
 
 During `mere store init`, the implementation MUST:
 - Ensure all directories exist
@@ -2334,7 +2287,7 @@ During system profile activation, the implementation MUST harden each referenced
 
 Any violation MUST be reported. Silent repair is not permitted without user-visible output.
 
-#### 23.6 Validation Mode
+#### 22.6 Validation Mode
 
 `mere store init` provides a validation-only mode that performs verification and reports deviations without making changes.
 
@@ -2358,7 +2311,7 @@ Checking /mere/profiles/system... FAIL: missing directory
 Summary: 2 issues found
 ```
 
-#### 23.7 Repair Mode
+#### 22.7 Repair Mode
 
 `mere store init` (default behavior) applies repairs when deviations are found. The command is idempotent: running it multiple times when the layout already conforms is a no-op and reports no changes.
 
@@ -2378,7 +2331,7 @@ Fixing ownership on /mere/store (user:user -> root:root)... done
 Summary: 3 changes applied
 ```
 
-#### 23.8 Optional Flags
+#### 22.8 Optional Flags
 
 | Flag               | Behavior                                    |
 | ------------------ | ------------------------------------------- |
@@ -2395,7 +2348,7 @@ Would fix ownership on /mere/store (user:user -> root:root)
 Summary: 3 changes would be applied (dry-run, no changes made)
 ```
 
-#### 23.9 Failure Semantics
+#### 22.9 Failure Semantics
 
 `mere store init` MUST fail if:
 - Not executed as root
@@ -2417,7 +2370,7 @@ Refusing to proceed - potential symlink attack
 Remove the symlink and run 'mere store init' again
 ```
 
-#### 23.10 Relationship to Other Commands
+#### 22.10 Relationship to Other Commands
 
 **Assumptions**:
 - `mere install` assumes `mere store init` has been run
@@ -2430,7 +2383,7 @@ Remove the symlink and run 'mere store init' again
 2. `mere import` or `mere install` - populate store and profiles
 3. `mere activate` - switch to new generation
 
-#### 23.11 Rationale
+#### 22.11 Rationale
 
 This design ensures:
 - **Predictable system layout**: No hidden setup steps
@@ -2468,11 +2421,11 @@ All specifications preserve Mere's core principles:
 
 ---
 
-## 24. Recipe `package.files` Semantics
+## 23. Recipe `package.files` Semantics
 
 This section defines the authoritative behavior for `files` entries in recipe `package` nodes.
 
-### 24.1 Variable Expansion in `files`
+### 23.1 Variable Expansion in `files`
 
 `files` entries are interpolated at recipe-parse time using the same interpolation engine as phase scripts.
 
@@ -2482,12 +2435,12 @@ Supported placeholders:
 - `${recipe.release}`
 - `${recipe.url}`
 - `${recipe.description}`
-- `${recipe.arch}` (only when architecture has been resolved; see 24.3)
+- `${recipe.arch}` (only when architecture has been resolved; see 23.3)
 - `${vars.<key>}`
 
 Unsupported or malformed placeholders are handled using recipe interpolation error rules.
 
-### 24.2 Pattern Matching Rules
+### 23.2 Pattern Matching Rules
 
 `files` patterns are matched using POSIX `fnmatch(3)` semantics with pathname-aware matching enabled (`FNM_PATHNAME`).
 
@@ -2507,7 +2460,7 @@ Normative rules:
   - The path MUST NOT match any exclusion pattern (pattern starting with `!`).
 - Example: `usr/bin/*` with `!usr/bin/ncurses6-config` includes all `usr/bin/*` except `usr/bin/ncurses6-config`.
 
-### 24.3 Pattern Authoritativeness
+### 23.3 Pattern Authoritativeness
 
 The `files` list is authoritative at per-pattern granularity.
 
@@ -2516,7 +2469,7 @@ Normative invariant:
 - If any inclusion pattern matches zero paths, artifact collection MUST fail with a hard error.
 - Exclusion patterns are filters and are NOT required to match any path.
 
-### 24.4 Architecture Guidance
+### 23.4 Architecture Guidance
 
 `recipe.arch` is resolved during recipe parsing from `archs` against the host architecture.
 
