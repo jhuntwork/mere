@@ -1,5 +1,6 @@
 /// Packaging module: creates signed package artifacts from staged payloads.
 const std = @import("std");
+const builtin = @import("builtin");
 const mere = @import("mere.zig");
 const recipe = @import("recipe.zig");
 const package = @import("package.zig");
@@ -119,19 +120,15 @@ pub const Packager = struct {
 
         var pkg = package.Package.init(self.ctx);
         defer pkg.deinit();
-        // Set arch from recipe for the dependency scan (target_arch filtering).
-        // This will be replaced by the inferred arch after scanning.
-        if (config.recipe.arch) |arch| {
-            pkg.arch = self.ctx.allocator.dupe(u8, arch) catch |err| {
-                self.ctx.allocator.free(content_hash);
-                return self.fail(arch, "failed to copy architecture", if (err == error.OutOfMemory) PackagingError.OutOfMemory else PackagingError.CreationFailed);
-            };
-        } else {
-            pkg.arch = self.ctx.allocator.dupe(u8, "any") catch |err| {
-                self.ctx.allocator.free(content_hash);
-                return self.fail("any", "failed to copy architecture", if (err == error.OutOfMemory) PackagingError.OutOfMemory else PackagingError.CreationFailed);
-            };
-        }
+        // Set arch for the dependency scan (target_arch filtering). Resolution order:
+        // recipe `archs` declaration > host arch. "any" must be opted into via
+        // `archs "any"` in the recipe; absence of the declaration is not a claim
+        // of arch-independence.
+        const initial_arch = config.recipe.arch orelse @tagName(builtin.cpu.arch);
+        pkg.arch = self.ctx.allocator.dupe(u8, initial_arch) catch |err| {
+            self.ctx.allocator.free(content_hash);
+            return self.fail(initial_arch, "failed to copy architecture", if (err == error.OutOfMemory) PackagingError.OutOfMemory else PackagingError.CreationFailed);
+        };
         pkg.scanDirectory(config.staging_dir) catch |err| {
             self.ctx.allocator.free(content_hash);
             const diag = self.ctx.getDiagnosticContext();
@@ -146,28 +143,13 @@ pub const Packager = struct {
             );
         };
 
-        // Determine final package arch: explicit override > ELF inference > "any"
-        {
-            const final_arch = if (config.artifact.arch) |override|
-                override
-            else
-                package.inferArch(self.ctx, config.staging_dir) catch |err| {
-                    self.ctx.allocator.free(content_hash);
-                    const diag = self.ctx.getDiagnosticContext();
-                    if (diag.subject != null or diag.details != null) {
-                        return PackagingError.CreationFailed;
-                    }
-                    return self.ctx.failFmt(
-                        PackagingError.CreationFailed,
-                        config.staging_dir,
-                        "failed to infer package architecture ({s})",
-                        .{@errorName(err)},
-                    );
-                };
+        // Apply explicit artifact arch override if set. Otherwise pkg.arch
+        // already holds recipe.arch (or host arch) from the initial assignment.
+        if (config.artifact.arch) |override| {
             if (pkg.arch) |old| self.ctx.allocator.free(old);
-            pkg.arch = self.ctx.allocator.dupe(u8, final_arch) catch |err| {
+            pkg.arch = self.ctx.allocator.dupe(u8, override) catch |err| {
                 self.ctx.allocator.free(content_hash);
-                return self.fail(final_arch, "failed to copy inferred architecture", if (err == error.OutOfMemory) PackagingError.OutOfMemory else PackagingError.CreationFailed);
+                return self.fail(override, "failed to copy architecture override", if (err == error.OutOfMemory) PackagingError.OutOfMemory else PackagingError.CreationFailed);
             };
         }
 
@@ -547,11 +529,11 @@ test "Packager handles signing and metadata generation" {
     });
     defer result.deinit(test_env.ctx.allocator);
 
-    // Verify the archive filename format includes architecture + content hash
-    // No ELF files in staging, so arch is inferred as "any"
+    // Verify the archive filename format includes architecture + content hash.
+    // The recipe declares arch = "x86_64", which is honored in the filename.
     const expected_filename_prefix = try std.fmt.allocPrint(
         test_env.ctx.allocator,
-        "custom-name-2.1.0-3-any-{s}.pkg.tar.zst",
+        "custom-name-2.1.0-3-x86_64-{s}.pkg.tar.zst",
         .{result.archive_hash},
     );
     defer test_env.ctx.allocator.free(expected_filename_prefix);
