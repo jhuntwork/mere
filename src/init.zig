@@ -117,13 +117,11 @@ fn getRequiredDirectories(allocator: std.mem.Allocator, root: []const u8) ![]Dir
     return list.toOwnedSlice(allocator);
 }
 
-/// Check if running as root
+/// Check if running as root. Retained for callers that legitimately
+/// need to differentiate (e.g. ownership reporting). `mere store init`
+/// itself does not gate on this — it defers to filesystem permissions.
 fn isRoot() bool {
     return std.os.linux.geteuid() == 0;
-}
-
-fn requiresRoot(options: InitOptions) bool {
-    return !options.dry_run;
 }
 
 /// Get ownership information for a path
@@ -184,15 +182,10 @@ fn checkDirectory(
         result.status = .wrong_permissions;
     }
 
-    // Get actual ownership
+    // Record actual ownership for reporting. Ownership is informational
+    // only — `mere store init` does not manage ownership; the filesystem
+    // assigns it based on who creates the directory.
     result.actual_owner = try getOwnership(allocator, spec.path);
-
-    // Check ownership (should be root:root, which is uid:0 gid:0)
-    if (result.actual_owner) |owner| {
-        if (!std.mem.eql(u8, owner, result.expected_owner)) {
-            result.status = .wrong_ownership;
-        }
-    }
 
     return result;
 }
@@ -239,22 +232,24 @@ fn setDirectoryPermissions(path: []const u8, mode: u32) !void {
     };
 }
 
-/// Fix a single directory
+/// Fix a single directory.
+///
+/// Only filesystem state we manage is existence and mode bits.
+/// Ownership inherits from whoever invoked `mere store init` — if
+/// that's root, dirs end up root-owned; if a user, user-owned.
 fn fixDirectory(spec: DirSpec, check: CheckResult) !void {
     switch (check.status) {
         .ok => {}, // Nothing to fix
         .missing => {
             try createDirectory(spec.path, spec.mode);
-            try setOwnership(spec.path);
         },
         .wrong_permissions => {
-            // Fix permissions - also fix ownership since we're already fixing the directory
             try setDirectoryPermissions(spec.path, spec.mode);
-            try setOwnership(spec.path);
         },
         .wrong_ownership => {
-            // Fix ownership - also fix permissions since we're already fixing the directory
-            try setOwnership(spec.path);
+            // Unreachable in normal flow — checkDirectory no longer
+            // flags this status. Retained for safety if a caller
+            // constructs a CheckResult manually with this status.
             try setDirectoryPermissions(spec.path, spec.mode);
         },
         .not_directory => {
@@ -374,13 +369,12 @@ fn createSystemLayout(result: *InitResult, allocator: std.mem.Allocator, dry_run
     }
 }
 
-/// Initialize and validate Mere filesystem layout
+/// Initialize and validate Mere filesystem layout.
+///
+/// Access is gated by filesystem permissions, not by uid. If the
+/// invoking user can write to the prefix, init succeeds; if not,
+/// the filesystem returns EACCES at the failing operation.
 pub fn initialize(ctx: *Context, options: InitOptions) !InitResult {
-    // Check if running as root
-    if (requiresRoot(options) and !isRoot()) {
-        return InitError.PermissionDenied;
-    }
-
     var result = InitResult.init(ctx.allocator);
     errdefer result.deinit();
 
@@ -521,9 +515,4 @@ test "init mapInitFsError preserves actionable classes" {
     try std.testing.expectEqual(InitError.OutOfMemory, mapInitFsError(error.OutOfMemory));
     try std.testing.expectEqual(InitError.InvalidInput, mapInitFsError(error.BadPathName));
     try std.testing.expectEqual(InitError.FileSystem, mapInitFsError(error.InputOutput));
-}
-
-test "init requiresRoot allows dry run without root" {
-    try std.testing.expect(!requiresRoot(.{ .dry_run = true }));
-    try std.testing.expect(requiresRoot(.{ .dry_run = false }));
 }
