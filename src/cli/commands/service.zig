@@ -210,7 +210,7 @@ fn handleList(ctx: *mere.Context, _: *const types.ParsedArgs) MereError!types.Co
 fn serviceFailure(ctx: *mere.Context, err: services.ServiceError, fallback: []const u8) !types.CommandResult {
     const message = switch (err) {
         error.UnsupportedProvider => try ctx.allocator.dupe(u8, "configured init provider is not implemented for service management"),
-        error.InvalidConfig => blk: {
+        error.InvalidConfig, error.PermissionDenied => blk: {
             const user_message = getUserFriendlyMessage(err);
             const error_ctx = ctx.getDiagnosticContext().toErrorContext();
             const formatted = error_ctx.formatWithMessage(ctx.allocator, user_message) catch
@@ -218,7 +218,6 @@ fn serviceFailure(ctx: *mere.Context, err: services.ServiceError, fallback: []co
             break :blk formatted;
         },
         error.OutOfMemory => try ctx.allocator.dupe(u8, "out of memory"),
-        error.PermissionDenied => try ctx.allocator.dupe(u8, "permission denied"),
         else => try std.fmt.allocPrint(ctx.allocator, "{s}: {s}", .{ fallback, getUserFriendlyMessage(err) }),
     };
     return .{ .success = false, .exit_code = 1, .message = message };

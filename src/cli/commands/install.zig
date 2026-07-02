@@ -54,6 +54,9 @@ fn handleInstall(ctx: *mere.Context, args: *const types.ParsedArgs) MereError!ty
         .withSubject(package_names[0]);
     ctx.withDiagnosticContext(diagnostic_ctx);
 
+    if (try command.acquireStoreLockOrResult(ctx)) |result| return result;
+    defer ctx.releaseStoreLock();
+
     // Error boundary: catch all errors and map them to user-friendly messages at CLI boundary
     const success_message = performInstallation(ctx, package_names, profile_name, verify_store, force_sync) catch |err| {
         // Map error to MereError vocabulary

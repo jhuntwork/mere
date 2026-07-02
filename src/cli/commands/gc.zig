@@ -48,6 +48,9 @@ fn emitGCSummary(ctx: *mere.Context, action: []const u8, count: usize) void {
 pub fn handleGC(ctx: *mere.Context, args: *const types.ParsedArgs) MereError!types.CommandResult {
     const dry_run = args.getBool("dry-run");
 
+    if (try command.acquireStoreLockOrResult(ctx)) |result| return result;
+    defer ctx.releaseStoreLock();
+
     emit.phaseStart(ctx, .gc, null);
     emit.stepStartLast(ctx, .gc, "collect", true);
 

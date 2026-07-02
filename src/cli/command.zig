@@ -258,3 +258,17 @@ pub fn exitCodeForError(err: MereError) u8 {
         else => 1,
     };
 }
+
+/// Acquire the store lock for a mutating command. On success returns null
+/// and the caller must `defer ctx.releaseStoreLock()`. On failure returns
+/// a CommandResult the handler should return immediately.
+pub fn acquireStoreLockOrResult(ctx: *mere.Context) !?types.CommandResult {
+    ctx.acquireStoreLock() catch |err| {
+        return types.CommandResult{
+            .success = false,
+            .exit_code = exitCodeForError(mere.errors.ErrorMapping.mapZigError(err)),
+            .message = try ctx.allocator.dupe(u8, mere.errors.getUserFriendlyMessage(err)),
+        };
+    };
+    return null;
+}

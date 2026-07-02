@@ -55,6 +55,8 @@ pub const Context = struct {
     ui_emitter: ui.NoopEmitter,
     custom_emitter: ?*ui.Emitter = null,
     event_counter: u64 = 0,
+    store_lock_fd: ?std.posix.fd_t = null,
+    store_lock_depth: u32 = 0,
 
     const default_root_path = "/";
 
@@ -127,6 +129,12 @@ pub const Context = struct {
 
     /// Clean up resources when done
     pub fn deinit(self: *Context) void {
+        // Safety net: release the store lock if a caller forgot to (or
+        // returned early past a defer). Not expected in normal operation.
+        if (self.store_lock_depth > 0) {
+            self.store_lock_depth = 1;
+            self.releaseStoreLock();
+        }
         // Free diagnostic arena if initialized
         if (self.diag_arena) |*arena| {
             arena.deinit();
@@ -172,6 +180,57 @@ pub const Context = struct {
 
     pub fn root(self: *const Context) []const u8 {
         return self.root_path;
+    }
+
+    /// Acquire the process-wide store lock: a blocking exclusive flock on
+    /// `<root>/mere/.lock`. Serializes mutating operations (install,
+    /// uninstall, activate, generation keep/unkeep/delete, gc) across
+    /// concurrent `mere` invocations against the same root.
+    ///
+    /// Reentrant within a single Context: nested acquisitions are counted,
+    /// so an already-locked top-level operation can safely call another
+    /// lock-taking operation internally without deadlocking on itself.
+    pub fn acquireStoreLock(self: *Context) !void {
+        if (self.store_lock_depth > 0) {
+            self.store_lock_depth += 1;
+            return;
+        }
+
+        const mere_dir = try std.fs.path.join(self.allocator, &.{ self.root_path, "mere" });
+        defer self.allocator.free(mere_dir);
+        try path.ensureDirExists(mere_dir);
+
+        const lock_path = try std.fs.path.join(self.allocator, &.{ mere_dir, ".lock" });
+        defer self.allocator.free(lock_path);
+
+        const lock_file = try std.Io.Dir.createFileAbsolute(path.currentIo(), lock_path, .{ .truncate = false });
+        const lock_fd = lock_file.handle;
+
+        // Try non-blocking first so we can tell the user we're waiting
+        // rather than appearing to hang if another mere process holds it.
+        if (std.posix.errno(std.c.flock(lock_fd, std.c.LOCK.EX | std.c.LOCK.NB)) != .SUCCESS) {
+            self.info("waiting for store lock (another mere process may be running)...", .{});
+            if (std.posix.errno(std.c.flock(lock_fd, std.c.LOCK.EX)) != .SUCCESS) {
+                _ = std.c.close(lock_fd);
+                return error.Locked;
+            }
+        }
+
+        self.store_lock_fd = lock_fd;
+        self.store_lock_depth = 1;
+    }
+
+    /// Release a previously acquired store lock. No-op if not held.
+    pub fn releaseStoreLock(self: *Context) void {
+        if (self.store_lock_depth == 0) return;
+        self.store_lock_depth -= 1;
+        if (self.store_lock_depth > 0) return;
+
+        if (self.store_lock_fd) |fd| {
+            _ = std.c.flock(fd, std.c.LOCK.UN);
+            _ = std.c.close(fd);
+            self.store_lock_fd = null;
+        }
     }
 
     /// Format and log an info message
@@ -322,6 +381,75 @@ test "Context.root returns the default root path" {
     var ctx = Context.init(testing.allocator, null);
     defer ctx.deinit();
     try testing.expectEqualStrings("/", ctx.root());
+}
+
+test "Context.acquireStoreLock creates the lock file and releaseStoreLock unlocks it" {
+    const th = @import("test_helpers.zig");
+    var test_env = try th.createTestEnv();
+    defer {
+        test_env.cleanup();
+        std.testing.allocator.destroy(test_env);
+    }
+
+    try test_env.ctx.acquireStoreLock();
+    try std.testing.expect(test_env.ctx.store_lock_fd != null);
+    try std.testing.expectEqual(@as(u32, 1), test_env.ctx.store_lock_depth);
+
+    const lock_path = try std.fs.path.join(std.testing.allocator, &.{ test_env.path, "mere", ".lock" });
+    defer std.testing.allocator.free(lock_path);
+    try std.Io.Dir.accessAbsolute(path.currentIo(), lock_path, .{});
+
+    test_env.ctx.releaseStoreLock();
+    try std.testing.expect(test_env.ctx.store_lock_fd == null);
+    try std.testing.expectEqual(@as(u32, 0), test_env.ctx.store_lock_depth);
+}
+
+test "Context.acquireStoreLock is reentrant within the same Context" {
+    const th = @import("test_helpers.zig");
+    var test_env = try th.createTestEnv();
+    defer {
+        test_env.cleanup();
+        std.testing.allocator.destroy(test_env);
+    }
+
+    try test_env.ctx.acquireStoreLock();
+    try test_env.ctx.acquireStoreLock();
+    try std.testing.expectEqual(@as(u32, 2), test_env.ctx.store_lock_depth);
+
+    test_env.ctx.releaseStoreLock();
+    try std.testing.expect(test_env.ctx.store_lock_fd != null); // still held at depth 1
+    test_env.ctx.releaseStoreLock();
+    try std.testing.expect(test_env.ctx.store_lock_fd == null);
+
+    // Releasing past zero is a no-op, not a crash.
+    test_env.ctx.releaseStoreLock();
+}
+
+test "Context.acquireStoreLock actually excludes a second independent lock holder" {
+    const th = @import("test_helpers.zig");
+    var test_env = try th.createTestEnv();
+    defer {
+        test_env.cleanup();
+        std.testing.allocator.destroy(test_env);
+    }
+
+    try test_env.ctx.acquireStoreLock();
+
+    const lock_path = try std.fs.path.join(std.testing.allocator, &.{ test_env.path, "mere", ".lock" });
+    defer std.testing.allocator.free(lock_path);
+
+    const rival = try std.Io.Dir.createFileAbsolute(path.currentIo(), lock_path, .{ .truncate = false });
+    defer rival.close(path.currentIo());
+
+    // A second, independent file description should fail to take the lock
+    // non-blocking while the Context still holds it.
+    try std.testing.expect(std.posix.errno(std.c.flock(rival.handle, std.c.LOCK.EX | std.c.LOCK.NB)) != .SUCCESS);
+
+    test_env.ctx.releaseStoreLock();
+
+    // Once released, the rival can now take it.
+    try std.testing.expectEqual(std.posix.E.SUCCESS, std.posix.errno(std.c.flock(rival.handle, std.c.LOCK.EX | std.c.LOCK.NB)));
+    _ = std.c.flock(rival.handle, std.c.LOCK.UN);
 }
 
 test "Context diagnostic_context field initialization" {

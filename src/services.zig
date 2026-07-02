@@ -202,7 +202,11 @@ pub fn readLogs(ctx: *mere.Context, name: []const u8) ServiceError![]const u8 {
     const cat_cmd = try std.fmt.allocPrint(allocator, "cat {s} | s6-tai64nlocal", .{current});
     defer allocator.free(cat_cmd);
 
-    const result = try s6rc.run(allocator, &.{ "sh", "-c", cat_cmd });
+    const result = s6rc.run(allocator, &.{ "sh", "-c", cat_cmd }) catch |err| {
+        if (err == error.OutOfMemory) return error.OutOfMemory;
+        const mapped: ServiceError = if (err == error.AccessDenied) error.PermissionDenied else error.FileSystem;
+        return ctx.failFmt(mapped, name, "failed to run log command ({s}): {s}", .{ cat_cmd, @errorName(err) });
+    };
     defer allocator.free(result.stderr);
     if (result.term != .exited or result.term.exited != 0) {
         allocator.free(result.stdout);
