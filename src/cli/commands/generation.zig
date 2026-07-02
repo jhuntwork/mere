@@ -257,6 +257,9 @@ pub fn handleKeep(ctx: *mere.Context, args: *const types.ParsedArgs) MereError!t
 
     const note = args.getString("note");
 
+    if (try command.acquireStoreLockOrResult(ctx)) |result| return result;
+    defer ctx.releaseStoreLock();
+
     const profile_dir = std.fs.path.join(ctx.allocator, &.{ ctx.root_path, "mere", "profiles", "system" }) catch {
         return MereError.OutOfMemory;
     };
@@ -301,6 +304,9 @@ pub fn handleUnkeep(ctx: *mere.Context, args: *const types.ParsedArgs) MereError
         };
     };
 
+    if (try command.acquireStoreLockOrResult(ctx)) |result| return result;
+    defer ctx.releaseStoreLock();
+
     const profile_dir = std.fs.path.join(ctx.allocator, &.{ ctx.root_path, "mere", "profiles", "system" }) catch {
         return MereError.OutOfMemory;
     };
@@ -343,6 +349,9 @@ pub fn handleDelete(ctx: *mere.Context, args: *const types.ParsedArgs) MereError
             .message = try std.fmt.allocPrint(ctx.allocator, "invalid generation number: {s}", .{gen_str}),
         };
     };
+
+    if (try command.acquireStoreLockOrResult(ctx)) |result| return result;
+    defer ctx.releaseStoreLock();
 
     const profile_dir = std.fs.path.join(ctx.allocator, &.{ ctx.root_path, "mere", "profiles", "system" }) catch {
         return MereError.OutOfMemory;
@@ -395,6 +404,9 @@ pub fn handleActivate(ctx: *mere.Context, args: *const types.ParsedArgs) MereErr
     };
 
     const verify_store = args.getBool("verify-store");
+
+    if (try command.acquireStoreLockOrResult(ctx)) |result| return result;
+    defer ctx.releaseStoreLock();
 
     const profile_dir = std.fs.path.join(ctx.allocator, &.{ ctx.root_path, "mere", "profiles", "system" }) catch {
         return MereError.OutOfMemory;
