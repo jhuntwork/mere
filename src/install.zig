@@ -2160,12 +2160,12 @@ test "multi-repository install uses priority and resolves dependencies across re
         d2.close(path.currentIo());
     }
 
-    // Place DB files as repo1/repo1.db and repo2/repo2.db using path helpers
-    const db_file1 = "repo1.db";
-    const db_file2 = "repo2.db";
-    const db_path1 = try std.fs.path.join(std.testing.allocator, &.{ repo1_dir, db_file1 });
+    // Place DB files as repo1/repo.db and repo2/repo.db - Repository.init
+    // always uses the fixed repo.db/repo.db.sig filenames, regardless of
+    // the containing directory's name.
+    const db_path1 = try std.fs.path.join(std.testing.allocator, &.{ repo1_dir, "repo.db" });
     defer std.testing.allocator.free(db_path1);
-    const db_path2 = try std.fs.path.join(std.testing.allocator, &.{ repo2_dir, db_file2 });
+    const db_path2 = try std.fs.path.join(std.testing.allocator, &.{ repo2_dir, "repo.db" });
     defer std.testing.allocator.free(db_path2);
     var f1 = try path.makePathAndOpenFile(db_path1);
     f1.close(path.currentIo());
@@ -2347,14 +2347,14 @@ test "multi-repository install uses priority and resolves dependencies across re
     pkg_b.deinit();
 
     // Now sign the DB files AFTER all writes
-    const sig_path1 = try std.fs.path.join(std.testing.allocator, &.{ repo1_dir, "repo1.db.sig" });
+    const sig_path1 = try std.fs.path.join(std.testing.allocator, &.{ repo1_dir, "repo.db.sig" });
     defer std.testing.allocator.free(sig_path1);
 
     // Set the signing key path in the context to use keypair1 and write raw signature bytes
     ctx.signing_key_path = key_path1;
     _ = try sign.writeSignatureFileWithResolver(ctx, db_path1, sig_path1, null, null);
 
-    const sig_path2 = try std.fs.path.join(std.testing.allocator, &.{ repo2_dir, "repo2.db.sig" });
+    const sig_path2 = try std.fs.path.join(std.testing.allocator, &.{ repo2_dir, "repo.db.sig" });
     defer std.testing.allocator.free(sig_path2);
 
     // Set the signing key path in the context to use keypair2 and write raw signature bytes
@@ -3476,10 +3476,11 @@ test "integration: multi-repository priority selection" {
         d2.close(path.currentIo());
     }
 
-    // Create DB files
-    const db_path_high = try std.fs.path.join(std.testing.allocator, &.{ high_repo_dir, "high_repo.db" });
+    // Create DB files. Repository.init always uses the fixed repo.db/
+    // repo.db.sig filenames regardless of the containing directory's name.
+    const db_path_high = try std.fs.path.join(std.testing.allocator, &.{ high_repo_dir, "repo.db" });
     defer std.testing.allocator.free(db_path_high);
-    const db_path_low = try std.fs.path.join(std.testing.allocator, &.{ low_repo_dir, "low_repo.db" });
+    const db_path_low = try std.fs.path.join(std.testing.allocator, &.{ low_repo_dir, "repo.db" });
     defer std.testing.allocator.free(db_path_low);
     {
         var f1 = try path.makePathAndOpenFile(db_path_high);
@@ -3635,12 +3636,12 @@ test "integration: multi-repository priority selection" {
     pkg_low.deinit();
 
     // Sign database files
-    const sig_path_high = try std.fs.path.join(std.testing.allocator, &.{ high_repo_dir, "high_repo.db.sig" });
+    const sig_path_high = try std.fs.path.join(std.testing.allocator, &.{ high_repo_dir, "repo.db.sig" });
     defer std.testing.allocator.free(sig_path_high);
     ctx.signing_key_path = key_path_high;
     _ = try sign.writeSignatureFileWithResolver(ctx, db_path_high, sig_path_high, null, null);
 
-    const sig_path_low = try std.fs.path.join(std.testing.allocator, &.{ low_repo_dir, "low_repo.db.sig" });
+    const sig_path_low = try std.fs.path.join(std.testing.allocator, &.{ low_repo_dir, "repo.db.sig" });
     defer std.testing.allocator.free(sig_path_low);
     ctx.signing_key_path = key_path_low;
     _ = try sign.writeSignatureFileWithResolver(ctx, db_path_low, sig_path_low, null, null);
