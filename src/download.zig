@@ -1177,11 +1177,22 @@ test "ensurePackageArchiveCached downloads and caches, then hits cache" {
     }
     const ctx = &test_env.ctx;
 
-    // Dummy HTTP client that returns fixed body
+    // Dummy HTTP client that returns fixed body. archive_hash must be the
+    // real hash of the body now that ensurePackageArchiveCached verifies
+    // downloads against it.
+    const archive_body = "archive-cached";
+    const content_hash = try hash_mod.calculateBytesHash(ctx.allocator, archive_body);
+    defer ctx.allocator.free(content_hash);
+
     var dummy = th.DummyClient.init(ctx.allocator);
     defer dummy.deinit();
-    const content_hash = "a" ** 64;
-    try dummy.set("https://repo.example.com/packages/mypkg-1.2.3-1-x86_64-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.pkg.tar.zst", "archive-cached");
+    const archive_url = try std.fmt.allocPrint(
+        ctx.allocator,
+        "https://repo.example.com/packages/mypkg-1.2.3-1-x86_64-{s}.pkg.tar.zst",
+        .{content_hash},
+    );
+    defer ctx.allocator.free(archive_url);
+    try dummy.set(archive_url, archive_body);
     var vtable = TransferClient.VTable{ .download_file = th.dummy_download_file };
     const client = TransferClient{ .ptr = @ptrCast(&dummy), .vtable = &vtable };
 
@@ -1220,7 +1231,7 @@ test "ensurePackageArchiveCached downloads and caches, then hits cache" {
     defer ctx.allocator.free(cached);
     try std.testing.expectEqualStrings("archive-cached", cached);
     // Second call: should hit cache and keep the original cached bytes.
-    try dummy.set("https://repo.example.com/packages/mypkg-1.2.3-1-x86_64-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.pkg.tar.zst", "should-not-be-used");
+    try dummy.set(archive_url, "should-not-be-used");
     const cache_path2 = try th.ensurePackageArchiveCached(
         &test_repocache,
         &test_pkg,
