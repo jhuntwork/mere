@@ -224,7 +224,7 @@ pub const RepoCache = struct {
         // Local repos point cache_dir directly at the source directory.
         // No download needed — just verify the signature in-place.
         if (self.is_local) {
-            try self.syncLocal();
+            try self.syncLocal(loaded_keys);
             return;
         }
 
@@ -317,12 +317,35 @@ pub const RepoCache = struct {
 
     /// Sync a local (file://) repository.
     ///
-    /// For local repos, sync is a no-op. The signature was already verified
-    /// during local repo discovery and cache_dir points directly
-    /// at the source directory — there is nothing to download or re-verify.
-    /// The DB is opened lazily by ensureRepository().
-    fn syncLocal(self: *RepoCache) RepoCacheError!void {
-        self.ctx.debug("local repo {s}: sync is a no-op (verified at discovery)", .{self.name});
+    /// There is nothing to download — cache_dir points directly at the
+    /// source directory — but the signature still needs checking here.
+    /// Auto-discovered dev repos (repo_sources.zig) verify before ever
+    /// constructing a RepoCache, but a file:// repo declared in config.kdl
+    /// reaches this path with its own trusted_fingerprints unverified.
+    fn syncLocal(self: *RepoCache, loaded_keys: []const sign.LoadedKey) RepoCacheError!void {
+        const allocator = self.ctx.allocator;
+        const paths = try buildRepoPaths(self, allocator);
+        defer {
+            allocator.free(paths.db_path);
+            allocator.free(paths.sig_path);
+        }
+
+        if (self.trusted_fingerprints.len == 0) {
+            self.ctx.setDiagnosticContext(self.name, "no trusted fingerprints configured for repository");
+            return RepoCacheError.SignatureInvalid;
+        }
+
+        var result = sign.verifyWithTrustedFingerprints(self.ctx, paths.db_path, paths.sig_path, self.trusted_fingerprints, loaded_keys) catch {
+            const diag = self.ctx.getDiagnosticContext();
+            if (diag.details) |details| {
+                self.ctx.setDiagnosticContext(self.name, details);
+            } else {
+                self.ctx.setDiagnosticContext(self.name, "failed to verify repository database signature");
+            }
+            return RepoCacheError.SignatureInvalid;
+        };
+        result.deinit(allocator);
+        self.ctx.debug("local repo {s}: signature verification passed", .{self.name});
     }
 
     pub fn archiveCacheDir(self: *RepoCache) ![]const u8 {
@@ -826,6 +849,67 @@ test "RepoCache.sync downloads and verifies DB and signature" {
         sig_exists = false;
     };
     try std.testing.expect(sig_exists);
+}
+
+// Regression: a file:// repo declared in config.kdl (as opposed to an
+// auto-discovered dev repo, which verifies before ever constructing a
+// RepoCache) previously skipped signature verification entirely - sync()
+// on a local repo was a no-op. A repo.db signed with a key that isn't in
+// the configured trusted_fingerprints must be rejected.
+test "RepoCache.sync rejects a local repo signed with an untrusted key" {
+    const th = @import("test_helpers.zig");
+    var test_env = try th.createTestEnv();
+    defer {
+        test_env.cleanup();
+        std.testing.allocator.destroy(test_env);
+    }
+    const ctx = &test_env.ctx;
+
+    const remote_dir = test_env.path;
+    const db_file = try std.fs.path.join(ctx.allocator, &.{ remote_dir, repo_history.REPO_DB_FILENAME });
+    defer ctx.allocator.free(db_file);
+    const sig_file = try std.fs.path.join(ctx.allocator, &.{ remote_dir, repo_history.REPO_SIG_FILENAME });
+    defer ctx.allocator.free(sig_file);
+
+    {
+        const f = try std.Io.Dir.createFileAbsolute(path.currentIo(), db_file, .{});
+        try f.writeStreamingAll(path.currentIo(), "dummy-db-bytes");
+        f.close(path.currentIo());
+    }
+
+    // Sign with a DIFFERENT key than the one the repo config trusts -
+    // simulating an attacker (or a stale/misconfigured mirror) serving a
+    // repo.db that isn't actually signed by a key this config trusts.
+    const attacker_key_path = try std.fs.path.join(ctx.allocator, &.{ remote_dir, "attacker.key" });
+    defer ctx.allocator.free(attacker_key_path);
+    const attacker_keypair = try sign.generateKeyPair();
+    try attacker_keypair.secret_key.saveToFile(attacker_key_path);
+    ctx.signing_key_path = attacker_key_path;
+    _ = try sign.writeSignatureFileWithResolver(ctx, db_file, sig_file, null, null);
+
+    // The trusted fingerprint belongs to a completely different key.
+    const trusted_keypair = try sign.generateKeyPair();
+    const trusted_fingerprint = try trusted_keypair.public_key.fingerprint(ctx.allocator);
+    defer ctx.allocator.free(trusted_fingerprint);
+
+    const url = try std.fmt.allocPrintSentinel(ctx.allocator, "file://{s}", .{remote_dir}, 0);
+    defer ctx.allocator.free(url);
+
+    const trusted_fps = [_][]const u8{trusted_fingerprint};
+    var repocache = try RepoCache.init(ctx, "testrepo", url, &trusted_fps, 100);
+    defer repocache.deinit();
+    try std.testing.expect(repocache.is_local);
+
+    var curl_client = try download.CurlTransferClient.init(ctx, "mere");
+    defer download.CurlTransferClient.cleanupFn(ctx, curl_client);
+    const client = curl_client.client();
+    var loaded_keys = try sign.loadAllKeys(ctx);
+    defer {
+        for (loaded_keys.items) |*key| key.deinit(ctx.allocator);
+        loaded_keys.deinit(ctx.allocator);
+    }
+
+    try std.testing.expectError(RepoCacheError.SignatureInvalid, repocache.sync(client, .{}, loaded_keys.items));
 }
 
 test "writeLastSync reports permission denied for read-only cache dir" {
