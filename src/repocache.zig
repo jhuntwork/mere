@@ -171,8 +171,18 @@ pub const RepoCache = struct {
         return cache;
     }
 
-    pub fn ensureRepository(self: *RepoCache) !void {
+    /// Open the cached repository database, verifying it against
+    /// trusted_fingerprints first. This is the single choke point every
+    /// caller passes through before ever reading from the database, so it
+    /// catches the case sync() itself doesn't: a repo.db that was verified
+    /// at some earlier download but has been usable (and trusted) ever
+    /// since with no re-check - including when sync() was skipped
+    /// entirely (TTL, or the caller opted out of syncing) or fell back to
+    /// stale cached metadata after a failed sync.
+    pub fn ensureRepository(self: *RepoCache, loaded_keys: []const sign.LoadedKey) !void {
         if (self.repository == null) {
+            try self.verifyCachedDb(loaded_keys);
+
             self.repository = Repository.init(self.ctx, self.cache_dir, true) catch |err| {
                 const diag = self.ctx.getDiagnosticContext();
                 if (diag.details == null) {
@@ -185,6 +195,36 @@ pub const RepoCache = struct {
                 };
             };
         }
+    }
+
+    /// Verify the repo.db currently sitting in cache_dir against
+    /// trusted_fingerprints. Shared by ensureRepository() (every repo,
+    /// every open) and syncLocal() (local repos specifically, so a bad
+    /// signature is caught at sync time with a clear error rather than
+    /// deferred to whenever the database is first opened).
+    fn verifyCachedDb(self: *RepoCache, loaded_keys: []const sign.LoadedKey) RepoCacheError!void {
+        const allocator = self.ctx.allocator;
+        const paths = try buildRepoPaths(self, allocator);
+        defer {
+            allocator.free(paths.db_path);
+            allocator.free(paths.sig_path);
+        }
+
+        if (self.trusted_fingerprints.len == 0) {
+            self.ctx.setDiagnosticContext(self.name, "no trusted fingerprints configured for repository");
+            return RepoCacheError.SignatureInvalid;
+        }
+
+        var result = sign.verifyWithTrustedFingerprints(self.ctx, paths.db_path, paths.sig_path, self.trusted_fingerprints, loaded_keys) catch {
+            const diag = self.ctx.getDiagnosticContext();
+            if (diag.details) |details| {
+                self.ctx.setDiagnosticContext(self.name, details);
+            } else {
+                self.ctx.setDiagnosticContext(self.name, "failed to verify repository database signature");
+            }
+            return RepoCacheError.SignatureInvalid;
+        };
+        result.deinit(allocator);
     }
 
     /// Deinitialize a RepoCache, cleaning up resources owned by this object.
@@ -323,28 +363,7 @@ pub const RepoCache = struct {
     /// constructing a RepoCache, but a file:// repo declared in config.kdl
     /// reaches this path with its own trusted_fingerprints unverified.
     fn syncLocal(self: *RepoCache, loaded_keys: []const sign.LoadedKey) RepoCacheError!void {
-        const allocator = self.ctx.allocator;
-        const paths = try buildRepoPaths(self, allocator);
-        defer {
-            allocator.free(paths.db_path);
-            allocator.free(paths.sig_path);
-        }
-
-        if (self.trusted_fingerprints.len == 0) {
-            self.ctx.setDiagnosticContext(self.name, "no trusted fingerprints configured for repository");
-            return RepoCacheError.SignatureInvalid;
-        }
-
-        var result = sign.verifyWithTrustedFingerprints(self.ctx, paths.db_path, paths.sig_path, self.trusted_fingerprints, loaded_keys) catch {
-            const diag = self.ctx.getDiagnosticContext();
-            if (diag.details) |details| {
-                self.ctx.setDiagnosticContext(self.name, details);
-            } else {
-                self.ctx.setDiagnosticContext(self.name, "failed to verify repository database signature");
-            }
-            return RepoCacheError.SignatureInvalid;
-        };
-        result.deinit(allocator);
+        try self.verifyCachedDb(loaded_keys);
         self.ctx.debug("local repo {s}: signature verification passed", .{self.name});
     }
 
@@ -910,6 +929,94 @@ test "RepoCache.sync rejects a local repo signed with an untrusted key" {
     }
 
     try std.testing.expectError(RepoCacheError.SignatureInvalid, repocache.sync(client, .{}, loaded_keys.items));
+}
+
+// Regression: previously, a repo.db already sitting in cache_dir from an
+// earlier sync was trusted forever afterward with no re-check -
+// ensureRepository() just opened it. Tampering with the cached file after
+// it was verified (a local attacker, or on-disk corruption) went
+// undetected on every subsequent use as long as sync() itself didn't run
+// again (TTL not expired, or the caller opted out of syncing).
+// ensureRepository() must now re-verify every time it actually opens the
+// database (i.e. whenever self.repository is not already held open).
+test "ensureRepository rejects a cached db that was tampered with after being verified" {
+    const th = @import("test_helpers.zig");
+    var test_env = try th.createTestEnv();
+    defer {
+        test_env.cleanup();
+        std.testing.allocator.destroy(test_env);
+    }
+    const ctx = &test_env.ctx;
+    const allocator = ctx.allocator;
+
+    const keypair = try sign.generateKeyPair();
+    const key_path = try std.fs.path.join(allocator, &.{ test_env.path, "repo.key" });
+    defer allocator.free(key_path);
+    try keypair.secret_key.saveToFile(key_path);
+    const trusted_fingerprint = try keypair.public_key.fingerprint(allocator);
+    defer allocator.free(trusted_fingerprint);
+    const trusted_fps = [_][]const u8{trusted_fingerprint};
+
+    // The public key must be discoverable by loadAllKeys() so
+    // verifyWithTrustedFingerprints can match it against the fingerprint.
+    const user_keys_dir = try std.fs.path.join(allocator, &.{ test_env.path, ".mere", "keys" });
+    defer allocator.free(user_keys_dir);
+    try path.ensureDirExists(user_keys_dir);
+    const pubkey_path = try std.fs.path.join(allocator, &.{ user_keys_dir, "testrepo.pub" });
+    defer allocator.free(pubkey_path);
+    try keypair.public_key.saveToFile(pubkey_path);
+
+    // Use RepoCache's own computed cache_dir rather than guessing the path -
+    // it's derived from a hash of name+fingerprints.
+    var probe = try RepoCache.init(ctx, "testrepo", "https://repo.example.com", &trusted_fps, 100);
+    const cache_dir = try allocator.dupe(u8, probe.cacheDir());
+    defer allocator.free(cache_dir);
+    probe.deinit();
+
+    try path.ensureDirExists(cache_dir);
+    const db_file = try std.fs.path.join(allocator, &.{ cache_dir, repo_history.REPO_DB_FILENAME });
+    defer allocator.free(db_file);
+    const sig_file = try std.fs.path.join(allocator, &.{ cache_dir, repo_history.REPO_SIG_FILENAME });
+    defer allocator.free(sig_file);
+
+    // Simulate a repo.db already cached from an earlier successful sync.
+    {
+        const f = try std.Io.Dir.createFileAbsolute(path.currentIo(), db_file, .{});
+        try f.writeStreamingAll(path.currentIo(), "original-trusted-db-bytes");
+        f.close(path.currentIo());
+    }
+    ctx.signing_key_path = key_path;
+    _ = try sign.writeSignatureFileWithResolver(ctx, db_file, sig_file, null, null);
+
+    var loaded_keys = try sign.loadAllKeys(ctx);
+    defer {
+        for (loaded_keys.items) |*key| key.deinit(ctx.allocator);
+        loaded_keys.deinit(ctx.allocator);
+    }
+
+    // A fresh RepoCache (self.repository == null) pointing at the
+    // already-cached, still-untampered db opens cleanly.
+    {
+        var repocache = try RepoCache.init(ctx, "testrepo", "https://repo.example.com", &trusted_fps, 100);
+        defer repocache.deinit();
+        try repocache.ensureRepository(loaded_keys.items);
+    }
+
+    // Now tamper with the cached db in place - no sync() involved, just
+    // direct on-disk modification (a local attacker, or corruption).
+    {
+        const f = try std.Io.Dir.openFileAbsolute(path.currentIo(), db_file, .{ .mode = .write_only });
+        try f.writePositionalAll(path.currentIo(), "tampered-bytes-appended", 26);
+        f.close(path.currentIo());
+    }
+
+    // A second, fresh RepoCache instance (simulating the next mere
+    // invocation) must reject the now-tampered cached db.
+    {
+        var repocache = try RepoCache.init(ctx, "testrepo", "https://repo.example.com", &trusted_fps, 100);
+        defer repocache.deinit();
+        try std.testing.expectError(RepoCacheError.SignatureInvalid, repocache.ensureRepository(loaded_keys.items));
+    }
 }
 
 test "writeLastSync reports permission denied for read-only cache dir" {
