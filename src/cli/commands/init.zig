@@ -18,11 +18,6 @@ const init_meta = command.CommandMeta{
             .description = "Show what would be done without doing it",
             .flag_type = .bool,
         },
-        .{
-            .name = "system",
-            .description = "Also create system symlinks exposing the active profile at standard paths",
-            .flag_type = .bool,
-        },
     },
 };
 
@@ -30,12 +25,10 @@ const init_meta = command.CommandMeta{
 pub fn handleInit(ctx: *mere.Context, args: *const types.ParsedArgs) MereError!types.CommandResult {
     const dry_run = args.getBool("dry-run");
     const verbose = args.getBool("verbose");
-    const system = args.getBool("system");
 
     const options = init_mod.InitOptions{
         .dry_run = dry_run,
         .verbose = verbose,
-        .system = system,
     };
 
     // Run initialization
