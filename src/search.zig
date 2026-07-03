@@ -62,11 +62,19 @@ pub fn searchPackages(ctx: *mere.Context, term: []const u8, client: download.Tra
         repocaches.deinit(ctx.allocator);
     }
 
+    var loaded_keys = sign.loadAllKeys(ctx) catch {
+        return ctx.fail(SearchError.FileSystem, term, "failed to load trusted keys");
+    };
+    defer {
+        for (loaded_keys.items) |*key| key.deinit(ctx.allocator);
+        loaded_keys.deinit(ctx.allocator);
+    }
+
     // Check if any remote repo needs an initial sync
     var needs_sync = false;
     for (repocaches.items) |rc| {
         if (!rc.is_local) {
-            rc.ensureRepository() catch {
+            rc.ensureRepository(loaded_keys.items) catch {
                 needs_sync = true;
                 break;
             };
@@ -74,14 +82,6 @@ pub fn searchPackages(ctx: *mere.Context, term: []const u8, client: download.Tra
     }
 
     if (needs_sync) {
-        var loaded_keys = sign.loadAllKeys(ctx) catch {
-            return ctx.fail(SearchError.FileSystem, term, "failed to load trusted keys");
-        };
-        defer {
-            for (loaded_keys.items) |*key| key.deinit(ctx.allocator);
-            loaded_keys.deinit(ctx.allocator);
-        }
-
         for (repocaches.items) |rc| {
             if (rc.is_local) continue;
             rc.sync(client, .{
@@ -96,7 +96,7 @@ pub fn searchPackages(ctx: *mere.Context, term: []const u8, client: download.Tra
     }
 
     for (repocaches.items) |rc| {
-        rc.ensureRepository() catch {
+        rc.ensureRepository(loaded_keys.items) catch {
             ctx.debug("skipping repo {s}: failed to open", .{rc.name});
             continue;
         };

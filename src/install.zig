@@ -1178,7 +1178,7 @@ pub fn resolveProfile(
         try syncRepoCaches(ctx, repocaches, client, force_sync, loaded_keys.items);
     } else {
         for (repocaches) |repo_cache| {
-            try repo_cache.ensureRepository();
+            try repo_cache.ensureRepository(loaded_keys.items);
         }
     }
 
@@ -1269,7 +1269,7 @@ fn syncRepoCaches(
             .ttl_seconds = repo_cache.sync_ttl_seconds,
             .timeout_seconds = repo_cache.sync_timeout_seconds,
         }, loaded_keys);
-        try repo_cache.ensureRepository();
+        try repo_cache.ensureRepository(loaded_keys);
     }
     ctx.debug("repo sync complete for {d} repositories", .{repocaches.len});
 }
@@ -2425,12 +2425,12 @@ test "multi-repository install uses priority and resolves dependencies across re
         loaded_keys.deinit(ctx.allocator);
     }
     try repocache1.sync(client, .{}, loaded_keys.items); // Sync BEFORE initializing the repository
-    try repocache1.ensureRepository();
+    try repocache1.ensureRepository(loaded_keys.items);
 
     var repocache2 = try RepoCache.fromConfig(ctx, &ctx.configuration.?.repos.items[1]);
     defer repocache2.deinit();
     try repocache2.sync(client, .{}, loaded_keys.items); // Sync BEFORE initializing the repository
-    try repocache2.ensureRepository();
+    try repocache2.ensureRepository(loaded_keys.items);
 
     var repocaches = [_]*RepoCache{ &repocache1, &repocache2 };
 
@@ -2813,7 +2813,7 @@ test "integration: full install pipeline publishes named profile root" {
         loaded_keys.deinit(ctx.allocator);
     }
     try repocache.sync(client, .{}, loaded_keys.items);
-    try repocache.ensureRepository();
+    try repocache.ensureRepository(loaded_keys.items);
 
     var repocaches = [_]*RepoCache{&repocache};
 
@@ -3107,7 +3107,7 @@ test "integration: named profile lifecycle replaces root atomically and additive
         loaded_keys.deinit(ctx.allocator);
     }
     try repocache.sync(client, .{}, loaded_keys.items);
-    try repocache.ensureRepository();
+    try repocache.ensureRepository(loaded_keys.items);
 
     var repocaches = [_]*RepoCache{&repocache};
 
@@ -3427,7 +3427,7 @@ test "integration: symlink tree conflict detection" {
         loaded_keys.deinit(ctx.allocator);
     }
     try repocache.sync(client, .{}, loaded_keys.items);
-    try repocache.ensureRepository();
+    try repocache.ensureRepository(loaded_keys.items);
 
     var repocaches = [_]*RepoCache{&repocache};
 
@@ -3710,9 +3710,9 @@ test "integration: multi-repository priority selection" {
     }
 
     try repocache_high.sync(client, .{}, loaded_keys.items);
-    try repocache_high.ensureRepository();
+    try repocache_high.ensureRepository(loaded_keys.items);
     try repocache_low.sync(client, .{}, loaded_keys.items);
-    try repocache_low.ensureRepository();
+    try repocache_low.ensureRepository(loaded_keys.items);
 
     // Pass repocaches in priority order (high priority first)
     var repocaches = [_]*RepoCache{ &repocache_high, &repocache_low };
@@ -3933,7 +3933,7 @@ test "integration: garbage collection removes unreferenced store paths" {
         loaded_keys.deinit(ctx.allocator);
     }
     try repocache.sync(client, .{}, loaded_keys.items);
-    try repocache.ensureRepository();
+    try repocache.ensureRepository(loaded_keys.items);
 
     var repocaches = [_]*RepoCache{&repocache};
 
