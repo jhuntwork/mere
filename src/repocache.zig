@@ -9,6 +9,7 @@ const path = @import("path.zig");
 const kdl = @import("kdl.zig");
 const repo_history = @import("repo_history.zig");
 const ui = @import("ui/mod.zig");
+const hash = @import("hash.zig");
 
 /// Repository cache operations error set
 ///
@@ -374,7 +375,9 @@ pub const RepoCache = struct {
             const archive_url = try self.archiveUrl(pkg);
             defer self.ctx.allocator.free(archive_url);
 
-            try download.downloadFile(client, self.ctx, archive_url, dest_path, download.DownloadOptions{});
+            try download.downloadFile(client, self.ctx, archive_url, dest_path, download.DownloadOptions{
+                .expected_hash = if (pkg.archive_hash.len > 0) pkg.archive_hash else null,
+            });
         };
 
         return try self.ctx.allocator.dupe(u8, dest_path);
@@ -924,10 +927,23 @@ test "ensurePackageArchiveCached uses dummy HTTP client" {
     }
     const ctx = &test_env.ctx;
 
+    // ensurePackageArchiveCached now verifies the download against
+    // pkg.archive_hash, so the dummy body's hash must be real - a
+    // placeholder like "b" * 64 would (correctly) get rejected as a
+    // hash mismatch.
+    const archive_body = "archive-bytes";
+    const archive_hash = try hash.calculateBytesHash(ctx.allocator, archive_body);
+    defer ctx.allocator.free(archive_hash);
+
     var dummy = th.DummyClient.init(ctx.allocator);
     defer dummy.deinit();
-    const content_hash = "b" ** 64;
-    try dummy.set("https://repo.example.com/packages/mypkg-1.2.3-1-x86_64-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb.pkg.tar.zst", "archive-bytes");
+    const archive_url = try std.fmt.allocPrint(
+        ctx.allocator,
+        "https://repo.example.com/packages/mypkg-1.2.3-1-x86_64-{s}.pkg.tar.zst",
+        .{archive_hash},
+    );
+    defer ctx.allocator.free(archive_url);
+    try dummy.set(archive_url, archive_body);
     var vtable = download.TransferClient.VTable{ .download_file = th.dummy_download_file };
     const client = download.TransferClient{ .ptr = @ptrCast(&dummy), .vtable = &vtable };
 
@@ -948,8 +964,8 @@ test "ensurePackageArchiveCached uses dummy HTTP client" {
         .signature = null,
         .dependencies = undefined,
         .provisions = undefined,
-        .content_hash = content_hash,
-        .archive_hash = content_hash,
+        .content_hash = archive_hash,
+        .archive_hash = archive_hash,
     };
 
     const archive_path = try cache.ensurePackageArchiveCached(&pkg, client);
@@ -960,4 +976,62 @@ test "ensurePackageArchiveCached uses dummy HTTP client" {
     var buf: [32]u8 = undefined;
     const n = try file.readPositionalAll(path.currentIo(), &buf, 0);
     try std.testing.expectEqualStrings("archive-bytes", buf[0..n]);
+}
+
+// Regression: ensurePackageArchiveCached previously downloaded archives
+// with DownloadOptions{} (no expected_hash), so a tampered or corrupted
+// archive would be silently cached and later extracted despite the repo
+// db already knowing the correct archive_hash. It must now be rejected
+// before ever landing in the cache.
+test "ensurePackageArchiveCached rejects a downloaded archive that doesn't match the known hash" {
+    const th = @import("test_helpers.zig");
+    var test_env = try th.createTestEnv();
+    defer {
+        test_env.cleanup();
+        std.testing.allocator.destroy(test_env);
+    }
+    const ctx = &test_env.ctx;
+
+    const correct_hash = try hash.calculateBytesHash(ctx.allocator, "expected-bytes");
+    defer ctx.allocator.free(correct_hash);
+
+    var dummy = th.DummyClient.init(ctx.allocator);
+    defer dummy.deinit();
+    const archive_url = try std.fmt.allocPrint(
+        ctx.allocator,
+        "https://repo.example.com/packages/mypkg-1.2.3-1-x86_64-{s}.pkg.tar.zst",
+        .{correct_hash},
+    );
+    defer ctx.allocator.free(archive_url);
+    // The server serves different bytes than what the (correct) hash promises -
+    // a tampered mirror or a corrupted transfer, either way it must be rejected.
+    try dummy.set(archive_url, "tampered-bytes-served-instead");
+    var vtable = download.TransferClient.VTable{ .download_file = th.dummy_download_file };
+    const client = download.TransferClient{ .ptr = @ptrCast(&dummy), .vtable = &vtable };
+
+    var cache = try RepoCache.init(ctx, "testrepo", "https://repo.example.com", &.{}, 100);
+    defer cache.deinit();
+    var pkg = Package{
+        .ctx = ctx,
+        .name = "mypkg",
+        .version = "1.2.3",
+        .release = 1,
+        .arch = "x86_64",
+        .signature = null,
+        .dependencies = undefined,
+        .provisions = undefined,
+        .content_hash = correct_hash,
+        .archive_hash = correct_hash,
+    };
+
+    try std.testing.expectError(error.SignatureVerificationFailed, cache.ensurePackageArchiveCached(&pkg, client));
+
+    // The bad archive must not have been left behind under its final name.
+    const cache_path = try cache.archiveCachePath(&pkg);
+    defer ctx.allocator.free(cache_path);
+    std.Io.Dir.accessAbsolute(path.currentIo(), cache_path, .{}) catch |err| {
+        try std.testing.expectEqual(error.FileNotFound, err);
+        return;
+    };
+    return error.TestUnexpectedResult;
 }

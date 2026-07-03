@@ -1457,7 +1457,9 @@ fn prefetchMissingPackageArchives(
             try requests.append(ctx.allocator, .{
                 .url = archive_url,
                 .dest_path = cache_path,
-                .options = .{},
+                .options = .{
+                    .expected_hash = if (resolved.pkg.archive_hash.len > 0) resolved.pkg.archive_hash else null,
+                },
             });
             try owned_urls.append(ctx.allocator, archive_url);
             try cache_paths.append(ctx.allocator, cache_path);
