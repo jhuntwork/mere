@@ -66,6 +66,36 @@ const list_meta = command.CommandMeta{
     .description = "List all generations",
 };
 
+/// Recompute GC-root symlinks for `profile_dir` after a keep/unkeep change.
+/// `keepGeneration`/`unkeepGeneration` only touch the `.keep` marker file;
+/// without this, a kept generation has no GC root, so `mere store clean`
+/// deletes the store objects it references even though the generation
+/// directory itself survives pruning.
+fn syncGCRoots(ctx: *mere.Context, profile_dir: []const u8) !?types.CommandResult {
+    const store_root = std.fs.path.join(ctx.allocator, &.{ ctx.root_path, "mere", "store" }) catch {
+        return MereError.OutOfMemory;
+    };
+    defer ctx.allocator.free(store_root);
+
+    const gc_roots_dir = std.fs.path.join(ctx.allocator, &.{ ctx.root_path, "mere", "gc-roots" }) catch {
+        return MereError.OutOfMemory;
+    };
+    defer ctx.allocator.free(gc_roots_dir);
+
+    gcroots.updateRoots(ctx.allocator, store_root, gc_roots_dir, profile_dir, gcroots.DEFAULT_RETENTION_COUNT) catch |err| {
+        const msg = switch (err) {
+            gcroots.GCRootsError.PermissionDenied => "permission denied updating GC roots",
+            else => "failed to update GC roots",
+        };
+        return types.CommandResult{
+            .success = false,
+            .exit_code = 1,
+            .message = try ctx.allocator.dupe(u8, msg),
+        };
+    };
+    return null;
+}
+
 /// Keep subcommand metadata
 const keep_meta = command.CommandMeta{
     .name = "keep",
@@ -278,6 +308,8 @@ pub fn handleKeep(ctx: *mere.Context, args: *const types.ParsedArgs) MereError!t
         };
     };
 
+    if (try syncGCRoots(ctx, profile_dir)) |result| return result;
+
     var gen_buf: [32]u8 = undefined;
     const gen_text = std.fmt.bufPrint(&gen_buf, "{d}", .{gen_num}) catch return MereError.OutOfMemory;
     const segments = [_]mere.ui.Segment{
@@ -323,6 +355,8 @@ pub fn handleUnkeep(ctx: *mere.Context, args: *const types.ParsedArgs) MereError
             .message = try ctx.allocator.dupe(u8, msg),
         };
     };
+
+    if (try syncGCRoots(ctx, profile_dir)) |result| return result;
 
     var gen_buf: [32]u8 = undefined;
     const gen_text = std.fmt.bufPrint(&gen_buf, "{d}", .{gen_num}) catch return MereError.OutOfMemory;

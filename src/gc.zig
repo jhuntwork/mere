@@ -1138,6 +1138,91 @@ test "collectGarbage prunes unkept generations" {
     try std.testing.expect(std.mem.endsWith(u8, gc_result.deleted_paths.items[0], "gen-2"));
 }
 
+// Regression: `mere store generation keep` must create a GC root, otherwise
+// `mere store clean` deletes store objects a kept generation still
+// references even though the generation directory itself survives pruning.
+test "collectGarbage preserves store paths from an explicitly kept generation outside the retention window" {
+    const th = @import("test_helpers.zig");
+    var test_env = try th.createTestEnv();
+    defer {
+        test_env.cleanup();
+        std.testing.allocator.destroy(test_env);
+    }
+
+    const allocator = test_env.ctx.allocator;
+
+    // collectFromRoot() rebuilds store_root as `<ctx.root_path>/mere/store`
+    // when following a gc-root that points at a generation manifest, so
+    // these paths must live under `mere/` to match ctx.root_path.
+    const gc_roots_dir = try std.fs.path.join(allocator, &.{ test_env.path, "mere", "gc-roots" });
+    defer allocator.free(gc_roots_dir);
+    try path_mod.ensureDirExists(gc_roots_dir);
+
+    const store_dir = try std.fs.path.join(allocator, &.{ test_env.path, "mere", "store" });
+    defer allocator.free(store_dir);
+    try path_mod.ensureDirExists(store_dir);
+
+    const profiles_dir = try std.fs.path.join(allocator, &.{ test_env.path, "mere", "profiles" });
+    defer allocator.free(profiles_dir);
+    try path_mod.ensureDirExists(profiles_dir);
+
+    const profile_dir = try std.fs.path.join(allocator, &.{ profiles_dir, "system" });
+    defer allocator.free(profile_dir);
+    try path_mod.ensureDirExists(profile_dir);
+
+    // GenerationManifest.parse() doesn't persist a literal store_path - it
+    // reconstructs `<store_root>/<content_hash>-<name>-<version>` from the
+    // hash on read, so the on-disk directory name must match that pattern
+    // exactly (see the sibling "collects from generation manifest" test).
+    const old_hash = "aaaa000000000000000000000000000000000000000000000000000000000000";
+    const old_obj = try std.fs.path.join(allocator, &.{ store_dir, old_hash ++ "-old-1.0" });
+    defer allocator.free(old_obj);
+    try path_mod.ensureDirExists(old_obj);
+
+    const current_hash = "bbbb000000000000000000000000000000000000000000000000000000000000";
+    const current_obj = try std.fs.path.join(allocator, &.{ store_dir, current_hash ++ "-current-1.0" });
+    defer allocator.free(current_obj);
+    try path_mod.ensureDirExists(current_obj);
+
+    const gen1_dir = try generation.getGenerationPath(allocator, profile_dir, 1);
+    defer allocator.free(gen1_dir);
+    try path_mod.ensureDirExists(gen1_dir);
+    {
+        var manifest = generation.GenerationManifest.init(allocator, 1);
+        defer manifest.deinit();
+        try manifest.addPackage("old", "1.0", 1, "x86_64", old_obj, old_hash);
+        try generation.writeManifest(allocator, gen1_dir, &manifest);
+    }
+
+    // retention_count=2 (the default) means gen-1 falls outside the
+    // automatic retention window once gen-2 and gen-3 exist.
+    for ([_]u32{ 2, 3 }) |gen| {
+        const gen_dir = try generation.getGenerationPath(allocator, profile_dir, gen);
+        defer allocator.free(gen_dir);
+        try path_mod.ensureDirExists(gen_dir);
+        var manifest = generation.GenerationManifest.init(allocator, gen);
+        defer manifest.deinit();
+        try manifest.addPackage("current", "1.0", 1, "x86_64", current_obj, current_hash);
+        try generation.writeManifest(allocator, gen_dir, &manifest);
+    }
+
+    var profile_handle = try std.Io.Dir.openDirAbsolute(path_mod.currentIo(), profile_dir, .{});
+    defer profile_handle.close(path_mod.currentIo());
+    profile_handle.symLink(path_mod.currentIo(), "gen-3", "current", .{}) catch {};
+
+    // What `mere store generation keep 1` now does end-to-end: mark the
+    // .keep file, then sync GC roots so the mark actually protects anything.
+    try gcroots.keepGeneration(allocator, profile_dir, 1, null);
+    try gcroots.updateRoots(allocator, store_dir, gc_roots_dir, profile_dir, gcroots.DEFAULT_RETENTION_COUNT);
+
+    var gc_result = try collectGarbageAtPaths(&test_env.ctx, gc_roots_dir, store_dir, profiles_dir, .{ .dry_run = true });
+    defer gc_result.deinit();
+
+    for (gc_result.deleted_paths.items) |deleted| {
+        try std.testing.expect(!std.mem.endsWith(u8, deleted, "-old-1.0"));
+    }
+}
+
 test "hasRootsAt" {
     const th = @import("test_helpers.zig");
     var test_env = try th.createTestEnv();
