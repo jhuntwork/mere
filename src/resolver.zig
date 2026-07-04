@@ -593,15 +593,24 @@ fn candidateArchRank(candidate: Candidate, target_arch: []const u8) u8 {
 fn compareCandidates(target_arch: []const u8, a: Candidate, b: Candidate) bool {
     const version_mod = @import("version.zig");
 
-    // 1. Compare versions and releases together
-    const ver_cmp = version_mod.comparePackageVersions(
-        a.pkg.version.?,
-        a.pkg.release.?,
-        b.pkg.version.?,
-        b.pkg.release.?,
-    ) catch return false;
-    if (ver_cmp == .greater) return true; // a > b, a should come first
-    if (ver_cmp == .less) return false; // a < b, b should come first
+    // 1. Compare versions and releases together — but only when the candidates
+    //    represent the same package. Comparing versions across different
+    //    packages (e.g. two different providers of the same soname) is not
+    //    meaningful: "26.0.3" vs "1.7.0" says nothing about which package is
+    //    the better provider. When names differ, we skip straight to the
+    //    repo-priority tiebreaker so that the priority ordering (and the
+    //    ambiguity check downstream) can decide correctly.
+    const same_name = std.mem.eql(u8, a.pkg.name.?, b.pkg.name.?);
+    if (same_name) {
+        const ver_cmp = version_mod.comparePackageVersions(
+            a.pkg.version.?,
+            a.pkg.release.?,
+            b.pkg.version.?,
+            b.pkg.release.?,
+        ) catch return false;
+        if (ver_cmp == .greater) return true; // a > b, a should come first
+        if (ver_cmp == .less) return false; // a < b, b should come first
+    }
 
     // 2. Compare repo priority (lower number = higher priority)
     if (a.priority < b.priority) return true; // Lower priority number is better
@@ -618,6 +627,14 @@ fn compareCandidates(target_arch: []const u8, a: Candidate, b: Candidate) bool {
 
 fn sameRank(target_arch: []const u8, a: Candidate, b: Candidate) bool {
     const version_mod = @import("version.zig");
+    // Different package names providing the same requirement are "same rank"
+    // when their repo priority and arch match — that's a genuine ambiguity
+    // the resolver should flag rather than silently pick one via arbitrary
+    // sort order. For same-named candidates we additionally require identical
+    // version/release before treating them as tied.
+    if (!std.mem.eql(u8, a.pkg.name.?, b.pkg.name.?)) {
+        return a.priority == b.priority and candidateArchRank(a, target_arch) == candidateArchRank(b, target_arch);
+    }
     const ver_cmp = version_mod.comparePackageVersions(
         a.pkg.version.?,
         a.pkg.release.?,
@@ -2030,6 +2047,137 @@ test "resolve prefers current selection when it is already the latest" {
     // When preferred IS the latest, it should still be selected
     try std.testing.expectEqual(@as(usize, 1), result.packages.len);
     try std.testing.expectEqualStrings("2.0.0", result.packages[0].pkg.version.?);
+}
+
+// Provider selection across different package names must not compare versions.
+// Two packages that both provide the same soname are not comparable by version
+// (e.g. "libglvnd" 1.7.0 vs "mesa" 26.0.3): version comparison is meaningful
+// only within a single package identity. The tiebreaker for cross-package
+// provider selection is repo priority.
+test "resolve picks higher-priority provider when soname is provided by different packages" {
+    const th = @import("test_helpers.zig");
+    var test_env = try th.createTestEnv();
+    defer {
+        test_env.cleanup();
+        std.testing.allocator.destroy(test_env);
+    }
+
+    const ctx = &test_env.ctx;
+    const allocator = ctx.allocator;
+
+    // High-priority (priority 50) repo carries "dispatch" 1.7.0 which provides libEGL.so.1.
+    const repo_url_high = try std.fmt.allocPrint(allocator, "file://{s}/repo-dispatch", .{test_env.path});
+    defer allocator.free(repo_url_high);
+    var repo_high = try RepoCache.init(ctx, "repo-dispatch", repo_url_high, &.{}, 50);
+    defer repo_high.deinit();
+    try initTestRepository(&repo_high);
+
+    if (repo_high.repository) |*repo| {
+        var pkg = package.Package.init(ctx);
+        defer pkg.deinit();
+        pkg.name = try allocator.dupe(u8, "dispatch");
+        pkg.version = try allocator.dupe(u8, "1.7.0");
+        pkg.release = 1;
+        pkg.arch = try allocator.dupe(u8, currentTargetArch());
+        pkg.signature = try allocator.dupe(u8, "sig");
+        pkg.content_hash = try allocator.dupe(u8, "hash-dispatch");
+        pkg.archive_hash = try allocator.dupe(u8, "d" ** 64);
+        try pkg.addProvision("libEGL.so.1", .elf_soname);
+        _ = try repo.db.insertPackageTransaction(&pkg);
+    }
+
+    // Low-priority (priority 100) repo carries "monolith" 26.0.3 which also
+    // provides libEGL.so.1. The version number is much larger — the bug we're
+    // testing for is picking this one purely because 26.0.3 > 1.7.0.
+    const repo_url_low = try std.fmt.allocPrint(allocator, "file://{s}/repo-monolith", .{test_env.path});
+    defer allocator.free(repo_url_low);
+    var repo_low = try RepoCache.init(ctx, "repo-monolith", repo_url_low, &.{}, 100);
+    defer repo_low.deinit();
+    try initTestRepository(&repo_low);
+
+    if (repo_low.repository) |*repo| {
+        var pkg = package.Package.init(ctx);
+        defer pkg.deinit();
+        pkg.name = try allocator.dupe(u8, "monolith");
+        pkg.version = try allocator.dupe(u8, "26.0.3");
+        pkg.release = 5;
+        pkg.arch = try allocator.dupe(u8, currentTargetArch());
+        pkg.signature = try allocator.dupe(u8, "sig");
+        pkg.content_hash = try allocator.dupe(u8, "hash-monolith");
+        pkg.archive_hash = try allocator.dupe(u8, "m" ** 64);
+        try pkg.addProvision("libEGL.so.1", .elf_soname);
+        _ = try repo.db.insertPackageTransaction(&pkg);
+    }
+
+    var repocaches = [_]*RepoCache{ &repo_high, &repo_low };
+    var result = try resolve(ctx, &.{"libEGL.so.1"}, repocaches[0..], allocator);
+    defer result.deinit();
+
+    // Repo priority should decide: dispatch (priority 50) wins over monolith
+    // (priority 100), regardless of the version numbers.
+    try std.testing.expectEqual(@as(usize, 1), result.packages.len);
+    try std.testing.expectEqualStrings("dispatch", result.packages[0].pkg.name.?);
+}
+
+// When two different packages provide the same soname at the same repo
+// priority, the resolver must not silently pick one via arbitrary sort order.
+// This is a genuine ambiguity that requires human resolution.
+test "resolve flags ambiguity when different packages provide the same soname at same priority" {
+    const th = @import("test_helpers.zig");
+    var test_env = try th.createTestEnv();
+    defer {
+        test_env.cleanup();
+        std.testing.allocator.destroy(test_env);
+    }
+
+    const ctx = &test_env.ctx;
+    const allocator = ctx.allocator;
+    ctx.resetDiagnostics();
+    defer ctx.resetDiagnostics();
+
+    const repo_url = try std.fmt.allocPrint(allocator, "file://{s}/repo-shared-provision", .{test_env.path});
+    defer allocator.free(repo_url);
+    var repocache = try RepoCache.init(ctx, "repo-shared-provision", repo_url, &.{}, 100);
+    defer repocache.deinit();
+    try initTestRepository(&repocache);
+
+    if (repocache.repository) |*repo| {
+        var pkg = package.Package.init(ctx);
+        defer pkg.deinit();
+        pkg.name = try allocator.dupe(u8, "provider-a");
+        pkg.version = try allocator.dupe(u8, "1.0.0");
+        pkg.release = 1;
+        pkg.arch = try allocator.dupe(u8, currentTargetArch());
+        pkg.signature = try allocator.dupe(u8, "sig");
+        pkg.content_hash = try allocator.dupe(u8, "hash-a");
+        pkg.archive_hash = try allocator.dupe(u8, "a" ** 64);
+        try pkg.addProvision("libshared.so.1", .elf_soname);
+        _ = try repo.db.insertPackageTransaction(&pkg);
+    }
+
+    if (repocache.repository) |*repo| {
+        var pkg = package.Package.init(ctx);
+        defer pkg.deinit();
+        pkg.name = try allocator.dupe(u8, "provider-b");
+        pkg.version = try allocator.dupe(u8, "2.0.0");
+        pkg.release = 1;
+        pkg.arch = try allocator.dupe(u8, currentTargetArch());
+        pkg.signature = try allocator.dupe(u8, "sig");
+        pkg.content_hash = try allocator.dupe(u8, "hash-b");
+        pkg.archive_hash = try allocator.dupe(u8, "b" ** 64);
+        try pkg.addProvision("libshared.so.1", .elf_soname);
+        _ = try repo.db.insertPackageTransaction(&pkg);
+    }
+
+    var repocaches = [_]*RepoCache{&repocache};
+    try std.testing.expectError(
+        ResolverError.ConflictingProvisions,
+        resolve(ctx, &.{"libshared.so.1"}, repocaches[0..], allocator),
+    );
+
+    const diag = ctx.getDiagnosticContext();
+    const details = diag.details orelse return error.TestUnexpectedResult;
+    try std.testing.expect(std.mem.indexOf(u8, details, "ambiguous providers") != null);
 }
 
 test "resolve upgrades current selection when new dependency requires it" {
