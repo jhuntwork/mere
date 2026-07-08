@@ -32,7 +32,7 @@ const shell_meta = command.CommandMeta{
 
 fn handleShell(ctx: *mere.Context, args: *const types.ParsedArgs) MereError!types.CommandResult {
     const no_etc_overlay = args.getBool("no-etc-overlay");
-    if (args.positional.len > 1 and args.passthrough.len == 0) {
+    if (args.positional.len > 1) {
         return types.CommandResult{
             .success = false,
             .exit_code = 2,
@@ -196,8 +196,9 @@ fn resolveProfileName(ctx: *mere.Context, args: *const types.ParsedArgs) ![]cons
         return try ctx.allocator.dupe(u8, value);
     }
 
-    // 2. Positional arg (path to profile.kdl)
-    if (args.positional.len > 0 and args.passthrough.len == 0) {
+    // 2. Positional arg (path to profile.kdl) - independent of whether a
+    // passthrough command follows the `--`.
+    if (args.positional.len > 0) {
         return try buildProfileFromFile(ctx, args.positional[0]);
     }
 
