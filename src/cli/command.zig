@@ -272,3 +272,65 @@ pub fn acquireStoreLockOrResult(ctx: *mere.Context) !?types.CommandResult {
     };
     return null;
 }
+
+/// Map an error caught at a CLI command boundary into a failed CommandResult
+/// with a consistent exit code and a diagnostic-context-aware message.
+///
+/// `message_override`, if non-null, replaces the generic
+/// `getUserFriendlyMessage(err)` text for this error - use it for
+/// domain-specific errors the generic table doesn't know about (e.g.
+/// "generation not found"). Either way, whatever diagnostic context
+/// (subject/details) the failing call already set via `ctx.fail`/
+/// `ctx.setDiagnosticContext` is folded into the final message, and the
+/// exit code always goes through `exitCodeForError` rather than being
+/// hardcoded per call site.
+pub fn errorResult(ctx: *mere.Context, err: anyerror, message_override: ?[]const u8) !types.CommandResult {
+    const mapped_error = mere.errors.ErrorMapping.mapZigError(err);
+    const user_message = message_override orelse mere.errors.getUserFriendlyMessage(err);
+    const error_ctx = ctx.getDiagnosticContext().toErrorContext();
+    const formatted = error_ctx.formatWithMessage(ctx.allocator, user_message) catch user_message;
+    const message = if (formatted.ptr != user_message.ptr) formatted else try ctx.allocator.dupe(u8, formatted);
+    return types.CommandResult{
+        .success = false,
+        .exit_code = exitCodeForError(mapped_error),
+        .message = message,
+    };
+}
+
+test "errorResult maps the exit code correctly instead of hardcoding it" {
+    const testing = std.testing;
+    var ctx = mere.Context.init(testing.allocator, "/test");
+    defer ctx.deinit();
+
+    // Regression: every CLI handler's error boundary used to hardcode
+    // exit_code = 1 regardless of the underlying error, so a
+    // PermissionDenied surfaced identically to an out-of-memory failure.
+    const result = try errorResult(&ctx, error.PermissionDenied, null);
+    defer ctx.allocator.free(result.message.?);
+    try testing.expectEqual(@as(u8, 13), result.exit_code);
+    try testing.expect(!result.success);
+}
+
+test "errorResult folds existing diagnostic context into the message" {
+    const testing = std.testing;
+    var ctx = mere.Context.init(testing.allocator, "/test");
+    defer ctx.deinit();
+
+    ctx.setDiagnosticContext("my-package", "extra detail");
+    const result = try errorResult(&ctx, error.FileSystem, null);
+    defer ctx.allocator.free(result.message.?);
+
+    try testing.expect(std.mem.indexOf(u8, result.message.?, "my-package") != null);
+    try testing.expect(std.mem.indexOf(u8, result.message.?, "extra detail") != null);
+}
+
+test "errorResult uses message_override for errors the generic table doesn't know" {
+    const testing = std.testing;
+    var ctx = mere.Context.init(testing.allocator, "/test");
+    defer ctx.deinit();
+
+    const result = try errorResult(&ctx, error.GenerationNotFound, "generation not found");
+    defer ctx.allocator.free(result.message.?);
+
+    try testing.expect(std.mem.indexOf(u8, result.message.?, "generation not found") != null);
+}

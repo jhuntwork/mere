@@ -475,14 +475,7 @@ pub fn handleApply(ctx: *mere.Context, args: *const types.ParsedArgs) MereError!
     const profile_name = args.getString("profile") orelse "system";
 
     const result = performApply(ctx, file_path, profile_name) catch |err| {
-        const user_message = mere.errors.getUserFriendlyMessage(err);
-        const error_ctx = ctx.getDiagnosticContext().toErrorContext();
-        const formatted = error_ctx.formatWithMessage(ctx.allocator, user_message) catch user_message;
-        return types.CommandResult{
-            .success = false,
-            .exit_code = 1,
-            .message = if (formatted.ptr != user_message.ptr) formatted else try ctx.allocator.dupe(u8, formatted),
-        };
+        return try command.errorResult(ctx, err, null);
     };
 
     return result;

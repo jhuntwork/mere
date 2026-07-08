@@ -67,20 +67,7 @@ fn handleUninstall(ctx: *mere.Context, args: *const types.ParsedArgs) MereError!
     defer ctx.releaseStoreLock();
 
     const result = performUninstall(ctx, package_names, profile_name, verify_store, force_sync, cascade, dry_run) catch |err| {
-        const mapped_error = mere.errors.ErrorMapping.mapZigError(err);
-        const current_diag_ctx = ctx.getDiagnosticContext();
-        const user_message = mere.errors.getUserFriendlyMessage(err);
-        const error_ctx = current_diag_ctx.toErrorContext();
-        const formatted_message = error_ctx.formatWithMessage(ctx.allocator, user_message) catch user_message;
-        defer if (formatted_message.ptr != user_message.ptr) {
-            ctx.allocator.free(formatted_message);
-        };
-        const exit_code = command.exitCodeForError(mapped_error);
-        return types.CommandResult{
-            .success = false,
-            .exit_code = exit_code,
-            .message = try ctx.allocator.dupe(u8, formatted_message),
-        };
+        return try command.errorResult(ctx, err, null);
     };
 
     if (result) |msg| {

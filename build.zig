@@ -432,6 +432,7 @@ pub fn build(b: *std.Build) void {
         .{ .name = "build_orchestrator", .path = "src/build_orchestrator.zig" },
         .{ .name = "artifact_model", .path = "src/build_orchestrator/artifact_model.zig" },
         .{ .name = "cache_solver", .path = "src/build_orchestrator/cache_solver.zig" },
+        .{ .name = "command", .path = "src/cli/command.zig" },
         .{ .name = "config", .path = "src/config.zig" },
         .{ .name = "download", .path = "src/download.zig" },
         .{ .name = "elf", .path = "src/elf.zig" },
@@ -482,12 +483,12 @@ pub fn build(b: *std.Build) void {
 
     // Main test step uses all_tests.zig to run each test exactly once
     const test_step = b.step("test", "Run all tests");
-    const all_tests_run = createTestStep(b, .{ .name = "all", .path = "src/all_tests.zig" }, target, optimize, sqlite_lib, ckdl_lib, vendored);
+    const all_tests_run = createTestStep(b, .{ .name = "all", .path = "src/all_tests.zig" }, target, optimize, sqlite_lib, ckdl_lib, vendored, mere_module, zon_module);
     test_step.dependOn(&all_tests_run.step);
 
     // Individual test steps for running specific module tests
     for (test_modules) |test_module| {
-        _ = createTestStep(b, test_module, target, optimize, sqlite_lib, ckdl_lib, vendored);
+        _ = createTestStep(b, test_module, target, optimize, sqlite_lib, ckdl_lib, vendored, mere_module, zon_module);
     }
 }
 
@@ -508,6 +509,8 @@ fn createTestStep(
     sqlite_lib: *std.Build.Step.Compile,
     ckdl_lib: *std.Build.Step.Compile,
     deps: VendoredDeps,
+    mere_module: *std.Build.Module,
+    zon_module: *std.Build.Module,
 ) *std.Build.Step.Run {
     // Create test executable
     const test_exe = b.addTest(.{
@@ -518,6 +521,15 @@ fn createTestStep(
                 .optimize = optimize,
             });
             mod.addCMacro("_GNU_SOURCE", "1");
+            // Files under src/cli/ import "mere" and "build_zon" as named
+            // modules rather than by relative filename - wire both edges
+            // so those files can be used as test roots too (only files
+            // whose relative imports stay within src/cli/ actually work
+            // this way; Zig rejects a standalone module reaching outside
+            // its own root's directory, e.g. src/cli/commands/*.zig's
+            // "../types.zig").
+            mod.addImport("mere", mere_module);
+            mod.addImport("build_zon", zon_module);
             break :blk mod;
         },
     });
