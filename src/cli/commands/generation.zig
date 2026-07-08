@@ -87,11 +87,7 @@ fn syncGCRoots(ctx: *mere.Context, profile_dir: []const u8) !?types.CommandResul
             gcroots.GCRootsError.PermissionDenied => "permission denied updating GC roots",
             else => "failed to update GC roots",
         };
-        return types.CommandResult{
-            .success = false,
-            .exit_code = 1,
-            .message = try ctx.allocator.dupe(u8, msg),
-        };
+        return try command.errorResult(ctx, err, msg);
     };
     return null;
 }
@@ -195,11 +191,7 @@ pub fn handleList(ctx: *mere.Context, args: *const types.ParsedArgs) MereError!t
             generation_mod.GenerationError.FileSystem => "failed to read generations directory",
             else => "failed to list generations",
         };
-        return types.CommandResult{
-            .success = false,
-            .exit_code = 1,
-            .message = try ctx.allocator.dupe(u8, msg),
-        };
+        return try command.errorResult(ctx, err, msg);
     };
     defer ctx.allocator.free(all_gens);
 
@@ -301,11 +293,7 @@ pub fn handleKeep(ctx: *mere.Context, args: *const types.ParsedArgs) MereError!t
             gcroots.GCRootsError.PermissionDenied => "permission denied",
             else => "failed to keep generation",
         };
-        return types.CommandResult{
-            .success = false,
-            .exit_code = 1,
-            .message = try ctx.allocator.dupe(u8, msg),
-        };
+        return try command.errorResult(ctx, err, msg);
     };
 
     if (try syncGCRoots(ctx, profile_dir)) |result| return result;
@@ -349,11 +337,7 @@ pub fn handleUnkeep(ctx: *mere.Context, args: *const types.ParsedArgs) MereError
             gcroots.GCRootsError.PermissionDenied => "permission denied",
             else => "failed to unkeep generation",
         };
-        return types.CommandResult{
-            .success = false,
-            .exit_code = 1,
-            .message = try ctx.allocator.dupe(u8, msg),
-        };
+        return try command.errorResult(ctx, err, msg);
     };
 
     if (try syncGCRoots(ctx, profile_dir)) |result| return result;
@@ -404,11 +388,7 @@ pub fn handleDelete(ctx: *mere.Context, args: *const types.ParsedArgs) MereError
             gcroots.GCRootsError.PermissionDenied => "permission denied",
             else => "failed to delete generation",
         };
-        return types.CommandResult{
-            .success = false,
-            .exit_code = 1,
-            .message = try ctx.allocator.dupe(u8, msg),
-        };
+        return try command.errorResult(ctx, err, msg);
     };
 
     var gen_buf: [32]u8 = undefined;
@@ -476,11 +456,7 @@ pub fn handleActivate(ctx: *mere.Context, args: *const types.ParsedArgs) MereErr
             activation.ActivationError.FileSystem => "file system error",
             else => "failed to activate generation",
         };
-        return types.CommandResult{
-            .success = false,
-            .exit_code = 1,
-            .message = try ctx.allocator.dupe(u8, msg),
-        };
+        return try command.errorResult(ctx, err, msg);
     };
 
     emitGenerationActivationStatus(ctx, gen_num, result.etc_copied, result.etc_skipped, result.etc_differing);

@@ -59,48 +59,27 @@ fn handleShell(ctx: *mere.Context, args: *const types.ParsedArgs) MereError!type
                 ),
             };
         }
-        return types.CommandResult{
-            .success = false,
-            .exit_code = 1,
-            .message = try ctx.allocator.dupe(u8, "Failed to resolve profile"),
-        };
+        return try command.errorResult(ctx, err, "Failed to resolve profile");
     };
     defer ctx.allocator.free(profile_name);
 
     const profile_root = resolveProfileRoot(ctx.allocator, ctx.root_path, profile_name) catch |err| {
-        // Set diagnostic context for profile resolution failure
         const diag_ctx = mere.errors.DiagnosticContext.init()
             .withSubject(profile_name)
             .withDetails("failed to resolve profile path");
         ctx.withDiagnosticContext(diag_ctx);
 
-        const user_message = mere.errors.getUserFriendlyMessage(err);
-        const error_ctx = ctx.getDiagnosticContext().toErrorContext();
-        const formatted = error_ctx.formatWithMessage(ctx.allocator, user_message) catch user_message;
-
-        return types.CommandResult{
-            .success = false,
-            .exit_code = 1,
-            .message = if (formatted.ptr != user_message.ptr) formatted else try ctx.allocator.dupe(u8, formatted),
-        };
+        return try command.errorResult(ctx, err, null);
     };
     defer ctx.allocator.free(profile_root);
 
-    const invocation_cwd = std.process.currentPathAlloc(path.currentIo(), ctx.allocator) catch {
-        return types.CommandResult{
-            .success = false,
-            .exit_code = 1,
-            .message = try ctx.allocator.dupe(u8, "Failed to resolve current working directory"),
-        };
+    const invocation_cwd = std.process.currentPathAlloc(path.currentIo(), ctx.allocator) catch |err| {
+        return try command.errorResult(ctx, err, "Failed to resolve current working directory");
     };
     defer ctx.allocator.free(invocation_cwd);
 
-    const shell_env = namespace.cloneHostEnvWithVar(ctx.allocator, "MERE_PROFILE", profile_name) catch {
-        return types.CommandResult{
-            .success = false,
-            .exit_code = 1,
-            .message = try ctx.allocator.dupe(u8, "Failed to prepare shell environment"),
-        };
+    const shell_env = namespace.cloneHostEnvWithVar(ctx.allocator, "MERE_PROFILE", profile_name) catch |err| {
+        return try command.errorResult(ctx, err, "Failed to prepare shell environment");
     };
     defer namespace.freeOwnedEnv(ctx.allocator, shell_env);
 
@@ -109,16 +88,8 @@ fn handleShell(ctx: *mere.Context, args: *const types.ParsedArgs) MereError!type
         .withSubject(profile_root);
     ctx.withDiagnosticContext(diag_ctx);
 
-    std.Io.Dir.accessAbsolute(path.currentIo(), profile_root, .{}) catch {
-        const error_ctx = ctx.getDiagnosticContext().toErrorContext();
-        const formatted = error_ctx.formatWithMessage(ctx.allocator, "profile not found") catch
-            try ctx.allocator.dupe(u8, "profile not found");
-
-        return types.CommandResult{
-            .success = false,
-            .exit_code = 1,
-            .message = formatted,
-        };
+    std.Io.Dir.accessAbsolute(path.currentIo(), profile_root, .{}) catch |err| {
+        return try command.errorResult(ctx, err, "profile not found");
     };
 
     const opts = namespace.EnvOptions{
@@ -168,22 +139,9 @@ fn handleShell(ctx: *mere.Context, args: *const types.ParsedArgs) MereError!type
         };
 
         // Update diagnostic context with error details
-        const updated_diag_ctx = diag_ctx.withDetails(details);
-        ctx.withDiagnosticContext(updated_diag_ctx);
+        ctx.withDiagnosticContext(diag_ctx.withDetails(details));
 
-        // Get user-friendly error message
-        const user_message = mere.errors.getUserFriendlyMessage(err);
-
-        // Format: "{error_message}: \"{subject}\" - {details}"
-        const error_ctx = updated_diag_ctx.toErrorContext();
-        const formatted = error_ctx.formatWithMessage(ctx.allocator, user_message) catch
-            try ctx.allocator.dupe(u8, user_message);
-
-        return types.CommandResult{
-            .success = false,
-            .exit_code = 1,
-            .message = formatted,
-        };
+        return try command.errorResult(ctx, err, null);
     };
 
     unreachable;

@@ -59,31 +59,7 @@ fn handleInstall(ctx: *mere.Context, args: *const types.ParsedArgs) MereError!ty
 
     // Error boundary: catch all errors and map them to user-friendly messages at CLI boundary
     const success_message = performInstallation(ctx, package_names, profile_name, verify_store, force_sync) catch |err| {
-        // Map error to MereError vocabulary
-        const mapped_error = mere.errors.ErrorMapping.mapZigError(err);
-
-        // Get the current diagnostic context (may have been updated by module functions)
-        const current_diag_ctx = ctx.getDiagnosticContext();
-
-        // Get user-friendly error message
-        const user_message = mere.errors.getUserFriendlyMessage(err);
-
-        // Format: "{error_message}: \"{subject}\"" or "{error_message}: \"{subject}\" - {details}"
-        const error_ctx = current_diag_ctx.toErrorContext();
-        const formatted_message = error_ctx.formatWithMessage(ctx.allocator, user_message) catch user_message;
-        defer if (formatted_message.ptr != user_message.ptr) {
-            ctx.allocator.free(formatted_message);
-        };
-
-        // Return error result with appropriate exit code
-        // Note: CLI system will print the message, following single-point logging pattern
-        const exit_code = command.exitCodeForError(mapped_error);
-
-        return types.CommandResult{
-            .success = false,
-            .exit_code = exit_code,
-            .message = try ctx.allocator.dupe(u8, formatted_message),
-        };
+        return try command.errorResult(ctx, err, null);
     };
 
     // Success case - no error logging needed
