@@ -552,80 +552,96 @@ pub fn uninstallPackagesFromConfig(
         var resolution = try resolveProfile(ctx, repocaches.items, resolver_requirements, preferred_selections_state.selections, client, force_sync, false);
         defer resolution.deinit();
 
-        // Check if removed packages are still in the resolved set as transitive deps
-        for (pkg_names) |removed_name| {
-            if (resolution.containsPackage(removed_name)) {
-                // Find which resolved packages directly depend on the removed one
-                var dependents: std.ArrayList(u8) = .empty;
-                defer dependents.deinit(ctx.allocator);
-                for (resolution.plan.sorted) |resolved| {
-                    for (resolved.dependency_names) |dep_name| {
-                        if (std.mem.eql(u8, dep_name, removed_name)) {
-                            if (dependents.items.len > 0) try dependents.appendSlice(ctx.allocator, ", ");
-                            try dependents.appendSlice(ctx.allocator, resolved.pkg.name orelse "unknown");
-                            break;
-                        }
+        // Check if removed packages are still in the resolved set as transitive
+        // deps. Loop to a fixed point: each cascade round only accounts for the
+        // one removed_name it processed, so another requested removal that's
+        // still pulled in by a different, unrelated dependent wouldn't be
+        // caught by a single pass - keep re-checking all pkg_names against the
+        // latest resolution until none of them remain.
+        while (true) {
+            var still_required: ?[]const u8 = null;
+            for (pkg_names) |removed_name| {
+                if (resolution.containsPackage(removed_name)) {
+                    still_required = removed_name;
+                    break;
+                }
+            }
+            const removed_name = still_required orelse break;
+
+            // Find which resolved packages directly depend on the removed one
+            var dependents: std.ArrayList(u8) = .empty;
+            defer dependents.deinit(ctx.allocator);
+            for (resolution.plan.sorted) |resolved| {
+                for (resolved.dependency_names) |dep_name| {
+                    if (std.mem.eql(u8, dep_name, removed_name)) {
+                        if (dependents.items.len > 0) try dependents.appendSlice(ctx.allocator, ", ");
+                        try dependents.appendSlice(ctx.allocator, resolved.pkg.name orelse "unknown");
+                        break;
                     }
                 }
+            }
 
-                if (!cascade) {
-                    const msg = try std.fmt.allocPrint(
-                        ctx.allocator,
-                        "cannot uninstall '{s}': it is required by {s}. Use --cascade to remove dependent packages.",
-                        .{ removed_name, dependents.items },
-                    );
-                    emit.phaseEnd(ctx, .uninstall, false);
-                    return msg;
+            if (!cascade) {
+                const msg = try std.fmt.allocPrint(
+                    ctx.allocator,
+                    "cannot uninstall '{s}': it is required by {s}. Use --cascade to remove dependent packages.",
+                    .{ removed_name, dependents.items },
+                );
+                emit.phaseEnd(ctx, .uninstall, false);
+                return msg;
+            }
+
+            // Cascade: find requested roots that transitively depend on the removed package
+            var all_dependents = findTransitiveDependents(ctx.allocator, resolution.plan.sorted, removed_name);
+            defer all_dependents.deinit();
+
+            var roots_to_remove = std.StringHashMap(void).init(ctx.allocator);
+            defer roots_to_remove.deinit();
+            for (pkg_names) |name| try roots_to_remove.put(name, {});
+
+            for (requested_state.packages.items) |root_pkg| {
+                if (all_dependents.contains(root_pkg.name)) {
+                    try roots_to_remove.put(root_pkg.name, {});
                 }
+            }
 
-                // Cascade: find requested roots that transitively depend on the removed package
-                var all_dependents = findTransitiveDependents(ctx.allocator, resolution.plan.sorted, removed_name);
-                defer all_dependents.deinit();
-
-                var roots_to_remove = std.StringHashMap(void).init(ctx.allocator);
-                defer roots_to_remove.deinit();
-                for (pkg_names) |name| try roots_to_remove.put(name, {});
-
-                for (requested_state.packages.items) |root_pkg| {
-                    if (all_dependents.contains(root_pkg.name)) {
-                        try roots_to_remove.put(root_pkg.name, {});
-                    }
+            // Rebuild requested state without cascaded roots
+            var i: usize = 0;
+            while (i < requested_state.packages.items.len) {
+                if (roots_to_remove.contains(requested_state.packages.items[i].name)) {
+                    var removed = requested_state.packages.orderedRemove(i);
+                    removed.deinit(ctx.allocator);
+                    continue;
                 }
+                i += 1;
+            }
 
-                // Rebuild requested state without cascaded roots
-                var i: usize = 0;
-                while (i < requested_state.packages.items.len) {
-                    if (roots_to_remove.contains(requested_state.packages.items[i].name)) {
-                        var removed = requested_state.packages.orderedRemove(i);
-                        removed.deinit(ctx.allocator);
-                        continue;
-                    }
-                    i += 1;
-                }
-
-                // Re-resolve with reduced roots
+            // Re-resolve with reduced roots
+            if (requested_state.packages.items.len > 0) {
                 resolution.deinit();
-                if (requested_state.packages.items.len > 0) {
-                    const new_reqs = try ctx.allocator.alloc(resolver.Requirement, requested_state.packages.items.len);
-                    defer ctx.allocator.free(new_reqs);
-                    for (requested_state.packages.items, 0..) |pkg, ri| {
-                        new_reqs[ri] = .{ .name = pkg.name, .constraint_expr = pkg.version };
-                    }
-                    resolution = try resolveProfile(ctx, repocaches.items, new_reqs, preferred_selections_state.selections, client, force_sync, false);
-                } else {
-                    // All roots removed
-                    if (dry_run) {
-                        emitResolutionDiff(ctx, profile_name, &.{}, .uninstall);
-                        emit.logLineSeverity(ctx, .uninstall, .info, "dry run: no changes made");
-                    } else {
-                        const empty: [0]generation.PackageEntry = .{};
-                        try applyProfileRealization(ctx, profile_name, &empty, verify_store, .uninstall);
-                    }
-                    emit.phaseEnd(ctx, .uninstall, true);
-                    return null;
+                const new_reqs = try ctx.allocator.alloc(resolver.Requirement, requested_state.packages.items.len);
+                defer ctx.allocator.free(new_reqs);
+                for (requested_state.packages.items, 0..) |pkg, ri| {
+                    new_reqs[ri] = .{ .name = pkg.name, .constraint_expr = pkg.version };
                 }
-
-                break;
+                resolution = try resolveProfile(ctx, repocaches.items, new_reqs, preferred_selections_state.selections, client, force_sync, false);
+            } else {
+                // All roots removed. Do NOT deinit `resolution` here - the
+                // caller's `defer resolution.deinit()` (set up right after
+                // the initial resolveProfile call) still owns it and will
+                // clean it up exactly once when this function returns.
+                // Deiniting it here too was a double-free: harmless while
+                // cascade only ever ran a single round, but a real crash
+                // once a second round could reach this branch.
+                if (dry_run) {
+                    emitResolutionDiff(ctx, profile_name, &.{}, .uninstall);
+                    emit.logLineSeverity(ctx, .uninstall, .info, "dry run: no changes made");
+                } else {
+                    const empty: [0]generation.PackageEntry = .{};
+                    try applyProfileRealization(ctx, profile_name, &empty, verify_store, .uninstall);
+                }
+                emit.phaseEnd(ctx, .uninstall, true);
+                return null;
             }
         }
 
@@ -4366,6 +4382,212 @@ fn finalizeTestPackageArchive(
 
     try std.Io.Dir.renameAbsolute(archive_temp, archive_final, path.currentIo());
     return archive_final;
+}
+
+/// Create a minimal signed package (name/version/deps) and insert it into
+/// `repo`'s database. Shared by tests that need several interdependent
+/// packages without repeating the full staging/manifest/sign dance per
+/// package.
+fn createSignedTestPackage(
+    ctx: *mere.Context,
+    repo: *Repository,
+    staging_root: []const u8,
+    packages_dir: []const u8,
+    key_path: []const u8,
+    name: []const u8,
+    version: []const u8,
+    deps: []const []const u8,
+) !void {
+    var pkg = package.Package.init(ctx);
+    defer pkg.deinit();
+    pkg.name = try ctx.allocator.dupe(u8, name);
+    pkg.version = try ctx.allocator.dupe(u8, version);
+    pkg.release = 1;
+    pkg.arch = try ctx.allocator.dupe(u8, "x86_64");
+
+    const staging = try std.fs.path.join(ctx.allocator, &.{ staging_root, name });
+    defer ctx.allocator.free(staging);
+    try path.ensureDirExists(staging);
+
+    // Filename includes the package name - these packages may all end up
+    // merged into the same profile, and identical paths across packages
+    // would collide when publishing the symlink tree.
+    const file_txt_name = try std.fmt.allocPrint(ctx.allocator, "{s}.txt", .{name});
+    defer ctx.allocator.free(file_txt_name);
+    const file_txt_path = try std.fs.path.join(ctx.allocator, &.{ staging, file_txt_name });
+    defer ctx.allocator.free(file_txt_path);
+    var file_txt = try path.makePathAndOpenFile(file_txt_path);
+    try file_txt.writeStreamingAll(path.currentIo(), name);
+    file_txt.close(path.currentIo());
+
+    const mere_dir_path = try std.fs.path.join(ctx.allocator, &.{ staging, manifest.META_DIR });
+    defer ctx.allocator.free(mere_dir_path);
+    try path.ensureDirExists(mere_dir_path);
+
+    const content_hash = try hash.calculateStoreContentHash(ctx.allocator, staging, null);
+    defer ctx.allocator.free(content_hash);
+    var content_hash_bytes: [32]u8 = undefined;
+    _ = std.fmt.hexToBytes(&content_hash_bytes, content_hash) catch unreachable;
+
+    const pkg_manifest = manifest.PackageManifestV1{
+        .schema_version = 1,
+        .created_at = 1706745600,
+        .release = 1,
+        .arch = "x86_64",
+        .name = name,
+        .version = version,
+        .content_hash = content_hash_bytes,
+    };
+
+    const secret_key = try sign.SecretKey.loadFromFile(key_path);
+    try manifest.writeManifest(ctx, staging, &pkg_manifest, &secret_key.key);
+    try writeProjectionForPackageDir(ctx.allocator, staging);
+
+    pkg.content_hash = try ctx.allocator.dupe(u8, content_hash);
+    const pkg_file = try finalizeTestPackageArchive(ctx, &pkg, staging, packages_dir);
+    defer ctx.allocator.free(pkg_file);
+
+    ctx.signing_key_path = key_path;
+    const sig = try sign.signWithResolvedKey(ctx, pkg_file, null, null);
+    const sig_len = sign.c.crypto_sign_BYTES;
+    const sig_buf = try ctx.allocator.alloc(u8, sig_len);
+    std.mem.copyForwards(u8, sig_buf, sig[0..sig_len]);
+    pkg.signature = sig_buf[0..sig_len];
+
+    for (deps) |dep| {
+        try pkg.addDependency(dep, package.DependencyType.elf_needed);
+    }
+
+    _ = try repo.db.insertPackageTransaction(&pkg);
+}
+
+// Regression: uninstall --cascade with multiple package names only cascaded
+// the first one still required, then stopped checking entirely (a `break`
+// exited the whole loop after one cascade round). A second requested
+// removal that's still pulled in by a *different*, unrelated dependent
+// silently survived with no error and no cascade. Fixed by looping to a
+// fixed point: keep re-checking every requested name against the latest
+// resolution until none of them remain.
+test "uninstallPackagesFromConfig cascade handles multiple independently-required packages" {
+    const th = @import("test_helpers.zig");
+    var test_env = try th.createTestEnv();
+    defer {
+        test_env.cleanup();
+        std.testing.allocator.destroy(test_env);
+    }
+    const ctx = &test_env.ctx;
+    const allocator = ctx.allocator;
+
+    ctx.configuration = config_mod.Config.init(ctx, ctx.allocator);
+    defer {
+        if (ctx.configuration) |*cfg| cfg.deinit();
+        ctx.configuration = null;
+    }
+
+    const repo_dir = try std.fs.path.join(allocator, &.{ test_env.path, "repo" });
+    defer allocator.free(repo_dir);
+    try path.ensureDirExists(repo_dir);
+
+    const packages_dir = try std.fs.path.join(allocator, &.{ repo_dir, "packages" });
+    defer allocator.free(packages_dir);
+    try path.ensureDirExists(packages_dir);
+
+    const staging_root = try std.fs.path.join(allocator, &.{ test_env.path, "staging" });
+    defer allocator.free(staging_root);
+    try path.ensureDirExists(staging_root);
+
+    const keypair = try sign.generateKeyPair();
+    const key_path = try std.fs.path.join(allocator, &.{ repo_dir, "repo.key" });
+    defer allocator.free(key_path);
+    try keypair.secret_key.saveToFile(key_path);
+
+    var repo = try Repository.init(ctx, repo_dir, false);
+    defer repo.deinit();
+
+    // A and C are each independently required by a *different* other
+    // package (E and F respectively) - neither depends on the other.
+    try createSignedTestPackage(ctx, &repo, staging_root, packages_dir, key_path, "A", "1.0.0", &.{});
+    try createSignedTestPackage(ctx, &repo, staging_root, packages_dir, key_path, "C", "1.0.0", &.{});
+    try createSignedTestPackage(ctx, &repo, staging_root, packages_dir, key_path, "E", "1.0.0", &.{"A"});
+    try createSignedTestPackage(ctx, &repo, staging_root, packages_dir, key_path, "F", "1.0.0", &.{"C"});
+
+    const db_path = try std.fs.path.join(allocator, &.{ repo_dir, "repo.db" });
+    defer allocator.free(db_path);
+    const sig_path = try std.fs.path.join(allocator, &.{ repo_dir, "repo.db.sig" });
+    defer allocator.free(sig_path);
+    ctx.signing_key_path = key_path;
+    _ = try sign.writeSignatureFileWithResolver(ctx, db_path, sig_path, null, null);
+
+    // The public key must be discoverable by loadAllKeys() so
+    // verifyWithTrustedFingerprints can match it against the fingerprint.
+    const user_keys_dir = try std.fs.path.join(allocator, &.{ test_env.path, ".mere", "keys" });
+    defer allocator.free(user_keys_dir);
+    try path.ensureDirExists(user_keys_dir);
+    const pubkey_path = try std.fs.path.join(allocator, &.{ user_keys_dir, "testrepo.pub" });
+    defer allocator.free(pubkey_path);
+    try keypair.public_key.saveToFile(pubkey_path);
+
+    const fingerprint = try keypair.public_key.fingerprint(allocator);
+    defer allocator.free(fingerprint);
+
+    var fps: std.ArrayList([]const u8) = .empty;
+    try fps.append(allocator, try allocator.dupe(u8, fingerprint));
+
+    const repo_url = try std.fmt.allocPrint(allocator, "file://{s}", .{repo_dir});
+    defer allocator.free(repo_url);
+    try ctx.configuration.?.repos.append(allocator, config_mod.RepoConfig{
+        .name = try allocator.dupe(u8, "testrepo"),
+        .url = try allocator.dupe(u8, repo_url),
+        .priority = 100,
+        .trusted_fingerprints = fps,
+    });
+
+    var curl_client = try download.CurlTransferClient.init(ctx, "mere");
+    defer download.CurlTransferClient.cleanupFn(ctx, curl_client);
+    const client = curl_client.client();
+
+    // Install all four as roots of a named profile.
+    _ = try installPackagesFromConfig(ctx, &.{ "A", "C", "E", "F" }, client, false, false, false, "testprofile");
+
+    // Sanity: all four are actually present before we try to remove any.
+    {
+        const profile_dir = try getProfileDir(ctx, "testprofile");
+        defer allocator.free(profile_dir);
+        const root_path = try profile.getRootPath(allocator, profile_dir);
+        defer allocator.free(root_path);
+        const store_root = try std.fs.path.join(allocator, &.{ ctx.root_path, "mere", "store" });
+        defer allocator.free(store_root);
+        var before = try generation.readManifest(allocator, store_root, root_path);
+        defer before.deinit();
+        try std.testing.expectEqual(@as(usize, 4), before.packages.items.len);
+    }
+
+    // Uninstall A and C with cascade. Both E (depends on A) and F (depends
+    // on C) must be cascaded away too - not just whichever is checked first.
+    const result = try uninstallPackagesFromConfig(ctx, &.{ "A", "C" }, client, false, false, "testprofile", true, false);
+    defer if (result) |msg| allocator.free(msg);
+    try std.testing.expect(result == null);
+
+    const profile_dir = try getProfileDir(ctx, "testprofile");
+    defer allocator.free(profile_dir);
+    const root_path = try profile.getRootPath(allocator, profile_dir);
+    defer allocator.free(root_path);
+    const store_root = try std.fs.path.join(allocator, &.{ ctx.root_path, "mere", "store" });
+    defer allocator.free(store_root);
+
+    const after_opt = generation.readManifest(allocator, store_root, root_path);
+    if (after_opt) |after_const| {
+        var after = after_const;
+        defer after.deinit();
+        for (after.packages.items) |pkg| {
+            inline for (.{ "A", "C", "E", "F" }) |removed| {
+                try std.testing.expect(!std.mem.eql(u8, pkg.name, removed));
+            }
+        }
+    } else |_| {
+        // No profile root at all (everything removed) is also an acceptable
+        // outcome, depending on how publishProfileRoot handles an empty set.
+    }
 }
 
 test "determineInstallTargetBehavior preserves explicit store-only and profile targets" {
