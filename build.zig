@@ -254,6 +254,7 @@ pub fn build(b: *std.Build) void {
         .{ .name = "artifact_model", .path = "src/build_orchestrator/artifact_model.zig" },
         .{ .name = "cache_solver", .path = "src/build_orchestrator/cache_solver.zig" },
         .{ .name = "command", .path = "src/cli/command.zig" },
+        .{ .name = "commands_test", .path = "src/cli/commands_test.zig" },
         .{ .name = "config", .path = "src/config.zig" },
         .{ .name = "download", .path = "src/download.zig" },
         .{ .name = "elf", .path = "src/elf.zig" },
