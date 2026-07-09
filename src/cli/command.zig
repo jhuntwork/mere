@@ -4,13 +4,7 @@ const types = @import("types.zig");
 const MereError = mere.errors.MereError;
 const help = @import("help.zig");
 
-pub const build_zon: struct {
-    name: enum { mere },
-    version: []const u8,
-    fingerprint: u64,
-    minimum_zig_version: []const u8,
-    paths: []const []const u8,
-} = @import("build_zon");
+pub const build_zon = @import("build_zon");
 pub const user_agent: [*:0]const u8 = "mere/" ++ build_zon.version;
 
 /// Command metadata - defines a command's interface

@@ -9,4 +9,55 @@
         "src",
         "README.md",
     },
+    .dependencies = .{
+        // Vendored C dependencies, fetched and verified by Zig's package
+        // manager instead of a hand-rolled curl+sha256sum shell script.
+        //
+        // Two are deliberately NOT listed here, kept on the old
+        // curl+sha256sum fetch instead (see bootstrapLibsodium and
+        // bootstrapMbedTls in build.zig for why each is a genuine
+        // blocker, not a preference):
+        //   - libsodium ships its own build.zig, which Zig's package
+        //     manager unconditionally tries to run while resolving the
+        //     dependency; that build.zig targets a different Zig version
+        //     than this project's and fails to compile.
+        //   - mbedtls's CMakeLists.txt requires a git submodule
+        //     (framework/) that a plain GitHub tag-archive tarball never
+        //     includes (git archives never include submodule content);
+        //     only its official release asset bundles it, and that host
+        //     sends Content-Type/Content-Disposition headers Zig's
+        //     fetcher rejects.
+        .zlib_ng = .{
+            .url = "https://github.com/zlib-ng/zlib-ng/archive/refs/tags/2.2.5.tar.gz",
+            .hash = "N-V-__8AAM_abQARVOuSWYyopJIgTFhIR_mCG1ZS6XAVi2lO",
+        },
+        .zstd = .{
+            .url = "https://github.com/facebook/zstd/releases/download/v1.5.7/zstd-1.5.7.tar.gz",
+            .hash = "N-V-__8AAPZ7fwBg4JoCzM_0o2A8wxH2hsUUeiU1iuZv53L5",
+        },
+        .xz = .{
+            .url = "https://github.com/tukaani-project/xz/releases/download/v5.8.2/xz-5.8.2.tar.xz",
+            .hash = "N-V-__8AAHGzrgC5wvCP0oFJnn3HB72iHUk1dvjB4j_3-2He",
+        },
+        .bzip2 = .{
+            .url = "https://sourceware.org/pub/bzip2/bzip2-1.0.8.tar.gz",
+            .hash = "N-V-__8AAEg_LwBxlEVzMYnlhoZahVvdwk6ddIRturUKBCXF",
+        },
+        .libarchive = .{
+            .url = "https://github.com/libarchive/libarchive/releases/download/v3.8.2/libarchive-3.8.2.tar.xz",
+            .hash = "N-V-__8AALc-bAEzm3IpQbUTxS7yL3BMvh1aUmSaGYnK-bv1",
+        },
+        .curl = .{
+            .url = "https://curl.se/download/curl-8.19.0.tar.xz",
+            .hash = "N-V-__8AAM-tPgFSsje3FI7iURLjDLSOquhtONinvYZp3AHh",
+        },
+        .sqlite = .{
+            .url = "https://www.sqlite.org/2026/sqlite-autoconf-3510300.tar.gz",
+            .hash = "N-V-__8AAM4NvwDJH-WU5OxH0i19GSDowz3YvDYVHlUqygVG",
+        },
+        .ckdl = .{
+            .url = "https://github.com/tjol/ckdl/archive/refs/tags/1.0.tar.gz",
+            .hash = "N-V-__8AAIUjBQDxqUrvA7_b-RDtfFUBrlTSF_hEWKk_5_Kx",
+        },
+    },
 }
