@@ -252,6 +252,9 @@ pub fn handleCreate(ctx: *mere.Context, args: *const types.ParsedArgs) MereError
         };
     }
 
+    if (try command.acquireStoreLockOrResult(ctx)) |result| return result;
+    defer ctx.releaseStoreLock();
+
     const profiles_dir = std.fs.path.join(ctx.allocator, &.{ ctx.root_path, "mere", "profiles" }) catch {
         return MereError.OutOfMemory;
     };
@@ -419,6 +422,9 @@ pub fn handleDelete(ctx: *mere.Context, args: *const types.ParsedArgs) MereError
         };
     }
 
+    if (try command.acquireStoreLockOrResult(ctx)) |result| return result;
+    defer ctx.releaseStoreLock();
+
     const profiles_dir = std.fs.path.join(ctx.allocator, &.{ ctx.root_path, "mere", "profiles" }) catch {
         return MereError.OutOfMemory;
     };
@@ -473,6 +479,9 @@ pub fn handleApply(ctx: *mere.Context, args: *const types.ParsedArgs) MereError!
 
     const file_path = args.positional[0];
     const profile_name = args.getString("profile") orelse "system";
+
+    if (try command.acquireStoreLockOrResult(ctx)) |result| return result;
+    defer ctx.releaseStoreLock();
 
     const result = performApply(ctx, file_path, profile_name) catch |err| {
         return try command.errorResult(ctx, err, null);

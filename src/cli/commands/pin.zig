@@ -100,6 +100,9 @@ pub fn handleAdd(ctx: *mere.Context, args: *const types.ParsedArgs) MereError!ty
 
     const note = args.getString("note");
 
+    if (try command.acquireStoreLockOrResult(ctx)) |result| return result;
+    defer ctx.releaseStoreLock();
+
     // Build gc-roots path
     const gc_roots_dir = std.fs.path.join(ctx.allocator, &.{ ctx.root_path, "mere", "gc-roots" }) catch {
         return MereError.OutOfMemory;
@@ -151,6 +154,9 @@ pub fn handleRemove(ctx: *mere.Context, args: *const types.ParsedArgs) MereError
     const diagnostic_ctx = mere.errors.DiagnosticContext.init()
         .withSubject(pin_name);
     ctx.withDiagnosticContext(diagnostic_ctx);
+
+    if (try command.acquireStoreLockOrResult(ctx)) |result| return result;
+    defer ctx.releaseStoreLock();
 
     const gc_roots_dir = std.fs.path.join(ctx.allocator, &.{ ctx.root_path, "mere", "gc-roots" }) catch {
         return MereError.OutOfMemory;
