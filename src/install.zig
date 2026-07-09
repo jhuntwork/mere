@@ -1788,7 +1788,15 @@ fn installSinglePackageToStore(
         ctx.setDiagnosticContext(staging.install_dir, "failed to create store parent directory");
         return mapInstallFsError(err);
     };
-    parent_dir.close(path.currentIo());
+    defer parent_dir.close(path.currentIo());
+
+    // Ensure the staged payload is durable on disk before it becomes
+    // reachable under its final store path.
+    fsyncTree(ctx.allocator, staging.staging_dir) catch |err| {
+        ctx.debug("fsync of staged content failed: {}", .{err});
+        path.deleteTreeAbsolute(staging.staging_dir) catch {};
+        return ctx.fail(error.FileSystem, staging.install_dir, "failed to sync staged package content to disk");
+    };
 
     // === Step 4: Atomic rename to final path ===
     const staging_z = try ctx.allocator.dupeZ(u8, staging.staging_dir);
@@ -1808,6 +1816,12 @@ fn installSinglePackageToStore(
             path.deleteTreeAbsolute(staging.staging_dir) catch {};
             return ctx.fail(error.FileSystem, staging.install_dir, "atomic rename to final path failed");
         }
+    } else {
+        // Make the rename itself durable: fsync the directory that now
+        // contains the new entry.
+        fsyncFd(parent_dir.handle) catch |err| {
+            ctx.debug("fsync of store parent directory failed: {}", .{err});
+        };
     }
     ctx.debug("package admitted to store: {s}", .{staging.install_dir});
 
@@ -2120,6 +2134,44 @@ fn stageAndValidatePayload(
         .install_dir = install_dir,
         .content_exists = content_exists,
     };
+}
+
+fn fsyncFd(fd: std.posix.fd_t) !void {
+    if (std.os.linux.fsync(fd) != 0) return error.FileSystem;
+}
+
+// Recursively fsync every file's data and every directory's entries under
+// dir_path (including dir_path itself), so the staged payload is durable
+// on disk before it is made visible via rename into the content-addressed
+// store.
+fn fsyncTree(allocator: std.mem.Allocator, dir_path: []const u8) !void {
+    const io = path.currentIo();
+    var dir = try std.Io.Dir.openDirAbsolute(io, dir_path, .{ .iterate = true });
+    defer dir.close(io);
+
+    var walker = try dir.walk(allocator);
+    defer walker.deinit();
+
+    while (try walker.next(io)) |entry| {
+        switch (entry.kind) {
+            .file => {
+                var file = try dir.openFile(io, entry.path, .{});
+                defer file.close(io);
+                try fsyncFd(file.handle);
+            },
+            .directory => {
+                // iterate = true is required here: without it Zig opens
+                // the directory O_PATH, and fsync() on an O_PATH fd fails
+                // with EBADF.
+                var sub = try dir.openDir(io, entry.path, .{ .iterate = true });
+                defer sub.close(io);
+                try fsyncFd(sub.handle);
+            },
+            else => {},
+        }
+    }
+
+    try fsyncFd(dir.handle);
 }
 
 fn finalizeAdmittedStoreObject(
@@ -4187,6 +4239,57 @@ test "store admission uses atomic rename from staging directory to final store p
     var mbuf: [20]u8 = undefined;
     const mn = try mf.readPositionalAll(path.currentIo(), &mbuf, 0);
     try std.testing.expectEqualStrings("MEREMFST", mbuf[0..mn]);
+}
+
+test "fsyncTree recursively syncs nested files and directories without following symlinks" {
+    const th = @import("test_helpers.zig");
+    var test_env = try th.createTestEnv();
+    defer {
+        test_env.cleanup();
+        std.testing.allocator.destroy(test_env);
+    }
+    const ctx = &test_env.ctx;
+
+    const root_dir = try std.fs.path.join(ctx.allocator, &.{ test_env.path, "fsync-tree-test" });
+    defer ctx.allocator.free(root_dir);
+    const nested_dir = try std.fs.path.join(ctx.allocator, &.{ root_dir, "sub", "nested" });
+    defer ctx.allocator.free(nested_dir);
+    try path.ensureDirExists(nested_dir);
+
+    const nested_file = try std.fs.path.join(ctx.allocator, &.{ nested_dir, "data.txt" });
+    defer ctx.allocator.free(nested_file);
+    {
+        var f = try std.Io.Dir.createFileAbsolute(path.currentIo(), nested_file, .{});
+        try f.writeStreamingAll(path.currentIo(), "hello");
+        f.close(path.currentIo());
+    }
+
+    // Dangling symlink: if fsyncTree opened walk entries without checking
+    // .kind, following this would fail with FileNotFound.
+    const sub_dir = try std.fs.path.join(ctx.allocator, &.{ root_dir, "sub" });
+    defer ctx.allocator.free(sub_dir);
+    const dangling_link = try std.fs.path.join(ctx.allocator, &.{ sub_dir, "dangling" });
+    defer ctx.allocator.free(dangling_link);
+    const dangling_target = try std.fs.path.join(ctx.allocator, &.{ root_dir, "does-not-exist" });
+    defer ctx.allocator.free(dangling_target);
+    try std.Io.Dir.symLinkAbsolute(path.currentIo(), dangling_target, dangling_link, .{});
+
+    try fsyncTree(ctx.allocator, root_dir);
+}
+
+test "fsyncTree fails for a nonexistent directory" {
+    const th = @import("test_helpers.zig");
+    var test_env = try th.createTestEnv();
+    defer {
+        test_env.cleanup();
+        std.testing.allocator.destroy(test_env);
+    }
+    const ctx = &test_env.ctx;
+
+    const missing_dir = try std.fs.path.join(ctx.allocator, &.{ test_env.path, "does-not-exist" });
+    defer ctx.allocator.free(missing_dir);
+
+    try std.testing.expectError(error.FileNotFound, fsyncTree(ctx.allocator, missing_dir));
 }
 
 test "enforceRepoMetadataBinding rejects content hash mismatch" {
