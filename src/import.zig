@@ -156,12 +156,16 @@ fn extractArchiveToTemp(ctx: *Context, archive_path: []const u8) !ExtractResult 
     return ExtractResult{ .temp_dir = temp_dir, .temp = temp_dir_result };
 }
 
-fn verifyManifestSignatureAndGetSigner(
+/// Verifies the manifest signature and returns the verified bytes alongside
+/// the signing fingerprint. Callers must parse the manifest from the
+/// returned bytes rather than reading the file again, so that nothing gets
+/// parsed or trusted before its signature has actually been checked.
+fn verifyManifestSignatureAndGetBytes(
     ctx: *Context,
     temp_dir: []const u8,
     trusted_fingerprints: []const []const u8,
     loaded_keys: []const sign.LoadedKey,
-) ![]const u8 {
+) !sign.VerifyManifestResult {
     const manifest_path = std.fs.path.join(ctx.allocator, &.{ temp_dir, manifest.MANIFEST_FILENAME }) catch {
         return ctx.fail(ImportError.OutOfMemory, temp_dir, "failed to construct manifest path");
     };
@@ -172,6 +176,12 @@ fn verifyManifestSignatureAndGetSigner(
     };
     defer ctx.allocator.free(sig_path);
 
+    // A missing manifest means the package is invalid / not found as far as
+    // import is concerned, not a signature failure.
+    std.Io.Dir.accessAbsolute(p.currentIo(), manifest_path, .{}) catch {
+        return ImportError.PackageNotFound;
+    };
+
     const result = sign.verifyManifestWithTrustedFingerprints(ctx, manifest_path, sig_path, trusted_fingerprints, loaded_keys) catch |err| {
         ctx.debug("manifest signature verification failed: {}", .{err});
         ctx.setDiagnosticContextFmt(manifest_path, "manifest signature verification failed ({d} trusted key{s} tried)", .{
@@ -180,10 +190,9 @@ fn verifyManifestSignatureAndGetSigner(
         });
         return ImportError.SignatureInvalid;
     };
-    defer ctx.allocator.free(result.manifest_bytes);
 
     ctx.debug("manifest signature verified successfully by key: {s}", .{result.verifying_fingerprint});
-    return result.verifying_fingerprint;
+    return result;
 }
 
 const ManifestResult = struct {
@@ -204,47 +213,12 @@ const PreparedImport = struct {
     }
 };
 
-fn readManifestAndCreatePackage(ctx: *Context, temp_dir: []const u8) !ManifestResult {
-    const manifest_path = std.fs.path.join(ctx.allocator, &.{ temp_dir, manifest.MANIFEST_FILENAME }) catch {
-        return ctx.fail(ImportError.OutOfMemory, temp_dir, "failed to construct manifest path");
-    };
-    defer ctx.allocator.free(manifest_path);
-
-    const io = p.currentIo();
-    var manifest_file = p.openExistingFile(manifest_path) catch |err| {
-        if (err == error.FileNotFound) {
-            // Missing manifest means the package is invalid / not found as far as import
-            return ImportError.PackageNotFound;
-        }
-        return ctx.fail(ImportError.FileSystem, manifest_path, "failed to open manifest");
-    };
-    defer manifest_file.close(io);
-
-    const stat = manifest_file.stat(io) catch {
-        return ctx.fail(ImportError.FileSystem, manifest_path, "failed to stat manifest");
-    };
-
-    if (stat.size > 1024 * 1024) {
-        // Manifest should never be > 1MB
-        return ctx.fail(ImportError.InvalidInput, manifest_path, "manifest exceeds size limit");
-    }
-
-    const manifest_data = ctx.allocator.alloc(u8, @intCast(stat.size)) catch {
-        return ctx.fail(ImportError.OutOfMemory, manifest_path, "out of memory allocating manifest buffer");
-    };
-    errdefer ctx.allocator.free(manifest_data);
-
-    const bytes_read = manifest_file.readPositionalAll(io, manifest_data, 0) catch {
-        return ctx.fail(ImportError.FileSystem, manifest_path, "failed to read manifest");
-    };
-
-    if (bytes_read != stat.size) {
-        return ctx.fail(ImportError.FileSystem, manifest_path, "short read while reading manifest");
-    }
-
-    // Decode the manifest
-    const pkg_manifest = manifest.PackageManifestV1.decode(manifest_data) catch {
-        return ctx.fail(ImportError.InvalidInput, manifest_path, "failed to decode manifest");
+/// Builds a Package from already-verified manifest bytes. Takes ownership of
+/// manifest_bytes on success (stored as ManifestResult.manifest_data); the
+/// caller must free it on failure, since ownership has not transferred yet.
+fn createPackageFromManifest(ctx: *Context, temp_dir: []const u8, manifest_bytes: []u8) !ManifestResult {
+    const pkg_manifest = manifest.PackageManifestV1.decode(manifest_bytes) catch {
+        return ctx.fail(ImportError.InvalidInput, temp_dir, "failed to decode manifest");
     };
 
     // Create a Package from the manifest
@@ -252,22 +226,22 @@ fn readManifestAndCreatePackage(ctx: *Context, temp_dir: []const u8) !ManifestRe
     errdefer pkg.deinit();
 
     pkg.name = ctx.allocator.dupe(u8, pkg_manifest.name) catch {
-        return ctx.fail(ImportError.OutOfMemory, manifest_path, "out of memory allocating package name");
+        return ctx.fail(ImportError.OutOfMemory, temp_dir, "out of memory allocating package name");
     };
     pkg.version = ctx.allocator.dupe(u8, pkg_manifest.version) catch {
-        return ctx.fail(ImportError.OutOfMemory, manifest_path, "out of memory allocating package version");
+        return ctx.fail(ImportError.OutOfMemory, temp_dir, "out of memory allocating package version");
     };
     pkg.arch = ctx.allocator.dupe(u8, pkg_manifest.arch) catch {
-        return ctx.fail(ImportError.OutOfMemory, manifest_path, "out of memory allocating package arch");
+        return ctx.fail(ImportError.OutOfMemory, temp_dir, "out of memory allocating package arch");
     };
     pkg.release = pkg_manifest.release;
 
     // Format content_hash as hex string
     pkg.content_hash = pkg_manifest.contentHashHex(ctx.allocator) catch {
-        return ctx.fail(ImportError.OutOfMemory, manifest_path, "failed to format content hash (allocation)");
+        return ctx.fail(ImportError.OutOfMemory, temp_dir, "failed to format content hash (allocation)");
     };
 
-    return ManifestResult{ .manifest_data = manifest_data, .pkg_manifest = pkg_manifest, .pkg = pkg };
+    return ManifestResult{ .manifest_data = manifest_bytes, .pkg_manifest = pkg_manifest, .pkg = pkg };
 }
 
 fn readMetaAndPopulatePackage(ctx: *Context, temp_dir: []const u8, pkg: *package.Package) !void {
@@ -515,12 +489,6 @@ fn prepareVerifiedImport(ctx: *Context, final_pkg_path: []const u8) !PreparedImp
         extract_res.temp.cleanup();
     }
 
-    var manifest_res = try readManifestAndCreatePackage(ctx, extract_res.temp_dir);
-    errdefer manifest_res.pkg.deinit();
-    errdefer ctx.allocator.free(manifest_res.manifest_data);
-
-    try readMetaAndPopulatePackage(ctx, extract_res.temp_dir, &manifest_res.pkg);
-
     var trusted_fingerprints = try collectTrustedFingerprintsForImport(ctx);
     defer {
         for (trusted_fingerprints.items) |fp| {
@@ -538,8 +506,23 @@ fn prepareVerifiedImport(ctx: *Context, final_pkg_path: []const u8) !PreparedImp
         loaded_keys.deinit(ctx.allocator);
     }
 
-    const signer_fingerprint = try verifyManifestSignatureAndGetSigner(ctx, extract_res.temp_dir, trusted_fingerprints.items, loaded_keys.items);
+    // Verify the manifest signature first, and build the package directly
+    // from the verified bytes below — nothing gets parsed or trusted before
+    // its signature has actually been checked, and there's no second,
+    // unverified read of manifest.v1 from disk.
+    const verify_result = try verifyManifestSignatureAndGetBytes(ctx, extract_res.temp_dir, trusted_fingerprints.items, loaded_keys.items);
+    var manifest_res = createPackageFromManifest(ctx, extract_res.temp_dir, verify_result.manifest_bytes) catch |err| {
+        ctx.allocator.free(verify_result.verifying_fingerprint);
+        ctx.allocator.free(verify_result.manifest_bytes);
+        return err;
+    };
+    errdefer manifest_res.pkg.deinit();
+    errdefer ctx.allocator.free(manifest_res.manifest_data);
+
+    const signer_fingerprint = verify_result.verifying_fingerprint;
     defer ctx.allocator.free(signer_fingerprint);
+
+    try readMetaAndPopulatePackage(ctx, extract_res.temp_dir, &manifest_res.pkg);
 
     try computeAndVerifyContentHash(ctx, extract_res.temp_dir, &manifest_res.pkg_manifest);
     try validateProjectionIndex(ctx, extract_res.temp_dir);
@@ -1224,6 +1207,17 @@ test "packages with invalid manifest format" {
     // Invalid manifest content - missing magic bytes
     const invalid_manifest_content = "not a valid manifest format - random bytes";
 
+    // Sign the invalid content with the default test key (createTestEnv()
+    // creates one under .mere/keys, which loadAllKeys() scans) so the
+    // archive gets past signature verification and fails on manifest
+    // decode specifically, not on signature checking. Verification now
+    // happens before decode, so a signature-less archive would fail there
+    // instead of exercising the decode-failure path this test targets.
+    const default_secret_key_path = try std.fs.path.join(std.testing.allocator, &.{ test_env.path, ".mere", "keys", "mere.key" });
+    defer std.testing.allocator.free(default_secret_key_path);
+    const default_secret_key = try sign.SecretKey.loadFromFile(default_secret_key_path);
+    const signature = try sign.signBytes(&default_secret_key.key, invalid_manifest_content);
+
     // Create package archive
     const pkg_file = "invalid-manifest.tar";
     const pkg_path = try std.fs.path.join(std.testing.allocator, &.{ test_env.path, pkg_file });
@@ -1238,7 +1232,58 @@ test "packages with invalid manifest format" {
         .underlying_writer = &buffer.writer,
     };
 
-    // Add .mere directory and manifest.v1 with invalid content to archive
+    // Add .mere directory, manifest.v1 with invalid content, and a valid
+    // signature over that content to the archive.
+    try tar_writer.writeDir(manifest.META_DIR, .{});
+    try tar_writer.writeFileBytes(manifest.MANIFEST_FILENAME, invalid_manifest_content, .{});
+    try tar_writer.writeFileBytes(manifest.MANIFEST_SIG_FILENAME, &signature, .{});
+
+    const tar_contents = try std.testing.allocator.dupe(u8, buffer.written());
+    defer std.testing.allocator.free(tar_contents);
+    var pkg_file_handle = try std.Io.Dir.createFileAbsolute(p.currentIo(), pkg_path, .{});
+    defer pkg_file_handle.close(p.currentIo());
+    try pkg_file_handle.writeStreamingAll(p.currentIo(), tar_contents);
+
+    // Set signing key in context (enables bootstrap)
+    ctx.signing_key_path = default_secret_key_path;
+
+    const repo_name = "test-repo";
+    const single = [_][]const u8{pkg_path};
+    const result = packages(ctx, repo_name, single[0..], false);
+    if (result) |_| {
+        try std.testing.expect(false);
+    } else |err| {
+        try std.testing.expect(err == ImportError.InvalidInput);
+    }
+}
+
+test "packages rejects a malformed manifest as a signature failure when it has no valid signature" {
+    // Signature verification must run before manifest decode. A manifest
+    // with no valid signature at all is rejected as SignatureInvalid even
+    // when its content is also malformed, rather than decoding untrusted
+    // bytes first and reporting InvalidInput.
+    const th = @import("test_helpers.zig");
+    var test_env = try th.createTestEnv();
+    defer {
+        test_env.cleanup();
+        std.testing.allocator.destroy(test_env);
+    }
+    var ctx = &test_env.ctx;
+
+    const invalid_manifest_content = "not a valid manifest format - random bytes";
+
+    const pkg_file = "invalid-manifest-no-sig.tar";
+    const pkg_path = try std.fs.path.join(std.testing.allocator, &.{ test_env.path, pkg_file });
+    defer std.testing.allocator.free(pkg_path);
+
+    var buffer: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer buffer.deinit();
+    var tar_writer = std.tar.Writer{
+        .underlying_writer = &buffer.writer,
+    };
+
+    // No manifest.v1.sig at all — verification must fail before decode of
+    // the malformed manifest.v1 content is ever attempted.
     try tar_writer.writeDir(manifest.META_DIR, .{});
     try tar_writer.writeFileBytes(manifest.MANIFEST_FILENAME, invalid_manifest_content, .{});
 
@@ -1248,18 +1293,9 @@ test "packages with invalid manifest format" {
     defer pkg_file_handle.close(p.currentIo());
     try pkg_file_handle.writeStreamingAll(p.currentIo(), tar_contents);
 
-    // Generate a key pair for signing
-    const key_dir = try std.fs.path.join(std.testing.allocator, &.{ test_env.path, "keys" });
-    defer std.testing.allocator.free(key_dir);
-    try p.ensureDirExists(key_dir);
-
-    const key_pair = try sign.generateKeyPair();
-    const secret_key_path = try std.fs.path.join(std.testing.allocator, &.{ key_dir, "test.key" });
-    defer std.testing.allocator.free(secret_key_path);
-    try key_pair.secret_key.saveToFile(secret_key_path);
-
-    // Set signing key in context (enables bootstrap)
-    ctx.signing_key_path = secret_key_path;
+    const default_secret_key_path = try std.fs.path.join(std.testing.allocator, &.{ test_env.path, ".mere", "keys", "mere.key" });
+    defer std.testing.allocator.free(default_secret_key_path);
+    ctx.signing_key_path = default_secret_key_path;
 
     const repo_name = "test-repo";
     const single = [_][]const u8{pkg_path};
@@ -1267,7 +1303,7 @@ test "packages with invalid manifest format" {
     if (result) |_| {
         try std.testing.expect(false);
     } else |err| {
-        try std.testing.expect(err == ImportError.InvalidInput);
+        try std.testing.expect(err == ImportError.SignatureInvalid);
     }
 }
 
