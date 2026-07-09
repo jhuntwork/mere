@@ -1940,23 +1940,6 @@ fn mapGenerationError(err: generation.GenerationError) anyerror {
     };
 }
 
-fn readManifestFromDir(ctx: *Context, extract_dir: []const u8) !ParsedManifest {
-    const manifest_data = manifest.readManifestFile(ctx, extract_dir) catch {
-        return ctx.fail(error.FileNotFound, extract_dir, "manifest.v1 not found in extracted package");
-    };
-
-    const pkg_manifest = manifest.PackageManifestV1.decode(manifest_data) catch {
-        ctx.setDiagnosticContext(extract_dir, "manifest.v1 invalid or failed to decode");
-        ctx.allocator.free(manifest_data);
-        return error.InvalidInput;
-    };
-
-    return ParsedManifest{
-        .data = manifest_data,
-        .manifest = pkg_manifest,
-    };
-}
-
 fn preVerifyManifest(
     ctx: *Context,
     repo_cache: *RepoCache,
@@ -1987,13 +1970,24 @@ fn preVerifyManifest(
     }
 
     ctx.debug("verifying manifest signature against {d} trusted fingerprints", .{repo_cache.trusted_fingerprints.len});
-    var result = sign.verifyManifestWithTrustedFingerprints(ctx, manifest_path, sig_path, repo_cache.trusted_fingerprints, loaded_keys) catch {
+    const result = sign.verifyManifestWithTrustedFingerprints(ctx, manifest_path, sig_path, repo_cache.trusted_fingerprints, loaded_keys) catch {
         return ctx.fail(error.SignatureInvalid, pkg_id, "manifest signature verification");
     };
-    errdefer result.deinit(ctx.allocator);
+    errdefer ctx.allocator.free(result.verifying_fingerprint);
     ctx.debug("manifest signature verified (pre-extraction)", .{});
 
-    var parsed_manifest = try readManifestFromDir(ctx, verify_dir);
+    // Decode directly from the bytes that were just verified, rather than
+    // re-reading manifest_path from disk a second time (avoids a
+    // verify-then-reread TOCTOU window).
+    const pkg_manifest = manifest.PackageManifestV1.decode(result.manifest_bytes) catch {
+        ctx.allocator.free(result.manifest_bytes);
+        ctx.setDiagnosticContext(verify_dir, "manifest.v1 invalid or failed to decode");
+        return error.InvalidInput;
+    };
+    var parsed_manifest = ParsedManifest{
+        .data = result.manifest_bytes,
+        .manifest = pkg_manifest,
+    };
     errdefer parsed_manifest.deinit(ctx.allocator);
 
     const manifest_content_hash = try parsed_manifest.manifest.contentHashHex(ctx.allocator);

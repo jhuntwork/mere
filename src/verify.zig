@@ -286,12 +286,12 @@ fn verifyStore(
         }
 
         if (trusted_fingerprints.len > 0) {
-            const verify_result = sign.verifyManifestWithTrustedFingerprints(ctx, manifest_path, sig_path, trusted_fingerprints, loaded_keys.items) catch {
+            var verify_result = sign.verifyManifestWithTrustedFingerprints(ctx, manifest_path, sig_path, trusted_fingerprints, loaded_keys.items) catch {
                 result.store_issues += 1;
                 try addIssue(ctx, result, .store, entry_path, "manifest signature verification failed");
                 continue;
             };
-            ctx.allocator.free(verify_result.verifying_fingerprint);
+            verify_result.deinit(ctx.allocator);
         }
 
         path_safety.validateStorePayload(ctx.allocator, entry_path) catch |err| {
