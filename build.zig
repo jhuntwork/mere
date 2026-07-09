@@ -1,29 +1,5 @@
 const std = @import("std");
 
-const ArchiveKind = enum {
-    tar_gz,
-    tar_bz2,
-    tar_xz,
-
-    fn tarExtractFlag(self: ArchiveKind) []const u8 {
-        return switch (self) {
-            .tar_gz => "-xzf",
-            .tar_bz2 => "-xjf",
-            .tar_xz => "-xJf",
-        };
-    }
-};
-
-const VendorSource = struct {
-    name: []const u8,
-    version: []const u8,
-    url: []const u8,
-    sha256: []const u8,
-    archive_basename: []const u8,
-    source_dirname: []const u8,
-    archive_kind: ArchiveKind,
-};
-
 const VendorDep = enum {
     zlib,
     mbedtls,
@@ -35,12 +11,33 @@ const VendorDep = enum {
     curl,
     sqlite,
     ckdl,
+
+    /// Name of the corresponding entry in build.zig.zon's .dependencies.
+    /// mbedtls and libsodium have no entry: see bootstrapMbedTls and
+    /// bootstrapLibsodium for why.
+    fn zonName(self: VendorDep) []const u8 {
+        return switch (self) {
+            .zlib => "zlib_ng",
+            .mbedtls => unreachable,
+            .libsodium => unreachable,
+            .zstd => "zstd",
+            .lzma => "xz",
+            .bzip2 => "bzip2",
+            .libarchive => "libarchive",
+            .curl => "curl",
+            .sqlite => "sqlite",
+            .ckdl => "ckdl",
+        };
+    }
 };
 
-const VendorSourceEntry = struct {
-    dep: VendorDep,
-    source: VendorSource,
-};
+/// Source tree for a vendored C dependency, fetched and verified by Zig's
+/// package manager (see build.zig.zon) rather than a hand-rolled
+/// curl+sha256sum shell script. This participates in Zig's global package
+/// cache and `--fetch` offline-build support.
+fn vendorSourceDir(b: *std.Build, dep: VendorDep) std.Build.LazyPath {
+    return b.dependency(dep.zonName(), .{}).path("");
+}
 
 const BootstrappedPrefix = struct {
     prefix: std.Build.LazyPath,
@@ -121,7 +118,7 @@ fn detectCrossToolchain(b: *std.Build, target: std.Build.ResolvedTarget) ?CrossT
 const CMakeBootstrap = struct {
     step_name: []const u8,
     output_dirname: []const u8,
-    source: VendorSource,
+    dep: VendorDep,
     cmake_source_subdir: ?[]const u8 = null,
     cmake_flags: []const []const u8,
     cross: ?CrossToolchain = null,
@@ -130,15 +127,9 @@ const CMakeBootstrap = struct {
 const AutotoolsBootstrap = struct {
     step_name: []const u8,
     output_dirname: []const u8,
-    source: VendorSource,
+    dep: VendorDep,
     configure_args: []const []const u8,
     cross: ?CrossToolchain = null,
-};
-
-const SourceTreeBootstrap = struct {
-    step_name: []const u8,
-    output_dirname: []const u8,
-    source: VendorSource,
 };
 
 const VendoredDeps = struct {
@@ -185,168 +176,6 @@ const ckdl_source_files = &[_][]const u8{
     "src/utf8.c",
 };
 
-const vendor_sources = [_]VendorSourceEntry{
-    .{
-        .dep = .zlib,
-        .source = blk: {
-            const version = "2.2.5";
-            break :blk .{
-                .name = "zlib-ng",
-                .version = version,
-                .url = std.fmt.comptimePrint("https://github.com/zlib-ng/zlib-ng/archive/refs/tags/{s}.tar.gz", .{version}),
-                .sha256 = "5b3b022489f3ced82384f06db1e13ba148cbce38c7941e424d6cb414416acd18",
-                .archive_basename = std.fmt.comptimePrint("zlib-ng-{s}.tar.gz", .{version}),
-                .source_dirname = std.fmt.comptimePrint("zlib-ng-{s}", .{version}),
-                .archive_kind = .tar_gz,
-            };
-        },
-    },
-    .{
-        .dep = .mbedtls,
-        .source = blk: {
-            const version = "3.6.5";
-            break :blk .{
-                .name = "mbedtls",
-                .version = version,
-                .url = std.fmt.comptimePrint("https://github.com/Mbed-TLS/mbedtls/releases/download/mbedtls-{0s}/mbedtls-{0s}.tar.bz2", .{version}),
-                .sha256 = "4a11f1777bb95bf4ad96721cac945a26e04bf19f57d905f241fe77ebeddf46d8",
-                .archive_basename = std.fmt.comptimePrint("mbedtls-{s}.tar.bz2", .{version}),
-                .source_dirname = std.fmt.comptimePrint("mbedtls-{s}", .{version}),
-                .archive_kind = .tar_bz2,
-            };
-        },
-    },
-    .{
-        .dep = .libsodium,
-        .source = blk: {
-            const version = "1.0.21";
-            break :blk .{
-                .name = "libsodium",
-                .version = version,
-                .url = std.fmt.comptimePrint("https://download.libsodium.org/libsodium/releases/libsodium-{s}.tar.gz", .{version}),
-                .sha256 = "9e4285c7a419e82dedb0be63a72eea357d6943bc3e28e6735bf600dd4883feaf",
-                .archive_basename = std.fmt.comptimePrint("libsodium-{s}.tar.gz", .{version}),
-                .source_dirname = std.fmt.comptimePrint("libsodium-{s}", .{version}),
-                .archive_kind = .tar_gz,
-            };
-        },
-    },
-    .{
-        .dep = .zstd,
-        .source = blk: {
-            const version = "1.5.7";
-            break :blk .{
-                .name = "zstd",
-                .version = version,
-                .url = std.fmt.comptimePrint("https://github.com/facebook/zstd/releases/download/v{0s}/zstd-{0s}.tar.gz", .{version}),
-                .sha256 = "eb33e51f49a15e023950cd7825ca74a4a2b43db8354825ac24fc1b7ee09e6fa3",
-                .archive_basename = std.fmt.comptimePrint("zstd-{s}.tar.gz", .{version}),
-                .source_dirname = std.fmt.comptimePrint("zstd-{s}", .{version}),
-                .archive_kind = .tar_gz,
-            };
-        },
-    },
-    .{
-        .dep = .lzma,
-        .source = blk: {
-            const version = "5.8.2";
-            break :blk .{
-                .name = "xz",
-                .version = version,
-                .url = std.fmt.comptimePrint("https://github.com/tukaani-project/xz/releases/download/v{0s}/xz-{0s}.tar.xz", .{version}),
-                .sha256 = "890966ec3f5d5cc151077879e157c0593500a522f413ac50ba26d22a9a145214",
-                .archive_basename = std.fmt.comptimePrint("xz-{s}.tar.xz", .{version}),
-                .source_dirname = std.fmt.comptimePrint("xz-{s}", .{version}),
-                .archive_kind = .tar_xz,
-            };
-        },
-    },
-    .{
-        .dep = .bzip2,
-        .source = blk: {
-            const version = "1.0.8";
-            break :blk .{
-                .name = "bzip2",
-                .version = version,
-                .url = std.fmt.comptimePrint("https://sourceware.org/pub/bzip2/bzip2-{s}.tar.gz", .{version}),
-                .sha256 = "ab5a03176ee106d3f0fa90e381da478ddae405918153cca248e682cd0c4a2269",
-                .archive_basename = std.fmt.comptimePrint("bzip2-{s}.tar.gz", .{version}),
-                .source_dirname = std.fmt.comptimePrint("bzip2-{s}", .{version}),
-                .archive_kind = .tar_gz,
-            };
-        },
-    },
-    .{
-        .dep = .libarchive,
-        .source = blk: {
-            const version = "3.8.2";
-            break :blk .{
-                .name = "libarchive",
-                .version = version,
-                .url = std.fmt.comptimePrint("https://github.com/libarchive/libarchive/releases/download/v{0s}/libarchive-{0s}.tar.xz", .{version}),
-                .sha256 = "db0dee91561cbd957689036a3a71281efefd131d35d1d98ebbc32720e4da58e2",
-                .archive_basename = std.fmt.comptimePrint("libarchive-{s}.tar.xz", .{version}),
-                .source_dirname = std.fmt.comptimePrint("libarchive-{s}", .{version}),
-                .archive_kind = .tar_xz,
-            };
-        },
-    },
-    .{
-        .dep = .curl,
-        .source = blk: {
-            const version = "8.19.0";
-            break :blk .{
-                .name = "curl",
-                .version = version,
-                .url = std.fmt.comptimePrint("https://curl.se/download/curl-{s}.tar.xz", .{version}),
-                .sha256 = "4eb41489790d19e190d7ac7e18e82857cdd68af8f4e66b292ced562d333f11df",
-                .archive_basename = std.fmt.comptimePrint("curl-{s}.tar.xz", .{version}),
-                .source_dirname = std.fmt.comptimePrint("curl-{s}", .{version}),
-                .archive_kind = .tar_xz,
-            };
-        },
-    },
-    .{
-        .dep = .sqlite,
-        .source = blk: {
-            const version = "3.51.3";
-            const release_id = "3510300";
-            const year = "2026";
-            break :blk .{
-                .name = "sqlite",
-                .version = version,
-                .url = std.fmt.comptimePrint("https://www.sqlite.org/{0s}/sqlite-autoconf-{1s}.tar.gz", .{ year, release_id }),
-                .sha256 = "81f5be397049b0cae1b167f2225af7646fc0f82e4a9b3c48c9ea3a533e21d77a",
-                .archive_basename = std.fmt.comptimePrint("sqlite-autoconf-{s}.tar.gz", .{release_id}),
-                .source_dirname = std.fmt.comptimePrint("sqlite-autoconf-{s}", .{release_id}),
-                .archive_kind = .tar_gz,
-            };
-        },
-    },
-    .{
-        .dep = .ckdl,
-        .source = blk: {
-            const version = "1.0";
-            break :blk .{
-                .name = "ckdl",
-                .version = version,
-                .url = std.fmt.comptimePrint("https://github.com/tjol/ckdl/archive/refs/tags/{s}.tar.gz", .{version}),
-                .sha256 = "0bf3a7d81d661eafccfbf82c68278d38c939b0b7329ad4599f95bbf2f4ca6dc8",
-                .archive_basename = std.fmt.comptimePrint("ckdl-{s}.tar.gz", .{version}),
-                .source_dirname = std.fmt.comptimePrint("ckdl-{s}", .{version}),
-                .archive_kind = .tar_gz,
-            };
-        },
-    },
-};
-
-fn vendorSource(comptime dep: VendorDep) VendorSource {
-    inline for (vendor_sources) |entry| {
-        if (entry.dep == dep) return entry.source;
-    }
-    @compileError("missing vendor source manifest entry");
-}
-
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
@@ -360,16 +189,8 @@ pub fn build(b: *std.Build) void {
         .bzip2 = bootstrapBzip2(b, cross),
         .libarchive = undefined,
         .curl = undefined,
-        .sqlite = unpackVendorSourceTree(b, .{
-            .step_name = "vendor-source-sqlite",
-            .output_dirname = "sqlite-source",
-            .source = vendorSource(.sqlite),
-        }),
-        .ckdl = unpackVendorSourceTree(b, .{
-            .step_name = "vendor-source-ckdl",
-            .output_dirname = "ckdl-source",
-            .source = vendorSource(.ckdl),
-        }),
+        .sqlite = .{ .root = vendorSourceDir(b, .sqlite) },
+        .ckdl = .{ .root = vendorSourceDir(b, .ckdl) },
     };
     var vendored = deps;
     vendored.libarchive = bootstrapLibarchive(b, vendored.zlib, vendored.bzip2, vendored.zstd, vendored.lzma, cross);
@@ -637,7 +458,204 @@ fn createCkdlLibrary(
     return ckdl_lib;
 }
 
-fn downloadVendorSource(b: *std.Build, source: VendorSource) std.Build.LazyPath {
+fn appendCMakeFlags(b: *std.Build, flags: []const []const u8) []const u8 {
+    var script: std.ArrayList(u8) = .empty;
+    for (flags) |flag| {
+        script.appendSlice(b.allocator, " \\\n  ") catch @panic("OOM");
+        script.appendSlice(b.allocator, flag) catch @panic("OOM");
+    }
+    return script.toOwnedSlice(b.allocator) catch @panic("OOM");
+}
+
+fn appendShellQuotedArg(list: *std.ArrayList(u8), allocator: std.mem.Allocator, arg: []const u8) void {
+    list.append(allocator, '\'') catch @panic("OOM");
+    for (arg) |byte| {
+        if (byte == '\'') {
+            list.appendSlice(allocator, "'\\''") catch @panic("OOM");
+        } else {
+            list.append(allocator, byte) catch @panic("OOM");
+        }
+    }
+    list.append(allocator, '\'') catch @panic("OOM");
+}
+
+fn appendShellSetArgs(b: *std.Build, args: []const []const u8) []const u8 {
+    var script: std.ArrayList(u8) = .empty;
+    for (args) |arg| {
+        script.appendSlice(b.allocator, "\nset -- \"$@\" ") catch @panic("OOM");
+        appendShellQuotedArg(&script, b.allocator, arg);
+    }
+    return script.toOwnedSlice(b.allocator) catch @panic("OOM");
+}
+
+fn bootstrapCMakePrefix(b: *std.Build, spec: CMakeBootstrap) BootstrappedPrefix {
+    const source_dir = vendorSourceDir(b, spec.dep);
+    const cross_env_setup = if (spec.cross) |cross|
+        b.fmt(
+            \\cross_dir="$(realpath "$3")"
+            \\cross_flags="-DCMAKE_SYSTEM_NAME={s} -DCMAKE_SYSTEM_PROCESSOR={s}"
+            \\cross_flags="$cross_flags -DCMAKE_C_COMPILER=$cross_dir/zig-cc"
+            \\cross_flags="$cross_flags -DCMAKE_CXX_COMPILER=$cross_dir/zig-c++"
+            \\cross_flags="$cross_flags -DCMAKE_ASM_COMPILER=$cross_dir/zig-cc"
+            \\cross_flags="$cross_flags -DCMAKE_AR=$cross_dir/zig-ar"
+            \\cross_flags="$cross_flags -DCMAKE_RANLIB=$cross_dir/zig-ranlib"
+            \\cross_flags="$cross_flags -DCMAKE_CROSSCOMPILING=ON"
+            \\
+        , .{ cross.cmake_system_name, cross.cmake_system_processor })
+    else
+        "cross_flags=\n";
+    const cmake_flags = appendCMakeFlags(b, spec.cmake_flags);
+    const source_subdir = spec.cmake_source_subdir orelse "";
+    const source_suffix = if (source_subdir.len == 0)
+        ""
+    else
+        b.fmt("/{s}", .{source_subdir});
+    const bootstrap_script = b.fmt(
+        \\srcdir="$1"
+        \\prefix="$2"
+        \\{s}
+        \\tmpdir="$(mktemp -d)"
+        \\cleanup() {{
+        \\  rm -rf "$tmpdir"
+        \\}}
+        \\trap cleanup EXIT INT TERM
+        \\mkdir -p "$prefix"
+        \\log="$prefix/.mere-build.log"
+        \\: > "$log"
+        \\run_logged() {{
+        \\  "$@" >>"$log" 2>&1 || {{
+        \\    status="$?"
+        \\    echo "vendor bootstrap failed, see $log" >&2
+        \\    tail -n 50 "$log" >&2 || true
+        \\    exit "$status"
+        \\  }}
+        \\}}
+        \\
+        \\mkdir -p "$tmpdir/src"
+        \\run_logged cp -Rp "$srcdir/." "$tmpdir/src"
+        \\run_logged find "$tmpdir/src" -exec touch -r "$tmpdir/src" {{}} +
+        \\src="$tmpdir/src{s}"
+        \\build="$tmpdir/build"
+        \\
+        \\# shellcheck disable=SC2086
+        \\run_logged cmake -Wno-dev -S "$src" -B "$build" $cross_flags{s}
+        \\run_logged cmake --build "$build"
+        \\run_logged cmake --install "$build" --prefix "$prefix"
+    ,
+        .{
+            cross_env_setup,
+            source_suffix,
+            cmake_flags,
+        },
+    );
+    const bootstrap = b.addSystemCommand(&.{ "sh", "-ceu", bootstrap_script, spec.step_name });
+    bootstrap.addDirectoryArg(source_dir);
+    const prefix = bootstrap.addOutputDirectoryArg(spec.output_dirname);
+    if (spec.cross) |cross| {
+        bootstrap.step.dependOn(cross.cmake_setup_step);
+        bootstrap.addDirectoryArg(cross.cmake_wrapper_dir);
+    }
+
+    return .{
+        .prefix = prefix,
+        .include_dir = prefix.path(b, "include"),
+    };
+}
+
+fn bootstrapAutotoolsPrefix(b: *std.Build, spec: AutotoolsBootstrap) BootstrappedPrefix {
+    const source_dir = vendorSourceDir(b, spec.dep);
+    const configure_args = appendShellSetArgs(b, spec.configure_args);
+    const cross_env = if (spec.cross) |cross|
+        b.fmt(
+            \\export CC="{s}"
+            \\export AR="{s}"
+            \\export RANLIB="{s}"
+            \\
+        , .{ cross.cc, cross.ar, cross.ranlib })
+    else
+        "";
+    const cross_host = if (spec.cross) |cross|
+        b.fmt(" --host={s}", .{cross.triple})
+    else
+        "";
+    const bootstrap_script = b.fmt(
+        \\srcdir="$1"
+        \\prefix="$2"
+        \\tmpdir="$(mktemp -d)"
+        \\cleanup() {{
+        \\  rm -rf "$tmpdir"
+        \\}}
+        \\trap cleanup EXIT INT TERM
+        \\mkdir -p "$prefix"
+        \\log="$prefix/.mere-build.log"
+        \\: > "$log"
+        \\run_logged() {{
+        \\  "$@" >>"$log" 2>&1 || {{
+        \\    status="$?"
+        \\    echo "vendor bootstrap failed, see $log" >&2
+        \\    tail -n 50 "$log" >&2 || true
+        \\    exit "$status"
+        \\  }}
+        \\}}
+        \\{s}
+        \\mkdir -p "$tmpdir/src"
+        \\run_logged cp -Rp "$srcdir/." "$tmpdir/src"
+        \\run_logged find "$tmpdir/src" -exec touch -r "$tmpdir/src" {{}} +
+        \\src="$tmpdir/src"
+        \\build="$tmpdir/build"
+        \\mkdir -p "$build"
+        \\cd "$build"
+        \\
+        \\set -- "$src/configure" --prefix="$prefix" --libdir="$prefix/lib"{s}{s}
+        \\run_logged "$@"
+        \\run_logged make -j"$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 1)"
+        \\run_logged make install
+    ,
+        .{
+            cross_env,
+            cross_host,
+            configure_args,
+        },
+    );
+    const bootstrap = b.addSystemCommand(&.{ "sh", "-ceu", bootstrap_script, spec.step_name });
+    bootstrap.addDirectoryArg(source_dir);
+    const prefix = bootstrap.addOutputDirectoryArg(spec.output_dirname);
+
+    return .{
+        .prefix = prefix,
+        .include_dir = prefix.path(b, "include"),
+    };
+}
+
+fn bootstrapZlib(b: *std.Build, cross: ?CrossToolchain) BootstrappedPrefix {
+    return bootstrapCMakePrefix(b, .{
+        .step_name = "vendor-bootstrap-zlib",
+        .output_dirname = "zlib-ng",
+        .dep = .zlib,
+        .cmake_flags = &.{
+            "-DCMAKE_BUILD_TYPE=Release",
+            "-DBUILD_SHARED_LIBS=OFF",
+            "-DCMAKE_INSTALL_LIBDIR=lib",
+            "-DZLIB_COMPAT=ON",
+            "-DZLIB_ENABLE_TESTS=OFF",
+            "-DZLIBNG_ENABLE_TESTS=OFF",
+        },
+        .cross = cross,
+    });
+}
+
+/// mbedtls is the other vendored dependency NOT fetched via build.zig.zon:
+/// its CMakeLists.txt requires a git submodule (framework/) that a plain
+/// GitHub tag-archive tarball never includes (git archives never contain
+/// submodule content); only its official release asset bundles it, and
+/// that host sends Content-Type/Content-Disposition headers Zig's fetcher
+/// rejects. So this keeps the old curl+sha256sum fetch, inlined here
+/// rather than as a shared helper since it's a one-off.
+fn bootstrapMbedTls(b: *std.Build, cross: ?CrossToolchain) BootstrappedPrefix {
+    const url = "https://github.com/Mbed-TLS/mbedtls/releases/download/mbedtls-3.6.5/mbedtls-3.6.5.tar.bz2";
+    const sha256 = "4a11f1777bb95bf4ad96721cac945a26e04bf19f57d905f241fe77ebeddf46d8";
+    const source_dirname = "mbedtls-3.6.5";
+
     const download = b.addSystemCommand(&.{
         "sh",
         "-ceu",
@@ -674,74 +692,13 @@ fn downloadVendorSource(b: *std.Build, source: VendorSource) std.Build.LazyPath 
         \\  exit 1
         \\fi
         ,
-        "vendor-fetch",
+        "vendor-fetch-mbedtls",
     });
-    download.addArg(source.url);
-    download.addArg(source.sha256);
-    return download.addOutputFileArg(source.archive_basename);
-}
+    download.addArg(url);
+    download.addArg(sha256);
+    const tarball = download.addOutputFileArg("mbedtls-3.6.5.tar.bz2");
 
-fn unpackVendorSourceTree(b: *std.Build, spec: SourceTreeBootstrap) SourceTree {
-    const tarball = downloadVendorSource(b, spec.source);
-    const unpack_script = b.fmt(
-        \\tarball="$1"
-        \\out="$2"
-        \\tmpdir="$(mktemp -d)"
-        \\cleanup() {{
-        \\  rm -rf "$tmpdir"
-        \\}}
-        \\trap cleanup EXIT INT TERM
-        \\
-        \\tar {s} "$tarball" -C "$tmpdir"
-        \\src="$tmpdir/{s}"
-        \\cp -R "$src/." "$out"
-    ,
-        .{
-            spec.source.archive_kind.tarExtractFlag(),
-            spec.source.source_dirname,
-        },
-    );
-    const unpack = b.addSystemCommand(&.{ "sh", "-ceu", unpack_script, spec.step_name });
-    unpack.addFileArg(tarball);
-
-    return .{
-        .root = unpack.addOutputDirectoryArg(spec.output_dirname),
-    };
-}
-
-fn appendCMakeFlags(b: *std.Build, flags: []const []const u8) []const u8 {
-    var script: std.ArrayList(u8) = .empty;
-    for (flags) |flag| {
-        script.appendSlice(b.allocator, " \\\n  ") catch @panic("OOM");
-        script.appendSlice(b.allocator, flag) catch @panic("OOM");
-    }
-    return script.toOwnedSlice(b.allocator) catch @panic("OOM");
-}
-
-fn appendShellQuotedArg(list: *std.ArrayList(u8), allocator: std.mem.Allocator, arg: []const u8) void {
-    list.append(allocator, '\'') catch @panic("OOM");
-    for (arg) |byte| {
-        if (byte == '\'') {
-            list.appendSlice(allocator, "'\\''") catch @panic("OOM");
-        } else {
-            list.append(allocator, byte) catch @panic("OOM");
-        }
-    }
-    list.append(allocator, '\'') catch @panic("OOM");
-}
-
-fn appendShellSetArgs(b: *std.Build, args: []const []const u8) []const u8 {
-    var script: std.ArrayList(u8) = .empty;
-    for (args) |arg| {
-        script.appendSlice(b.allocator, "\nset -- \"$@\" ") catch @panic("OOM");
-        appendShellQuotedArg(&script, b.allocator, arg);
-    }
-    return script.toOwnedSlice(b.allocator) catch @panic("OOM");
-}
-
-fn bootstrapCMakePrefix(b: *std.Build, spec: CMakeBootstrap) BootstrappedPrefix {
-    const tarball = downloadVendorSource(b, spec.source);
-    const cross_env_setup = if (spec.cross) |cross|
+    const cross_env_setup = if (cross) |c|
         b.fmt(
             \\cross_dir="$(realpath "$3")"
             \\cross_flags="-DCMAKE_SYSTEM_NAME={s} -DCMAKE_SYSTEM_PROCESSOR={s}"
@@ -752,15 +709,18 @@ fn bootstrapCMakePrefix(b: *std.Build, spec: CMakeBootstrap) BootstrappedPrefix 
             \\cross_flags="$cross_flags -DCMAKE_RANLIB=$cross_dir/zig-ranlib"
             \\cross_flags="$cross_flags -DCMAKE_CROSSCOMPILING=ON"
             \\
-        , .{ cross.cmake_system_name, cross.cmake_system_processor })
+        , .{ c.cmake_system_name, c.cmake_system_processor })
     else
         "cross_flags=\n";
-    const cmake_flags = appendCMakeFlags(b, spec.cmake_flags);
-    const source_subdir = spec.cmake_source_subdir orelse "";
-    const source_suffix = if (source_subdir.len == 0)
-        ""
-    else
-        b.fmt("/{s}", .{source_subdir});
+    const cmake_flags = appendCMakeFlags(b, &.{
+        "-DCMAKE_BUILD_TYPE=Release",
+        "-DCMAKE_INSTALL_LIBDIR=lib",
+        "-DBUILD_SHARED_LIBS=OFF",
+        "-DENABLE_PROGRAMS=OFF",
+        "-DENABLE_TESTING=OFF",
+        "-DUSE_STATIC_MBEDTLS_LIBRARY=ON",
+        "-DUSE_SHARED_MBEDTLS_LIBRARY=OFF",
+    });
     const bootstrap_script = b.fmt(
         \\tarball="$1"
         \\prefix="$2"
@@ -782,8 +742,8 @@ fn bootstrapCMakePrefix(b: *std.Build, spec: CMakeBootstrap) BootstrappedPrefix 
         \\  }}
         \\}}
         \\
-        \\run_logged tar {s} "$tarball" -C "$tmpdir"
-        \\src="$tmpdir/{s}{s}"
+        \\run_logged tar -xjf "$tarball" -C "$tmpdir"
+        \\src="$tmpdir/{s}"
         \\build="$tmpdir/build"
         \\
         \\# shellcheck disable=SC2086
@@ -793,18 +753,16 @@ fn bootstrapCMakePrefix(b: *std.Build, spec: CMakeBootstrap) BootstrappedPrefix 
     ,
         .{
             cross_env_setup,
-            spec.source.archive_kind.tarExtractFlag(),
-            spec.source.source_dirname,
-            source_suffix,
+            source_dirname,
             cmake_flags,
         },
     );
-    const bootstrap = b.addSystemCommand(&.{ "sh", "-ceu", bootstrap_script, spec.step_name });
+    const bootstrap = b.addSystemCommand(&.{ "sh", "-ceu", bootstrap_script, "vendor-bootstrap-mbedtls" });
     bootstrap.addFileArg(tarball);
-    const prefix = bootstrap.addOutputDirectoryArg(spec.output_dirname);
-    if (spec.cross) |cross| {
-        bootstrap.step.dependOn(cross.cmake_setup_step);
-        bootstrap.addDirectoryArg(cross.cmake_wrapper_dir);
+    const prefix = bootstrap.addOutputDirectoryArg("mbedtls");
+    if (cross) |c| {
+        bootstrap.step.dependOn(c.cmake_setup_step);
+        bootstrap.addDirectoryArg(c.cmake_wrapper_dir);
     }
 
     return .{
@@ -813,20 +771,76 @@ fn bootstrapCMakePrefix(b: *std.Build, spec: CMakeBootstrap) BootstrappedPrefix 
     };
 }
 
-fn bootstrapAutotoolsPrefix(b: *std.Build, spec: AutotoolsBootstrap) BootstrappedPrefix {
-    const tarball = downloadVendorSource(b, spec.source);
-    const configure_args = appendShellSetArgs(b, spec.configure_args);
-    const cross_env = if (spec.cross) |cross|
+/// libsodium is the one vendored dependency NOT fetched via build.zig.zon:
+/// its source (official release tarball and GitHub tag archive alike)
+/// ships its own build.zig, and Zig's package manager unconditionally
+/// tries to run a fetched dependency's build.zig while resolving it —
+/// which fails here, since that build.zig targets a different Zig version
+/// than this project's. So this keeps the old curl+sha256sum fetch,
+/// inlined here rather than as a shared helper since it's a one-off.
+fn bootstrapLibsodium(b: *std.Build, cross: ?CrossToolchain) BootstrappedPrefix {
+    const url = "https://download.libsodium.org/libsodium/releases/libsodium-1.0.21.tar.gz";
+    const sha256 = "9e4285c7a419e82dedb0be63a72eea357d6943bc3e28e6735bf600dd4883feaf";
+    const source_dirname = "libsodium-1.0.21";
+
+    const download = b.addSystemCommand(&.{
+        "sh",
+        "-ceu",
+        \\url="$1"
+        \\expected="$2"
+        \\out="$3"
+        \\log="$out.log"
+        \\
+        \\: > "$log"
+        \\curl -fsSL --retry 3 -o "$out" "$url" 2>>"$log" || {
+        \\  status="$?"
+        \\  echo "vendor fetch failed, see $log" >&2
+        \\  tail -n 50 "$log" >&2 || true
+        \\  exit "$status"
+        \\}
+        \\
+        \\checksum_line="$(sha256sum "$out" 2>>"$log")" || {
+        \\  status="$?"
+        \\  echo "vendor fetch failed, see $log" >&2
+        \\  tail -n 50 "$log" >&2 || true
+        \\  exit "$status"
+        \\}
+        \\set -- $checksum_line
+        \\actual="$1"
+        \\if [ "$actual" != "$expected" ]; then
+        \\  {
+        \\    echo "sha256 mismatch for $out"
+        \\    echo "expected: $expected"
+        \\    echo "actual:   $actual"
+        \\  } >>"$log"
+        \\  echo "vendor fetch failed, see $log" >&2
+        \\  tail -n 50 "$log" >&2 || true
+        \\  rm -f "$out"
+        \\  exit 1
+        \\fi
+        ,
+        "vendor-fetch-libsodium",
+    });
+    download.addArg(url);
+    download.addArg(sha256);
+    const tarball = download.addOutputFileArg("libsodium-1.0.21.tar.gz");
+
+    const configure_args = appendShellSetArgs(b, &.{
+        "--disable-shared",
+        "--enable-static",
+        "--enable-minimal",
+    });
+    const cross_env = if (cross) |c|
         b.fmt(
             \\export CC="{s}"
             \\export AR="{s}"
             \\export RANLIB="{s}"
             \\
-        , .{ cross.cc, cross.ar, cross.ranlib })
+        , .{ c.cc, c.ar, c.ranlib })
     else
         "";
-    const cross_host = if (spec.cross) |cross|
-        b.fmt(" --host={s}", .{cross.triple})
+    const cross_host = if (cross) |c|
+        b.fmt(" --host={s}", .{c.triple})
     else
         "";
     const bootstrap_script = b.fmt(
@@ -849,7 +863,7 @@ fn bootstrapAutotoolsPrefix(b: *std.Build, spec: AutotoolsBootstrap) Bootstrappe
         \\  }}
         \\}}
         \\{s}
-        \\run_logged tar {s} "$tarball" -C "$tmpdir"
+        \\run_logged tar -xzf "$tarball" -C "$tmpdir"
         \\src="$tmpdir/{s}"
         \\build="$tmpdir/build"
         \\mkdir -p "$build"
@@ -862,15 +876,14 @@ fn bootstrapAutotoolsPrefix(b: *std.Build, spec: AutotoolsBootstrap) Bootstrappe
     ,
         .{
             cross_env,
-            spec.source.archive_kind.tarExtractFlag(),
-            spec.source.source_dirname,
+            source_dirname,
             cross_host,
             configure_args,
         },
     );
-    const bootstrap = b.addSystemCommand(&.{ "sh", "-ceu", bootstrap_script, spec.step_name });
+    const bootstrap = b.addSystemCommand(&.{ "sh", "-ceu", bootstrap_script, "vendor-bootstrap-libsodium" });
     bootstrap.addFileArg(tarball);
-    const prefix = bootstrap.addOutputDirectoryArg(spec.output_dirname);
+    const prefix = bootstrap.addOutputDirectoryArg("libsodium");
 
     return .{
         .prefix = prefix,
@@ -878,60 +891,11 @@ fn bootstrapAutotoolsPrefix(b: *std.Build, spec: AutotoolsBootstrap) Bootstrappe
     };
 }
 
-fn bootstrapZlib(b: *std.Build, cross: ?CrossToolchain) BootstrappedPrefix {
-    return bootstrapCMakePrefix(b, .{
-        .step_name = "vendor-bootstrap-zlib",
-        .output_dirname = "zlib-ng",
-        .source = vendorSource(.zlib),
-        .cmake_flags = &.{
-            "-DCMAKE_BUILD_TYPE=Release",
-            "-DBUILD_SHARED_LIBS=OFF",
-            "-DCMAKE_INSTALL_LIBDIR=lib",
-            "-DZLIB_COMPAT=ON",
-            "-DZLIB_ENABLE_TESTS=OFF",
-            "-DZLIBNG_ENABLE_TESTS=OFF",
-        },
-        .cross = cross,
-    });
-}
-
-fn bootstrapMbedTls(b: *std.Build, cross: ?CrossToolchain) BootstrappedPrefix {
-    return bootstrapCMakePrefix(b, .{
-        .step_name = "vendor-bootstrap-mbedtls",
-        .output_dirname = "mbedtls",
-        .source = vendorSource(.mbedtls),
-        .cmake_flags = &.{
-            "-DCMAKE_BUILD_TYPE=Release",
-            "-DCMAKE_INSTALL_LIBDIR=lib",
-            "-DBUILD_SHARED_LIBS=OFF",
-            "-DENABLE_PROGRAMS=OFF",
-            "-DENABLE_TESTING=OFF",
-            "-DUSE_STATIC_MBEDTLS_LIBRARY=ON",
-            "-DUSE_SHARED_MBEDTLS_LIBRARY=OFF",
-        },
-        .cross = cross,
-    });
-}
-
-fn bootstrapLibsodium(b: *std.Build, cross: ?CrossToolchain) BootstrappedPrefix {
-    return bootstrapAutotoolsPrefix(b, .{
-        .step_name = "vendor-bootstrap-libsodium",
-        .output_dirname = "libsodium",
-        .source = vendorSource(.libsodium),
-        .configure_args = &.{
-            "--disable-shared",
-            "--enable-static",
-            "--enable-minimal",
-        },
-        .cross = cross,
-    });
-}
-
 fn bootstrapZstd(b: *std.Build, cross: ?CrossToolchain) BootstrappedPrefix {
     return bootstrapCMakePrefix(b, .{
         .step_name = "vendor-bootstrap-zstd",
         .output_dirname = "zstd",
-        .source = vendorSource(.zstd),
+        .dep = .zstd,
         .cmake_source_subdir = "build/cmake",
         .cmake_flags = &.{
             "-DCMAKE_BUILD_TYPE=Release",
@@ -949,7 +913,7 @@ fn bootstrapLzma(b: *std.Build, cross: ?CrossToolchain) BootstrappedPrefix {
     return bootstrapAutotoolsPrefix(b, .{
         .step_name = "vendor-bootstrap-lzma",
         .output_dirname = "lzma",
-        .source = vendorSource(.lzma),
+        .dep = .lzma,
         .configure_args = &.{
             "--disable-shared",
             "--enable-static",
@@ -966,13 +930,12 @@ fn bootstrapLzma(b: *std.Build, cross: ?CrossToolchain) BootstrappedPrefix {
 }
 
 fn bootstrapBzip2(b: *std.Build, cross: ?CrossToolchain) BootstrappedPrefix {
-    const source = vendorSource(.bzip2);
-    const tarball = downloadVendorSource(b, source);
+    const source_dir = vendorSourceDir(b, .bzip2);
     const cc = if (cross) |c| c.cc else "cc";
     const ar = if (cross) |c| c.ar else "ar";
     const ranlib = if (cross) |c| c.ranlib else "ranlib";
     const bootstrap_script = b.fmt(
-        \\tarball="$1"
+        \\srcdir="$1"
         \\prefix="$2"
         \\tmpdir="$(mktemp -d)"
         \\cleanup() {{
@@ -991,8 +954,10 @@ fn bootstrapBzip2(b: *std.Build, cross: ?CrossToolchain) BootstrappedPrefix {
         \\  }}
         \\}}
         \\
-        \\run_logged tar {s} "$tarball" -C "$tmpdir"
-        \\src="$tmpdir/{s}"
+        \\mkdir -p "$tmpdir/src"
+        \\run_logged cp -Rp "$srcdir/." "$tmpdir/src"
+        \\run_logged find "$tmpdir/src" -exec touch -r "$tmpdir/src" {{}} +
+        \\src="$tmpdir/src"
         \\cd "$src"
         \\make -f Makefile-libbz2_so clean >>"$log" 2>&1 || true
         \\run_logged make \
@@ -1006,15 +971,13 @@ fn bootstrapBzip2(b: *std.Build, cross: ?CrossToolchain) BootstrappedPrefix {
         \\run_logged cp bzlib.h "$prefix/include/bzlib.h"
     ,
         .{
-            source.archive_kind.tarExtractFlag(),
-            source.source_dirname,
             cc,
             ar,
             ranlib,
         },
     );
     const bootstrap = b.addSystemCommand(&.{ "sh", "-ceu", bootstrap_script, "vendor-bootstrap-bzip2" });
-    bootstrap.addFileArg(tarball);
+    bootstrap.addDirectoryArg(source_dir);
     const prefix = bootstrap.addOutputDirectoryArg("bzip2");
 
     return .{
@@ -1031,8 +994,7 @@ fn bootstrapLibarchive(
     lzma: BootstrappedPrefix,
     cross: ?CrossToolchain,
 ) BootstrappedPrefix {
-    const source = vendorSource(.libarchive);
-    const tarball = downloadVendorSource(b, source);
+    const source_dir = vendorSourceDir(b, .libarchive);
     const cross_env = if (cross) |c|
         b.fmt(
             \\export CC="{s}"
@@ -1047,7 +1009,7 @@ fn bootstrapLibarchive(
     else
         "";
     const bootstrap_script = b.fmt(
-        \\tarball="$1"
+        \\srcdir="$1"
         \\prefix="$2"
         \\zlib_prefix="$(realpath "$3")"
         \\bzip2_prefix="$(realpath "$4")"
@@ -1070,8 +1032,10 @@ fn bootstrapLibarchive(
         \\  }}
         \\}}
         \\{s}
-        \\run_logged tar {s} "$tarball" -C "$tmpdir"
-        \\src="$tmpdir/{s}"
+        \\mkdir -p "$tmpdir/src"
+        \\run_logged cp -Rp "$srcdir/." "$tmpdir/src"
+        \\run_logged find "$tmpdir/src" -exec touch -r "$tmpdir/src" {{}} +
+        \\src="$tmpdir/src"
         \\build="$tmpdir/build"
         \\mkdir -p "$build"
         \\cd "$build"
@@ -1108,13 +1072,11 @@ fn bootstrapLibarchive(
     ,
         .{
             cross_env,
-            source.archive_kind.tarExtractFlag(),
-            source.source_dirname,
             cross_host,
         },
     );
     const bootstrap = b.addSystemCommand(&.{ "sh", "-ceu", bootstrap_script, "vendor-bootstrap-libarchive" });
-    bootstrap.addFileArg(tarball);
+    bootstrap.addDirectoryArg(source_dir);
     const prefix = bootstrap.addOutputDirectoryArg("libarchive");
     bootstrap.addDirectoryArg(zlib.prefix);
     bootstrap.addDirectoryArg(bzip2.prefix);
@@ -1134,8 +1096,7 @@ fn bootstrapCurl(
     zstd: BootstrappedPrefix,
     cross: ?CrossToolchain,
 ) BootstrappedPrefix {
-    const source = vendorSource(.curl);
-    const tarball = downloadVendorSource(b, source);
+    const source_dir = vendorSourceDir(b, .curl);
     const cross_env = if (cross) |c|
         b.fmt(
             \\export CC="{s}"
@@ -1150,7 +1111,7 @@ fn bootstrapCurl(
     else
         "";
     const bootstrap_script = b.fmt(
-        \\tarball="$1"
+        \\srcdir="$1"
         \\prefix="$2"
         \\zlib_prefix="$(realpath "$3")"
         \\mbedtls_prefix="$(realpath "$4")"
@@ -1172,8 +1133,10 @@ fn bootstrapCurl(
         \\  }}
         \\}}
         \\{s}
-        \\run_logged tar {s} "$tarball" -C "$tmpdir"
-        \\src="$tmpdir/{s}"
+        \\mkdir -p "$tmpdir/src"
+        \\run_logged cp -Rp "$srcdir/." "$tmpdir/src"
+        \\run_logged find "$tmpdir/src" -exec touch -r "$tmpdir/src" {{}} +
+        \\src="$tmpdir/src"
         \\build="$tmpdir/build"
         \\mkdir -p "$build"
         \\cd "$build"
@@ -1227,13 +1190,11 @@ fn bootstrapCurl(
     ,
         .{
             cross_env,
-            source.archive_kind.tarExtractFlag(),
-            source.source_dirname,
             cross_host,
         },
     );
     const bootstrap = b.addSystemCommand(&.{ "sh", "-ceu", bootstrap_script, "vendor-bootstrap-curl" });
-    bootstrap.addFileArg(tarball);
+    bootstrap.addDirectoryArg(source_dir);
     const prefix = bootstrap.addOutputDirectoryArg("curl");
     bootstrap.addDirectoryArg(zlib.prefix);
     bootstrap.addDirectoryArg(mbedtls.prefix);
