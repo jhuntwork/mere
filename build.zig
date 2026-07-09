@@ -276,6 +276,7 @@ pub fn build(b: *std.Build) void {
         .{ .name = "package", .path = "src/package.zig" },
         .{ .name = "package_staging", .path = "src/package_staging.zig" },
         .{ .name = "packaging", .path = "src/packaging.zig" },
+        .{ .name = "parser", .path = "src/cli/parser.zig" },
         .{ .name = "path", .path = "src/path.zig" },
         .{ .name = "pin", .path = "src/pin.zig" },
         .{ .name = "publish", .path = "src/publish.zig" },

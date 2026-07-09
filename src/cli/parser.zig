@@ -32,22 +32,28 @@ pub const ArgumentParser = struct {
         defer positional.deinit(self.allocator);
 
         var i: usize = 1; // Skip program name
-        var parsing_flags = false;
 
         while (i < args.len) {
             const arg = args[i];
 
-            if (std.mem.startsWith(u8, arg, "--")) {
+            if (std.mem.eql(u8, arg, "--")) {
+                // End-of-flags separator: everything after this is positional,
+                // even if it looks like a flag.
+                i += 1;
+                while (i < args.len) {
+                    try positional.append(self.allocator, args[i]);
+                    i += 1;
+                }
+                break;
+            } else if (std.mem.startsWith(u8, arg, "--")) {
                 // Long flag
-                parsing_flags = true;
                 const flag_name = arg[2..];
                 i = try self.parseLongFlag(&parsed, args, &i, flag_name, command_flags);
             } else if (std.mem.startsWith(u8, arg, "-") and arg.len > 1) {
                 // Short flag(s)
-                parsing_flags = true;
                 i = try self.parseShortFlags(&parsed, args, &i, arg[1..], command_flags);
             } else {
-                // Positional argument - once we start parsing flags, everything else is positional
+                // Positional argument
                 try positional.append(self.allocator, arg);
                 i += 1;
             }
@@ -245,3 +251,49 @@ pub const ArgumentParser = struct {
         return false;
     }
 };
+
+test "parse treats -- as end-of-flags, keeping flag-like tokens positional" {
+    const testing = std.testing;
+    const global_flags = [_]Flag{};
+    var p = ArgumentParser.init(testing.allocator, &global_flags);
+
+    const command_flags = [_]Flag{
+        .{ .name = "verbose", .short = 'v', .description = "", .flag_type = .bool },
+    };
+
+    const args = [_][]const u8{ "mere", "-v", "--", "-v", "--not-a-flag", "pos" };
+    var parsed = try p.parse(&args, &command_flags);
+    defer parsed.deinit();
+
+    // The flag before -- was parsed normally.
+    try testing.expect(parsed.getFlag("verbose").?.bool);
+
+    // Everything after -- is positional, including tokens that look like flags.
+    try testing.expectEqual(@as(usize, 3), parsed.positional.len);
+    try testing.expectEqualStrings("-v", parsed.positional[0]);
+    try testing.expectEqualStrings("--not-a-flag", parsed.positional[1]);
+    try testing.expectEqualStrings("pos", parsed.positional[2]);
+}
+
+test "parse handles a bare -- with nothing before or after it" {
+    const testing = std.testing;
+    const global_flags = [_]Flag{};
+    var p = ArgumentParser.init(testing.allocator, &global_flags);
+    const command_flags = [_]Flag{};
+
+    const args = [_][]const u8{ "mere", "--" };
+    var parsed = try p.parse(&args, &command_flags);
+    defer parsed.deinit();
+
+    try testing.expectEqual(@as(usize, 0), parsed.positional.len);
+}
+
+test "parse still rejects an unknown long flag before --" {
+    const testing = std.testing;
+    const global_flags = [_]Flag{};
+    var p = ArgumentParser.init(testing.allocator, &global_flags);
+    const command_flags = [_]Flag{};
+
+    const args = [_][]const u8{ "mere", "--bogus", "--", "pos" };
+    try testing.expectError(MereError.InvalidInput, p.parse(&args, &command_flags));
+}
