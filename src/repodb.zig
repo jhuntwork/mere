@@ -135,6 +135,76 @@ pub const RepoDB = struct {
         return self;
     }
 
+    /// Opens a read-only RepoDB from bytes the caller has already verified
+    /// against a trusted signature, instead of letting sqlite read db_path
+    /// from disk itself. Without this, a caller that hashes db_path to
+    /// verify it and then opens db_path via sqlite3_open_v2 has a window
+    /// between the two reads where the on-disk file could be swapped out
+    /// from under the verified hash.
+    ///
+    /// db_path is used only as a diagnostic label; the actual database
+    /// content comes entirely from `bytes`. `bytes` is copied into a
+    /// sqlite-owned buffer, so the caller may free its copy immediately
+    /// after this call returns.
+    pub fn initFromVerifiedBytes(ctx: *mere.Context, db_path: []const u8, bytes: []const u8) !*RepoDB {
+        if (db_path.len == 0) {
+            return ctx.fail(RepoDBError.InvalidInput, "repository db", "db path is empty");
+        }
+
+        const allocator = ctx.allocator;
+        const self = try allocator.create(RepoDB);
+        errdefer allocator.destroy(self);
+
+        const db_path_copy = allocator.dupe(u8, db_path) catch {
+            return ctx.fail(RepoDBError.OutOfMemory, db_path, "failed to allocate repository db path");
+        };
+        errdefer allocator.free(db_path_copy);
+
+        self.* = RepoDB{
+            .ctx = ctx,
+            .db_path = db_path_copy,
+            .db = null,
+            .read_only = true,
+        };
+
+        self.openFromBytes(bytes) catch {
+            return ctx.fail(RepoDBError.CorruptData, db_path, "failed to open repository db from verified bytes");
+        };
+
+        return self;
+    }
+
+    fn openFromBytes(self: *RepoDB, bytes: []const u8) !void {
+        const rc_open = c.sqlite3_open_v2(":memory:", &self.db, c.SQLITE_OPEN_READWRITE, null);
+        if (rc_open != c.SQLITE_OK) {
+            if (self.db != null) {
+                _ = c.sqlite3_close(self.db);
+            }
+            self.db = null;
+            return RepoDBError.FileSystem;
+        }
+
+        const buf_size: c.sqlite3_int64 = @intCast(bytes.len);
+        const raw_buf = c.sqlite3_malloc64(@intCast(bytes.len));
+        if (raw_buf == null) {
+            _ = c.sqlite3_close(self.db);
+            self.db = null;
+            return RepoDBError.OutOfMemory;
+        }
+        const sqlite_buf: [*]u8 = @ptrCast(raw_buf.?);
+        @memcpy(sqlite_buf[0..bytes.len], bytes);
+
+        const flags: c_uint = c.SQLITE_DESERIALIZE_READONLY | c.SQLITE_DESERIALIZE_FREEONCLOSE;
+        const rc = c.sqlite3_deserialize(self.db, "main", sqlite_buf, buf_size, buf_size, flags);
+        if (rc != c.SQLITE_OK) {
+            // On failure with FREEONCLOSE set, sqlite3_deserialize() has
+            // already freed sqlite_buf itself.
+            _ = c.sqlite3_close(self.db);
+            self.db = null;
+            return RepoDBError.FileSystem;
+        }
+    }
+
     fn open(self: *RepoDB) !void {
         // Ensure we pass a NUL-terminated C string to sqlite3_open_v2.
         var c_path = try self.ctx.allocator.alloc(u8, self.db_path.len + 1);
@@ -1542,6 +1612,71 @@ pub const RepoDB = struct {
         }
     }
 };
+
+test "RepoDB.initFromVerifiedBytes queries correctly and stays usable after the source file is deleted" {
+    const th = @import("test_helpers.zig");
+
+    var test_env = try th.createTestEnv();
+    defer {
+        test_env.cleanup();
+        std.testing.allocator.destroy(test_env);
+    }
+
+    const db_path = try std.fs.path.join(test_env.ctx.allocator, &.{ test_env.path, "test_repodb.db" });
+    defer test_env.ctx.allocator.free(db_path);
+
+    // Build a real repo.db on disk with the normal read-write path.
+    {
+        var db = try RepoDB.init(&test_env.ctx, db_path, false);
+        defer {
+            db.deinit();
+            test_env.ctx.allocator.destroy(db);
+        }
+        var err_msg: [*c]u8 = null;
+        const rc = c.sqlite3_exec(
+            db.db,
+            "INSERT INTO packages (name, version, release, arch, content_hash, archive_hash) VALUES ('demo', '1.0.0', 1, 'x86_64', 'a', 'b');",
+            null,
+            null,
+            &err_msg,
+        );
+        if (err_msg != null) c.sqlite3_free(err_msg);
+        try std.testing.expectEqual(c.SQLITE_OK, rc);
+    }
+
+    // Read the file's bytes exactly as sign.verifyWithTrustedFingerprints would.
+    const io = path.currentIo();
+    var file = try std.Io.Dir.openFileAbsolute(io, db_path, .{});
+    const stat = try file.stat(io);
+    const bytes = try test_env.ctx.allocator.alloc(u8, @intCast(stat.size));
+    defer test_env.ctx.allocator.free(bytes);
+    _ = try file.readPositionalAll(io, bytes, 0);
+    file.close(io);
+
+    // Simulate the swap window this fix closes: remove the on-disk repo.db
+    // right after "verification" reads it. A caller that let sqlite reopen
+    // db_path itself (the pre-fix TOCTOU) would now fail; the deserialized
+    // in-memory copy must still work.
+    try std.Io.Dir.deleteFileAbsolute(io, db_path);
+
+    var db = try RepoDB.initFromVerifiedBytes(&test_env.ctx, db_path, bytes);
+    defer {
+        db.deinit();
+        test_env.ctx.allocator.destroy(db);
+    }
+
+    const stmt = try db.prepareStatement("SELECT name, version FROM packages WHERE name = 'demo'");
+    defer _ = c.sqlite3_finalize(stmt);
+    try std.testing.expectEqual(c.SQLITE_ROW, c.sqlite3_step(stmt));
+    const name = std.mem.span(@as([*c]const u8, @ptrCast(c.sqlite3_column_text(stmt, 0))));
+    try std.testing.expectEqualStrings("demo", name);
+
+    // Read-only enforcement: a write attempt must fail.
+    var write_err_msg: [*c]u8 = null;
+    const write_rc = c.sqlite3_exec(db.db, "DELETE FROM packages;", null, null, &write_err_msg);
+    if (write_err_msg != null) c.sqlite3_free(write_err_msg);
+    try std.testing.expect(write_rc != c.SQLITE_OK);
+}
 
 test "RepoDB basic usage: init, schema, prepareStatement" {
     const th = @import("test_helpers.zig");
