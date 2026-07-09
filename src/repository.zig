@@ -131,6 +131,34 @@ pub const Repository = struct {
         };
     }
 
+    /// Opens a read-only Repository whose repo.db content has already been
+    /// verified by the caller (bytes come from sign.verifyWithTrustedFingerprints),
+    /// instead of reopening dir_path's repo.db from disk. See
+    /// RepoDB.initFromVerifiedBytes for why this matters.
+    pub fn initFromVerifiedBytes(ctx: *mere.Context, dir_path: []const u8, bytes: []const u8) !Repository {
+        const active_paths = try resolveActiveRepoStatePaths(ctx, dir_path, true);
+        errdefer ctx.allocator.free(active_paths.db_path);
+        errdefer ctx.allocator.free(active_paths.sig_path);
+
+        const db = RepoDB.initFromVerifiedBytes(ctx, active_paths.db_path, bytes) catch |err| {
+            return switch (err) {
+                error.OutOfMemory => Error.OutOfMemory,
+                error.PermissionDenied => Error.PermissionDenied,
+                error.InvalidInput => Error.InvalidInput,
+                error.CorruptData => Error.CorruptData,
+                error.SignatureInvalid => Error.SignatureInvalid,
+                else => ctx.fail(Error.FileSystem, active_paths.db_path, "failed to open repository database from verified bytes"),
+            };
+        };
+        return Repository{
+            .ctx = ctx,
+            .dir_path = dir_path,
+            .db_path = active_paths.db_path,
+            .sig_path = active_paths.sig_path,
+            .db = db,
+        };
+    }
+
     pub fn deinit(self: *Repository) void {
         self.db.deinit();
         self.ctx.allocator.destroy(self.db);

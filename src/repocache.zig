@@ -181,9 +181,13 @@ pub const RepoCache = struct {
     /// stale cached metadata after a failed sync.
     pub fn ensureRepository(self: *RepoCache, loaded_keys: []const sign.LoadedKey) !void {
         if (self.repository == null) {
-            try self.verifyCachedDb(loaded_keys);
+            var verify_result = try self.verifyCachedDb(loaded_keys);
+            defer verify_result.deinit(self.ctx.allocator);
 
-            self.repository = Repository.init(self.ctx, self.cache_dir, true) catch |err| {
+            // Open sqlite directly against the bytes just verified, rather
+            // than letting it reopen cache_dir's repo.db from disk — see
+            // RepoDB.initFromVerifiedBytes.
+            self.repository = Repository.initFromVerifiedBytes(self.ctx, self.cache_dir, verify_result.file_bytes) catch |err| {
                 const diag = self.ctx.getDiagnosticContext();
                 if (diag.details == null) {
                     self.ctx.setDiagnosticContextFmt(self.cache_dir, "failed to initialize repository: {s}", .{@errorName(err)});
@@ -202,7 +206,7 @@ pub const RepoCache = struct {
     /// every open) and syncLocal() (local repos specifically, so a bad
     /// signature is caught at sync time with a clear error rather than
     /// deferred to whenever the database is first opened).
-    fn verifyCachedDb(self: *RepoCache, loaded_keys: []const sign.LoadedKey) RepoCacheError!void {
+    fn verifyCachedDb(self: *RepoCache, loaded_keys: []const sign.LoadedKey) RepoCacheError!sign.VerifyFileResult {
         const allocator = self.ctx.allocator;
         const paths = try buildRepoPaths(self, allocator);
         defer {
@@ -215,7 +219,7 @@ pub const RepoCache = struct {
             return RepoCacheError.SignatureInvalid;
         }
 
-        var result = sign.verifyWithTrustedFingerprints(self.ctx, paths.db_path, paths.sig_path, self.trusted_fingerprints, loaded_keys) catch {
+        return sign.verifyWithTrustedFingerprints(self.ctx, paths.db_path, paths.sig_path, self.trusted_fingerprints, loaded_keys) catch {
             const diag = self.ctx.getDiagnosticContext();
             if (diag.details) |details| {
                 self.ctx.setDiagnosticContext(self.name, details);
@@ -224,7 +228,6 @@ pub const RepoCache = struct {
             }
             return RepoCacheError.SignatureInvalid;
         };
-        result.deinit(allocator);
     }
 
     /// Deinitialize a RepoCache, cleaning up resources owned by this object.
@@ -363,7 +366,8 @@ pub const RepoCache = struct {
     /// constructing a RepoCache, but a file:// repo declared in config.kdl
     /// reaches this path with its own trusted_fingerprints unverified.
     fn syncLocal(self: *RepoCache, loaded_keys: []const sign.LoadedKey) RepoCacheError!void {
-        try self.verifyCachedDb(loaded_keys);
+        var verify_result = try self.verifyCachedDb(loaded_keys);
+        verify_result.deinit(self.ctx.allocator);
         self.ctx.debug("local repo {s}: signature verification passed", .{self.name});
     }
 

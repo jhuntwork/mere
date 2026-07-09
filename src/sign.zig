@@ -561,6 +561,41 @@ pub const VerifyWithFingerprintResult = struct {
     }
 };
 
+/// Result of file signature verification: the verifying fingerprint plus
+/// the exact bytes that were hashed and verified. Callers that need to use
+/// the file's content afterward should use `file_bytes` rather than
+/// re-opening file_path, so that what gets used is guaranteed to be what
+/// was actually verified (avoids a verify-then-reread TOCTOU window).
+pub const VerifyFileResult = struct {
+    verifying_fingerprint: []const u8,
+    file_bytes: []u8,
+
+    pub fn deinit(self: *VerifyFileResult, allocator: std.mem.Allocator) void {
+        allocator.free(self.verifying_fingerprint);
+        allocator.free(self.file_bytes);
+    }
+};
+
+fn readWholeFile(ctx: *Context, file_path: []const u8) SignError![]u8 {
+    const io = path_mod.currentIo();
+    var file = std.Io.Dir.openFileAbsolute(io, file_path, .{}) catch |err| {
+        return switch (err) {
+            error.AccessDenied, error.PermissionDenied => SignError.PermissionDenied,
+            else => SignError.FileSystem,
+        };
+    };
+    defer file.close(io);
+
+    const stat = file.stat(io) catch return SignError.FileSystem;
+    const buffer = ctx.allocator.alloc(u8, @intCast(stat.size)) catch return SignError.OutOfMemory;
+    errdefer ctx.allocator.free(buffer);
+
+    const n = file.readPositionalAll(io, buffer, 0) catch return SignError.FileSystem;
+    if (n != stat.size) return SignError.FileSystem;
+
+    return buffer;
+}
+
 /// Verify a file signature against an allowlist of trusted key fingerprints.
 /// This is the secure verification method that matches keys by cryptographic identity.
 ///
@@ -570,20 +605,35 @@ pub const VerifyWithFingerprintResult = struct {
 /// - signature_path: Path to the signature file (or null for default .sig)
 /// - trusted_fingerprints: Slice of 64-char hex fingerprints that are trusted for this operation
 ///
-/// Returns the fingerprint of the key that verified successfully.
+/// Returns the fingerprint of the key that verified successfully, along
+/// with the verified file bytes (owned by ctx.allocator) so callers can use
+/// them directly instead of reading the file again.
 /// Returns SignError.VerifyFailed if no trusted key verifies the signature.
 ///
-/// Caller owns the returned fingerprint string and must free it.
+/// Caller owns the returned result and must call deinit().
 pub fn verifyWithTrustedFingerprints(
     ctx: *Context,
     file_path: []const u8,
     signature_path: ?[]const u8,
     trusted_fingerprints: []const []const u8,
     all_keys: []const LoadedKey,
-) SignError!VerifyWithFingerprintResult {
-    // Hash the file (large files use hash-based signatures)
-    const file_hash = getFileHash(ctx, file_path) catch |err| return err;
-    return verifyMsgWithTrustedFingerprints(
+) SignError!VerifyFileResult {
+    var file_path_abs_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const file_path_abs = path_mod.resolveToAbsolutePath(file_path, &file_path_abs_buf) catch {
+        return SignError.FileSystem;
+    };
+
+    // Read the whole file once; hash and, on success, return the exact same
+    // bytes so callers never need a second, separately-timed read.
+    const file_bytes = try readWholeFile(ctx, file_path_abs);
+    errdefer ctx.allocator.free(file_bytes);
+
+    const file_hash_hex = hash.calculateBytesHash(ctx.allocator, file_bytes) catch return SignError.OutOfMemory;
+    defer ctx.allocator.free(file_hash_hex);
+    var file_hash: [32]u8 = undefined;
+    _ = std.fmt.hexToBytes(&file_hash, file_hash_hex) catch return SignError.InvalidInput;
+
+    const result = try verifyMsgWithTrustedFingerprints(
         ctx,
         file_path,
         file_hash[0..],
@@ -591,6 +641,10 @@ pub fn verifyWithTrustedFingerprints(
         trusted_fingerprints,
         all_keys,
     );
+    return VerifyFileResult{
+        .verifying_fingerprint = result.verifying_fingerprint,
+        .file_bytes = file_bytes,
+    };
 }
 
 /// Result of manifest signature verification: the verifying fingerprint plus
