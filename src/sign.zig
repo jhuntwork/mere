@@ -593,27 +593,48 @@ pub fn verifyWithTrustedFingerprints(
     );
 }
 
+/// Result of manifest signature verification: the verifying fingerprint plus
+/// the exact bytes that were verified. Callers should parse the manifest
+/// from `manifest_bytes` rather than re-reading the file from disk, so that
+/// what gets parsed is guaranteed to be what was actually verified (avoids a
+/// verify-then-reread TOCTOU window).
+pub const VerifyManifestResult = struct {
+    verifying_fingerprint: []const u8,
+    manifest_bytes: []u8,
+
+    pub fn deinit(self: *VerifyManifestResult, allocator: std.mem.Allocator) void {
+        allocator.free(self.verifying_fingerprint);
+        allocator.free(self.manifest_bytes);
+    }
+};
+
 /// Verify a manifest file's signature against trusted fingerprints.
 /// Unlike verifyWithTrustedFingerprints, this verifies the raw file bytes (not a hash),
 /// which is the format used by manifest.v1.sig files.
 ///
-/// Returns the fingerprint of the key that verified successfully.
+/// Returns the fingerprint of the key that verified successfully, along with
+/// the verified manifest bytes (owned by ctx.allocator) so callers can parse
+/// directly from them instead of reading the file again.
 /// Returns SignError.VerifyFailed if no trusted key verifies the signature.
 ///
-/// Caller owns the returned fingerprint string and must free it.
+/// Caller owns the returned result and must call deinit().
 pub fn verifyManifestWithTrustedFingerprints(
     ctx: *Context,
     manifest_path: []const u8,
     signature_path: ?[]const u8,
     trusted_fingerprints: []const []const u8,
     all_keys: []const LoadedKey,
-) SignError!VerifyWithFingerprintResult {
+) SignError!VerifyManifestResult {
     // Read raw manifest bytes (manifests are signed directly, not hashed)
     const manifest_bytes = sign_io.readRawFile(manifest_path) catch |e| {
         return mapIOReadError(e);
     };
     defer std.heap.page_allocator.free(manifest_bytes);
-    return verifyMsgWithTrustedFingerprints(
+
+    const owned_bytes = ctx.allocator.dupe(u8, manifest_bytes) catch return SignError.OutOfMemory;
+    errdefer ctx.allocator.free(owned_bytes);
+
+    const result = try verifyMsgWithTrustedFingerprints(
         ctx,
         manifest_path,
         manifest_bytes,
@@ -621,6 +642,67 @@ pub fn verifyManifestWithTrustedFingerprints(
         trusted_fingerprints,
         all_keys,
     );
+    return VerifyManifestResult{
+        .verifying_fingerprint = result.verifying_fingerprint,
+        .manifest_bytes = owned_bytes,
+    };
+}
+
+test "verifyManifestWithTrustedFingerprints returns manifest bytes usable after the source file is deleted" {
+    const testing = std.testing;
+    const th = @import("test_helpers.zig");
+    const manifest_mod = @import("manifest.zig");
+
+    var test_env = try th.createTestEnv();
+    defer {
+        test_env.cleanup();
+        std.testing.allocator.destroy(test_env);
+    }
+    const ctx = &test_env.ctx;
+
+    if (c.sodium_init() < 0) return error.SodiumInitFailed;
+
+    const secret_key_path = try std.fs.path.join(ctx.allocator, &.{ test_env.path, ".mere", "keys", "mere.key" });
+    defer ctx.allocator.free(secret_key_path);
+    const secret_key = try SecretKey.loadFromFile(secret_key_path);
+    const public_key = secret_key.derivePublicKey();
+    const fingerprint = try public_key.fingerprint(ctx.allocator);
+    defer ctx.allocator.free(fingerprint);
+
+    const pkg_manifest = manifest_mod.PackageManifestV1{
+        .schema_version = 1,
+        .created_at = 1706745600,
+        .name = "toctoutest",
+        .version = "1.0.0",
+        .release = 1,
+        .arch = "x86_64",
+        .content_hash = [_]u8{0xAB} ** 32,
+    };
+    try manifest_mod.writeManifest(ctx, test_env.path, &pkg_manifest, &secret_key.key);
+
+    const manifest_path = try std.fs.path.join(ctx.allocator, &.{ test_env.path, manifest_mod.MANIFEST_FILENAME });
+    defer ctx.allocator.free(manifest_path);
+    const sig_path = try std.fs.path.join(ctx.allocator, &.{ test_env.path, manifest_mod.MANIFEST_SIG_FILENAME });
+    defer ctx.allocator.free(sig_path);
+
+    const loaded_keys = [_]LoadedKey{.{
+        .public_key = public_key,
+        .fingerprint = fingerprint,
+        .path = secret_key_path,
+    }};
+    const trusted = [_][]const u8{fingerprint};
+
+    var result = try verifyManifestWithTrustedFingerprints(ctx, manifest_path, sig_path, &trusted, &loaded_keys);
+    defer result.deinit(ctx.allocator);
+
+    // Simulate the swap window this fix closes: remove the on-disk manifest
+    // right after verification succeeds. A caller that had to re-read
+    // manifest_path to parse it (the pre-fix TOCTOU) would fail here;
+    // decoding from the already-verified bytes must still succeed.
+    try std.Io.Dir.deleteFileAbsolute(path_mod.currentIo(), manifest_path);
+
+    const decoded = try manifest_mod.PackageManifestV1.decode(result.manifest_bytes);
+    try testing.expectEqualStrings("toctoutest", decoded.name);
 }
 
 /// Internal helper: verify message bytes against signature using trusted fingerprints.

@@ -180,6 +180,7 @@ fn verifyManifestSignatureAndGetSigner(
         });
         return ImportError.SignatureInvalid;
     };
+    defer ctx.allocator.free(result.manifest_bytes);
 
     ctx.debug("manifest signature verified successfully by key: {s}", .{result.verifying_fingerprint});
     return result.verifying_fingerprint;
