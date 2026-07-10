@@ -457,7 +457,6 @@ pub fn createTestManifest(allocator: std.mem.Allocator, name: []const u8, versio
 /// This is used by tests that need a RepoConfig but don't care about fingerprint verification.
 pub fn createTestRepoConfig(
     allocator: std.mem.Allocator,
-    ctx: *Context,
     name: []const u8,
     url: []const u8,
 ) !@import("config.zig").RepoConfig {
@@ -471,7 +470,6 @@ pub fn createTestRepoConfig(
         .url = url_copy,
         .priority = 100,
         .trusted_fingerprints = .empty,
-        .ctx = ctx,
     };
 }
 

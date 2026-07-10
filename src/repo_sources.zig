@@ -78,6 +78,7 @@ pub fn loadTrustedFingerprints(ctx: *Context) !std.ArrayList([]const u8) {
 
         if (sign.PublicKey.loadFromFile(default_pub_path)) |pub_key| {
             if (pub_key.fingerprint(ctx.allocator)) |fp| {
+                errdefer ctx.allocator.free(fp);
                 try fingerprints.append(ctx.allocator, fp);
             } else |fp_err| {
                 ctx.debug("failed to get fingerprint: {}", .{fp_err});
@@ -115,7 +116,7 @@ pub fn loadTrustedFingerprints(ctx: *Context) !std.ArrayList([]const u8) {
         ctx.debug("failed to allocate trusted.kdl buffer: {}", .{err});
         return fingerprints;
     };
-    errdefer ctx.allocator.free(content);
+    defer ctx.allocator.free(content);
 
     const bytes_read = file.readPositionalAll(io, content, 0) catch |err| {
         ctx.debug("failed to read trusted.kdl: {}", .{err});
@@ -125,7 +126,6 @@ pub fn loadTrustedFingerprints(ctx: *Context) !std.ArrayList([]const u8) {
         ctx.debug("failed to read complete trusted.kdl content", .{});
         return fingerprints;
     }
-    defer ctx.allocator.free(content);
 
     var nodes = kdl.parseDocument(ctx.allocator, content) catch |err| {
         ctx.debug("failed to parse trusted.kdl: {}", .{err});
@@ -144,6 +144,7 @@ pub fn loadTrustedFingerprints(ctx: *Context) !std.ArrayList([]const u8) {
                     continue;
                 }
                 const fp_copy = try ctx.allocator.dupe(u8, fp_str);
+                errdefer ctx.allocator.free(fp_copy);
                 try fingerprints.append(ctx.allocator, fp_copy);
             }
         }
@@ -312,6 +313,103 @@ test "loadTrustedFingerprints returns empty list when file missing" {
     defer fingerprints.deinit(test_env.ctx.allocator);
 
     try std.testing.expectEqual(@as(usize, 0), fingerprints.items.len);
+}
+
+test "loadTrustedFingerprints does not leak the mere.pub fingerprint if appending it fails" {
+    // Regression: pub_key.fingerprint(allocator) allocates the fingerprint string,
+    // then a separate fingerprints.append() call could fail (OOM) before that string
+    // was ever added to the list the function's own errdefer cleans up - orphaning it.
+    // createTestEnv sets up a real mere.pub. Several allocations in this function sit
+    // behind a catch-and-degrade-gracefully branch rather than propagating an error, so
+    // rather than guess which fail_index actually causes an overall failure, scan every
+    // one - a fixed index guess previously landed on a resilient branch and silently
+    // leaked the *test's own* discarded successful result instead of exercising the bug.
+    var test_env = try @import("test_helpers.zig").createTestEnv();
+    defer {
+        test_env.cleanup();
+        std.testing.allocator.destroy(test_env);
+    }
+
+    const real_allocator = test_env.ctx.allocator;
+
+    var counting_allocator = std.testing.FailingAllocator.init(real_allocator, .{});
+    test_env.ctx.allocator = counting_allocator.allocator();
+    var warm = try loadTrustedFingerprints(&test_env.ctx);
+    try std.testing.expectEqual(@as(usize, 1), warm.items.len);
+    for (warm.items) |fp| test_env.ctx.allocator.free(fp);
+    warm.deinit(test_env.ctx.allocator);
+    test_env.ctx.allocator = real_allocator;
+    const total_allocs = counting_allocator.alloc_index;
+
+    var idx: usize = 0;
+    while (idx < total_allocs) : (idx += 1) {
+        var failing_allocator = std.testing.FailingAllocator.init(real_allocator, .{ .fail_index = idx });
+        test_env.ctx.allocator = failing_allocator.allocator();
+        const result = loadTrustedFingerprints(&test_env.ctx);
+        test_env.ctx.allocator = real_allocator;
+
+        if (result) |*fps| {
+            var mutable_fps = fps.*;
+            for (mutable_fps.items) |fp| real_allocator.free(fp);
+            mutable_fps.deinit(real_allocator);
+        } else |_| {}
+    }
+}
+
+test "loadTrustedFingerprints does not double-free the trusted.kdl buffer on a late allocation failure" {
+    // Regression: the trusted.kdl content buffer was freed by both an errdefer
+    // registered right after allocating it and a second, redundant unconditional
+    // defer registered later - any error after the second defer (e.g. the loop's
+    // dupe/append failing) freed it twice. Targets exactly the last allocation of a
+    // fully successful run (the loop's append, for a single-entry trusted.kdl) since
+    // that's precisely what surfaced the double free originally; deliberately not a
+    // broader scan from index 0, since kdl.parseDocument's own OOM cleanup path has
+    // a separate, real crash bug (segfault) that's out of scope here.
+    var test_env = try @import("test_helpers.zig").createTestEnv();
+    defer {
+        test_env.cleanup();
+        std.testing.allocator.destroy(test_env);
+    }
+
+    const auto_pub_path = try std.fs.path.join(test_env.ctx.allocator, &.{ test_env.path, ".mere", "keys", "mere.pub" });
+    defer test_env.ctx.allocator.free(auto_pub_path);
+    std.Io.Dir.deleteFileAbsolute(path_mod.currentIo(), auto_pub_path) catch {};
+
+    const mere_dir = try std.fs.path.join(test_env.ctx.allocator, &.{ test_env.path, ".mere" });
+    defer test_env.ctx.allocator.free(mere_dir);
+    try path_mod.ensureDirExists(mere_dir);
+
+    const trusted_path = try std.fs.path.join(test_env.ctx.allocator, &.{ mere_dir, "trusted.kdl" });
+    defer test_env.ctx.allocator.free(trusted_path);
+
+    const trusted_content =
+        \\trusted-fingerprint "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+    ;
+    const file = try std.Io.Dir.createFileAbsolute(path_mod.currentIo(), trusted_path, .{});
+    try file.writeStreamingAll(path_mod.currentIo(), trusted_content);
+    file.close(path_mod.currentIo());
+
+    const real_allocator = test_env.ctx.allocator;
+
+    var counting_allocator = std.testing.FailingAllocator.init(real_allocator, .{});
+    test_env.ctx.allocator = counting_allocator.allocator();
+    var warm = try loadTrustedFingerprints(&test_env.ctx);
+    try std.testing.expectEqual(@as(usize, 1), warm.items.len);
+    for (warm.items) |fp| test_env.ctx.allocator.free(fp);
+    warm.deinit(test_env.ctx.allocator);
+    test_env.ctx.allocator = real_allocator;
+    const total_allocs = counting_allocator.alloc_index;
+
+    var failing_allocator = std.testing.FailingAllocator.init(real_allocator, .{ .fail_index = total_allocs - 1 });
+    test_env.ctx.allocator = failing_allocator.allocator();
+    defer test_env.ctx.allocator = real_allocator;
+
+    const result = loadTrustedFingerprints(&test_env.ctx);
+    if (result) |*fps| {
+        var mutable_fps = fps.*;
+        for (mutable_fps.items) |fp| real_allocator.free(fp);
+        mutable_fps.deinit(real_allocator);
+    } else |_| {}
 }
 
 test "resolveUserTrustedKdlPath uses provided home directory" {
