@@ -1817,7 +1817,7 @@ fn runOneNamespacePhase(
     };
 
     const exit_code = state.namespace_runner(exec_ctx.allocator, .build, opts) catch |err| {
-        state.ctx.setDiagnosticContext("namespace", "failed to fork and enter env");
+        state.ctx.setDiagnosticContextFmt("namespace", "failed to fork and enter env: {s}", .{@errorName(err)});
         return switch (err) {
             namespace.EnvError.UserNamespacesDisabled => BuildError.PermissionDenied,
             namespace.EnvError.ProfileNotFound => BuildError.InvalidInput,
@@ -3459,6 +3459,65 @@ fn executeBuildPlanWithTestRunner(
     const result = try plan.execute();
     plan.deinit();
     return result;
+}
+
+fn failingNamespaceRunner(allocator: std.mem.Allocator, mode: namespace.EnvMode, opts: namespace.EnvOptions) anyerror!u8 {
+    _ = allocator;
+    _ = mode;
+    _ = opts;
+    return error.MknodError;
+}
+
+test "runOneNamespacePhase includes the specific namespace error name in its diagnostic message" {
+    // Regression: the diagnostic message set on a namespace_runner failure used to be a
+    // static "failed to fork and enter env" regardless of which of namespace.EnvError's ~20
+    // variants actually occurred, making it impossible for an operator to tell uid-map
+    // failure, overlayfs unavailable, disabled user namespaces, etc. apart from the message
+    // alone.
+    const th = @import("test_helpers.zig");
+    var test_env = try th.createTestEnv();
+    defer {
+        test_env.cleanup();
+        std.testing.allocator.destroy(test_env);
+    }
+    var repo_setup = try th.setupBusyboxRepo(test_env);
+    defer repo_setup.deinit();
+
+    const kdl_text =
+        \\recipe {
+        \\    name "ns-error-detail"
+        \\    version "1.0"
+        \\    release 1
+        \\    depends "busybox"
+        \\    archs "x86_64"
+        \\}
+        \\build {
+        \\    script "true"
+        \\}
+        \\install {
+        \\    script "mkdir -p $DESTDIR"
+        \\}
+        \\package "ns-error-detail" {
+        \\    files "*"
+        \\}
+    ;
+
+    var dummy = th.DummyClient.init(test_env.ctx.allocator);
+    defer dummy.deinit();
+    var vt: download.TransferClient.VTable = .{ .download_file = th.dummy_download_file };
+    const client = download.TransferClient{ .ptr = @ptrCast(&dummy), .vtable = &vt };
+
+    const request = try makeHermeticTestBuildRequest(test_env, kdl_text, client);
+    defer test_env.ctx.allocator.free(request.cache_dir.?);
+
+    var plan = try planBuild(&test_env.ctx, request);
+    defer plan.deinit();
+    plan.state.namespace_runner = &failingNamespaceRunner;
+
+    try std.testing.expectError(BuildError.PhaseExecutionFailed, plan.execute());
+
+    const diag = test_env.ctx.getDiagnosticContext();
+    try std.testing.expect(std.mem.indexOf(u8, diag.details.?, "MknodError") != null);
 }
 
 fn makeHermeticTestBuildRequest(
