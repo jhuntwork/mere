@@ -929,6 +929,12 @@ fn restoreOrStageSplitPackages(
         return err;
     };
 
+    // Under FailurePolicy.ContinueOnError, stageSplitPackages can skip a
+    // sub-package that failed to stage and still return successfully.
+    // Caching that result would let a later rebuild restore the same
+    // incomplete package set from cache while reporting success.
+    if (state.split_staging_errors_encountered) return;
+
     var stored = cache_solver.persist(
         state.allocator,
         state.ctx,
@@ -3541,6 +3547,91 @@ test "executeBuild restores profile phases split staging and package archive on 
     try std.testing.expect(hit_capture.contains("phase restored from cache: install"));
     try std.testing.expect(hit_capture.contains("split staging restored from cache"));
     try std.testing.expect(hit_capture.contains("packaged from cache:"));
+}
+
+var split_partial_test_fail_pkg_b = false;
+
+fn stagePackageFilesFailingPkgBWhenToggled(ctx: *mere.Context, config: package_staging.PackageStagingConfig) anyerror!package_staging.PackageStagingResult {
+    if (split_partial_test_fail_pkg_b and std.mem.endsWith(u8, config.destination, "pkg-b")) {
+        return ctx.fail(error.InvalidInput, config.destination, "synthetic staging failure injected by test");
+    }
+    return package_staging.stagePackageFiles(ctx, config);
+}
+
+test "restoreOrStageSplitPackages does not cache a partial result under ContinueOnError" {
+    const th = @import("test_helpers.zig");
+    var test_env = try th.createTestEnv();
+    defer {
+        test_env.cleanup();
+        std.testing.allocator.destroy(test_env);
+    }
+
+    const kdl_text =
+        \\recipe {
+        \\    name "split-partial"
+        \\    version "1.0"
+        \\    release 1
+        \\    archs "x86_64"
+        \\}
+        \\build { script "true" }
+        \\package "pkg-a" { files "usr/bin/a" }
+        \\package "pkg-b" { files "usr/bin/b" }
+    ;
+    var parsed = try recipe.parse(&test_env.ctx, kdl_text);
+    defer parsed.deinit();
+
+    const workspace_root = try std.fs.path.join(test_env.ctx.allocator, &.{ test_env.path, "workspace-split-partial" });
+    const destdir = try std.fs.path.join(test_env.ctx.allocator, &.{ workspace_root, "destdir" });
+    const workspace = workspace_manager.Workspace{
+        .recipe_root = workspace_root,
+        .sources_dir = try std.fs.path.join(test_env.ctx.allocator, &.{ workspace_root, "sources" }),
+        .src_dir = try std.fs.path.join(test_env.ctx.allocator, &.{ workspace_root, "src" }),
+        .destdir = destdir,
+        .profile_dir = try std.fs.path.join(test_env.ctx.allocator, &.{ workspace_root, "profile" }),
+        .allocator = test_env.ctx.allocator,
+    };
+    defer workspace.deinit();
+
+    // Both packages' files exist from the start and destdir's content never
+    // changes across the two calls below, so the split-stage cache key is
+    // identical both times — mirroring a real "unchanged rebuild".
+    const bin_dir = try std.fs.path.join(test_env.ctx.allocator, &.{ destdir, "usr", "bin" });
+    defer test_env.ctx.allocator.free(bin_dir);
+    var bin_dir_handle = try path_mod.makePathAndOpenDir(bin_dir);
+    bin_dir_handle.close(path_mod.currentIo());
+
+    for ([_][]const u8{ "a", "b" }) |name| {
+        const file_path = try std.fs.path.join(test_env.ctx.allocator, &.{ bin_dir, name });
+        defer test_env.ctx.allocator.free(file_path);
+        var f = try std.Io.Dir.createFileAbsolute(path_mod.currentIo(), file_path, .{});
+        f.close(path_mod.currentIo());
+    }
+
+    var request = BuildRequest.init();
+    request.recipe_dir = workspace_root;
+    request.failure_policy = FailurePolicy.ContinueOnError;
+    var state = BuildExecutionState.init(test_env.ctx.allocator, &test_env.ctx, request);
+    defer state.deinit();
+    state.stage_package_files_fn = &stagePackageFilesFailingPkgBWhenToggled;
+
+    // First "build": pkg-b fails to stage (a stand-in for any transient,
+    // content-independent staging failure ContinueOnError is meant to
+    // tolerate). This must not abort, but it also must not cache the
+    // resulting incomplete package set as if it were complete.
+    split_partial_test_fail_pkg_b = true;
+    try restoreOrStageSplitPackages(&state, &parsed, &workspace);
+    try std.testing.expect(state.split_staging_errors_encountered);
+    try std.testing.expectEqual(@as(usize, 1), state.staged_packages.items.len);
+
+    // Second "build" with byte-for-byte identical inputs (same recipe, same
+    // destdir contents), but this time pkg-b's staging succeeds too. If the
+    // first, partial result had been cached, this would restore only 1
+    // package from cache and wrongly report success instead of genuinely
+    // re-staging both packages.
+    split_partial_test_fail_pkg_b = false;
+    try restoreOrStageSplitPackages(&state, &parsed, &workspace);
+    try std.testing.expect(!state.split_staging_errors_encountered);
+    try std.testing.expectEqual(@as(usize, 2), state.staged_packages.items.len);
 }
 
 test "executeBuild restores unpacked source tree from cache on unchanged rebuild" {
