@@ -165,22 +165,44 @@ pub fn computeSourceUnpackKey(
     return std.fmt.allocPrint(allocator, "source-unpack-v2-{s}", .{fetch_key_hex}) catch error.OutOfMemory;
 }
 
+/// A dependency's resolved identity, as it will actually be installed —
+/// not just the name a recipe's `depends` list asks for. Callers resolve
+/// once and pass the result here so the cache key reflects what would
+/// actually get installed right now.
+pub const ResolvedDependency = struct {
+    name: []const u8,
+    content_hash: []const u8,
+};
+
 pub fn computeProfileRealizeKey(
     allocator: std.mem.Allocator,
     ctx: *mere.Context,
     parsed_recipe: *const recipe.Recipe,
     config: *const @import("config.zig").Config,
+    resolved_deps: []const ResolvedDependency,
 ) CacheError![]const u8 {
     var buf: std.ArrayList(u8) = .empty;
     defer buf.deinit(allocator);
     var out_buf: std.Io.Writer.Allocating = .fromArrayList(allocator, &buf);
     const out = &out_buf.writer;
 
-    out.writeAll("profile-realize-v1\n") catch return error.OutOfMemory;
+    out.writeAll("profile-realize-v2\n") catch return error.OutOfMemory;
     out.print("root={s}\n", .{ctx.root()}) catch return error.OutOfMemory;
     out.print("arch={s}\n", .{parsed_recipe.arch orelse ""}) catch return error.OutOfMemory;
-    for (parsed_recipe.depends.items) |dep| {
-        out.print("dep={s}\n", .{dep}) catch return error.OutOfMemory;
+    // Resolved package identities (name + content hash), not just the
+    // recipe's raw dependency names: a repo sync that bumps a dependency
+    // to a new version must invalidate this key even though the recipe
+    // itself is unchanged. Sorted by name here so the key is stable
+    // regardless of what order the resolver produced them in.
+    const sorted_deps = allocator.dupe(ResolvedDependency, resolved_deps) catch return error.OutOfMemory;
+    defer allocator.free(sorted_deps);
+    std.sort.pdq(ResolvedDependency, sorted_deps, {}, struct {
+        fn lessThan(_: void, a: ResolvedDependency, b: ResolvedDependency) bool {
+            return std.mem.lessThan(u8, a.name, b.name);
+        }
+    }.lessThan);
+    for (sorted_deps) |dep| {
+        out.print("dep={s}@{s}\n", .{ dep.name, dep.content_hash }) catch return error.OutOfMemory;
     }
 
     const config_kdl = config.toKdl() catch |err| {
@@ -195,6 +217,51 @@ pub fn computeProfileRealizeKey(
     return hash.calculateBytesHash(allocator, buf.items) catch |err| {
         return mapHashError(err);
     };
+}
+
+test "computeProfileRealizeKey changes when a resolved dependency's content hash changes" {
+    const config_mod = @import("config.zig");
+    var test_env = try test_helpers.createTestEnv();
+    defer {
+        test_env.cleanup();
+        std.testing.allocator.destroy(test_env);
+    }
+    const ctx = &test_env.ctx;
+
+    const recipe_buf =
+        \\recipe {
+        \\  name "demo"
+        \\  version "1.0.0"
+        \\  release 1
+        \\  depends "openssl"
+        \\}
+        \\source "source.txt" {}
+        \\package "demo" {
+        \\  files "usr/share/demo/*"
+        \\}
+    ;
+    var parsed_recipe = try recipe.parse(ctx, recipe_buf);
+    defer parsed_recipe.deinit();
+
+    var config = config_mod.Config.init(ctx, ctx.allocator);
+    defer config.deinit();
+
+    const deps_v1 = [_]ResolvedDependency{.{ .name = "openssl", .content_hash = "a" ** 64 }};
+    const deps_v2 = [_]ResolvedDependency{.{ .name = "openssl", .content_hash = "b" ** 64 }};
+
+    // A repo sync that bumps openssl to a new build (new content hash, same
+    // recipe, same config) must change the key — otherwise a stale cached
+    // profile tree gets served forever.
+    const key_v1 = try computeProfileRealizeKey(ctx.allocator, ctx, &parsed_recipe, &config, &deps_v1);
+    defer ctx.allocator.free(key_v1);
+    const key_v2 = try computeProfileRealizeKey(ctx.allocator, ctx, &parsed_recipe, &config, &deps_v2);
+    defer ctx.allocator.free(key_v2);
+    try std.testing.expect(!std.mem.eql(u8, key_v1, key_v2));
+
+    // Same resolved deps must still produce the same key (idempotence).
+    const key_v1_again = try computeProfileRealizeKey(ctx.allocator, ctx, &parsed_recipe, &config, &deps_v1);
+    defer ctx.allocator.free(key_v1_again);
+    try std.testing.expectEqualStrings(key_v1, key_v1_again);
 }
 
 pub fn computePhaseStepKey(

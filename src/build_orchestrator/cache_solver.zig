@@ -182,6 +182,7 @@ pub const RestoreRequest = union(enum) {
         parsed_recipe: *const recipe.Recipe,
         cfg: *const config.Config,
         profile_root: []const u8,
+        resolved_deps: []const build_cache.ResolvedDependency,
     },
     phase_output: struct {
         cache: bool,
@@ -239,6 +240,7 @@ pub const PersistRequest = union(enum) {
         parsed_recipe: *const recipe.Recipe,
         cfg: *const config.Config,
         profile_root: []const u8,
+        resolved_deps: []const build_cache.ResolvedDependency,
     },
     phase_output: struct {
         phase_name: []const u8,
@@ -332,6 +334,7 @@ pub fn restoreProfileTreeRequest(
     parsed_recipe: *const recipe.Recipe,
     cfg: *const config.Config,
     profile_root: []const u8,
+    resolved_deps: []const build_cache.ResolvedDependency,
 ) RestoreRequest {
     return .{
         .profile_tree = .{
@@ -339,6 +342,7 @@ pub fn restoreProfileTreeRequest(
             .parsed_recipe = parsed_recipe,
             .cfg = cfg,
             .profile_root = profile_root,
+            .resolved_deps = resolved_deps,
         },
     };
 }
@@ -347,12 +351,14 @@ pub fn persistProfileTreeRequest(
     parsed_recipe: *const recipe.Recipe,
     cfg: *const config.Config,
     profile_root: []const u8,
+    resolved_deps: []const build_cache.ResolvedDependency,
 ) PersistRequest {
     return .{
         .profile_tree = .{
             .parsed_recipe = parsed_recipe,
             .cfg = cfg,
             .profile_root = profile_root,
+            .resolved_deps = resolved_deps,
         },
     };
 }
@@ -572,7 +578,7 @@ pub fn restore(
             RestoreResult{ .node = node }
         else
             null,
-        .profile_tree => |req| if (try restoreProfileTree(allocator, ctx, req.cache, req.parsed_recipe, req.cfg, req.profile_root)) |node|
+        .profile_tree => |req| if (try restoreProfileTree(allocator, ctx, req.cache, req.parsed_recipe, req.cfg, req.profile_root, req.resolved_deps)) |node|
             RestoreResult{ .node = node }
         else
             null,
@@ -603,7 +609,7 @@ pub fn persist(
     return switch (request) {
         .source_fetch => |req| persistFetchedSources(allocator, ctx, req.recipe_dir, req.parsed_recipe, req.workspace_sources_dir),
         .source_unpack => |req| persistUnpackedSources(allocator, ctx, req.recipe_dir, req.parsed_recipe, req.workspace_src_dir, req.actual_src_dir),
-        .profile_tree => |req| persistProfileTree(allocator, ctx, req.parsed_recipe, req.cfg, req.profile_root),
+        .profile_tree => |req| persistProfileTree(allocator, ctx, req.parsed_recipe, req.cfg, req.profile_root, req.resolved_deps),
         .phase_output => |req| persistPhaseOutput(allocator, ctx, req.phase_name, req.phase_script, req.global_env, req.phase_env, req.source_tree_hash, req.profile_tree_hash, req.ns_working_dir, req.phase_output_dir),
         .split_stage => |req| persistSplitStage(allocator, ctx, req.parsed_recipe, req.destdir, req.recipe_root, req.staged_packages),
         .package_archive => |req| {
@@ -790,10 +796,11 @@ fn restoreProfileTree(
     parsed_recipe: *const recipe.Recipe,
     cfg: *const config.Config,
     profile_root: []const u8,
+    resolved_deps: []const build_cache.ResolvedDependency,
 ) build_cache.CacheError!?SolvedNodeOutput {
     if (!cache) return null;
 
-    const key_hex = try profileTreeKey(allocator, ctx, parsed_recipe, cfg);
+    const key_hex = try profileTreeKey(allocator, ctx, parsed_recipe, cfg, resolved_deps);
     errdefer allocator.free(key_hex);
 
     var restored = try build_cache.restoreDirectoryForKey(allocator, ctx, .profile_realize, key_hex, profile_root);
@@ -819,8 +826,9 @@ fn persistProfileTree(
     parsed_recipe: *const recipe.Recipe,
     cfg: *const config.Config,
     profile_root: []const u8,
+    resolved_deps: []const build_cache.ResolvedDependency,
 ) build_cache.CacheError!SolvedNodeOutput {
-    const key_hex = try profileTreeKey(allocator, ctx, parsed_recipe, cfg);
+    const key_hex = try profileTreeKey(allocator, ctx, parsed_recipe, cfg, resolved_deps);
     errdefer allocator.free(key_hex);
 
     var stored = try build_cache.storeDirectoryForKey(allocator, ctx, .profile_realize, key_hex, profile_root, null);
@@ -1054,8 +1062,9 @@ fn profileTreeKey(
     ctx: *mere.Context,
     parsed_recipe: *const recipe.Recipe,
     cfg: *const config.Config,
+    resolved_deps: []const build_cache.ResolvedDependency,
 ) build_cache.CacheError![]const u8 {
-    return build_cache.computeProfileRealizeKey(allocator, ctx, parsed_recipe, cfg);
+    return build_cache.computeProfileRealizeKey(allocator, ctx, parsed_recipe, cfg, resolved_deps);
 }
 
 fn phaseOutputKey(

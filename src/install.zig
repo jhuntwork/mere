@@ -1173,6 +1173,32 @@ pub const ProfileResolution = struct {
     }
 };
 
+/// Resolve a list of package-name tokens (each optionally carrying a
+/// version constraint, e.g. "openssl>=3.0" — the same syntax
+/// installPackagesToProfile accepts) into a ProfileResolution, without
+/// installing anything. Used by build orchestration to compute a cache key
+/// from the actual resolved package versions, not just a recipe's raw
+/// dependency name list — otherwise a repo sync that bumps a dependency's
+/// version is invisible to the cache and a stale profile gets served
+/// forever. Mirrors exactly how installPackagesToProfile itself resolves
+/// unconstrained dependency tokens (no preferred selections), so the
+/// resolution here matches what installing these tokens would actually do.
+pub fn resolveDependencyTokens(
+    ctx: *Context,
+    repocaches: []*RepoCache,
+    pkg_tokens: []const []const u8,
+    client: download.TransferClient,
+    force_sync: bool,
+) !ProfileResolution {
+    var input_requirements = try parseInstallRootRequirements(ctx.allocator, pkg_tokens);
+    defer deinitInstallRootRequirements(ctx.allocator, &input_requirements);
+
+    const resolver_requirements = try installRequirementsToResolverRequirements(ctx.allocator, input_requirements.items);
+    defer ctx.allocator.free(resolver_requirements);
+
+    return resolveProfile(ctx, repocaches, resolver_requirements, &.{}, client, force_sync, true);
+}
+
 /// Resolve a profile: sync repos, resolve dependencies, return the resolved package set.
 /// No side effects on the store or profile — purely computes the resolution.
 pub fn resolveProfile(

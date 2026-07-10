@@ -20,6 +20,7 @@ const package_staging = @import("package_staging.zig");
 const packaging = @import("packaging.zig");
 const config_mod = @import("config.zig");
 const repo_sources = @import("repo_sources.zig");
+const RepoCache = @import("repocache.zig").RepoCache;
 const namespace = @import("namespace.zig");
 const build_profile = @import("build_orchestrator/build_profile.zig");
 const build_cache = @import("build_cache.zig");
@@ -1399,6 +1400,31 @@ fn installDependencies(state: *BuildExecutionState, parsed_recipe: *const recipe
     return ctx.fail(BuildError.InvalidInput, "build_profile", "missing build profile for dependency installation");
 }
 
+const install_mod = @import("install.zig");
+
+fn createRepoCachesForBuild(ctx: *mere.Context, config: *const config_mod.Config) BuildError!std.ArrayList(*RepoCache) {
+    return repo_sources.createCaches(ctx, config) catch |err| {
+        ctx.setDiagnosticContext("config", "failed to create repo caches from config");
+        return switch (err) {
+            error.OutOfMemory => BuildError.OutOfMemory,
+            error.Network => BuildError.Network,
+            error.PermissionDenied, error.AccessDenied => BuildError.PermissionDenied,
+            error.FileSystem, error.SystemResources, error.Unexpected, error.Canceled => BuildError.FileSystem,
+            error.SignatureInvalid, error.InvalidKey, error.VerifyFailed, error.SodiumInitFailed => BuildError.InvalidInput,
+            error.CorruptData => BuildError.FileSystem,
+            error.InvalidInput => BuildError.InvalidInput,
+        };
+    };
+}
+
+fn destroyRepoCachesForBuild(ctx: *mere.Context, repocaches: *std.ArrayList(*RepoCache)) void {
+    for (repocaches.items) |rc| {
+        rc.deinit();
+        ctx.allocator.destroy(rc);
+    }
+    repocaches.deinit(ctx.allocator);
+}
+
 fn restoreOrInstallDependenciesToBuildProfile(
     state: *BuildExecutionState,
     parsed_recipe: *const recipe.Recipe,
@@ -1410,6 +1436,39 @@ fn restoreOrInstallDependenciesToBuildProfile(
         return ctx.fail(BuildError.InvalidInput, "config", "no configuration loaded for dependency installation");
     };
 
+    var repocaches = try createRepoCachesForBuild(ctx, &config);
+    defer destroyRepoCachesForBuild(ctx, &repocaches);
+
+    // Resolve dependencies up front — the cache key needs the actual
+    // resolved package versions, not just the recipe's dependency names.
+    // Otherwise a repo sync that bumps a dependency's version is invisible
+    // to the cache and a stale profile gets served forever.
+    var resolution = install_mod.resolveDependencyTokens(
+        ctx,
+        repocaches.items,
+        parsed_recipe.depends.items,
+        client,
+        false, // force_sync
+    ) catch |err| {
+        if (ctx.diagnostic_context == null) {
+            ctx.setDiagnosticContext(parsed_recipe.name, "failed to resolve dependency versions");
+        }
+        return switch (err) {
+            error.OutOfMemory => BuildError.OutOfMemory,
+            error.PermissionDenied => BuildError.PermissionDenied,
+            error.CorruptData => BuildError.DependencyInstallFailed,
+            else => BuildError.DependencyInstallFailed,
+        };
+    };
+    defer resolution.deinit();
+
+    var resolved_deps: std.ArrayList(build_cache.ResolvedDependency) = .empty;
+    defer resolved_deps.deinit(state.allocator);
+    for (resolution.plan.sorted) |resolved| {
+        const name = resolved.pkg.name orelse continue;
+        resolved_deps.append(state.allocator, .{ .name = name, .content_hash = resolved.pkg.content_hash }) catch return BuildError.OutOfMemory;
+    }
+
     var restored_profile = cache_solver.restore(
         state.allocator,
         ctx,
@@ -1418,6 +1477,7 @@ fn restoreOrInstallDependenciesToBuildProfile(
             parsed_recipe,
             &config,
             profile.root(),
+            resolved_deps.items,
         ),
     ) catch |err| {
         return mapBuildCacheError(ctx, profile.root(), "failed to restore dependency profile cache", err);
@@ -1430,7 +1490,7 @@ fn restoreOrInstallDependenciesToBuildProfile(
         return;
     }
 
-    try installDependenciesToBuildProfile(state, parsed_recipe, profile, client);
+    try installDependenciesToBuildProfile(state, parsed_recipe, profile, client, repocaches.items);
 
     var stored = cache_solver.persist(
         state.allocator,
@@ -1439,6 +1499,7 @@ fn restoreOrInstallDependenciesToBuildProfile(
             parsed_recipe,
             &config,
             profile.root(),
+            resolved_deps.items,
         ),
     ) catch |err| {
         return mapBuildCacheError(ctx, profile.root(), "failed to persist dependency profile cache", err);
@@ -1448,18 +1509,20 @@ fn restoreOrInstallDependenciesToBuildProfile(
     emitBuildCacheDigest(ctx, "dependency profile", false, stored.digest_hex);
 }
 
-/// Install dependencies to the build profile
+/// Install dependencies to the build profile. `repocaches` is already
+/// built and (via the resolve pass just done) already synced within its
+/// TTL, so this doesn't need to build or sync its own.
 fn installDependenciesToBuildProfile(
     state: *BuildExecutionState,
     parsed_recipe: *const recipe.Recipe,
     profile: *build_profile.BuildProfile,
     client: download.TransferClient,
+    repocaches: []*RepoCache,
 ) BuildError!void {
     const ctx = state.ctx;
 
     ctx.debug("installing {d} dependencies to build profile", .{parsed_recipe.depends.items.len});
 
-    // Get configuration for repository access
     const config = ctx.configuration orelse {
         return ctx.fail(BuildError.InvalidInput, "config", "no configuration loaded for dependency installation");
     };
@@ -1468,32 +1531,10 @@ fn installDependenciesToBuildProfile(
         return BuildError.InvalidInput;
     };
 
-    // Create RepoCaches from the configuration
-    var repocaches = repo_sources.createCaches(ctx, &config) catch |err| {
-        ctx.setDiagnosticContext("config", "failed to create repo caches from config");
-        return switch (err) {
-            error.OutOfMemory => BuildError.OutOfMemory,
-            error.Network => BuildError.Network,
-            error.PermissionDenied, error.AccessDenied => BuildError.PermissionDenied,
-            error.FileSystem, error.SystemResources, error.Unexpected, error.Canceled => BuildError.FileSystem,
-            error.SignatureInvalid, error.InvalidKey, error.VerifyFailed, error.SodiumInitFailed => BuildError.InvalidInput,
-            error.CorruptData => BuildError.FileSystem,
-            error.InvalidInput => BuildError.InvalidInput,
-        };
-    };
-    defer {
-        for (repocaches.items) |rc| {
-            rc.deinit();
-            ctx.allocator.destroy(rc);
-        }
-        repocaches.deinit(ctx.allocator);
-    }
-
     // Install all dependency roots in one pass to avoid repeated repo sync churn.
-    const install_mod = @import("install.zig");
     install_mod.installPackagesToProfile(
         ctx,
-        repocaches.items,
+        repocaches,
         parsed_recipe.depends.items,
         client,
         false, // reinstall
