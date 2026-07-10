@@ -153,6 +153,33 @@ fn applyArchivedSpecialBitsAtPath(
     }
 }
 
+// Guards against decompression bombs: a small compressed archive whose
+// entry declares (accurately) that it expands to an enormous amount of
+// data. The main signed-install path is already protected because
+// install.zig hash-verifies the whole archive against trusted repo
+// metadata before extraction ever runs, but `mere dev import` and
+// build-source unpacking extract before any such binding exists.
+const max_extracted_entry_size: u64 = 4 * 1024 * 1024 * 1024; // 4 GiB
+
+// archive_entry_size() reflects the declared uncompressed size from the
+// entry's own header, independent of how small the compressed bytes
+// backing it are - exactly the value a decompression bomb would inflate.
+// Entries without a declared size (e.g. some streaming formats) aren't
+// checked; mere's real formats (tar) always declare it.
+fn checkEntryExtractedSize(ctx: *Context, name: []const u8, archive_entry: *c.struct_archive_entry) ExtractError!void {
+    if (c.archive_entry_size_is_set(archive_entry) == 0) return;
+    const raw_size = c.archive_entry_size(archive_entry);
+    const entry_size: u64 = if (raw_size > 0) @intCast(raw_size) else 0;
+    if (entry_size > max_extracted_entry_size) {
+        return ctx.failFmt(
+            ExtractError.InvalidInput,
+            name,
+            "declared size {d} bytes exceeds the {d} byte extraction limit",
+            .{ entry_size, max_extracted_entry_size },
+        );
+    }
+}
+
 fn extractWithLibarchive(
     ctx: *Context,
     archive_path: []const u8,
@@ -225,6 +252,9 @@ fn extractWithLibarchive(
                     ((name.len == target.len) or (name[name.len - target.len - 1] == '/')));
             if (!is_match) continue;
         }
+
+        try checkEntryExtractedSize(ctx, name, archive_entry);
+
         const rel_path = try ctx.allocator.dupe(u8, name);
         defer ctx.allocator.free(rel_path);
 
@@ -696,6 +726,66 @@ test "Error when extracting a tar archive with relative path traversal" {
 
         try std.testing.expectError(error.InvalidInput, into(&test_env.ctx, abs_target, test_env.path));
     }
+}
+
+test "checkEntryExtractedSize rejects an entry declaring a decompression-bomb-sized payload" {
+    // Exercises the size check directly against a synthetic archive_entry rather than
+    // extracting a real archive: constructing an actual archive whose header declares
+    // a huge size but whose real body is small/absent hits libarchive's own "truncated
+    // archive" failure first (which happens to also map to InvalidInput), masking whether
+    // this check ran at all. Setting the size directly on a fresh entry avoids that entirely.
+    const th = @import("test_helpers.zig");
+    var test_env = try th.createTestEnv();
+    defer {
+        test_env.cleanup();
+        std.testing.allocator.destroy(test_env);
+    }
+
+    const archive_entry = c.archive_entry_new() orelse return error.OutOfMemory;
+    defer c.archive_entry_free(archive_entry);
+    c.archive_entry_set_size(archive_entry, 6 * 1024 * 1024 * 1024); // 6 GiB, over the cap
+
+    try std.testing.expectError(
+        error.InvalidInput,
+        checkEntryExtractedSize(&test_env.ctx, "bomb.bin", archive_entry),
+    );
+
+    // The subject/details should be specific enough that a user hitting this
+    // in practice can tell which file was rejected and why, not just "invalid
+    // input" - regression guard for the diagnostic context actually being set.
+    const diag = test_env.ctx.getDiagnosticContext();
+    try std.testing.expectEqualStrings("bomb.bin", diag.subject.?);
+    try std.testing.expect(std.mem.indexOf(u8, diag.details.?, "6442450944") != null);
+    try std.testing.expect(std.mem.indexOf(u8, diag.details.?, "4294967296") != null);
+}
+
+test "checkEntryExtractedSize allows an entry at or under the cap" {
+    const th = @import("test_helpers.zig");
+    var test_env = try th.createTestEnv();
+    defer {
+        test_env.cleanup();
+        std.testing.allocator.destroy(test_env);
+    }
+
+    const archive_entry = c.archive_entry_new() orelse return error.OutOfMemory;
+    defer c.archive_entry_free(archive_entry);
+    c.archive_entry_set_size(archive_entry, max_extracted_entry_size);
+
+    try checkEntryExtractedSize(&test_env.ctx, "large-but-allowed.bin", archive_entry);
+}
+
+test "checkEntryExtractedSize skips entries with no declared size" {
+    const th = @import("test_helpers.zig");
+    var test_env = try th.createTestEnv();
+    defer {
+        test_env.cleanup();
+        std.testing.allocator.destroy(test_env);
+    }
+
+    const archive_entry = c.archive_entry_new() orelse return error.OutOfMemory;
+    defer c.archive_entry_free(archive_entry);
+
+    try checkEntryExtractedSize(&test_env.ctx, "unknown-size.bin", archive_entry);
 }
 
 test "Extract a sample tar.zst archive" {
