@@ -932,6 +932,26 @@ pub fn restorePackageArchiveForKey(
     errdefer allocator.free(archive_path);
     try copyFileReplace(archive_cache_path, archive_path);
 
+    // The cached archive can bit-rot or otherwise diverge from the metadata
+    // recorded when it was stored. Re-verify before handing back a
+    // hash/signature pair that might not match the bytes just restored,
+    // mirroring the check storePackageArchiveForKey already does on write.
+    const actual_hash = hash.calculateFileHash(ctx, archive_path) catch |err| return mapHashError(err);
+    defer allocator.free(actual_hash);
+    if (!std.mem.eql(u8, actual_hash, meta.archive_hash)) {
+        // Treat a corrupted/stale cache entry as a miss so the caller
+        // rebuilds it fresh instead of trusting a mismatched hash/signature
+        // pair. The stale file at archive_path is harmlessly overwritten by
+        // the rebuild that follows.
+        allocator.free(archive_path);
+        allocator.free(meta.archive_basename);
+        allocator.free(meta.content_hash);
+        allocator.free(meta.archive_hash);
+        allocator.free(meta.signature);
+        record.deinit();
+        return null;
+    }
+
     allocator.free(meta.archive_basename);
 
     return RestoredPackageArchive{
@@ -1856,6 +1876,84 @@ test "build_cache restore replaces existing destination tree" {
     try std.testing.expectEqualStrings("fresh", content);
 
     try std.testing.expectError(error.FileNotFound, std.Io.Dir.accessAbsolute(io, stale_file, .{}));
+}
+
+test "restorePackageArchiveForKey treats a corrupted cached archive as a cache miss" {
+    var test_env = try test_helpers.createTestEnv();
+    defer {
+        test_env.cleanup();
+        std.testing.allocator.destroy(test_env);
+    }
+    const io = path_mod.currentIo();
+
+    const staging_dir = try std.fs.path.join(test_env.ctx.allocator, &.{ test_env.path, "pkg-staging" });
+    defer test_env.ctx.allocator.free(staging_dir);
+    {
+        var dir = try path_mod.makePathAndOpenDir(staging_dir);
+        dir.close(io);
+    }
+    const staged_file = try std.fs.path.join(test_env.ctx.allocator, &.{ staging_dir, "payload.txt" });
+    defer test_env.ctx.allocator.free(staged_file);
+    {
+        var f = try std.Io.Dir.createFileAbsolute(io, staged_file, .{});
+        defer f.close(io);
+        try f.writeStreamingAll(io, "payload");
+    }
+
+    const output_dir = try std.fs.path.join(test_env.ctx.allocator, &.{ test_env.path, "output" });
+    defer test_env.ctx.allocator.free(output_dir);
+    {
+        var dir = try path_mod.makePathAndOpenDir(output_dir);
+        dir.close(io);
+    }
+    const archive_path = try std.fs.path.join(test_env.ctx.allocator, &.{ output_dir, "demo-1.0-1-x86_64.pkg.tar.zst" });
+    defer test_env.ctx.allocator.free(archive_path);
+    {
+        var f = try std.Io.Dir.createFileAbsolute(io, archive_path, .{});
+        defer f.close(io);
+        try f.writeStreamingAll(io, "archive bytes");
+    }
+
+    const real_archive_hash = try hash.calculateFileHash(&test_env.ctx, archive_path);
+    defer test_env.ctx.allocator.free(real_archive_hash);
+
+    var record = try storePackageArchiveForKey(
+        test_env.ctx.allocator,
+        &test_env.ctx,
+        "archive-key",
+        staging_dir,
+        archive_path,
+        "content-hash",
+        real_archive_hash,
+        "signature-bytes",
+    );
+    defer record.deinit();
+
+    // Corrupt the cached archive bytes directly, simulating bit rot between
+    // the original store and this restore.
+    const cache_root = try buildCacheRoot(test_env.ctx.allocator, &test_env.ctx);
+    defer test_env.ctx.allocator.free(cache_root);
+    const cached_archive_path = try std.fs.path.join(test_env.ctx.allocator, &.{ cache_root, "artifacts", record.artifact_digest_hex, "archive.pkg.tar.zst" });
+    defer test_env.ctx.allocator.free(cached_archive_path);
+    {
+        var f = try std.Io.Dir.createFileAbsolute(io, cached_archive_path, .{});
+        defer f.close(io);
+        try f.writeStreamingAll(io, "corrupted bytes that do not match the recorded archive_hash");
+    }
+
+    const restore_staging_dir = try std.fs.path.join(test_env.ctx.allocator, &.{ test_env.path, "pkg-staging-restored" });
+    defer test_env.ctx.allocator.free(restore_staging_dir);
+    const restore_output_dir = try std.fs.path.join(test_env.ctx.allocator, &.{ test_env.path, "output-restored" });
+    defer test_env.ctx.allocator.free(restore_output_dir);
+
+    const restored = try restorePackageArchiveForKey(
+        test_env.ctx.allocator,
+        &test_env.ctx,
+        "archive-key",
+        restore_staging_dir,
+        restore_output_dir,
+    );
+    try std.testing.expect(restored == null);
 }
 
 test "build_cache restores split-stage metadata larger than 64 KiB" {
