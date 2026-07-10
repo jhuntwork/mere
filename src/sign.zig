@@ -231,15 +231,7 @@ fn getFileHash(ctx: *Context, file_path: []const u8) SignError![32]u8 {
         return SignError.FileSystem;
     };
 
-    const hex_hash = hash.calculateFileHash(ctx, file_path_abs) catch |err| {
-        if (err == error.FileNotFound or err == error.AccessDenied) {
-            return SignError.FileSystem;
-        } else if (err == error.OutOfMemory or err == error.EndOfStream or err == error.Unexpected) {
-            return SignError.FileSystem;
-        } else {
-            return SignError.FileSystem;
-        }
-    };
+    const hex_hash = hash.calculateFileHash(ctx, file_path_abs) catch |err| return err;
     defer ctx.allocator.free(hex_hash);
 
     var result: [32]u8 = undefined;
@@ -1564,6 +1556,36 @@ test "sign: rfc8032 ed25519 test vector 1 (empty message)" {
 
     // Verify using the pure API
     try verifyBytes(pub_key[0..], msg, sig[0..]);
+}
+
+test "getFileHash surfaces PermissionDenied instead of a generic FileSystem error" {
+    // Regression: getFileHash used to collapse every calculateFileHash error
+    // (including PermissionDenied) to a generic SignError.FileSystem, which
+    // masked the dedicated PermissionDenied handling in callers like
+    // repository.zig/repo_history.zig for this exact call.
+    if (std.os.linux.geteuid() == 0) return error.SkipZigTest;
+
+    const th = @import("test_helpers.zig");
+    var test_env = try th.createTestEnv();
+    defer {
+        test_env.cleanup();
+        std.testing.allocator.destroy(test_env);
+    }
+
+    const file_path = try std.fs.path.join(std.testing.allocator, &.{ test_env.path, "restricted.txt" });
+    defer std.testing.allocator.free(file_path);
+    {
+        var f = try std.Io.Dir.createFileAbsolute(path_mod.currentIo(), file_path, .{});
+        try f.writeStreamingAll(path_mod.currentIo(), "some content");
+        f.close(path_mod.currentIo());
+    }
+
+    var restricted = try path_mod.openExistingFile(file_path);
+    defer restricted.close(path_mod.currentIo());
+    try restricted.setPermissions(path_mod.currentIo(), .fromMode(0o000));
+    defer restricted.setPermissions(path_mod.currentIo(), .fromMode(0o644)) catch {};
+
+    try std.testing.expectError(SignError.PermissionDenied, getFileHash(&test_env.ctx, file_path));
 }
 
 test "standardized error handling" {
