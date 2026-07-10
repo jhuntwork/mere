@@ -1410,7 +1410,10 @@ const install_mod = @import("install.zig");
 
 fn createRepoCachesForBuild(ctx: *mere.Context, config: *const config_mod.Config) BuildError!std.ArrayList(*RepoCache) {
     return repo_sources.createCaches(ctx, config) catch |err| {
-        ctx.setDiagnosticContext("config", "failed to create repo caches from config");
+        const diag = ctx.getDiagnosticContext();
+        if (diag.subject == null and diag.details == null) {
+            ctx.setDiagnosticContext("config", "failed to create repo caches from config");
+        }
         return switch (err) {
             error.OutOfMemory => BuildError.OutOfMemory,
             error.Network => BuildError.Network,
@@ -1421,6 +1424,68 @@ fn createRepoCachesForBuild(ctx: *mere.Context, config: *const config_mod.Config
             error.InvalidInput => BuildError.InvalidInput,
         };
     };
+}
+
+test "createRepoCachesForBuild preserves a pre-existing diagnostic context on failure" {
+    // Regression: this catch used to unconditionally overwrite whatever diagnostic
+    // context was already set (e.g. by repo_sources.createCaches failing on a
+    // specific repo) with a generic "config"/"failed to create repo caches from
+    // config", inconsistent with mapBuildCacheError's guarded pattern elsewhere in
+    // this file. The diagnostic is set manually here (rather than relying on a
+    // specific real inner failure) so the test doesn't depend on which allocation
+    // inside repo_sources.createCaches happens to fail - only on whether an
+    // already-present diagnostic survives.
+    const th = @import("test_helpers.zig");
+    var test_env = try th.createTestEnv();
+    defer {
+        test_env.cleanup();
+        std.testing.allocator.destroy(test_env);
+    }
+
+    var config = config_mod.Config.init(&test_env.ctx, test_env.ctx.allocator);
+    defer config.deinit();
+    const repo_cfg = try th.createTestRepoConfig(test_env.ctx.allocator, "test-repo", "https://example.test/repo");
+    try config.repos.append(test_env.ctx.allocator, repo_cfg);
+
+    const real_allocator = test_env.ctx.allocator;
+
+    // Learn the real allocation count for a fully successful call (no failures
+    // injected) purely to bound the scan below - repo_sources.createCaches has
+    // several early paths that catch an allocation failure internally and
+    // degrade gracefully rather than propagating an error, so the first
+    // fail_index isn't guaranteed to make the overall call fail.
+    var counting_allocator = std.testing.FailingAllocator.init(real_allocator, .{});
+    test_env.ctx.allocator = counting_allocator.allocator();
+    var warm_caches = try createRepoCachesForBuild(&test_env.ctx, &config);
+    destroyRepoCachesForBuild(&test_env.ctx, &warm_caches);
+    test_env.ctx.allocator = real_allocator;
+    const total_allocs = counting_allocator.alloc_index;
+
+    var found = false;
+    var idx: usize = 0;
+    while (idx < total_allocs) : (idx += 1) {
+        test_env.ctx.resetDiagnostics();
+        test_env.ctx.setDiagnosticContext("preexisting-subject", "preexisting-details");
+
+        var failing_allocator = std.testing.FailingAllocator.init(real_allocator, .{ .fail_index = idx });
+        test_env.ctx.allocator = failing_allocator.allocator();
+        const result = createRepoCachesForBuild(&test_env.ctx, &config);
+        test_env.ctx.allocator = real_allocator;
+
+        if (result) |*caches| {
+            var mutable_caches = caches.*;
+            destroyRepoCachesForBuild(&test_env.ctx, &mutable_caches);
+            continue;
+        } else |_| {}
+
+        const diag = test_env.ctx.getDiagnosticContext();
+        try std.testing.expectEqualStrings("preexisting-subject", diag.subject.?);
+        try std.testing.expectEqualStrings("preexisting-details", diag.details.?);
+        found = true;
+        break;
+    }
+
+    try std.testing.expect(found);
 }
 
 fn destroyRepoCachesForBuild(ctx: *mere.Context, repocaches: *std.ArrayList(*RepoCache)) void {
