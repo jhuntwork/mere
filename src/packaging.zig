@@ -374,14 +374,12 @@ pub const Packager = struct {
 
         const result_package_name = self.ctx.allocator.dupe(u8, pkg_name) catch |err| {
             self.ctx.allocator.free(content_hash);
-            self.ctx.allocator.free(archive_hash);
             return self.fail(pkg_name, "failed to copy package name", if (err == error.OutOfMemory) PackagingError.OutOfMemory else PackagingError.CreationFailed);
         };
         errdefer self.ctx.allocator.free(result_package_name);
 
         const result_signature = self.ctx.allocator.dupe(u8, &signature) catch |err| {
             self.ctx.allocator.free(content_hash);
-            self.ctx.allocator.free(archive_hash);
             return self.fail("manifest signature", "failed to copy package signature", if (err == error.OutOfMemory) PackagingError.OutOfMemory else PackagingError.CreationFailed);
         };
         errdefer self.ctx.allocator.free(result_signature);
@@ -472,6 +470,88 @@ test "Packager creates package artifacts with metadata independently" {
     defer test_env.ctx.allocator.free(projection_path);
     var _projf = try std.Io.Dir.openFileAbsolute(path_mod.currentIo(), projection_path, .{});
     defer _projf.close(path_mod.currentIo());
+}
+
+test "createPackageArtifact does not double-free archive_hash when the final allocation fails" {
+    var test_env = try test_helpers.createTestEnv();
+    defer {
+        test_env.cleanup();
+        std.testing.allocator.destroy(test_env);
+    }
+
+    const keys_dir = try std.fs.path.join(test_env.ctx.allocator, &.{ test_env.path, "keys" });
+    defer test_env.ctx.allocator.free(keys_dir);
+    try path_mod.ensureDirExists(keys_dir);
+
+    const key_path = try std.fs.path.join(test_env.ctx.allocator, &.{ keys_dir, "mere.key" });
+    defer test_env.ctx.allocator.free(key_path);
+
+    const key_pair = try sign.generateKeyPair();
+    try key_pair.secret_key.saveToFile(key_path);
+    test_env.ctx.signing_key_path = key_path;
+
+    var packager = Packager{ .ctx = &test_env.ctx };
+
+    var test_recipe = try recipe.Recipe.init(test_env.ctx.allocator, &test_env.ctx);
+    defer test_recipe.deinit();
+    test_recipe.name = try test_env.ctx.allocator.dupe(u8, "test-package");
+    test_recipe.version = try test_env.ctx.allocator.dupe(u8, "1.0.0");
+    test_recipe.release = 1;
+
+    var test_artifact = try recipe.BuildArtifact.init(test_env.ctx.allocator);
+    defer test_artifact.deinit(test_env.ctx.allocator);
+
+    const real_allocator = test_env.ctx.allocator;
+
+    const makeStaging = struct {
+        fn call(allocator: std.mem.Allocator, base: []const u8, name: []const u8) ![]const u8 {
+            const dir = try std.fs.path.join(allocator, &.{ base, name });
+            try path_mod.ensureDirExists(dir);
+            const file_path = try std.fs.path.join(allocator, &.{ dir, "test_file.txt" });
+            defer allocator.free(file_path);
+            const file = try std.Io.Dir.createFileAbsolute(path_mod.currentIo(), file_path, .{});
+            defer file.close(path_mod.currentIo());
+            try file.writeStreamingAll(path_mod.currentIo(), "test content");
+            return dir;
+        }
+    }.call;
+
+    // First pass: run to completion to learn exactly how many allocations
+    // createPackageArtifact performs on its happy path, so the fail_index
+    // below tracks the real last allocation instead of a brittle magic number.
+    const staging_dry = try makeStaging(real_allocator, test_env.path, "staging_dry");
+    defer real_allocator.free(staging_dry);
+
+    var counting_allocator = std.testing.FailingAllocator.init(real_allocator, .{});
+    test_env.ctx.allocator = counting_allocator.allocator();
+    var dry_result = try packager.createPackageArtifact(.{
+        .staging_dir = staging_dry,
+        .recipe = &test_recipe,
+        .artifact = &test_artifact,
+        .output_dir = test_env.path,
+    });
+    dry_result.deinit(test_env.ctx.allocator);
+    test_env.ctx.allocator = real_allocator;
+    const total_allocs = counting_allocator.alloc_index;
+
+    // Second pass: fail at the LAST allocation on the happy path (the
+    // `result_signature` dupe). Before the fix, the error branch for that
+    // dupe manually freed `archive_hash` even though an `errdefer` registered
+    // earlier for `archive_hash` was still armed, causing a double-free.
+    const staging_fail = try makeStaging(real_allocator, test_env.path, "staging_fail");
+    defer real_allocator.free(staging_fail);
+
+    var failing_allocator = std.testing.FailingAllocator.init(real_allocator, .{ .fail_index = total_allocs - 1 });
+    test_env.ctx.allocator = failing_allocator.allocator();
+    defer test_env.ctx.allocator = real_allocator;
+
+    const result = packager.createPackageArtifact(.{
+        .staging_dir = staging_fail,
+        .recipe = &test_recipe,
+        .artifact = &test_artifact,
+        .output_dir = test_env.path,
+    });
+    try std.testing.expectError(PackagingError.OutOfMemory, result);
 }
 
 test "Packager handles signing and metadata generation" {
