@@ -104,6 +104,10 @@ pub fn clear(
 ) CacheError!usize {
     const cache_root = try buildCacheRoot(allocator, ctx);
     defer allocator.free(cache_root);
+
+    ctx.acquireBuildCacheLock(cache_root) catch |err| return mapFsError(err);
+    defer ctx.releaseBuildCacheLock();
+
     const io = path_mod.currentIo();
 
     var dir = path_mod.openExistingDir(cache_root) catch |err| {
@@ -118,6 +122,10 @@ pub fn clear(
     var removed_count: usize = 0;
 
     while (iter.next(io) catch |err| return mapFsError(err)) |entry| {
+        // Skip the lock file itself - it's cache infrastructure (created by
+        // acquireBuildCacheLock above, currently held open), not cache content.
+        if (std.mem.eql(u8, entry.name, ".lock")) continue;
+
         switch (entry.kind) {
             .directory => dir.deleteTree(io, entry.name) catch |err| return mapFsError(err),
             else => dir.deleteFile(io, entry.name) catch |err| return mapFsError(err),
@@ -368,6 +376,12 @@ pub fn storeDirectoryForKey(
     };
     defer allocator.free(cache_root);
 
+    ctx.acquireBuildCacheLock(cache_root) catch |err| {
+        ctx.setDiagnosticContextFmt(cache_root, "failed to acquire build cache lock ({s})", .{@errorName(err)});
+        return mapFsError(err);
+    };
+    defer ctx.releaseBuildCacheLock();
+
     const artifacts_root = std.fs.path.join(allocator, &.{ cache_root, "artifacts" }) catch |err| {
         ctx.setDiagnosticContextFmt(cache_root, "failed to build cache artifacts path ({s})", .{@errorName(err)});
         return mapFsError(err);
@@ -524,6 +538,12 @@ pub fn invalidateKey(
     const cache_root = try buildCacheRoot(allocator, ctx);
     defer allocator.free(cache_root);
 
+    ctx.acquireBuildCacheLock(cache_root) catch |err| {
+        ctx.setDiagnosticContextFmt(cache_root, "failed to acquire build cache lock ({s})", .{@errorName(err)});
+        return mapFsError(err);
+    };
+    defer ctx.releaseBuildCacheLock();
+
     const keys_root = std.fs.path.join(allocator, &.{ cache_root, "keys", kind.asString() }) catch |err| {
         ctx.setDiagnosticContextFmt(cache_root, "failed to build cache keys path for {s} ({s})", .{ kind.asString(), @errorName(err) });
         return mapFsError(err);
@@ -648,8 +668,15 @@ pub fn gc(
 ) CacheError!GcResult {
     const cache_root = try buildCacheRoot(allocator, ctx);
     defer allocator.free(cache_root);
-    const io = path_mod.currentIo();
     if (!dirExists(cache_root)) return .{};
+
+    ctx.acquireBuildCacheLock(cache_root) catch |err| {
+        ctx.setDiagnosticContextFmt(cache_root, "failed to acquire build cache lock ({s})", .{@errorName(err)});
+        return mapFsError(err);
+    };
+    defer ctx.releaseBuildCacheLock();
+
+    const io = path_mod.currentIo();
 
     const keys_root = try std.fs.path.join(allocator, &.{ cache_root, "keys" });
     defer allocator.free(keys_root);
@@ -777,11 +804,17 @@ pub fn storeSplitStagingForKey(
     const pkg_root = try std.fs.path.join(allocator, &.{ workspace_recipe_root, "pkg" });
     defer allocator.free(pkg_root);
 
-    var record = try storeDirectoryForKey(allocator, ctx, .split_stage, key_hex, pkg_root, null);
-    errdefer record.deinit();
-
     const cache_root = try buildCacheRoot(allocator, ctx);
     defer allocator.free(cache_root);
+
+    ctx.acquireBuildCacheLock(cache_root) catch |err| {
+        ctx.setDiagnosticContextFmt(cache_root, "failed to acquire build cache lock ({s})", .{@errorName(err)});
+        return mapFsError(err);
+    };
+    defer ctx.releaseBuildCacheLock();
+
+    var record = try storeDirectoryForKey(allocator, ctx, .split_stage, key_hex, pkg_root, null);
+    errdefer record.deinit();
     const metadata_path = try std.fs.path.join(allocator, &.{ cache_root, "artifacts", record.artifact_digest_hex, "split-stage.kdl" });
     defer allocator.free(metadata_path);
     try writeSplitStageMetadata(allocator, metadata_path, staged_packages);
@@ -844,6 +877,12 @@ pub fn storePackageArchiveForKey(
 ) CacheError!CacheRecord {
     const cache_root = try buildCacheRoot(allocator, ctx);
     defer allocator.free(cache_root);
+
+    ctx.acquireBuildCacheLock(cache_root) catch |err| {
+        ctx.setDiagnosticContextFmt(cache_root, "failed to acquire build cache lock ({s})", .{@errorName(err)});
+        return mapFsError(err);
+    };
+    defer ctx.releaseBuildCacheLock();
 
     const artifacts_root = try std.fs.path.join(allocator, &.{ cache_root, "artifacts" });
     defer allocator.free(artifacts_root);
@@ -2179,8 +2218,12 @@ test "build_cache clear removes all cache entries" {
     const removed = try clear(test_env.ctx.allocator, &test_env.ctx);
     try std.testing.expectEqual(@as(usize, 2), removed);
 
+    // The lock file itself is expected to remain - it's cache infrastructure
+    // clear() deliberately skips, not cache content.
     var dir = try path_mod.openExistingDir(cache_root);
     defer dir.close(io);
     var iter = dir.iterate();
+    const remaining = (try iter.next(io)).?;
+    try std.testing.expectEqualStrings(".lock", remaining.name);
     try std.testing.expect((try iter.next(io)) == null);
 }

@@ -57,6 +57,8 @@ pub const Context = struct {
     event_counter: u64 = 0,
     store_lock_fd: ?std.posix.fd_t = null,
     store_lock_depth: u32 = 0,
+    build_cache_lock_fd: ?std.posix.fd_t = null,
+    build_cache_lock_depth: u32 = 0,
 
     const default_root_path = "/";
 
@@ -134,6 +136,10 @@ pub const Context = struct {
         if (self.store_lock_depth > 0) {
             self.store_lock_depth = 1;
             self.releaseStoreLock();
+        }
+        if (self.build_cache_lock_depth > 0) {
+            self.build_cache_lock_depth = 1;
+            self.releaseBuildCacheLock();
         }
         // Free diagnostic arena if initialized
         if (self.diag_arena) |*arena| {
@@ -230,6 +236,51 @@ pub const Context = struct {
             _ = std.c.flock(fd, std.c.LOCK.UN);
             _ = std.c.close(fd);
             self.store_lock_fd = null;
+        }
+    }
+
+    /// Acquire a blocking exclusive flock on `<cache_root>/.lock`, serializing
+    /// mutating build-cache operations (gc, storeDirectoryForKey, etc.) across
+    /// concurrent `mere` invocations - separate from the package store's own
+    /// lock since the build cache lives at a different root. Reentrant within
+    /// a single Context, same as acquireStoreLock, since some cache-writing
+    /// functions call other cache-writing functions internally.
+    pub fn acquireBuildCacheLock(self: *Context, cache_root: []const u8) !void {
+        if (self.build_cache_lock_depth > 0) {
+            self.build_cache_lock_depth += 1;
+            return;
+        }
+
+        try path.ensureDirExists(cache_root);
+
+        const lock_path = try std.fs.path.join(self.allocator, &.{ cache_root, ".lock" });
+        defer self.allocator.free(lock_path);
+
+        const lock_file = try std.Io.Dir.createFileAbsolute(path.currentIo(), lock_path, .{ .truncate = false });
+        const lock_fd = lock_file.handle;
+
+        if (std.posix.errno(std.c.flock(lock_fd, std.c.LOCK.EX | std.c.LOCK.NB)) != .SUCCESS) {
+            self.info("waiting for build cache lock (another mere process may be running)...", .{});
+            if (std.posix.errno(std.c.flock(lock_fd, std.c.LOCK.EX)) != .SUCCESS) {
+                _ = std.c.close(lock_fd);
+                return error.Locked;
+            }
+        }
+
+        self.build_cache_lock_fd = lock_fd;
+        self.build_cache_lock_depth = 1;
+    }
+
+    /// Release a previously acquired build-cache lock. No-op if not held.
+    pub fn releaseBuildCacheLock(self: *Context) void {
+        if (self.build_cache_lock_depth == 0) return;
+        self.build_cache_lock_depth -= 1;
+        if (self.build_cache_lock_depth > 0) return;
+
+        if (self.build_cache_lock_fd) |fd| {
+            _ = std.c.flock(fd, std.c.LOCK.UN);
+            _ = std.c.close(fd);
+            self.build_cache_lock_fd = null;
         }
     }
 
@@ -446,6 +497,62 @@ test "Context.acquireStoreLock actually excludes a second independent lock holde
     try std.testing.expect(std.posix.errno(std.c.flock(rival.handle, std.c.LOCK.EX | std.c.LOCK.NB)) != .SUCCESS);
 
     test_env.ctx.releaseStoreLock();
+
+    // Once released, the rival can now take it.
+    try std.testing.expectEqual(std.posix.E.SUCCESS, std.posix.errno(std.c.flock(rival.handle, std.c.LOCK.EX | std.c.LOCK.NB)));
+    _ = std.c.flock(rival.handle, std.c.LOCK.UN);
+}
+
+test "Context.acquireBuildCacheLock is reentrant within the same Context" {
+    const th = @import("test_helpers.zig");
+    var test_env = try th.createTestEnv();
+    defer {
+        test_env.cleanup();
+        std.testing.allocator.destroy(test_env);
+    }
+
+    const cache_root = try std.fs.path.join(std.testing.allocator, &.{ test_env.path, "mere", "dev", "cache", "build" });
+    defer std.testing.allocator.free(cache_root);
+
+    try test_env.ctx.acquireBuildCacheLock(cache_root);
+    try test_env.ctx.acquireBuildCacheLock(cache_root);
+    try std.testing.expectEqual(@as(u32, 2), test_env.ctx.build_cache_lock_depth);
+
+    test_env.ctx.releaseBuildCacheLock();
+    try std.testing.expect(test_env.ctx.build_cache_lock_fd != null); // still held at depth 1
+    test_env.ctx.releaseBuildCacheLock();
+    try std.testing.expect(test_env.ctx.build_cache_lock_fd == null);
+
+    // Releasing past zero is a no-op, not a crash.
+    test_env.ctx.releaseBuildCacheLock();
+}
+
+test "Context.acquireBuildCacheLock actually excludes a second independent lock holder" {
+    const th = @import("test_helpers.zig");
+    var test_env = try th.createTestEnv();
+    defer {
+        test_env.cleanup();
+        std.testing.allocator.destroy(test_env);
+    }
+
+    const cache_root = try std.fs.path.join(std.testing.allocator, &.{ test_env.path, "mere", "dev", "cache", "build" });
+    defer std.testing.allocator.free(cache_root);
+
+    try test_env.ctx.acquireBuildCacheLock(cache_root);
+
+    const lock_path = try std.fs.path.join(std.testing.allocator, &.{ cache_root, ".lock" });
+    defer std.testing.allocator.free(lock_path);
+
+    const rival = try std.Io.Dir.createFileAbsolute(path.currentIo(), lock_path, .{ .truncate = false });
+    defer rival.close(path.currentIo());
+
+    // A second, independent file description should fail to take the lock
+    // non-blocking while the Context still holds it - the actual protection
+    // against gc() racing storeDirectoryForKey(), or two concurrent builds
+    // racing on the same content digest.
+    try std.testing.expect(std.posix.errno(std.c.flock(rival.handle, std.c.LOCK.EX | std.c.LOCK.NB)) != .SUCCESS);
+
+    test_env.ctx.releaseBuildCacheLock();
 
     // Once released, the rival can now take it.
     try std.testing.expectEqual(std.posix.E.SUCCESS, std.posix.errno(std.c.flock(rival.handle, std.c.LOCK.EX | std.c.LOCK.NB)));
