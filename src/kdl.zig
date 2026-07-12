@@ -389,15 +389,18 @@ fn parseDocumentInternal(
             .KDL_EVENT_START_NODE => {
                 const name = event.name.toSlice() orelse "";
                 var new_node = try Node.init(allocator, name);
-                errdefer new_node.deinit();
+                var appended = false;
+                errdefer if (!appended) new_node.deinit();
 
                 if (node_stack.items.len == 0) {
                     nodes.append(allocator, new_node) catch return KdlError.OutOfMemory;
+                    appended = true;
                     const ptr = &nodes.items[nodes.items.len - 1];
                     node_stack.append(allocator, ptr) catch return KdlError.OutOfMemory;
                 } else {
                     const parent = node_stack.items[node_stack.items.len - 1];
                     parent.children.append(allocator, new_node) catch return KdlError.OutOfMemory;
+                    appended = true;
                     const ptr = &parent.children.items[parent.children.items.len - 1];
                     node_stack.append(allocator, ptr) catch return KdlError.OutOfMemory;
                 }
@@ -478,6 +481,41 @@ test "parse simple KDL document" {
     // Check second node
     try std.testing.expectEqual(@as(usize, 1), nodes.items[1].arguments.items.len);
     try std.testing.expectEqual(@as(i64, 42), nodes.items[1].arguments.items[0].getInteger().?);
+}
+
+test "parseDocument does not double-free a node whose stack-pointer append fails after the node itself was appended" {
+    // Regression: KDL_EVENT_START_NODE registered errdefer new_node.deinit()
+    // right after Node.init, but never cancelled it once new_node was
+    // successfully appended into nodes/parent.children - a later failure
+    // (node_stack.append OOMing) fired that errdefer AND parseDocumentInternal's
+    // own nodes-cleanup errdefer on the same underlying memory, a double free.
+    // Exercises both the top-level nodes.append branch and the nested
+    // parent.children.append branch by scanning every allocation index of a
+    // document with a top-level node and a nested child.
+    const content =
+        \\node1
+        \\node2 {
+        \\    child1
+        \\}
+    ;
+    const real_allocator = std.testing.allocator;
+
+    var counting_allocator = std.testing.FailingAllocator.init(real_allocator, .{});
+    var warm = try parseDocument(counting_allocator.allocator(), content);
+    for (warm.items) |*n| n.deinit();
+    warm.deinit(real_allocator);
+    const total_allocs = counting_allocator.alloc_index;
+
+    var idx: usize = 0;
+    while (idx < total_allocs) : (idx += 1) {
+        var failing_allocator = std.testing.FailingAllocator.init(real_allocator, .{ .fail_index = idx });
+        const result = parseDocument(failing_allocator.allocator(), content);
+        if (result) |*nodes| {
+            var mutable_nodes = nodes.*;
+            for (mutable_nodes.items) |*n| n.deinit();
+            mutable_nodes.deinit(real_allocator);
+        } else |_| {}
+    }
 }
 
 test "parse nested KDL nodes" {
