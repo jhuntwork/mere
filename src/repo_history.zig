@@ -45,6 +45,64 @@ fn currentDbPath(allocator: std.mem.Allocator, repo_dir: []const u8) []const u8 
     return std.fs.path.join(allocator, &.{ repo_dir, REPO_DB_FILENAME }) catch return &.{};
 }
 
+/// Publish `new_db`/`new_sig` (already fully written, e.g. staged files) into
+/// `live_db_path`/`live_sig_path` as a coherent pair. A crash between the two
+/// destination renames would otherwise leave a mismatched db/sig on disk;
+/// this backs up whatever is currently live first and rolls back to it on
+/// any partial failure, same pattern as repocache.zig's
+/// replaceCachedDbAndSigWithRollback.
+fn replaceLiveDbAndSigWithRollback(
+    allocator: std.mem.Allocator,
+    new_db: []const u8,
+    new_sig: []const u8,
+    live_db_path: []const u8,
+    live_sig_path: []const u8,
+) Error!void {
+    const io = path_mod.currentIo();
+
+    const db_backup = std.fmt.allocPrint(allocator, "{s}.bak", .{live_db_path}) catch return Error.OutOfMemory;
+    defer allocator.free(db_backup);
+    const sig_backup = std.fmt.allocPrint(allocator, "{s}.bak", .{live_sig_path}) catch return Error.OutOfMemory;
+    defer allocator.free(sig_backup);
+
+    std.Io.Dir.deleteFileAbsolute(io, db_backup) catch {};
+    std.Io.Dir.deleteFileAbsolute(io, sig_backup) catch {};
+
+    var moved_live_db = false;
+    var moved_live_sig = false;
+
+    std.Io.Dir.renameAbsolute(live_db_path, db_backup, io) catch |err| switch (err) {
+        error.FileNotFound => {},
+        else => return mapFs(err),
+    };
+    moved_live_db = path_mod.fileExists(db_backup);
+
+    std.Io.Dir.renameAbsolute(live_sig_path, sig_backup, io) catch |err| switch (err) {
+        error.FileNotFound => {},
+        else => {
+            if (moved_live_db) std.Io.Dir.renameAbsolute(db_backup, live_db_path, io) catch {};
+            return mapFs(err);
+        },
+    };
+    moved_live_sig = path_mod.fileExists(sig_backup);
+
+    std.Io.Dir.renameAbsolute(new_db, live_db_path, io) catch |err| {
+        if (moved_live_sig) std.Io.Dir.renameAbsolute(sig_backup, live_sig_path, io) catch {};
+        if (moved_live_db) std.Io.Dir.renameAbsolute(db_backup, live_db_path, io) catch {};
+        return mapFs(err);
+    };
+
+    std.Io.Dir.renameAbsolute(new_sig, live_sig_path, io) catch |err| {
+        std.Io.Dir.deleteFileAbsolute(io, live_db_path) catch {};
+        if (moved_live_db) std.Io.Dir.renameAbsolute(db_backup, live_db_path, io) catch {};
+        if (moved_live_sig) std.Io.Dir.renameAbsolute(sig_backup, live_sig_path, io) catch {};
+        return mapFs(err);
+    };
+
+    std.Io.Dir.deleteFileAbsolute(io, db_backup) catch {};
+    std.Io.Dir.deleteFileAbsolute(io, sig_backup) catch {};
+}
+
 pub const Staged = struct {
     ctx: *mere.Context,
     repo_dir: []const u8,
@@ -73,7 +131,8 @@ pub const Staged = struct {
             };
         };
 
-        // Flat layout: copy staged db and sig to repo root
+        // Flat layout: publish staged db and sig to repo root as a coherent
+        // pair, with rollback on partial failure.
         const root_db = std.fs.path.join(self.ctx.allocator, &.{ self.repo_dir, REPO_DB_FILENAME }) catch {
             return Error.OutOfMemory;
         };
@@ -83,12 +142,7 @@ pub const Staged = struct {
         };
         defer self.ctx.allocator.free(root_sig);
 
-        path_mod.copyFile(self.db_path, root_db) catch {
-            return Error.FileSystem;
-        };
-        path_mod.copyFile(self.sig_path, root_sig) catch {
-            return Error.FileSystem;
-        };
+        try replaceLiveDbAndSigWithRollback(self.ctx.allocator, self.db_path, self.sig_path, root_db, root_sig);
 
         self.committed = true;
     }
@@ -363,6 +417,67 @@ test "Staged.commit writes db and sig to repo root" {
     const root_sig = try std.fs.path.join(test_env.ctx.allocator, &.{ repo_dir, REPO_SIG_FILENAME });
     defer test_env.ctx.allocator.free(root_sig);
     try std.Io.Dir.accessAbsolute(path_mod.currentIo(), root_sig, .{});
+}
+
+test "replaceLiveDbAndSigWithRollback restores the original db and sig pair if the second rename fails" {
+    // Regression: Staged.commit used two independent, non-atomic copyFile
+    // calls to publish the staged db and sig - a crash between them left a
+    // mismatched pair on disk that every subsequent verify rejects (fails
+    // closed, but the repo is unusable until manually re-signed). Simulates
+    // the failure by pointing the new sig at a file that doesn't exist, so
+    // the second rename in the swap fails, and confirms the live pair is
+    // rolled back to its original content rather than left half-swapped.
+    const th = @import("test_helpers.zig");
+    var test_env = try th.createTestEnv();
+    defer {
+        test_env.cleanup();
+        std.testing.allocator.destroy(test_env);
+    }
+    const io = path_mod.currentIo();
+
+    const live_db = try std.fs.path.join(test_env.ctx.allocator, &.{ test_env.path, "repo.db" });
+    defer test_env.ctx.allocator.free(live_db);
+    const live_sig = try std.fs.path.join(test_env.ctx.allocator, &.{ test_env.path, "repo.db.sig" });
+    defer test_env.ctx.allocator.free(live_sig);
+    const new_db = try std.fs.path.join(test_env.ctx.allocator, &.{ test_env.path, "new.db" });
+    defer test_env.ctx.allocator.free(new_db);
+    const missing_new_sig = try std.fs.path.join(test_env.ctx.allocator, &.{ test_env.path, "does-not-exist.sig" });
+    defer test_env.ctx.allocator.free(missing_new_sig);
+
+    {
+        var f = try std.Io.Dir.createFileAbsolute(io, live_db, .{});
+        try f.writeStreamingAll(io, "old-db");
+        f.close(io);
+    }
+    {
+        var f = try std.Io.Dir.createFileAbsolute(io, live_sig, .{});
+        try f.writeStreamingAll(io, "old-sig");
+        f.close(io);
+    }
+    {
+        var f = try std.Io.Dir.createFileAbsolute(io, new_db, .{});
+        try f.writeStreamingAll(io, "new-db");
+        f.close(io);
+    }
+    // missing_new_sig is deliberately never created, so the second rename
+    // inside replaceLiveDbAndSigWithRollback fails.
+
+    try std.testing.expectError(
+        error.FileSystem,
+        replaceLiveDbAndSigWithRollback(test_env.ctx.allocator, new_db, missing_new_sig, live_db, live_sig),
+    );
+
+    var db_buf: [16]u8 = undefined;
+    var db_file = try std.Io.Dir.openFileAbsolute(io, live_db, .{});
+    defer db_file.close(io);
+    const db_bytes = try db_file.readPositionalAll(io, &db_buf, 0);
+    try std.testing.expectEqualStrings("old-db", db_buf[0..db_bytes]);
+
+    var sig_buf: [16]u8 = undefined;
+    var sig_file = try std.Io.Dir.openFileAbsolute(io, live_sig, .{});
+    defer sig_file.close(io);
+    const sig_bytes = try sig_file.readPositionalAll(io, &sig_buf, 0);
+    try std.testing.expectEqualStrings("old-sig", sig_buf[0..sig_bytes]);
 }
 
 test "Staged.deinit without commit cleans up staging dir" {
