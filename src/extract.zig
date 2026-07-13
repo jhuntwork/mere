@@ -343,8 +343,7 @@ const LibarchiveMessageClass = enum {
 
 fn classifyLibarchiveMessage(msg: []const u8) LibarchiveMessageClass {
     if (std.mem.indexOf(u8, msg, "Path contains") != null or
-        std.mem.indexOf(u8, msg, "Absolute path") != null or
-        std.mem.indexOf(u8, msg, "Bad path") != null)
+        std.mem.indexOf(u8, msg, "Path is absolute") != null)
     {
         return .security_path_violation;
     }
@@ -354,6 +353,22 @@ fn classifyLibarchiveMessage(msg: []const u8) LibarchiveMessageClass {
         return .missing_hardlink_target;
     }
     return .other;
+}
+
+test "classifyLibarchiveMessage recognizes libarchive's actual absolute-path message" {
+    // Regression: this used to check for "Absolute path", but libarchive's
+    // real message (archive_write_disk_posix.c, ARCHIVE_EXTRACT_SECURE_NOABSOLUTEPATHS)
+    // is "Path is absolute" - checked against the vendored 3.8.2 source. The
+    // wrong string meant this branch could never actually fire.
+    try std.testing.expectEqual(LibarchiveMessageClass.security_path_violation, classifyLibarchiveMessage("Path is absolute"));
+}
+
+test "classifyLibarchiveMessage recognizes libarchive's actual dotdot-path message" {
+    try std.testing.expectEqual(LibarchiveMessageClass.security_path_violation, classifyLibarchiveMessage("Path contains '..'"));
+}
+
+test "classifyLibarchiveMessage does not misclassify an unrelated message" {
+    try std.testing.expectEqual(LibarchiveMessageClass.other, classifyLibarchiveMessage("Bad path"));
 }
 
 fn mapPathError(err: anyerror) ExtractError {
