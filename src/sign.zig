@@ -324,9 +324,7 @@ pub fn verifySignature(ctx: *Context, file_path: []const u8, public_key_path: []
     ctx.debug("verifySignature: file_path={s} public_key_path={s} signature_path={?s}", .{ file_path, public_key_path, signature_path });
 
     // Load the public key
-    const public_key = PublicKey.loadFromFile(public_key_path) catch {
-        return SignError.FileSystem;
-    };
+    const public_key = PublicKey.loadFromFile(public_key_path) catch |err| return err;
 
     // Hash before verification.
     const file_hash_before = try hashFileForVerification(ctx, file_path);
@@ -994,6 +992,39 @@ test "verifySignature fails when file is mutated concurrently" {
     }
 
     try testing.expect(saw_verify_failed);
+}
+
+test "verifySignature surfaces PermissionDenied instead of a generic FileSystem error for an unreadable public key" {
+    // Regression: verifySignature collapsed every PublicKey.loadFromFile error
+    // to a generic SignError.FileSystem, even though loadFromFile already
+    // returns the fully-specific SignError itself.
+    if (std.os.linux.geteuid() == 0) return error.SkipZigTest;
+
+    const th = @import("test_helpers.zig");
+    var test_env = try th.createTestEnv();
+    defer {
+        test_env.cleanup();
+        std.testing.allocator.destroy(test_env);
+    }
+
+    const key_pair = try generateKeyPair();
+    const public_key_path = try std.fs.path.join(std.testing.allocator, &.{ test_env.path, "restricted.pub" });
+    defer std.testing.allocator.free(public_key_path);
+    try key_pair.public_key.saveToFile(public_key_path);
+
+    var restricted = try path_mod.openExistingFile(public_key_path);
+    defer restricted.close(path_mod.currentIo());
+    try restricted.setPermissions(path_mod.currentIo(), .fromMode(0o000));
+    defer restricted.setPermissions(path_mod.currentIo(), .fromMode(0o644)) catch {};
+
+    const file_path = try std.fs.path.join(std.testing.allocator, &.{ test_env.path, "dummy.bin" });
+    defer std.testing.allocator.free(file_path);
+    {
+        var f = try std.Io.Dir.createFileAbsolute(path_mod.currentIo(), file_path, .{});
+        f.close(path_mod.currentIo());
+    }
+
+    try std.testing.expectError(SignError.PermissionDenied, verifySignature(&test_env.ctx, file_path, public_key_path, null));
 }
 
 // Spec #5: Public key file exactly 32 bytes
