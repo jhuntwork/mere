@@ -23,6 +23,7 @@ pub const pin = @import("pin.zig");
 pub const repodb = @import("repodb.zig");
 pub const profile = @import("profile.zig");
 pub const recipe = @import("recipe.zig");
+pub const release = @import("release.zig");
 pub const repository = @import("repository.zig");
 pub const repo_sources = @import("repo_sources.zig");
 pub const search = @import("search.zig");
