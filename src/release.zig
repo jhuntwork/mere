@@ -178,19 +178,19 @@ fn packageExistsInDb(db: *repodb.RepoDB, pkg: *const package.Package) bool {
 }
 
 /// Collect packages that *will* be pruned: those beyond `keep_count` for a
-/// given (name, arch) pair, ordered by id DESC. These are the packages
-/// whose archive files should be deleted from the output directory after
-/// pruneOldVersions removes their DB rows.
+/// given (name, arch) pair, ordered by version descending. These are the
+/// packages whose archive files should be deleted from the output directory
+/// after pruneOldVersions removes their DB rows.
 fn collectPruneCandidates(ctx: *Context, db: *repodb.RepoDB, name: []const u8, arch: []const u8, keep_count: u32) ReleaseError!std.ArrayList(package.Package) {
-    // Mirror pruneOldVersions' selection: ORDER BY id DESC, OFFSET keep_count.
+    // Fetch all packages for this (name, arch), then use version comparison
+    // to identify which ones will be pruned (same logic as pruneOldVersions).
     const sqlite_db = db.db orelse return ReleaseError.FileSystem;
+    const ver = @import("version.zig");
 
     const sql =
         \\SELECT name, version, release, arch, archive_hash
         \\FROM packages
         \\WHERE name = ? AND arch = ?
-        \\ORDER BY id DESC
-        \\LIMIT -1 OFFSET ?;
     ;
 
     var stmt: ?*c.sqlite3_stmt = null;
@@ -201,12 +201,19 @@ fn collectPruneCandidates(ctx: *Context, db: *repodb.RepoDB, name: []const u8, a
 
     _ = c.sqlite3_bind_text(stmt.?, 1, name.ptr, @intCast(name.len), c.SQLITE_STATIC);
     _ = c.sqlite3_bind_text(stmt.?, 2, arch.ptr, @intCast(arch.len), c.SQLITE_STATIC);
-    _ = c.sqlite3_bind_int(stmt.?, 3, @intCast(keep_count));
 
-    var result: std.ArrayList(package.Package) = .empty;
-    errdefer {
-        for (result.items) |*pkg| pkg.deinit();
-        result.deinit(ctx.allocator);
+    const Candidate = struct {
+        pkg: package.Package,
+        keep: bool,
+    };
+
+    var candidates: std.ArrayList(Candidate) = .empty;
+    defer {
+        for (candidates.items) |*cand| {
+            if (!cand.keep) continue; // kept ones transferred to result
+            cand.pkg.deinit();
+        }
+        candidates.deinit(ctx.allocator);
     }
 
     while (c.sqlite3_step(stmt.?) == c.SQLITE_ROW) {
@@ -225,7 +232,58 @@ fn collectPruneCandidates(ctx: *Context, db: *repodb.RepoDB, name: []const u8, a
         pkg.arch = if (col_arch != null) ctx.allocator.dupe(u8, std.mem.span(col_arch.?)) catch return ReleaseError.OutOfMemory else null;
         pkg.archive_hash = if (col_hash != null) ctx.allocator.dupe(u8, std.mem.span(col_hash.?)) catch return ReleaseError.OutOfMemory else "";
 
-        result.append(ctx.allocator, pkg) catch return ReleaseError.OutOfMemory;
+        candidates.append(ctx.allocator, .{ .pkg = pkg, .keep = false }) catch return ReleaseError.OutOfMemory;
+    }
+
+    if (candidates.items.len <= keep_count) {
+        // Nothing to prune — mark all as kept so defer doesn't deinit them,
+        // then return empty.
+        for (candidates.items) |*cand| cand.keep = true;
+        // Actually we need to deinit them since we're not returning them.
+        for (candidates.items) |*cand| {
+            cand.keep = false; // let defer handle cleanup
+        }
+        return std.ArrayList(package.Package){ .items = &.{}, .capacity = 0 };
+    }
+
+    // Mark the top keep_count by version.
+    var kept: u32 = 0;
+    while (kept < keep_count) : (kept += 1) {
+        var best_idx: ?usize = null;
+        for (candidates.items, 0..) |cand, idx| {
+            if (cand.keep) continue;
+            if (best_idx == null) {
+                best_idx = idx;
+                continue;
+            }
+            const best = candidates.items[best_idx.?];
+            const cmp = ver.comparePackageVersions(
+                cand.pkg.version orelse "",
+                cand.pkg.release orelse 0,
+                best.pkg.version orelse "",
+                best.pkg.release orelse 0,
+            ) catch return ReleaseError.InvalidInput;
+            if (cmp == .greater) best_idx = idx;
+        }
+        if (best_idx) |idx| {
+            candidates.items[idx].keep = true;
+        } else break;
+    }
+
+    // Collect the non-kept packages as prune candidates.
+    var result: std.ArrayList(package.Package) = .empty;
+    errdefer {
+        for (result.items) |*pkg| pkg.deinit();
+        result.deinit(ctx.allocator);
+    }
+
+    for (candidates.items) |*cand| {
+        if (!cand.keep) {
+            result.append(ctx.allocator, cand.pkg) catch return ReleaseError.OutOfMemory;
+            // Prevent defer from deiniting transferred packages
+            cand.pkg = package.Package.init(ctx);
+            cand.keep = true;
+        }
     }
 
     return result;

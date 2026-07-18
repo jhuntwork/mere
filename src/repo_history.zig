@@ -280,12 +280,12 @@ pub fn pruneOldVersions(
 ) Error!u32 {
     const sqlite_db = db.db orelse return Error.FileSystem;
     const c = @import("repodb.zig").c;
+    const ver = @import("version.zig");
 
+    // Fetch all package IDs with their version+release for this (name, arch).
     const find_sql =
-        \\SELECT id FROM packages
+        \\SELECT id, version, release FROM packages
         \\WHERE name = ? AND arch = ?
-        \\ORDER BY id DESC
-        \\LIMIT -1 OFFSET ?;
     ;
 
     var find_stmt: ?*c.sqlite3_stmt = null;
@@ -296,14 +296,71 @@ pub fn pruneOldVersions(
 
     _ = c.sqlite3_bind_text(find_stmt.?, 1, name.ptr, @intCast(name.len), c.SQLITE_STATIC);
     _ = c.sqlite3_bind_text(find_stmt.?, 2, arch.ptr, @intCast(arch.len), c.SQLITE_STATIC);
-    _ = c.sqlite3_bind_int(find_stmt.?, 3, @intCast(keep_count));
 
-    var ids_to_delete: std.ArrayList(i64) = .empty;
-    defer ids_to_delete.deinit(db.ctx.allocator);
+    const Candidate = struct {
+        id: i64,
+        version: []const u8,
+        release: u32,
+        keep: bool,
+    };
+
+    var candidates: std.ArrayList(Candidate) = .empty;
+    defer {
+        for (candidates.items) |cand| {
+            db.ctx.allocator.free(cand.version);
+        }
+        candidates.deinit(db.ctx.allocator);
+    }
 
     while (c.sqlite3_step(find_stmt.?) == c.SQLITE_ROW) {
         const pkg_id = c.sqlite3_column_int64(find_stmt.?, 0);
-        ids_to_delete.append(db.ctx.allocator, pkg_id) catch return Error.OutOfMemory;
+        const ver_text = c.sqlite3_column_text(find_stmt.?, 1);
+        const rel: u32 = @intCast(c.sqlite3_column_int(find_stmt.?, 2));
+        const version_str = if (ver_text != null) db.ctx.allocator.dupe(u8, std.mem.span(ver_text.?)) catch return Error.OutOfMemory else db.ctx.allocator.dupe(u8, "") catch return Error.OutOfMemory;
+        candidates.append(db.ctx.allocator, .{
+            .id = pkg_id,
+            .version = version_str,
+            .release = rel,
+            .keep = false,
+        }) catch return Error.OutOfMemory;
+    }
+
+    if (candidates.items.len <= keep_count) return 0;
+
+    // Mark the top keep_count versions using selection (same algorithm as
+    // getLatestPackagesByNameArch): find the highest version, mark it,
+    // repeat keep_count times.
+    var kept: u32 = 0;
+    while (kept < keep_count) : (kept += 1) {
+        var best_idx: ?usize = null;
+        for (candidates.items, 0..) |cand, idx| {
+            if (cand.keep) continue;
+            if (best_idx == null) {
+                best_idx = idx;
+                continue;
+            }
+            const best = candidates.items[best_idx.?];
+            const cmp = ver.comparePackageVersions(
+                cand.version,
+                cand.release,
+                best.version,
+                best.release,
+            ) catch return Error.InvalidInput;
+            if (cmp == .greater) best_idx = idx;
+        }
+        if (best_idx) |idx| {
+            candidates.items[idx].keep = true;
+        } else break;
+    }
+
+    // Collect IDs to delete (everything not marked keep).
+    var ids_to_delete: std.ArrayList(i64) = .empty;
+    defer ids_to_delete.deinit(db.ctx.allocator);
+
+    for (candidates.items) |cand| {
+        if (!cand.keep) {
+            ids_to_delete.append(db.ctx.allocator, cand.id) catch return Error.OutOfMemory;
+        }
     }
 
     if (ids_to_delete.items.len == 0) return 0;
