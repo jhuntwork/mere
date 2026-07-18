@@ -706,6 +706,12 @@ fn insertPruneAndCommit(
         const pkg_ptr = &record.prepared.manifest.pkg;
         try insertPackageWithForce(ctx, staged.db, pkg_ptr, force);
         try appendUniqueNameArch(ctx, &touched_pairs, pkg_ptr.name.?, pkg_ptr.arch.?);
+        mere.ui.emit.logFmtSeverity(ctx, .import, .info, "imported {s} {s}-{d} ({s})", .{
+            pkg_ptr.name orelse "unknown",
+            pkg_ptr.version orelse "unknown",
+            pkg_ptr.release orelse 0,
+            pkg_ptr.arch orelse "unknown",
+        });
     }
 
     var pruned_total: u32 = 0;
