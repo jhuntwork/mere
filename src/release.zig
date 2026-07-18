@@ -164,16 +164,93 @@ fn clearAllPackages(db: *repodb.RepoDB) ReleaseError!void {
     }
 }
 
-/// Publish a dev repo's current package set (all-latest with keep-count
-/// retention) to a public release output directory: repo.db, repo.db.sig,
-/// and packages/. Both `dev_repo_dir` and `output_dir` must be absolute
-/// paths; the caller (CLI layer) is responsible for resolving them.
+/// Returns true if a package with the same (name, version, release, arch)
+/// tuple already exists in the given database.
+fn packageExistsInDb(db: *repodb.RepoDB, pkg: *const package.Package) bool {
+    var existing = db.getPackageExact(
+        pkg.name orelse return false,
+        pkg.version orelse return false,
+        pkg.release orelse return false,
+        pkg.arch orelse return false,
+    ) catch return false;
+    existing.deinit();
+    return true;
+}
+
+/// Collect packages that *will* be pruned: those beyond `keep_count` for a
+/// given (name, arch) pair, ordered by id DESC. These are the packages
+/// whose archive files should be deleted from the output directory after
+/// pruneOldVersions removes their DB rows.
+fn collectPruneCandidates(ctx: *Context, db: *repodb.RepoDB, name: []const u8, arch: []const u8, keep_count: u32) ReleaseError!std.ArrayList(package.Package) {
+    // Mirror pruneOldVersions' selection: ORDER BY id DESC, OFFSET keep_count.
+    const sqlite_db = db.db orelse return ReleaseError.FileSystem;
+
+    const sql =
+        \\SELECT name, version, release, arch, archive_hash
+        \\FROM packages
+        \\WHERE name = ? AND arch = ?
+        \\ORDER BY id DESC
+        \\LIMIT -1 OFFSET ?;
+    ;
+
+    var stmt: ?*c.sqlite3_stmt = null;
+    if (c.sqlite3_prepare_v2(sqlite_db, sql.ptr, @intCast(sql.len), &stmt, null) != c.SQLITE_OK or stmt == null) {
+        return ctx.fail(ReleaseError.FileSystem, name, "failed to prepare prune candidate query");
+    }
+    defer _ = c.sqlite3_finalize(stmt.?);
+
+    _ = c.sqlite3_bind_text(stmt.?, 1, name.ptr, @intCast(name.len), c.SQLITE_STATIC);
+    _ = c.sqlite3_bind_text(stmt.?, 2, arch.ptr, @intCast(arch.len), c.SQLITE_STATIC);
+    _ = c.sqlite3_bind_int(stmt.?, 3, @intCast(keep_count));
+
+    var result: std.ArrayList(package.Package) = .empty;
+    errdefer {
+        for (result.items) |*pkg| pkg.deinit();
+        result.deinit(ctx.allocator);
+    }
+
+    while (c.sqlite3_step(stmt.?) == c.SQLITE_ROW) {
+        var pkg = package.Package.init(ctx);
+        errdefer pkg.deinit();
+
+        const col_name = c.sqlite3_column_text(stmt.?, 0);
+        const col_version = c.sqlite3_column_text(stmt.?, 1);
+        const col_release: u32 = @intCast(c.sqlite3_column_int(stmt.?, 2));
+        const col_arch = c.sqlite3_column_text(stmt.?, 3);
+        const col_hash = c.sqlite3_column_text(stmt.?, 4);
+
+        pkg.name = if (col_name != null) ctx.allocator.dupe(u8, std.mem.span(col_name.?)) catch return ReleaseError.OutOfMemory else null;
+        pkg.version = if (col_version != null) ctx.allocator.dupe(u8, std.mem.span(col_version.?)) catch return ReleaseError.OutOfMemory else null;
+        pkg.release = col_release;
+        pkg.arch = if (col_arch != null) ctx.allocator.dupe(u8, std.mem.span(col_arch.?)) catch return ReleaseError.OutOfMemory else null;
+        pkg.archive_hash = if (col_hash != null) ctx.allocator.dupe(u8, std.mem.span(col_hash.?)) catch return ReleaseError.OutOfMemory else "";
+
+        result.append(ctx.allocator, pkg) catch return ReleaseError.OutOfMemory;
+    }
+
+    return result;
+}
+
+/// Publish merges new packages from a dev repo into the production output
+/// directory, applies retention, removes orphaned archives, and signs.
 ///
-/// `dev_repo_dir` is opened read-only and never mutated. `output_dir` is
-/// bootstrapped if needed, then rebuilt from scratch under the repo lock
-/// (`repo_history.stageNext`/`Staged.commit`) and signed with the resolved
-/// signing key (via `ctx.signing_key_path`, or the default key resolution
-/// chain if unset).
+/// The output directory's existing repo.db is the single source of truth
+/// for what is currently published. The dev repo contributes *new* packages
+/// only — it is a staging area, not an accumulator. Both paths must be
+/// absolute; the caller (CLI layer) is responsible for resolving them.
+///
+/// Flow:
+/// 1. Read all packages from the dev repo (with retention applied to its
+///    own contents — only the latest N per name+arch are considered).
+/// 2. Verify each selected archive exists and is hash-correct in the dev
+///    repo's pool.
+/// 3. Bootstrap the output directory if needed.
+/// 4. Stage from the output directory's current repo.db (preserving
+///    everything already published).
+/// 5. Insert new packages (skip any that already exist in the output DB).
+/// 6. Apply retention across the full output DB (prune to keep-count per
+///    name+arch). Delete orphaned archive files for pruned rows.
+/// 7. Sign and commit.
 pub fn publish(ctx: *Context, dev_repo_dir: []const u8, output_dir: []const u8) ReleaseError!void {
     var dev_repo = Repository.init(ctx, dev_repo_dir, true) catch |err| {
         return switch (err) {
@@ -199,9 +276,9 @@ pub fn publish(ctx: *Context, dev_repo_dir: []const u8, output_dir: []const u8) 
     defer ctx.allocator.free(dev_packages_dir);
 
     // Verify every selected package's archive exists in the dev repo's pool
-    // and matches its recorded archive_hash (requirements 3 & 4) *before*
-    // touching the output directory at all, so a bad dev repo state fails
-    // loudly without partially publishing anything.
+    // and matches its recorded archive_hash *before* touching the output
+    // directory at all, so a bad dev repo state fails loudly without
+    // partially publishing anything.
     var source_paths: std.ArrayList([]const u8) = .empty;
     defer {
         for (source_paths.items) |sp| ctx.allocator.free(sp);
@@ -216,13 +293,14 @@ pub fn publish(ctx: *Context, dev_repo_dir: []const u8, output_dir: []const u8) 
     }
 
     // Bootstrap the output directory (idempotent: creates repo.db +
-    // packages/ with schema if missing, no-ops if already present). The
-    // output directory is write-only; nothing here is ever read as input.
+    // packages/ with schema if missing, no-ops if already present).
     import_mod.bootstrapRepoSource(ctx, output_dir) catch {
         return ctx.fail(ReleaseError.FileSystem, output_dir, "failed to initialize release output directory");
     };
 
     // Acquire the output repo's exclusive lock and stage the next db state.
+    // stageNext copies the output dir's current repo.db into .next/ — this
+    // preserves everything already published.
     var staged = repo_history.stageNext(ctx, output_dir) catch |err| {
         return switch (err) {
             error.OutOfMemory => ReleaseError.OutOfMemory,
@@ -233,12 +311,12 @@ pub fn publish(ctx: *Context, dev_repo_dir: []const u8, output_dir: []const u8) 
     };
     defer staged.deinit();
 
-    // The dev repo is the sole source of truth: rebuild the output db from
-    // scratch on every publish rather than merging with whatever was
-    // published last time.
-    try clearAllPackages(staged.db);
-
+    // Insert new packages from the dev repo. Skip any that already exist
+    // in the output DB (same name+version+release+arch tuple).
     for (selected.items, source_paths.items) |*pkg, source_path| {
+        const already_exists = packageExistsInDb(staged.db, pkg);
+        if (already_exists) continue;
+
         const dest_path = import_mod.storeArtifactAtomically(ctx, pkg, source_path, output_dir) catch {
             return ctx.fail(ReleaseError.FileSystem, pkg.name orelse "unknown", "failed to publish package archive to release output");
         };
@@ -251,6 +329,62 @@ pub fn publish(ctx: *Context, dev_repo_dir: []const u8, output_dir: []const u8) 
                 else => ctx.fail(ReleaseError.CorruptData, pkg.name orelse "unknown", "failed to insert package into release output database"),
             };
         };
+    }
+
+    // Apply retention across the full output DB. Collect the set of
+    // (name, arch) pairs that might need pruning — both from newly
+    // inserted packages and from everything already in the DB.
+    const output_packages_dir = std.fs.path.join(ctx.allocator, &.{ output_dir, "packages" }) catch {
+        return ReleaseError.OutOfMemory;
+    };
+    defer ctx.allocator.free(output_packages_dir);
+
+    var pairs = staged.db.getDistinctPackageNameArch(ctx.allocator) catch |err| {
+        return switch (err) {
+            error.OutOfMemory => ReleaseError.OutOfMemory,
+            else => ctx.fail(ReleaseError.FileSystem, output_dir, "failed to enumerate packages for retention"),
+        };
+    };
+    defer {
+        for (pairs.items) |pair| {
+            ctx.allocator.free(pair.name);
+            ctx.allocator.free(pair.arch);
+        }
+        pairs.deinit(ctx.allocator);
+    }
+
+    for (pairs.items) |pair| {
+        // Collect packages that will be pruned (beyond keep-count) so we
+        // can delete their archive files after removing the DB rows.
+        var to_prune = try collectPruneCandidates(ctx, staged.db, pair.name, pair.arch, repo_history.DEFAULT_KEEP_VERSIONS);
+        defer {
+            for (to_prune.items) |*pkg| pkg.deinit();
+            to_prune.deinit(ctx.allocator);
+        }
+
+        if (to_prune.items.len == 0) continue;
+
+        // Prune DB rows.
+        _ = repo_history.pruneOldVersions(
+            staged.db,
+            pair.name,
+            pair.arch,
+            repo_history.DEFAULT_KEEP_VERSIONS,
+        ) catch |err| {
+            return switch (err) {
+                error.OutOfMemory => ReleaseError.OutOfMemory,
+                else => ctx.fail(ReleaseError.FileSystem, pair.name, "failed to prune old package versions"),
+            };
+        };
+
+        // Delete orphaned archive files for pruned packages.
+        for (to_prune.items) |*pruned_pkg| {
+            const canonical_name = pruned_pkg.canonicalArchiveName() catch continue;
+            defer ctx.allocator.free(canonical_name);
+            const archive_path = std.fs.path.join(ctx.allocator, &.{ output_packages_dir, canonical_name }) catch continue;
+            defer ctx.allocator.free(archive_path);
+            std.Io.Dir.deleteFileAbsolute(p.currentIo(), archive_path) catch {};
+        }
     }
 
     staged.commit() catch {
