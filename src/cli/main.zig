@@ -9,6 +9,7 @@ const MereError = mere.errors.MereError;
 const install = @import("commands/install.zig");
 const uninstall = @import("commands/uninstall.zig");
 const dev = @import("commands/dev.zig");
+const release_cmd = @import("commands/release.zig");
 const etc_cmd = @import("commands/etc.zig");
 const shell_cmd = @import("commands/shell.zig");
 const profile_cmd = @import("commands/profile.zig");
@@ -142,6 +143,11 @@ fn registerCommands(allocator: std.mem.Allocator, cli_system: *cli.CLI, root_com
     const dev_command = try dev.createCommand(allocator);
     try cli_system.registerCommand(dev_command);
     try root_command.addSubcommand(dev_command);
+
+    // Create release command with subcommands
+    const release_command = try release_cmd.createCommand(allocator);
+    try cli_system.registerCommand(release_command);
+    try root_command.addSubcommand(release_command);
 
     // Create store command (clean, verify, pin, generation)
     const store_command = try store_cmd.createCommand(allocator);

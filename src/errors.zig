@@ -197,6 +197,10 @@ pub fn getUserFriendlyMessage(err: anyerror) []const u8 {
         error.SigningFailed => "failed to sign repository metadata",
         error.StateNotFound => "required repository state not found",
 
+        // Release publish module errors
+        error.ArchiveMissing => "required package archive missing from dev repository pool",
+        error.ArchiveHashMismatch => "package archive content does not match dev repository database record",
+
         // Default fallback — static string avoids pulling in global error name table
         else => "unknown error",
     };

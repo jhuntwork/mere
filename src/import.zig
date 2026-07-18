@@ -99,7 +99,12 @@ fn getBootstrapPath(ctx: *Context, repo_name_or_path: []const u8) ![]const u8 {
     return bp;
 }
 
-fn bootstrapRepoSource(ctx: *Context, repo_path: []const u8) !void {
+/// Create/ensure a flat-layout repository directory (repo.db + packages/)
+/// exists and has its schema initialized. Idempotent: safe to call against
+/// an already-bootstrapped repository directory (used by both `mere dev
+/// import`'s auto-bootstrap and `mere release publish`'s output-directory
+/// bootstrap).
+pub fn bootstrapRepoSource(ctx: *Context, repo_path: []const u8) !void {
     // All repos use flat layout: repo.db + packages/ at root
     p.ensureDirExists(repo_path) catch {
         return ctx.fail(ImportError.FileSystem, repo_path, "failed to create repo directory");
@@ -329,7 +334,14 @@ fn validateProjectionIndex(ctx: *Context, temp_dir: []const u8) !void {
     };
 }
 
-fn storeArtifactAtomically(ctx: *Context, pkg: *const package.Package, final_pkg_path: []const u8, repo_dir: []const u8) ![]const u8 {
+/// Atomically copy `final_pkg_path` into `<repo_dir>/packages/<canonical_name>`,
+/// where canonical_name is derived from the package's (name, version, release,
+/// arch, archive_hash) tuple. The packages dir is content-addressed: an
+/// existing file at the canonical path is treated as already-present and
+/// returned as-is (idempotent). Exported for reuse by `mere release publish`,
+/// which persists archives into a release output directory the same way
+/// `mere dev import` persists them into a dev repo's pool.
+pub fn storeArtifactAtomically(ctx: *Context, pkg: *const package.Package, final_pkg_path: []const u8, repo_dir: []const u8) ![]const u8 {
     const packages_dir = try std.fs.path.join(ctx.allocator, &.{ repo_dir, "packages" });
     p.ensureDirExists(packages_dir) catch {
         ctx.setDiagnosticContext(packages_dir, "failed to create repo packages dir");
