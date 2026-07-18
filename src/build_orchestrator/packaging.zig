@@ -982,7 +982,7 @@ test "packageArtifacts records archive metadata for staged packages" {
         \\    name "pack"
         \\    version "1.0"
         \\    release 1
-        \\    archs "x86_64"
+        \\    archs "x86_64" "aarch64"
         \\}
         \\build { script "true" }
         \\package "pack" { files "usr/bin/*" }
@@ -1081,7 +1081,7 @@ test "packageArtifacts returns error when archive creation fails under stop poli
         \\    name "packfailstop"
         \\    version "1.0"
         \\    release 1
-        \\    archs "x86_64"
+        \\    archs "x86_64" "aarch64"
         \\}
         \\build { script "true" }
         \\package "packfailstop" { files "usr/bin/*" }
@@ -1157,7 +1157,7 @@ test "packageArtifacts compresses man pages by default before packaging" {
         \\    name "packman"
         \\    version "1.0"
         \\    release 1
-        \\    archs "x86_64"
+        \\    archs "x86_64" "aarch64"
         \\}
         \\build { script "true" }
         \\package "packman" { files "usr/share/man/man1/*" }
@@ -1250,7 +1250,7 @@ test "packageArtifacts respects compress-manpages false" {
         \\    name "packmanoptout"
         \\    version "1.0"
         \\    release 1
-        \\    archs "x86_64"
+        \\    archs "x86_64" "aarch64"
         \\}
         \\build { script "true" }
         \\package "packmanoptout" {
@@ -1346,7 +1346,7 @@ test "packageArtifacts continues on archive failure under continue policy" {
         \\    name "packfailcontinue"
         \\    version "1.0"
         \\    release 1
-        \\    archs "x86_64"
+        \\    archs "x86_64" "aarch64"
         \\}
         \\build { script "true" }
         \\package "packfailcontinue" { files "usr/bin/*" }
@@ -1418,7 +1418,7 @@ test "packageArtifacts emits per-package metadata report callback" {
         \\    name "pack-report"
         \\    version "1.0"
         \\    release 1
-        \\    archs "x86_64"
+        \\    archs "x86_64" "aarch64"
         \\}
         \\build { script "true" }
         \\package "pack-report" { files "usr/bin/*" }
@@ -1522,7 +1522,7 @@ test "packageArtifacts creates package archives concurrently and preserves outpu
         \\    name "pack-parallel"
         \\    version "1.0"
         \\    release 1
-        \\    archs "x86_64"
+        \\    archs "x86_64" "aarch64"
         \\}
         \\build { script "true" }
         \\package "pack-a" { files "usr/bin/a" }
@@ -1653,7 +1653,7 @@ test "buildInjectedDependenciesForSplit injects exact split runtime dependency f
         \\    name "split"
         \\    version "1.2.3"
         \\    release 7
-        \\    archs "x86_64"
+        \\    archs "x86_64" "aarch64"
         \\}
         \\build { script "true" }
         \\package "libfoo" { files "usr/lib/libfoo.so" "usr/lib/libfoo.so.1.2.3" }
@@ -1754,7 +1754,7 @@ test "buildInjectedDependenciesForSplit rejects ambiguous sibling runtime owners
         \\    name "split"
         \\    version "1.2.3"
         \\    release 7
-        \\    archs "x86_64"
+        \\    archs "x86_64" "aarch64"
         \\}
         \\build { script "true" }
         \\package "libfoo-one" { files "usr/lib/libfoo.so.1.2.3" }

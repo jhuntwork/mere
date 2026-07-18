@@ -69,7 +69,6 @@ pub fn parse(ctx: *mere.Context, recipe_buf: []const u8) !Recipe {
         const builtin = @import("builtin");
         const host_arch = @tagName(builtin.cpu.arch);
         recipe.arch = selectArchitecture(recipe.supported_archs.items, host_arch) catch |err| {
-            recipe.deinit();
             // Enrich error with recipe identity for easier debugging
             return ctx.fail(err, recipe.name, "failed to select/validate architecture");
         };
@@ -1111,7 +1110,7 @@ test "interpolate expands recipe and vars patterns" {
         \\    name "foo"
         \\    version "1.2.3"
         \\    release 1
-        \\    archs "x86_64"
+        \\    archs "x86_64" "aarch64"
         \\    description "desc"
         \\    url "http://example.com"
         \\    licenses "MIT"
@@ -1151,7 +1150,7 @@ test "interpolate leaves shell placeholders intact" {
         \\    name "foo"
         \\    version "1.2.3"
         \\    release 1
-        \\    archs "x86_64"
+        \\    archs "x86_64" "aarch64"
         \\    description "desc"
         \\    url "http://example.com"
         \\    licenses "MIT"
@@ -1231,7 +1230,7 @@ test "recipe arch interpolation" {
         \\    name "foo"
         \\    version "1.2.3"
         \\    release 1
-        \\    archs "x86_64"
+        \\    archs "x86_64" "aarch64"
         \\    description "desc"
         \\    url "http://example.com"
         \\    licenses "MIT"
@@ -1252,7 +1251,9 @@ test "recipe arch interpolation" {
     const out = try interpolate(test_env.ctx.allocator, &test_env.ctx, input, &r, &r.vars);
     defer test_env.ctx.allocator.free(out);
 
-    try std.testing.expect(std.mem.eql(u8, out, "Package for x86_64 architecture: foo"));
+    const expected = try std.fmt.allocPrint(test_env.ctx.allocator, "Package for {s} architecture: foo", .{@tagName(@import("builtin").cpu.arch)});
+    defer test_env.ctx.allocator.free(expected);
+    try std.testing.expectEqualStrings(expected, out);
 }
 
 test "KV.init OutOfMemory error on key allocation failure" {

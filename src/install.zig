@@ -2298,7 +2298,7 @@ test "multi-repository install uses priority and resolves dependencies across re
     pkg_a.name = try ctx.allocator.dupe(u8, "A");
     pkg_a.version = try ctx.allocator.dupe(u8, "1.0.0");
     pkg_a.release = 1;
-    pkg_a.arch = try ctx.allocator.dupe(u8, "x86_64");
+    pkg_a.arch = try ctx.allocator.dupe(u8, th.host_arch);
 
     var pkg_a_content_hash: []const u8 = "";
     defer if (pkg_a_content_hash.len > 0) ctx.allocator.free(pkg_a_content_hash);
@@ -2334,7 +2334,7 @@ test "multi-repository install uses priority and resolves dependencies across re
             .schema_version = 1,
             .created_at = 1706745600,
             .release = 1,
-            .arch = "x86_64",
+            .arch = th.host_arch,
             .name = "A",
             .version = "1.0.0",
             .content_hash = content_hash_bytes,
@@ -2372,7 +2372,7 @@ test "multi-repository install uses priority and resolves dependencies across re
     pkg_b.name = try ctx.allocator.dupe(u8, "B");
     pkg_b.version = try ctx.allocator.dupe(u8, "1.0.0");
     pkg_b.release = 1;
-    pkg_b.arch = try ctx.allocator.dupe(u8, "x86_64");
+    pkg_b.arch = try ctx.allocator.dupe(u8, th.host_arch);
 
     var pkg_b_content_hash: []const u8 = "";
     defer if (pkg_b_content_hash.len > 0) ctx.allocator.free(pkg_b_content_hash);
@@ -2408,7 +2408,7 @@ test "multi-repository install uses priority and resolves dependencies across re
             .schema_version = 1,
             .created_at = 1706745600,
             .release = 1,
-            .arch = "x86_64",
+            .arch = th.host_arch,
             .name = "B",
             .version = "1.0.0",
             .content_hash = content_hash_bytes,
@@ -2525,7 +2525,7 @@ test "multi-repository install uses priority and resolves dependencies across re
     // Print expected cache destination for A after repocache1 is declared
     const cache_dir1 = try repocache1.archiveCacheDir();
     defer ctx.allocator.free(cache_dir1);
-    const pkg_a_canon = try std.fmt.allocPrint(ctx.allocator, "A-1.0.0-1-x86_64-{s}.pkg.tar.zst", .{pkg_a.archive_hash});
+    const pkg_a_canon = try std.fmt.allocPrint(ctx.allocator, "A-1.0.0-1-{s}-{s}.pkg.tar.zst", .{ th.host_arch, pkg_a.archive_hash });
     defer ctx.allocator.free(pkg_a_canon);
     const cache_path_a = try std.fs.path.join(ctx.allocator, &.{ cache_dir1, pkg_a_canon });
     defer ctx.allocator.free(cache_path_a);
@@ -2555,7 +2555,7 @@ test "resolveInstallPlan batches multiple roots and deduplicates shared dependen
     pkg_a.name = try ctx.allocator.dupe(u8, "A");
     pkg_a.version = try ctx.allocator.dupe(u8, "1.0.0");
     pkg_a.release = 1;
-    pkg_a.arch = try ctx.allocator.dupe(u8, "x86_64");
+    pkg_a.arch = try ctx.allocator.dupe(u8, th.host_arch);
     pkg_a.signature = try ctx.allocator.dupe(u8, "sig-a");
     pkg_a.content_hash = try ctx.allocator.dupe(u8, "hash-a");
     pkg_a.archive_hash = try ctx.allocator.dupe(u8, "a" ** 64);
@@ -2567,7 +2567,7 @@ test "resolveInstallPlan batches multiple roots and deduplicates shared dependen
     pkg_b.name = try ctx.allocator.dupe(u8, "B");
     pkg_b.version = try ctx.allocator.dupe(u8, "1.0.0");
     pkg_b.release = 1;
-    pkg_b.arch = try ctx.allocator.dupe(u8, "x86_64");
+    pkg_b.arch = try ctx.allocator.dupe(u8, th.host_arch);
     pkg_b.signature = try ctx.allocator.dupe(u8, "sig-b");
     pkg_b.content_hash = try ctx.allocator.dupe(u8, "hash-b");
     pkg_b.archive_hash = try ctx.allocator.dupe(u8, "b" ** 64);
@@ -2579,7 +2579,7 @@ test "resolveInstallPlan batches multiple roots and deduplicates shared dependen
     pkg_c.name = try ctx.allocator.dupe(u8, "C");
     pkg_c.version = try ctx.allocator.dupe(u8, "1.0.0");
     pkg_c.release = 1;
-    pkg_c.arch = try ctx.allocator.dupe(u8, "x86_64");
+    pkg_c.arch = try ctx.allocator.dupe(u8, th.host_arch);
     pkg_c.signature = try ctx.allocator.dupe(u8, "sig-c");
     pkg_c.content_hash = try ctx.allocator.dupe(u8, "hash-c");
     pkg_c.archive_hash = try ctx.allocator.dupe(u8, "c" ** 64);
@@ -2730,7 +2730,7 @@ test "integration: full install pipeline publishes named profile root" {
     pkg_a.name = try ctx.allocator.dupe(u8, "pkgA");
     pkg_a.version = try ctx.allocator.dupe(u8, "1.0.0");
     pkg_a.release = 1;
-    pkg_a.arch = try ctx.allocator.dupe(u8, "x86_64");
+    pkg_a.arch = try ctx.allocator.dupe(u8, th.host_arch);
 
     var pkg_a_file: []const u8 = "";
     defer if (pkg_a_file.len > 0) ctx.allocator.free(pkg_a_file);
@@ -2767,7 +2767,7 @@ test "integration: full install pipeline publishes named profile root" {
         .schema_version = 1,
         .created_at = 1706745600,
         .release = 1,
-        .arch = "x86_64",
+        .arch = th.host_arch,
         .name = "pkgA",
         .version = "1.0.0",
         .content_hash = content_hash_bytes_a,
@@ -2797,7 +2797,7 @@ test "integration: full install pipeline publishes named profile root" {
     pkg_b.name = try ctx.allocator.dupe(u8, "pkgB");
     pkg_b.version = try ctx.allocator.dupe(u8, "2.0.0");
     pkg_b.release = 1;
-    pkg_b.arch = try ctx.allocator.dupe(u8, "x86_64");
+    pkg_b.arch = try ctx.allocator.dupe(u8, th.host_arch);
 
     var pkg_b_file: []const u8 = "";
     defer if (pkg_b_file.len > 0) ctx.allocator.free(pkg_b_file);
@@ -2834,7 +2834,7 @@ test "integration: full install pipeline publishes named profile root" {
         .schema_version = 1,
         .created_at = 1706745600,
         .release = 1,
-        .arch = "x86_64",
+        .arch = th.host_arch,
         .name = "pkgB",
         .version = "2.0.0",
         .content_hash = content_hash_bytes_b,
@@ -3033,7 +3033,7 @@ test "integration: named profile lifecycle replaces root atomically and additive
     pkg_a.name = try ctx.allocator.dupe(u8, "pkgA");
     pkg_a.version = try ctx.allocator.dupe(u8, "1.0.0");
     pkg_a.release = 1;
-    pkg_a.arch = try ctx.allocator.dupe(u8, "x86_64");
+    pkg_a.arch = try ctx.allocator.dupe(u8, th.host_arch);
 
     var pkg_a_file: []const u8 = "";
     defer if (pkg_a_file.len > 0) ctx.allocator.free(pkg_a_file);
@@ -3068,7 +3068,7 @@ test "integration: named profile lifecycle replaces root atomically and additive
         .schema_version = 1,
         .created_at = 1706745600,
         .release = 1,
-        .arch = "x86_64",
+        .arch = th.host_arch,
         .name = "pkgA",
         .version = "1.0.0",
         .content_hash = content_hash_bytes_a,
@@ -3097,7 +3097,7 @@ test "integration: named profile lifecycle replaces root atomically and additive
     pkg_c.name = try ctx.allocator.dupe(u8, "pkgC");
     pkg_c.version = try ctx.allocator.dupe(u8, "3.0.0");
     pkg_c.release = 1;
-    pkg_c.arch = try ctx.allocator.dupe(u8, "x86_64");
+    pkg_c.arch = try ctx.allocator.dupe(u8, th.host_arch);
 
     var pkg_c_file: []const u8 = "";
     defer if (pkg_c_file.len > 0) ctx.allocator.free(pkg_c_file);
@@ -3132,7 +3132,7 @@ test "integration: named profile lifecycle replaces root atomically and additive
         .schema_version = 1,
         .created_at = 1706745600,
         .release = 1,
-        .arch = "x86_64",
+        .arch = th.host_arch,
         .name = "pkgC",
         .version = "3.0.0",
         .content_hash = content_hash_bytes_c,
@@ -3313,7 +3313,7 @@ test "integration: symlink tree conflict detection" {
     pkg_x.name = try ctx.allocator.dupe(u8, "pkgX");
     pkg_x.version = try ctx.allocator.dupe(u8, "1.0.0");
     pkg_x.release = 1;
-    pkg_x.arch = try ctx.allocator.dupe(u8, "x86_64");
+    pkg_x.arch = try ctx.allocator.dupe(u8, th.host_arch);
 
     var pkg_x_file: []const u8 = "";
     defer if (pkg_x_file.len > 0) ctx.allocator.free(pkg_x_file);
@@ -3344,7 +3344,7 @@ test "integration: symlink tree conflict detection" {
         .schema_version = 1,
         .created_at = 1706745600,
         .release = 1,
-        .arch = "x86_64",
+        .arch = th.host_arch,
         .name = "pkgX",
         .version = "1.0.0",
         .content_hash = content_hash_bytes_x,
@@ -3372,7 +3372,7 @@ test "integration: symlink tree conflict detection" {
     pkg_y.name = try ctx.allocator.dupe(u8, "pkgY");
     pkg_y.version = try ctx.allocator.dupe(u8, "2.0.0");
     pkg_y.release = 1;
-    pkg_y.arch = try ctx.allocator.dupe(u8, "x86_64");
+    pkg_y.arch = try ctx.allocator.dupe(u8, th.host_arch);
 
     var pkg_y_file: []const u8 = "";
     defer if (pkg_y_file.len > 0) ctx.allocator.free(pkg_y_file);
@@ -3403,7 +3403,7 @@ test "integration: symlink tree conflict detection" {
         .schema_version = 1,
         .created_at = 1706745600,
         .release = 1,
-        .arch = "x86_64",
+        .arch = th.host_arch,
         .name = "pkgY",
         .version = "2.0.0",
         .content_hash = content_hash_bytes_y,
@@ -3429,7 +3429,7 @@ test "integration: symlink tree conflict detection" {
     pkg_main.name = try ctx.allocator.dupe(u8, "pkgMain");
     pkg_main.version = try ctx.allocator.dupe(u8, "1.0.0");
     pkg_main.release = 1;
-    pkg_main.arch = try ctx.allocator.dupe(u8, "x86_64");
+    pkg_main.arch = try ctx.allocator.dupe(u8, th.host_arch);
 
     var pkg_main_file: []const u8 = "";
     defer if (pkg_main_file.len > 0) ctx.allocator.free(pkg_main_file);
@@ -3452,7 +3452,7 @@ test "integration: symlink tree conflict detection" {
         .schema_version = 1,
         .created_at = 1706745600,
         .release = 1,
-        .arch = "x86_64",
+        .arch = th.host_arch,
         .name = "pkgMain",
         .version = "1.0.0",
         .content_hash = content_hash_bytes_main,
@@ -3610,7 +3610,7 @@ test "integration: multi-repository priority selection" {
     pkg_high.name = try ctx.allocator.dupe(u8, "sharedPkg");
     pkg_high.version = try ctx.allocator.dupe(u8, "2.0.0");
     pkg_high.release = 1;
-    pkg_high.arch = try ctx.allocator.dupe(u8, "x86_64");
+    pkg_high.arch = try ctx.allocator.dupe(u8, th.host_arch);
 
     var pkg_high_file: []const u8 = "";
     defer if (pkg_high_file.len > 0) ctx.allocator.free(pkg_high_file);
@@ -3642,7 +3642,7 @@ test "integration: multi-repository priority selection" {
         .schema_version = 1,
         .created_at = 1706745600,
         .release = 1,
-        .arch = "x86_64",
+        .arch = th.host_arch,
         .name = "sharedPkg",
         .version = "2.0.0",
         .content_hash = content_hash_bytes_high,
@@ -3669,7 +3669,7 @@ test "integration: multi-repository priority selection" {
     pkg_low.name = try ctx.allocator.dupe(u8, "sharedPkg");
     pkg_low.version = try ctx.allocator.dupe(u8, "1.0.0");
     pkg_low.release = 1;
-    pkg_low.arch = try ctx.allocator.dupe(u8, "x86_64");
+    pkg_low.arch = try ctx.allocator.dupe(u8, th.host_arch);
 
     var pkg_low_file: []const u8 = "";
     defer if (pkg_low_file.len > 0) ctx.allocator.free(pkg_low_file);
@@ -3701,7 +3701,7 @@ test "integration: multi-repository priority selection" {
         .schema_version = 1,
         .created_at = 1706745600,
         .release = 1,
-        .arch = "x86_64",
+        .arch = th.host_arch,
         .name = "sharedPkg",
         .version = "1.0.0",
         .content_hash = content_hash_bytes_low,
@@ -3908,7 +3908,7 @@ test "integration: garbage collection removes unreferenced store paths" {
             pkg.name = try context.allocator.dupe(u8, pkg_name);
             pkg.version = try context.allocator.dupe(u8, pkg_version);
             pkg.release = 1;
-            pkg.arch = try context.allocator.dupe(u8, "x86_64");
+            pkg.arch = try context.allocator.dupe(u8, th.host_arch);
             var pkg_file: []const u8 = "";
             defer if (pkg_file.len > 0) context.allocator.free(pkg_file);
 
@@ -3945,7 +3945,7 @@ test "integration: garbage collection removes unreferenced store paths" {
                 .schema_version = 1,
                 .created_at = 1706745600,
                 .release = 1,
-                .arch = "x86_64",
+                .arch = th.host_arch,
                 .name = pkg_name,
                 .version = pkg_version,
                 .content_hash = content_hash_bytes,
@@ -4144,7 +4144,7 @@ test "installPackageToProfile symlinks to target profile" {
             .name = "test-pkg",
             .version = "1.0.0",
             .release = 1,
-            .arch = "x86_64",
+            .arch = th.host_arch,
             .store_path = pkg_store_path,
             .content_hash = content_hash,
         },
@@ -4326,7 +4326,7 @@ test "enforceRepoMetadataBinding rejects content hash mismatch" {
     pkg.name = try ctx.allocator.dupe(u8, "pkgA");
     pkg.version = try ctx.allocator.dupe(u8, "1.0.0");
     pkg.release = 1;
-    pkg.arch = try ctx.allocator.dupe(u8, "x86_64");
+    pkg.arch = try ctx.allocator.dupe(u8, th.host_arch);
     pkg.content_hash = try ctx.allocator.dupe(u8, "a" ** 64);
     pkg.archive_hash = try ctx.allocator.dupe(u8, "b" ** 64);
 
@@ -4341,7 +4341,7 @@ test "enforceRepoMetadataBinding rejects content hash mismatch" {
             .name = "pkgA",
             .version = "1.0.0",
             .release = 1,
-            .arch = "x86_64",
+            .arch = th.host_arch,
             .content_hash = manifest_hash_bytes,
         },
     };
@@ -4373,7 +4373,7 @@ test "enforceRepoMetadataBinding rejects manifest identity mismatch" {
     pkg.name = try ctx.allocator.dupe(u8, "pkgA");
     pkg.version = try ctx.allocator.dupe(u8, "1.0.0");
     pkg.release = 1;
-    pkg.arch = try ctx.allocator.dupe(u8, "x86_64");
+    pkg.arch = try ctx.allocator.dupe(u8, th.host_arch);
     pkg.content_hash = try ctx.allocator.dupe(u8, "a" ** 64);
     pkg.archive_hash = try ctx.allocator.dupe(u8, "b" ** 64);
 
@@ -4388,7 +4388,7 @@ test "enforceRepoMetadataBinding rejects manifest identity mismatch" {
             .name = "pkgB",
             .version = "1.0.0",
             .release = 1,
-            .arch = "x86_64",
+            .arch = th.host_arch,
             .content_hash = hash_bytes,
         },
     };
@@ -4420,7 +4420,7 @@ test "preVerifyManifest fails when trusted fingerprints are missing" {
     pkg.name = try ctx.allocator.dupe(u8, "sigtest");
     pkg.version = try ctx.allocator.dupe(u8, "1.0.0");
     pkg.release = 1;
-    pkg.arch = try ctx.allocator.dupe(u8, "x86_64");
+    pkg.arch = try ctx.allocator.dupe(u8, th.host_arch);
     pkg.content_hash = try ctx.allocator.dupe(u8, "dummyhash");
     pkg.archive_hash = try ctx.allocator.dupe(u8, "a" ** 64);
 
@@ -4521,12 +4521,13 @@ fn createSignedTestPackage(
     version: []const u8,
     deps: []const []const u8,
 ) !void {
+    const th = @import("test_helpers.zig");
     var pkg = package.Package.init(ctx);
     defer pkg.deinit();
     pkg.name = try ctx.allocator.dupe(u8, name);
     pkg.version = try ctx.allocator.dupe(u8, version);
     pkg.release = 1;
-    pkg.arch = try ctx.allocator.dupe(u8, "x86_64");
+    pkg.arch = try ctx.allocator.dupe(u8, th.host_arch);
 
     const staging = try std.fs.path.join(ctx.allocator, &.{ staging_root, name });
     defer ctx.allocator.free(staging);
@@ -4556,7 +4557,7 @@ fn createSignedTestPackage(
         .schema_version = 1,
         .created_at = 1706745600,
         .release = 1,
-        .arch = "x86_64",
+        .arch = th.host_arch,
         .name = name,
         .version = version,
         .content_hash = content_hash_bytes,

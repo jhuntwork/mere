@@ -16,6 +16,8 @@ const projection_index = @import("projection_index.zig");
 const store = @import("store.zig");
 const Repository = repository.Repository;
 
+pub const host_arch = @tagName(@import("builtin").cpu.arch);
+
 fn makeWritable(dir_path: []const u8) void {
     const io = path.currentIo();
     var dir = std.Io.Dir.openDirAbsolute(io, dir_path, .{ .iterate = true }) catch return;
@@ -391,7 +393,7 @@ pub fn setupTestImport(
         .schema_version = 1,
         .created_at = @intCast(std.Io.Clock.real.now(path.currentIo()).toSeconds()),
         .release = pkg.release orelse 1,
-        .arch = pkg.arch orelse "x86_64",
+        .arch = pkg.arch orelse host_arch,
         .name = pkg.name orelse "testpkg",
         .version = pkg.version orelse "1.0.0",
         .content_hash = content_hash_bytes,
@@ -543,7 +545,7 @@ test "setupTestImport returns active current-state repo.db path" {
     pkg.name = try ctx.allocator.dupe(u8, "helper-testpkg");
     pkg.version = try ctx.allocator.dupe(u8, "1.0.0");
     pkg.release = 1;
-    pkg.arch = try ctx.allocator.dupe(u8, "x86_64");
+    pkg.arch = try ctx.allocator.dupe(u8, host_arch);
     pkg.content_hash = try ctx.allocator.dupe(u8, "dummyhash");
     pkg.archive_hash = try ctx.allocator.dupe(u8, "a" ** 64);
 
@@ -693,7 +695,7 @@ pub fn setupBusyboxRepo(test_env: *TestEnv) !TestRepoSetup {
     pkg.name = try ctx.allocator.dupe(u8, "busybox");
     pkg.version = try ctx.allocator.dupe(u8, "1.0.0");
     pkg.release = 1;
-    pkg.arch = try ctx.allocator.dupe(u8, "x86_64");
+    pkg.arch = try ctx.allocator.dupe(u8, host_arch);
 
     const pkg_staging = try std.fs.path.join(ctx.allocator, &.{ test_env.path, "busybox_staging" });
     defer ctx.allocator.free(pkg_staging);
@@ -724,7 +726,7 @@ pub fn setupBusyboxRepo(test_env: *TestEnv) !TestRepoSetup {
         .schema_version = 1,
         .created_at = 1706745600,
         .release = 1,
-        .arch = "x86_64",
+        .arch = host_arch,
         .name = "busybox",
         .version = "1.0.0",
         .content_hash = content_hash_bytes,

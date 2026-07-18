@@ -8,9 +8,9 @@ on:
 
 jobs:
   detect:
-    runs-on: docker
+    runs-on: docker-aarch64
     container:
-      image: mere/ci:v0.13.2
+      image: mere/ci:v0.15.0
     outputs:
       version_changed: ${{ steps.meta.outputs.version_changed }}
       version: ${{ steps.meta.outputs.version }}
@@ -57,12 +57,34 @@ jobs:
         run: |
           echo "build.zig.zon changed, but .version did not change."
 
-  release-x86_64:
+  test:
     needs: detect
+    if: needs.detect.outputs.version_changed == 'true'
+    runs-on: docker-aarch64
+    container:
+      image: mere/ci:v0.15.0
+    steps:
+      - name: Git checkout
+        run: |
+          git init "$GITHUB_WORKSPACE"
+          cd "$GITHUB_WORKSPACE"
+          git remote add origin "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY.git"
+          git -c http.extraHeader="Authorization: Bearer $GITHUB_TOKEN" \
+            fetch --depth=1 origin "$GITHUB_SHA"
+          git checkout --detach FETCH_HEAD
+      - name: Test
+        run: |
+          cd "$GITHUB_WORKSPACE"
+          zig build test --summary all
+
+  release-x86_64:
+    needs:
+      - detect
+      - test
     if: needs.detect.outputs.version_changed == 'true'
     runs-on: docker
     container:
-      image: mere/ci:v0.13.2
+      image: mere/ci:v0.15.0
     outputs:
       checksum: ${{ steps.build.outputs.checksum }}
     steps:
@@ -74,12 +96,6 @@ jobs:
           git -c http.extraHeader="Authorization: Bearer $GITHUB_TOKEN" \
             fetch --depth=50 --tags origin "$GITHUB_SHA"
           git checkout --detach FETCH_HEAD
-
-      - name: Test
-        run: |
-          set -eu
-          cd "$GITHUB_WORKSPACE"
-          zig build test --summary all
 
       - name: Build and package
         id: build
@@ -201,11 +217,12 @@ jobs:
   release-aarch64:
     needs:
       - detect
+      - test
       - release-x86_64
     if: needs.detect.outputs.version_changed == 'true'
     runs-on: docker-aarch64
     container:
-      image: mere/ci:v0.13.2
+      image: mere/ci:v0.15.0
     outputs:
       checksum: ${{ steps.build.outputs.checksum }}
     steps:
@@ -294,9 +311,9 @@ jobs:
       - release-x86_64
       - release-aarch64
     if: needs.detect.outputs.version_changed == 'true'
-    runs-on: docker
+    runs-on: docker-aarch64
     container:
-      image: mere/ci:v0.13.2
+      image: mere/ci:v0.15.0
     steps:
       - name: Upload SHA256SUMS
         run: |

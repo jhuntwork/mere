@@ -218,7 +218,7 @@ test "resetPackageStagingDirs removes stale package workspace contents before st
         \\    name "pack-reset"
         \\    version "1.0"
         \\    release 1
-        \\    archs "x86_64"
+        \\    archs "x86_64" "aarch64"
         \\}
         \\build { script "true" }
         \\package "pack-reset" { files "usr/bin/*" }

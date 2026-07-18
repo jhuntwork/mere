@@ -2461,7 +2461,7 @@ test "loadRecipe parses recipe buffer and marks state" {
         \\    name "sample"
         \\    version "1.0"
         \\    release 1
-        \\    archs "x86_64"
+        \\    archs "x86_64" "aarch64"
         \\}
         \\build {
         \\    script "true"
@@ -2527,7 +2527,7 @@ test "createWorkspace initializes workspace and updates state" {
         \\    name "workspace"
         \\    version "1.0"
         \\    release 1
-        \\    archs "x86_64"
+        \\    archs "x86_64" "aarch64"
         \\}
         \\build {
         \\    script "true"
@@ -2573,7 +2573,7 @@ test "downloadSources errors when download client missing" {
         \\    name "nosources"
         \\    version "1.0"
         \\    release 1
-        \\    archs "x86_64"
+        \\    archs "x86_64" "aarch64"
         \\}
         \\build {
         \\    script "true"
@@ -2616,7 +2616,7 @@ test "downloadSources succeeds with empty sources" {
         \\    name "emptysources"
         \\    version "1.0"
         \\    release 1
-        \\    archs "x86_64"
+        \\    archs "x86_64" "aarch64"
         \\}
         \\build {
         \\    script "true"
@@ -2671,7 +2671,7 @@ test "downloadSources resolves local source paths relative to recipe directory" 
         \\    name "localsource"
         \\    version "1.0"
         \\    release 1
-        \\    archs "x86_64"
+        \\    archs "x86_64" "aarch64"
         \\}
         \\build {
         \\    script "true"
@@ -2732,7 +2732,7 @@ test "downloadSources stages recipe directory companion files without source ent
         \\    name "companions"
         \\    version "1.0"
         \\    release 1
-        \\    archs "x86_64"
+        \\    archs "x86_64" "aarch64"
         \\}
         \\build {
         \\    script "true"
@@ -2777,7 +2777,7 @@ test "unpackSources leaves state unchanged when recipe has no sources" {
         \\    name "nosources"
         \\    version "1.0"
         \\    release 1
-        \\    archs "x86_64"
+        \\    archs "x86_64" "aarch64"
         \\}
         \\build {
         \\    script "true"
@@ -2821,7 +2821,7 @@ test "unpackSources sets actual source dir when source present" {
         \\    name "withsource"
         \\    version "1.0"
         \\    release 1
-        \\    archs "x86_64"
+        \\    archs "x86_64" "aarch64"
         \\}
         \\build {
         \\    script "true"
@@ -2874,7 +2874,7 @@ test "prepareEnvironment populates workspace variables and pkg install dir" {
         \\    name "envtest"
         \\    version "1.0"
         \\    release 1
-        \\    archs "x86_64"
+        \\    archs "x86_64" "aarch64"
         \\}
         \\build {
         \\    env PATH="/bin"
@@ -2937,7 +2937,7 @@ test "prepareEnvironment respects overridden src working dir" {
         \\    name "customsrc"
         \\    version "1.0"
         \\    release 1
-        \\    archs "x86_64"
+        \\    archs "x86_64" "aarch64"
         \\}
         \\build {
         \\    script "true"
@@ -2983,7 +2983,7 @@ test "installDependencies no-ops when recipe has no dependencies" {
         \\    name "nodeps"
         \\    version "1.0"
         \\    release 1
-        \\    archs "x86_64"
+        \\    archs "x86_64" "aarch64"
         \\}
         \\build {
         \\    script "true"
@@ -3018,7 +3018,7 @@ test "installDependencies errors when download client missing" {
         \\    name "missingclient"
         \\    version "1.0"
         \\    release 1
-        \\    archs "x86_64"
+        \\    archs "x86_64" "aarch64"
         \\    depends "dep-a"
         \\}
         \\build {
@@ -3092,7 +3092,7 @@ test "finalizeResult assembles success BuildResult" {
         \\    name "finalize"
         \\    version "1.0"
         \\    release 1
-        \\    archs "x86_64"
+        \\    archs "x86_64" "aarch64"
         \\}
         \\build {
         \\    script "true"
@@ -3125,7 +3125,10 @@ test "finalizeResult assembles success BuildResult" {
 
     const outputs_root = try buildOutputsRoot(&test_env.ctx);
     defer test_env.ctx.allocator.free(outputs_root);
-    const expected_path = try std.fs.path.join(test_env.ctx.allocator, &.{ outputs_root, "finalize-1.0-1-x86_64", "finalize.pkg.tar.zst" });
+    const host_arch = @tagName(@import("builtin").cpu.arch);
+    const expected_subdir = try std.fmt.allocPrint(test_env.ctx.allocator, "finalize-1.0-1-{s}", .{host_arch});
+    defer test_env.ctx.allocator.free(expected_subdir);
+    const expected_path = try std.fs.path.join(test_env.ctx.allocator, &.{ outputs_root, expected_subdir, "finalize.pkg.tar.zst" });
     defer test_env.ctx.allocator.free(expected_path);
 
     const dup_path = try state.allocator.dupe(u8, workspace_archive_path);
@@ -3247,7 +3250,7 @@ test "finalizeResult reports partial failure and fires progress callback" {
         \\    name "finalize-partial"
         \\    version "1.0"
         \\    release 1
-        \\    archs "x86_64"
+        \\    archs "x86_64" "aarch64"
         \\}
         \\build {
         \\    script "true"
@@ -3423,7 +3426,7 @@ test "emitSplitStagingReport logs conflicts and unassigned files" {
         \\    name "split"
         \\    version "1.0"
         \\    release 1
-        \\    archs "x86_64"
+        \\    archs "x86_64" "aarch64"
         \\}
         \\build { script "true" }
         \\package "split-a" { files "usr/bin/*" }
@@ -3554,7 +3557,7 @@ test "runOneNamespacePhase includes the specific namespace error name in its dia
         \\    version "1.0"
         \\    release 1
         \\    depends "busybox"
-        \\    archs "x86_64"
+        \\    archs "x86_64" "aarch64"
         \\}
         \\build {
         \\    script "true"
@@ -3620,7 +3623,7 @@ test "executeBuild restores profile phases split staging and package archive on 
         \\    version "1.0"
         \\    release 1
         \\    depends "busybox"
-        \\    archs "x86_64"
+        \\    archs "x86_64" "aarch64"
         \\}
         \\build {
         \\    script "mkdir -p dummy && printf built > dummy/hello.txt"
@@ -3695,7 +3698,7 @@ test "restoreOrStageSplitPackages does not cache a partial result under Continue
         \\    name "split-partial"
         \\    version "1.0"
         \\    release 1
-        \\    archs "x86_64"
+        \\    archs "x86_64" "aarch64"
         \\}
         \\build { script "true" }
         \\package "pkg-a" { files "usr/bin/a" }
@@ -3781,7 +3784,7 @@ test "executeBuild restores unpacked source tree from cache on unchanged rebuild
         \\    name "source-cache-hit"
         \\    version "1.0"
         \\    release 1
-        \\    archs "x86_64"
+        \\    archs "x86_64" "aarch64"
         \\}
         \\build {
         \\    script "test -f dummy.txt"
@@ -3843,7 +3846,7 @@ test "executeBuild applies global env to every phase and overlays per-phase env"
         \\    version "1.0"
         \\    release 1
         \\    depends "busybox"
-        \\    archs "x86_64"
+        \\    archs "x86_64" "aarch64"
         \\    env GLOBAL_FLAG="global" SHARED_FLAG="base"
         \\}
         \\prepare {
@@ -3897,7 +3900,7 @@ test "executeBuild reruns changed check phase while restoring build" {
         \\    version "1.0"
         \\    release 1
         \\    depends "busybox"
-        \\    archs "x86_64"
+        \\    archs "x86_64" "aarch64"
         \\}
         \\build {
         \\    script "mkdir -p dummy && printf built > dummy/hello.txt"
@@ -3919,7 +3922,7 @@ test "executeBuild reruns changed check phase while restoring build" {
         \\    version "1.0"
         \\    release 1
         \\    depends "busybox"
-        \\    archs "x86_64"
+        \\    archs "x86_64" "aarch64"
         \\}
         \\build {
         \\    script "mkdir -p dummy && printf built > dummy/hello.txt"

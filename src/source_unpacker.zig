@@ -232,7 +232,7 @@ test "SourceUnpacker extracts first source without mutating workspace state" {
         \\    name "testpkg"
         \\    version "1.0"
         \\    release 1
-        \\    archs "x86_64"
+        \\    archs "x86_64" "aarch64"
         \\    description "test"
         \\    url "http://example.com"
         \\    licenses "MIT"
@@ -283,7 +283,7 @@ test "SourceUnpacker handles single-directory detection functionally" {
         \\    name "testpkg"
         \\    version "1.0"
         \\    release 1
-        \\    archs "x86_64"
+        \\    archs "x86_64" "aarch64"
         \\    description "test"
         \\    url "http://example.com"
         \\    licenses "MIT"
@@ -377,7 +377,7 @@ test "SourceUnpacker returns NoSources when workspace has no matching source fil
         \\    name "testpkg"
         \\    version "1.0"
         \\    release 1
-        \\    archs "x86_64"
+        \\    archs "x86_64" "aarch64"
         \\    description "test"
         \\    url "http://example.com"
         \\    licenses "MIT"
@@ -428,7 +428,7 @@ test "SourceUnpacker reports malformed archive extraction failure" {
         \\    name "testpkg"
         \\    version "1.0"
         \\    release 1
-        \\    archs "x86_64"
+        \\    archs "x86_64" "aarch64"
         \\    description "test"
         \\    url "http://example.com"
         \\    licenses "MIT"

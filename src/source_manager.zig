@@ -385,7 +385,7 @@ test "download sources independently of build orchestration" {
         \\    name "testpkg"
         \\    version "1.0"
         \\    release 1
-        \\    archs "x86_64"
+        \\    archs "x86_64" "aarch64"
         \\    description "test"
         \\    url "http://example.com"
         \\    licenses "MIT"
@@ -458,7 +458,7 @@ test "download handles pre-existing files and hardlinks correctly" {
         \\    name "testpkg"
         \\    version "1.0"
         \\    release 1
-        \\    archs "x86_64"
+        \\    archs "x86_64" "aarch64"
         \\    description "test"
         \\    url "http://example.com"
         \\    licenses "MIT"
@@ -545,7 +545,7 @@ test "download validates hashes independently" {
         \\    name "testpkg"
         \\    version "1.0"
         \\    release 1
-        \\    archs "x86_64"
+        \\    archs "x86_64" "aarch64"
         \\    description "test"
         \\    url "http://example.com"
         \\    licenses "MIT"
@@ -629,7 +629,7 @@ test "download writes cache file with expected content (atomic rename smoke)" {
         \\    name "atomic"
         \\    version "0.1"
         \\    release 1
-        \\    archs "x86_64"
+        \\    archs "x86_64" "aarch64"
         \\    description "atomic test"
         \\    url "http://example.com"
         \\    licenses "MIT"
@@ -715,7 +715,7 @@ test "download reports read errors in cache-to-workspace copy fallback" {
         \\    name "fallback-read-error"
         \\    version "1.0"
         \\    release 1
-        \\    archs "x86_64"
+        \\    archs "x86_64" "aarch64"
         \\    description "fallback read error test"
         \\    url "http://example.com"
         \\    licenses "MIT"
@@ -793,7 +793,7 @@ test "download reports permission errors in cache-to-workspace fallback" {
         \\    name "fallback-perm-error"
         \\    version "1.0"
         \\    release 1
-        \\    archs "x86_64"
+        \\    archs "x86_64" "aarch64"
         \\    description "fallback permission error test"
         \\    url "http://example.com"
         \\    licenses "MIT"
@@ -879,7 +879,7 @@ test "download accepts pre-existing matching workspace source" {
         \\    name "existing-match"
         \\    version "1.0"
         \\    release 1
-        \\    archs "x86_64"
+        \\    archs "x86_64" "aarch64"
         \\    description "existing match test"
         \\    url "http://example.com"
         \\    licenses "MIT"
@@ -963,7 +963,7 @@ test "download rejects conflicting pre-existing workspace source" {
         \\    name "existing-conflict"
         \\    version "1.0"
         \\    release 1
-        \\    archs "x86_64"
+        \\    archs "x86_64" "aarch64"
         \\    description "existing conflict test"
         \\    url "http://example.com"
         \\    licenses "MIT"

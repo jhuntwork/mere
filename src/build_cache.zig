@@ -2007,7 +2007,7 @@ test "build_cache restores split-stage metadata larger than 64 KiB" {
         \\    name "large-split"
         \\    version "1.0"
         \\    release 1
-        \\    archs "x86_64"
+        \\    archs "x86_64" "aarch64"
         \\}
         \\build { script "true" }
         \\package "large-split" { files "usr/share/*" }
