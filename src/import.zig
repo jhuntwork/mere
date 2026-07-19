@@ -299,6 +299,84 @@ fn readMetaAndPopulatePackage(ctx: *Context, temp_dir: []const u8, pkg: *package
     });
 }
 
+/// Reads meta.kdl from the extracted archive directory and builds a JSON
+/// string for the properties column containing recipe metadata (description,
+/// url, licenses, source URLs). Returns null if no metadata is present.
+fn buildPropertiesJson(ctx: *Context, temp_dir: []const u8) ?[]const u8 {
+    var pkg_meta = meta.readFile(ctx.allocator, temp_dir) catch {
+        return null;
+    };
+    defer pkg_meta.deinit();
+
+    // Only produce JSON if there's actually metadata.
+    if (pkg_meta.description == null and pkg_meta.url == null and
+        pkg_meta.licenses.items.len == 0 and pkg_meta.source_urls.items.len == 0)
+    {
+        return null;
+    }
+
+    var json: std.ArrayList(u8) = .empty;
+    json.appendSlice(ctx.allocator, "{") catch return null;
+
+    var needs_comma = false;
+
+    if (pkg_meta.description) |desc| {
+        json.appendSlice(ctx.allocator, "\"description\":\"") catch return null;
+        appendJsonEscaped(&json, ctx.allocator, desc) catch return null;
+        json.appendSlice(ctx.allocator, "\"") catch return null;
+        needs_comma = true;
+    }
+
+    if (pkg_meta.url) |u| {
+        if (needs_comma) json.appendSlice(ctx.allocator, ",") catch return null;
+        json.appendSlice(ctx.allocator, "\"url\":\"") catch return null;
+        appendJsonEscaped(&json, ctx.allocator, u) catch return null;
+        json.appendSlice(ctx.allocator, "\"") catch return null;
+        needs_comma = true;
+    }
+
+    if (pkg_meta.licenses.items.len > 0) {
+        if (needs_comma) json.appendSlice(ctx.allocator, ",") catch return null;
+        json.appendSlice(ctx.allocator, "\"licenses\":[") catch return null;
+        for (pkg_meta.licenses.items, 0..) |l, i| {
+            if (i > 0) json.appendSlice(ctx.allocator, ",") catch return null;
+            json.appendSlice(ctx.allocator, "\"") catch return null;
+            appendJsonEscaped(&json, ctx.allocator, l) catch return null;
+            json.appendSlice(ctx.allocator, "\"") catch return null;
+        }
+        json.appendSlice(ctx.allocator, "]") catch return null;
+        needs_comma = true;
+    }
+
+    if (pkg_meta.source_urls.items.len > 0) {
+        if (needs_comma) json.appendSlice(ctx.allocator, ",") catch return null;
+        json.appendSlice(ctx.allocator, "\"source_urls\":[") catch return null;
+        for (pkg_meta.source_urls.items, 0..) |s, i| {
+            if (i > 0) json.appendSlice(ctx.allocator, ",") catch return null;
+            json.appendSlice(ctx.allocator, "\"") catch return null;
+            appendJsonEscaped(&json, ctx.allocator, s) catch return null;
+            json.appendSlice(ctx.allocator, "\"") catch return null;
+        }
+        json.appendSlice(ctx.allocator, "]") catch return null;
+    }
+
+    json.appendSlice(ctx.allocator, "}") catch return null;
+    return json.toOwnedSlice(ctx.allocator) catch return null;
+}
+
+fn appendJsonEscaped(buf: *std.ArrayList(u8), allocator: std.mem.Allocator, value: []const u8) !void {
+    for (value) |ch| {
+        switch (ch) {
+            '"' => try buf.appendSlice(allocator, "\\\""),
+            '\\' => try buf.appendSlice(allocator, "\\\\"),
+            '\n' => try buf.appendSlice(allocator, "\\n"),
+            '\r' => try buf.appendSlice(allocator, "\\r"),
+            '\t' => try buf.appendSlice(allocator, "\\t"),
+            else => try buf.append(allocator, ch),
+        }
+    }
+}
+
 fn computeAndVerifyContentHash(ctx: *Context, temp_dir: []const u8, pkg_manifest: *const manifest.PackageManifestV1) !void {
     const computed_hash = try hash.calculateStoreContentHash(ctx.allocator, temp_dir, null);
     defer ctx.allocator.free(computed_hash);
@@ -634,8 +712,9 @@ fn insertPackageWithForce(
     db: *repodb.RepoDB,
     pkg_ptr: *package.Package,
     force: bool,
+    properties: ?[]const u8,
 ) !void {
-    _ = db.insertPackageTransaction(pkg_ptr) catch |err| {
+    _ = db.insertPackageTransaction(pkg_ptr, properties) catch |err| {
         if (err == repodb.RepoDBError.PackageAlreadyExists and force) {
             ctx.debug("package already exists, --force specified, replacing", .{});
             db.deletePackage(
@@ -647,7 +726,7 @@ fn insertPackageWithForce(
                 ctx.debug("failed to delete existing package: {}", .{del_err});
                 return ctx.fail(del_err, pkg_ptr.name.?, "failed to delete existing package from database");
             };
-            _ = db.insertPackageTransaction(pkg_ptr) catch |retry_err| {
+            _ = db.insertPackageTransaction(pkg_ptr, properties) catch |retry_err| {
                 const diag = ctx.getDiagnosticContext();
                 if (diag.details == null) {
                     ctx.setDiagnosticContextFmt(pkg_ptr.name.?, "failed to insert package into database: {s}", .{@errorName(retry_err)});
@@ -704,7 +783,12 @@ fn insertPruneAndCommit(
 
     for (records) |*record| {
         const pkg_ptr = &record.prepared.manifest.pkg;
-        try insertPackageWithForce(ctx, staged.db, pkg_ptr, force);
+
+        // Build properties JSON from meta.kdl metadata fields.
+        const properties = buildPropertiesJson(ctx, record.prepared.extract.temp_dir);
+        defer if (properties) |props| ctx.allocator.free(props);
+
+        try insertPackageWithForce(ctx, staged.db, pkg_ptr, force, properties);
         try appendUniqueNameArch(ctx, &touched_pairs, pkg_ptr.name.?, pkg_ptr.arch.?);
         mere.ui.emit.logFmtSeverity(ctx, .import, .info, "imported {s} {s}-{d} ({s})", .{
             pkg_ptr.name orelse "unknown",

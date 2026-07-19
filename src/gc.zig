@@ -831,7 +831,7 @@ fn writeRepoStateDb(
     for (pkgs) |spec| {
         var pkg = try makeTestRepoPackage(ctx, spec);
         defer pkg.deinit();
-        _ = try db.insertPackageTransaction(&pkg);
+        _ = try db.insertPackageTransaction(&pkg, null);
     }
 }
 

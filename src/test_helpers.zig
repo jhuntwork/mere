@@ -755,7 +755,7 @@ pub fn setupBusyboxRepo(test_env: *TestEnv) !TestRepoSetup {
     std.mem.copyForwards(u8, sig_buf, sig_bytes[0..sign.c.crypto_sign_BYTES]);
     pkg.signature = sig_buf[0..sign.c.crypto_sign_BYTES];
 
-    _ = try repo.db.insertPackageTransaction(&pkg);
+    _ = try repo.db.insertPackageTransaction(&pkg, null);
     try repo.signDb();
 
     const fingerprint = try keypair.public_key.fingerprint(ctx.allocator);

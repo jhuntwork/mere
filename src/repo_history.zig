@@ -597,7 +597,7 @@ test "pruneOldVersions removes excess versions" {
         pkg.content_hash = try test_env.ctx.allocator.dupe(u8, "deadbeef");
         pkg.archive_hash = try test_env.ctx.allocator.dupe(u8, "a" ** 64);
         pkg.signature = try test_env.ctx.allocator.dupe(u8, "aabbccdd");
-        _ = try repo.db.insertPackageTransaction(&pkg);
+        _ = try repo.db.insertPackageTransaction(&pkg, null);
     }
 
     const deleted = try pruneOldVersions(repo.db, "mypkg", "x86_64", 3);
@@ -629,7 +629,7 @@ test "pruneOldVersions does nothing when under keep count" {
     pkg1.content_hash = try test_env.ctx.allocator.dupe(u8, "deadbeef");
     pkg1.archive_hash = try test_env.ctx.allocator.dupe(u8, "a" ** 64);
     pkg1.signature = try test_env.ctx.allocator.dupe(u8, "aabbccdd");
-    _ = try repo.db.insertPackageTransaction(&pkg1);
+    _ = try repo.db.insertPackageTransaction(&pkg1, null);
 
     var pkg2 = package.Package.init(&test_env.ctx);
     defer pkg2.deinit();
@@ -640,7 +640,7 @@ test "pruneOldVersions does nothing when under keep count" {
     pkg2.content_hash = try test_env.ctx.allocator.dupe(u8, "deadbeef");
     pkg2.archive_hash = try test_env.ctx.allocator.dupe(u8, "b" ** 64);
     pkg2.signature = try test_env.ctx.allocator.dupe(u8, "aabbccdd");
-    _ = try repo.db.insertPackageTransaction(&pkg2);
+    _ = try repo.db.insertPackageTransaction(&pkg2, null);
 
     const deleted = try pruneOldVersions(repo.db, "mypkg", "x86_64", 3);
     try std.testing.expectEqual(@as(u32, 0), deleted);

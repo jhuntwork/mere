@@ -279,6 +279,30 @@ pub const Packager = struct {
             };
         }
 
+        // Populate recipe-level metadata for downstream display and tracking.
+        {
+            // Collect source URL strings from the recipe.
+            var source_urls: std.ArrayList([]const u8) = .empty;
+            defer source_urls.deinit(self.ctx.allocator);
+            for (config.recipe.sources.items) |src| {
+                if (src.url.len > 0) {
+                    source_urls.append(self.ctx.allocator, src.url) catch {
+                        self.ctx.allocator.free(content_hash);
+                        return self.fail(config.staging_dir, "failed to collect source URLs", PackagingError.OutOfMemory);
+                    };
+                }
+            }
+            pkg_meta.populateRecipeMetadata(
+                config.recipe.description,
+                config.recipe.url,
+                config.recipe.licenses.items,
+                source_urls.items,
+            ) catch {
+                self.ctx.allocator.free(content_hash);
+                return self.fail(config.staging_dir, "failed to populate recipe metadata", PackagingError.CreationFailed);
+            };
+        }
+
         meta.writeFile(self.ctx.allocator, config.staging_dir, &pkg_meta) catch {
             self.ctx.allocator.free(content_hash);
             return self.fail(config.staging_dir, "failed to write meta.kdl", PackagingError.FileSystem);

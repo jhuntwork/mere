@@ -540,6 +540,48 @@ pub const RepoDB = struct {
         return pkg;
     }
 
+    /// Get the properties JSON string for a specific package by name/version/release/arch.
+    /// Returns null if the package has no properties, or an allocator-owned copy of the JSON text.
+    pub fn getPackageProperties(
+        self: *RepoDB,
+        allocator: std.mem.Allocator,
+        pkg_name: []const u8,
+        pkg_version: []const u8,
+        pkg_release: u32,
+        pkg_arch: []const u8,
+    ) !?[]const u8 {
+        if (self.db == null) return RepoDBError.FileSystem;
+
+        const sql =
+            \\SELECT properties FROM packages
+            \\WHERE name = ? AND version = ? AND release = ? AND arch = ?
+            \\LIMIT 1
+        ;
+
+        var stmt: ?*c.sqlite3_stmt = null;
+        const rc = c.sqlite3_prepare_v2(self.db, sql.ptr, @intCast(sql.len), &stmt, null);
+        if (rc != c.SQLITE_OK or stmt == null) return RepoDBError.CorruptData;
+        defer _ = c.sqlite3_finalize(stmt.?);
+
+        _ = c.sqlite3_bind_text(stmt.?, 1, pkg_name.ptr, @intCast(pkg_name.len), null);
+        _ = c.sqlite3_bind_text(stmt.?, 2, pkg_version.ptr, @intCast(pkg_version.len), null);
+        _ = c.sqlite3_bind_int(stmt.?, 3, @intCast(pkg_release));
+        _ = c.sqlite3_bind_text(stmt.?, 4, pkg_arch.ptr, @intCast(pkg_arch.len), null);
+
+        if (c.sqlite3_step(stmt.?) != c.SQLITE_ROW) {
+            return null;
+        }
+
+        const col_type = c.sqlite3_column_type(stmt.?, 0);
+        if (col_type == c.SQLITE_NULL) return null;
+
+        const text_ptr = c.sqlite3_column_text(stmt.?, 0);
+        if (text_ptr == null) return null;
+        const text_len: usize = @intCast(c.sqlite3_column_bytes(stmt.?, 0));
+        const text: [*]const u8 = @ptrCast(text_ptr.?);
+        return allocator.dupe(u8, text[0..text_len]) catch return RepoDBError.OutOfMemory;
+    }
+
     /// Search for packages whose name contains the given substring (case-insensitive).
     /// Returns the latest version of each matching (name, arch) pair.
     pub fn searchByName(self: *RepoDB, allocator: std.mem.Allocator, term: []const u8) !std.ArrayList(package.Package) {
@@ -927,7 +969,7 @@ pub const RepoDB = struct {
     /// Errors:
     ///   - CorruptData: When preparing or executing the query fails
     ///   - InvalidInput: When package data is invalid or missing
-    fn insertPackage(self: *RepoDB, pkg: *package.Package) !i64 {
+    fn insertPackage(self: *RepoDB, pkg: *package.Package, properties: ?[]const u8) !i64 {
         if (pkg.name == null or pkg.name.?.len == 0 or
             pkg.version == null or pkg.version.?.len == 0 or
             pkg.release == null or
@@ -940,7 +982,7 @@ pub const RepoDB = struct {
         }
 
         const sql =
-            "INSERT INTO packages (name, version, release, arch, signature, content_hash, archive_hash) VALUES (?, ?, ?, ?, ?, ?, ?);";
+            "INSERT INTO packages (name, version, release, arch, signature, content_hash, archive_hash, properties) VALUES (?, ?, ?, ?, ?, ?, ?, ?);";
 
         var stmt: ?*c.sqlite3_stmt = null;
         const rc = c.sqlite3_prepare_v2(self.db, sql.ptr, @intCast(sql.len), &stmt, null);
@@ -956,6 +998,11 @@ pub const RepoDB = struct {
         _ = c.sqlite3_bind_blob(stmt, 5, pkg.signature.?.ptr, @intCast(pkg.signature.?.len), null);
         _ = c.sqlite3_bind_text(stmt, 6, pkg.content_hash.ptr, @intCast(pkg.content_hash.len), null);
         _ = c.sqlite3_bind_text(stmt, 7, pkg.archive_hash.ptr, @intCast(pkg.archive_hash.len), null);
+        if (properties) |props| {
+            _ = c.sqlite3_bind_text(stmt, 8, props.ptr, @intCast(props.len), null);
+        } else {
+            _ = c.sqlite3_bind_null(stmt, 8);
+        }
 
         if (c.sqlite3_step(stmt) != c.SQLITE_DONE) {
             // Check for constraint violation (e.g., unique constraint on name/version/release)
@@ -1099,7 +1146,7 @@ pub const RepoDB = struct {
     ///   - CorruptData: When SQLite operations fail
     ///   - InvalidInput: When package data is invalid (propagated from insertPackage)
     ///   - OutOfMemory: When memory allocation fails (propagated)
-    pub fn insertPackageTransaction(self: *RepoDB, pkg: *package.Package) !i64 {
+    pub fn insertPackageTransaction(self: *RepoDB, pkg: *package.Package, properties: ?[]const u8) !i64 {
         if (self.db == null) {
             return RepoDBError.FileSystem;
         }
@@ -1113,7 +1160,7 @@ pub const RepoDB = struct {
 
         // Insert package row
         var pkg_id: i64 = 0;
-        pkg_id = self.insertPackage(pkg) catch |err| {
+        pkg_id = self.insertPackage(pkg, properties) catch |err| {
             var rbmsg: [*c]u8 = null;
             _ = c.sqlite3_exec(self.db, "ROLLBACK;", null, null, &rbmsg);
             if (rbmsg != null) c.sqlite3_free(rbmsg);
@@ -1331,7 +1378,7 @@ pub const RepoDB = struct {
         pkg.archive_hash = try ctx.allocator.dupe(u8, "archivehash");
 
         // Insert package
-        const pkg_id = try db.insertPackage(&pkg);
+        const pkg_id = try db.insertPackage(&pkg, null);
 
         // Insert dependency
         var dep = try @import("package.zig").Dependency.init(ctx.allocator, "libfoo.so", try @import("package.zig").DependencyType.fromString("elf-needed"));
@@ -1436,7 +1483,7 @@ pub const RepoDB = struct {
             .version_constraint = null,
         };
 
-        _ = try db.insertPackageTransaction(&pkg);
+        _ = try db.insertPackageTransaction(&pkg, null);
 
         const sql = "SELECT version_constraint FROM dependencies LIMIT 1;";
         var stmt: ?*c.sqlite3_stmt = null;
@@ -1791,7 +1838,7 @@ test "RepoDB deletePackage cascades to dependencies and provisions" {
     pkg.content_hash = try allocator.dupe(u8, "testhash");
     pkg.archive_hash = try allocator.dupe(u8, "testarchivehash");
 
-    const pkg_id = try db.insertPackage(&pkg);
+    const pkg_id = try db.insertPackage(&pkg, null);
 
     // Insert dependencies
     var dep1 = try package.Dependency.init(allocator, "libfoo.so", try package.DependencyType.fromString("elf-needed"));
@@ -1932,7 +1979,7 @@ test "RepoDB: getLatestPackageByName, getDependenciesForPackage, getLatestPackag
         p1.signature = try allocator.dupe(u8, "sig1");
         p1.content_hash = try allocator.dupe(u8, "h1");
         p1.archive_hash = try allocator.dupe(u8, "ah1");
-        _ = try db.insertPackage(&p1);
+        _ = try db.insertPackage(&p1, null);
 
         // Create package 'foo' 1.0.1 (the one that will have dependency/provision)
         var p2 = package.Package.init(&test_env.ctx);
@@ -1944,7 +1991,7 @@ test "RepoDB: getLatestPackageByName, getDependenciesForPackage, getLatestPackag
         p2.signature = try allocator.dupe(u8, "sig2");
         p2.content_hash = try allocator.dupe(u8, "h2");
         p2.archive_hash = try allocator.dupe(u8, "ah2");
-        const p2_id = try db.insertPackage(&p2);
+        const p2_id = try db.insertPackage(&p2, null);
 
         // Create package 'bar' 2.0.0
         var p3 = package.Package.init(&test_env.ctx);
@@ -1956,7 +2003,7 @@ test "RepoDB: getLatestPackageByName, getDependenciesForPackage, getLatestPackag
         p3.signature = try allocator.dupe(u8, "sig3");
         p3.content_hash = try allocator.dupe(u8, "h3");
         p3.archive_hash = try allocator.dupe(u8, "ah3");
-        _ = try db.insertPackage(&p3);
+        _ = try db.insertPackage(&p3, null);
 
         // Insert dependency for p2 -> libbar.so
         var dep = try package.Dependency.init(allocator, "libbar.so", try package.DependencyType.fromString("elf-needed"));
@@ -2034,7 +2081,7 @@ test "RepoDB: getLatestPackageByBinBasename matches bare names against bin provi
         p1.signature = try allocator.dupe(u8, "sig_py");
         p1.content_hash = try allocator.dupe(u8, "hash_py");
         p1.archive_hash = try allocator.dupe(u8, "archive_hash_py");
-        const p1_id = try db.insertPackage(&p1);
+        const p1_id = try db.insertPackage(&p1, null);
 
         var prov = try package.Provision.init(allocator, "/usr/bin/python3", .bin);
         defer prov.deinit(allocator);
@@ -2052,7 +2099,7 @@ test "RepoDB: getLatestPackageByBinBasename matches bare names against bin provi
         p2.signature = try allocator.dupe(u8, "sig_bash");
         p2.content_hash = try allocator.dupe(u8, "hash_bash");
         p2.archive_hash = try allocator.dupe(u8, "archive_hash_bash");
-        const p2_id = try db.insertPackage(&p2);
+        const p2_id = try db.insertPackage(&p2, null);
 
         var prov = try package.Provision.init(allocator, "/bin/bash", .bin);
         defer prov.deinit(allocator);
@@ -2070,7 +2117,7 @@ test "RepoDB: getLatestPackageByBinBasename matches bare names against bin provi
         p3.signature = try allocator.dupe(u8, "sig_cu");
         p3.content_hash = try allocator.dupe(u8, "hash_cu");
         p3.archive_hash = try allocator.dupe(u8, "archive_hash_cu");
-        const p3_id = try db.insertPackage(&p3);
+        const p3_id = try db.insertPackage(&p3, null);
 
         var prov = try package.Provision.init(allocator, "libcoreutils.so.1", .elf_soname);
         defer prov.deinit(allocator);
@@ -2145,7 +2192,7 @@ test "RepoDB resolveTransitiveDependencies resolves all dependencies recursively
         pA.signature = try allocator.dupe(u8, "sigA");
         pA.content_hash = try allocator.dupe(u8, "hA");
         pA.archive_hash = try allocator.dupe(u8, "ahA");
-        const idA = try db.insertPackage(&pA);
+        const idA = try db.insertPackage(&pA, null);
 
         var pB = package.Package.init(&ctx);
         defer pB.deinit();
@@ -2156,7 +2203,7 @@ test "RepoDB resolveTransitiveDependencies resolves all dependencies recursively
         pB.signature = try allocator.dupe(u8, "sigB");
         pB.content_hash = try allocator.dupe(u8, "hB");
         pB.archive_hash = try allocator.dupe(u8, "ahB");
-        const idB = try db.insertPackage(&pB);
+        const idB = try db.insertPackage(&pB, null);
 
         var pC = package.Package.init(&ctx);
         defer pC.deinit();
@@ -2167,7 +2214,7 @@ test "RepoDB resolveTransitiveDependencies resolves all dependencies recursively
         pC.signature = try allocator.dupe(u8, "sigC");
         pC.content_hash = try allocator.dupe(u8, "hC");
         pC.archive_hash = try allocator.dupe(u8, "ahC");
-        _ = try db.insertPackage(&pC);
+        _ = try db.insertPackage(&pC, null);
 
         // A -> B
         var depAB = try package.Dependency.init(allocator, "B", try package.DependencyType.fromString("elf-needed"));
@@ -2217,7 +2264,7 @@ test "RepoDB vercmp correctly orders 1.10 > 1.9" {
         p1.signature = try allocator.dupe(u8, "sig1");
         p1.content_hash = try allocator.dupe(u8, "h1");
         p1.archive_hash = try allocator.dupe(u8, "ah1");
-        _ = try db.insertPackage(&p1);
+        _ = try db.insertPackage(&p1, null);
 
         // Insert 1.10 second (higher version, but string-sorts lower)
         var p2 = package.Package.init(&test_env.ctx);
@@ -2229,7 +2276,7 @@ test "RepoDB vercmp correctly orders 1.10 > 1.9" {
         p2.signature = try allocator.dupe(u8, "sig2");
         p2.content_hash = try allocator.dupe(u8, "h2");
         p2.archive_hash = try allocator.dupe(u8, "ah2");
-        _ = try db.insertPackage(&p2);
+        _ = try db.insertPackage(&p2, null);
     }
 
     // getLatestPackageByName should return 1.10, not 1.9
@@ -2273,7 +2320,7 @@ test "RepoDB vercmp handles epoch correctly" {
         p1.signature = try allocator.dupe(u8, "sig1");
         p1.content_hash = try allocator.dupe(u8, "h1");
         p1.archive_hash = try allocator.dupe(u8, "ah1");
-        _ = try db.insertPackage(&p1);
+        _ = try db.insertPackage(&p1, null);
 
         var p2 = package.Package.init(&test_env.ctx);
         defer p2.deinit();
@@ -2284,7 +2331,7 @@ test "RepoDB vercmp handles epoch correctly" {
         p2.signature = try allocator.dupe(u8, "sig2");
         p2.content_hash = try allocator.dupe(u8, "h2");
         p2.archive_hash = try allocator.dupe(u8, "ah2");
-        _ = try db.insertPackage(&p2);
+        _ = try db.insertPackage(&p2, null);
     }
 
     // getLatestPackageByName should return 1:1.0 (epoch 1 wins over no epoch)
@@ -2328,7 +2375,7 @@ test "RepoDB vercmp handles tilde pre-release correctly" {
         p1.signature = try allocator.dupe(u8, "sig1");
         p1.content_hash = try allocator.dupe(u8, "h1");
         p1.archive_hash = try allocator.dupe(u8, "ah1");
-        _ = try db.insertPackage(&p1);
+        _ = try db.insertPackage(&p1, null);
 
         var p2 = package.Package.init(&test_env.ctx);
         defer p2.deinit();
@@ -2339,7 +2386,7 @@ test "RepoDB vercmp handles tilde pre-release correctly" {
         p2.signature = try allocator.dupe(u8, "sig2");
         p2.content_hash = try allocator.dupe(u8, "h2");
         p2.archive_hash = try allocator.dupe(u8, "ah2");
-        _ = try db.insertPackage(&p2);
+        _ = try db.insertPackage(&p2, null);
     }
 
     // getLatestPackageByName should return 1.0, not 1.0~rc1
