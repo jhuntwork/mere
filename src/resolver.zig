@@ -1594,7 +1594,7 @@ fn insertTestPackage(ctx: *Context, repo: *RepoCache, name: []const u8, deps: []
         try pkg.addDependency(dep_name, try package.DependencyType.fromString("elf-needed"));
     }
 
-    _ = try repo.repository.?.db.insertPackageTransaction(&pkg);
+    _ = try repo.repository.?.db.insertPackageTransaction(&pkg, null);
 }
 
 fn insertVersionedTestPackage(
@@ -1623,7 +1623,7 @@ fn insertVersionedTestPackage(
         try pkg.addDependencyWithConstraint(dep.resource, dep_type, dep.version_constraint);
     }
 
-    _ = try repo.repository.?.db.insertPackageTransaction(&pkg);
+    _ = try repo.repository.?.db.insertPackageTransaction(&pkg, null);
 }
 
 fn findInstallOrder(result: *const ResolutionResult, name: []const u8) ?usize {
@@ -1936,7 +1936,7 @@ test "resolve version wins over repo priority" {
         pkg.signature = try ctx.allocator.dupe(u8, "sig");
         pkg.content_hash = try ctx.allocator.dupe(u8, "hash1");
         pkg.archive_hash = try ctx.allocator.dupe(u8, "1" ** 64);
-        _ = try repo.db.insertPackageTransaction(&pkg);
+        _ = try repo.db.insertPackageTransaction(&pkg, null);
     }
 
     // Insert package "A" version 2.0.0 in low-priority repo
@@ -1950,7 +1950,7 @@ test "resolve version wins over repo priority" {
         pkg.signature = try ctx.allocator.dupe(u8, "sig");
         pkg.content_hash = try ctx.allocator.dupe(u8, "hash2");
         pkg.archive_hash = try ctx.allocator.dupe(u8, "2" ** 64);
-        _ = try repo.db.insertPackageTransaction(&pkg);
+        _ = try repo.db.insertPackageTransaction(&pkg, null);
     }
 
     // Resolve package "A" - should pick version 2.0.0 from low-priority repo
@@ -2083,7 +2083,7 @@ test "resolve picks higher-priority provider when soname is provided by differen
         pkg.content_hash = try allocator.dupe(u8, "hash-dispatch");
         pkg.archive_hash = try allocator.dupe(u8, "d" ** 64);
         try pkg.addProvision("libEGL.so.1", .elf_soname);
-        _ = try repo.db.insertPackageTransaction(&pkg);
+        _ = try repo.db.insertPackageTransaction(&pkg, null);
     }
 
     // Low-priority (priority 100) repo carries "monolith" 26.0.3 which also
@@ -2106,7 +2106,7 @@ test "resolve picks higher-priority provider when soname is provided by differen
         pkg.content_hash = try allocator.dupe(u8, "hash-monolith");
         pkg.archive_hash = try allocator.dupe(u8, "m" ** 64);
         try pkg.addProvision("libEGL.so.1", .elf_soname);
-        _ = try repo.db.insertPackageTransaction(&pkg);
+        _ = try repo.db.insertPackageTransaction(&pkg, null);
     }
 
     var repocaches = [_]*RepoCache{ &repo_high, &repo_low };
@@ -2152,7 +2152,7 @@ test "resolve flags ambiguity when different packages provide the same soname at
         pkg.content_hash = try allocator.dupe(u8, "hash-a");
         pkg.archive_hash = try allocator.dupe(u8, "a" ** 64);
         try pkg.addProvision("libshared.so.1", .elf_soname);
-        _ = try repo.db.insertPackageTransaction(&pkg);
+        _ = try repo.db.insertPackageTransaction(&pkg, null);
     }
 
     if (repocache.repository) |*repo| {
@@ -2166,7 +2166,7 @@ test "resolve flags ambiguity when different packages provide the same soname at
         pkg.content_hash = try allocator.dupe(u8, "hash-b");
         pkg.archive_hash = try allocator.dupe(u8, "b" ** 64);
         try pkg.addProvision("libshared.so.1", .elf_soname);
-        _ = try repo.db.insertPackageTransaction(&pkg);
+        _ = try repo.db.insertPackageTransaction(&pkg, null);
     }
 
     var repocaches = [_]*RepoCache{&repocache};
@@ -2349,7 +2349,7 @@ test "resolved packages with same path produce path conflict error" {
         pkg_a.signature = try allocator.dupe(u8, "sig-a");
         pkg_a.content_hash = try allocator.dupe(u8, "aaaa");
         pkg_a.archive_hash = try allocator.dupe(u8, "a" ** 64);
-        _ = try repo.db.insertPackageTransaction(&pkg_a);
+        _ = try repo.db.insertPackageTransaction(&pkg_a, null);
     }
 
     if (repocache.repository) |*repo| {
@@ -2362,7 +2362,7 @@ test "resolved packages with same path produce path conflict error" {
         pkg_b.signature = try allocator.dupe(u8, "sig-b");
         pkg_b.content_hash = try allocator.dupe(u8, "bbbb");
         pkg_b.archive_hash = try allocator.dupe(u8, "b" ** 64);
-        _ = try repo.db.insertPackageTransaction(&pkg_b);
+        _ = try repo.db.insertPackageTransaction(&pkg_b, null);
     }
 
     // Resolve both packages - resolver succeeds (it doesn't check file paths)
@@ -2419,7 +2419,7 @@ test "resolve filters out foreign-arch packages" {
         foreign_pkg.signature = try allocator.dupe(u8, "sig-foreign");
         foreign_pkg.content_hash = try allocator.dupe(u8, "foreign-hash");
         foreign_pkg.archive_hash = try allocator.dupe(u8, "f" ** 64);
-        _ = try repo.db.insertPackageTransaction(&foreign_pkg);
+        _ = try repo.db.insertPackageTransaction(&foreign_pkg, null);
     }
 
     if (repocache.repository) |*repo| {
@@ -2432,7 +2432,7 @@ test "resolve filters out foreign-arch packages" {
         host_pkg.signature = try allocator.dupe(u8, "sig-host");
         host_pkg.content_hash = try allocator.dupe(u8, "host-hash");
         host_pkg.archive_hash = try allocator.dupe(u8, "h" ** 64);
-        _ = try repo.db.insertPackageTransaction(&host_pkg);
+        _ = try repo.db.insertPackageTransaction(&host_pkg, null);
     }
 
     var repocaches = [_]*RepoCache{&repocache};
@@ -2471,7 +2471,7 @@ test "resolve prefers exact host arch over any when tied" {
         any_pkg.signature = try allocator.dupe(u8, "sig-any");
         any_pkg.content_hash = try allocator.dupe(u8, "any-hash");
         any_pkg.archive_hash = try allocator.dupe(u8, "a" ** 64);
-        _ = try repo.db.insertPackageTransaction(&any_pkg);
+        _ = try repo.db.insertPackageTransaction(&any_pkg, null);
     }
 
     if (repocache.repository) |*repo| {
@@ -2484,7 +2484,7 @@ test "resolve prefers exact host arch over any when tied" {
         host_pkg.signature = try allocator.dupe(u8, "sig-host");
         host_pkg.content_hash = try allocator.dupe(u8, "host-hash");
         host_pkg.archive_hash = try allocator.dupe(u8, "b" ** 64);
-        _ = try repo.db.insertPackageTransaction(&host_pkg);
+        _ = try repo.db.insertPackageTransaction(&host_pkg, null);
     }
 
     var repocaches = [_]*RepoCache{&repocache};

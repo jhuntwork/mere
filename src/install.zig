@@ -2360,7 +2360,7 @@ test "multi-repository install uses priority and resolves dependencies across re
 
     try pkg_a.addDependency("B", package.DependencyType.elf_needed);
 
-    _ = try repo1.db.insertPackageTransaction(&pkg_a);
+    _ = try repo1.db.insertPackageTransaction(&pkg_a, null);
     pkg_a.deinit();
 
     // --- Repo2: B has no dependencies ---
@@ -2431,7 +2431,7 @@ test "multi-repository install uses priority and resolves dependencies across re
     var sig_buf_b = try ctx.allocator.alloc(u8, sig_len_b);
     std.mem.copyForwards(u8, sig_buf_b, sig_b[0..sig_len_b]);
     pkg_b.signature = sig_buf_b[0..sig_len_b];
-    _ = try repo2.db.insertPackageTransaction(&pkg_b);
+    _ = try repo2.db.insertPackageTransaction(&pkg_b, null);
     pkg_b.deinit();
 
     // Now sign the DB files AFTER all writes
@@ -2560,7 +2560,7 @@ test "resolveInstallPlan batches multiple roots and deduplicates shared dependen
     pkg_a.content_hash = try ctx.allocator.dupe(u8, "hash-a");
     pkg_a.archive_hash = try ctx.allocator.dupe(u8, "a" ** 64);
     try pkg_a.addDependency("C", package.DependencyType.elf_needed);
-    _ = try repocache.repository.?.db.insertPackageTransaction(&pkg_a);
+    _ = try repocache.repository.?.db.insertPackageTransaction(&pkg_a, null);
 
     var pkg_b = package.Package.init(ctx);
     defer pkg_b.deinit();
@@ -2572,7 +2572,7 @@ test "resolveInstallPlan batches multiple roots and deduplicates shared dependen
     pkg_b.content_hash = try ctx.allocator.dupe(u8, "hash-b");
     pkg_b.archive_hash = try ctx.allocator.dupe(u8, "b" ** 64);
     try pkg_b.addDependency("C", package.DependencyType.elf_needed);
-    _ = try repocache.repository.?.db.insertPackageTransaction(&pkg_b);
+    _ = try repocache.repository.?.db.insertPackageTransaction(&pkg_b, null);
 
     var pkg_c = package.Package.init(ctx);
     defer pkg_c.deinit();
@@ -2583,7 +2583,7 @@ test "resolveInstallPlan batches multiple roots and deduplicates shared dependen
     pkg_c.signature = try ctx.allocator.dupe(u8, "sig-c");
     pkg_c.content_hash = try ctx.allocator.dupe(u8, "hash-c");
     pkg_c.archive_hash = try ctx.allocator.dupe(u8, "c" ** 64);
-    _ = try repocache.repository.?.db.insertPackageTransaction(&pkg_c);
+    _ = try repocache.repository.?.db.insertPackageTransaction(&pkg_c, null);
 
     var repocaches = [_]*RepoCache{&repocache};
     const roots = [_]resolver.Requirement{
@@ -2789,7 +2789,7 @@ test "integration: full install pipeline publishes named profile root" {
     std.mem.copyForwards(u8, sig_buf_a, sig_a[0..sig_len]);
     pkg_a.signature = sig_buf_a[0..sig_len];
     try pkg_a.addDependency("pkgB", package.DependencyType.elf_needed);
-    _ = try repo.db.insertPackageTransaction(&pkg_a);
+    _ = try repo.db.insertPackageTransaction(&pkg_a, null);
     pkg_a.deinit();
 
     // Create package B (no dependencies)
@@ -2853,7 +2853,7 @@ test "integration: full install pipeline publishes named profile root" {
     var sig_buf_b = try ctx.allocator.alloc(u8, sig_len);
     std.mem.copyForwards(u8, sig_buf_b, sig_b[0..sig_len]);
     pkg_b.signature = sig_buf_b[0..sig_len];
-    _ = try repo.db.insertPackageTransaction(&pkg_b);
+    _ = try repo.db.insertPackageTransaction(&pkg_b, null);
     pkg_b.deinit();
 
     // Sign the database
@@ -3089,7 +3089,7 @@ test "integration: named profile lifecycle replaces root atomically and additive
     var sig_buf_a = try ctx.allocator.alloc(u8, sig_len);
     std.mem.copyForwards(u8, sig_buf_a, sig_a[0..sig_len]);
     pkg_a.signature = sig_buf_a[0..sig_len];
-    _ = try repo.db.insertPackageTransaction(&pkg_a);
+    _ = try repo.db.insertPackageTransaction(&pkg_a, null);
     pkg_a.deinit();
 
     // Create package C (will be added when the root is republished)
@@ -3151,7 +3151,7 @@ test "integration: named profile lifecycle replaces root atomically and additive
     var sig_buf_c = try ctx.allocator.alloc(u8, sig_len);
     std.mem.copyForwards(u8, sig_buf_c, sig_c[0..sig_len]);
     pkg_c.signature = sig_buf_c[0..sig_len];
-    _ = try repo.db.insertPackageTransaction(&pkg_c);
+    _ = try repo.db.insertPackageTransaction(&pkg_c, null);
     pkg_c.deinit();
 
     // Sign the database
@@ -3364,7 +3364,7 @@ test "integration: symlink tree conflict detection" {
     var sig_buf_x = try ctx.allocator.alloc(u8, sig_len);
     std.mem.copyForwards(u8, sig_buf_x, sig_x[0..sig_len]);
     pkg_x.signature = sig_buf_x[0..sig_len];
-    _ = try repo.db.insertPackageTransaction(&pkg_x);
+    _ = try repo.db.insertPackageTransaction(&pkg_x, null);
     pkg_x.deinit();
 
     // Create package Y with SAME /usr/bin/conflict-tool (different content)
@@ -3421,7 +3421,7 @@ test "integration: symlink tree conflict detection" {
     var sig_buf_y = try ctx.allocator.alloc(u8, sig_len);
     std.mem.copyForwards(u8, sig_buf_y, sig_y[0..sig_len]);
     pkg_y.signature = sig_buf_y[0..sig_len];
-    _ = try repo.db.insertPackageTransaction(&pkg_y);
+    _ = try repo.db.insertPackageTransaction(&pkg_y, null);
     pkg_y.deinit();
 
     // Create pkgMain that depends on both pkgX and pkgY - installing it will pull both
@@ -3472,7 +3472,7 @@ test "integration: symlink tree conflict detection" {
     pkg_main.signature = sig_buf_main[0..sig_len];
     try pkg_main.addDependency("pkgX", package.DependencyType.elf_needed);
     try pkg_main.addDependency("pkgY", package.DependencyType.elf_needed);
-    _ = try repo.db.insertPackageTransaction(&pkg_main);
+    _ = try repo.db.insertPackageTransaction(&pkg_main, null);
     pkg_main.deinit();
 
     // Sign the database
@@ -3661,7 +3661,7 @@ test "integration: multi-repository priority selection" {
     var sig_buf_high = try ctx.allocator.alloc(u8, sig_len);
     std.mem.copyForwards(u8, sig_buf_high, sig_high[0..sig_len]);
     pkg_high.signature = sig_buf_high[0..sig_len];
-    _ = try repo_high.db.insertPackageTransaction(&pkg_high);
+    _ = try repo_high.db.insertPackageTransaction(&pkg_high, null);
     pkg_high.deinit();
 
     // Create sharedPkg 1.0.0 in low-priority repo (different content)
@@ -3720,7 +3720,7 @@ test "integration: multi-repository priority selection" {
     var sig_buf_low = try ctx.allocator.alloc(u8, sig_len);
     std.mem.copyForwards(u8, sig_buf_low, sig_low[0..sig_len]);
     pkg_low.signature = sig_buf_low[0..sig_len];
-    _ = try repo_low.db.insertPackageTransaction(&pkg_low);
+    _ = try repo_low.db.insertPackageTransaction(&pkg_low, null);
     pkg_low.deinit();
 
     // Sign database files
@@ -3965,7 +3965,7 @@ test "integration: garbage collection removes unreferenced store paths" {
             std.mem.copyForwards(u8, sig_buf, sig_bytes[0..signature_len]);
             pkg.signature = sig_buf[0..signature_len];
 
-            _ = try repository.db.insertPackageTransaction(&pkg);
+            _ = try repository.db.insertPackageTransaction(&pkg, null);
 
             // Return the content hash (for verification later)
             const result = try context.allocator.dupe(u8, content_hash_str);
@@ -4582,7 +4582,7 @@ fn createSignedTestPackage(
         try pkg.addDependency(dep, package.DependencyType.elf_needed);
     }
 
-    _ = try repo.db.insertPackageTransaction(&pkg);
+    _ = try repo.db.insertPackageTransaction(&pkg, null);
 }
 
 // Regression: uninstall --cascade with multiple package names only cascaded

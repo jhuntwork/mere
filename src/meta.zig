@@ -74,6 +74,12 @@ pub const Data = struct {
     provisions: std.ArrayList(Provision),
     allocator: std.mem.Allocator,
 
+    // Recipe metadata (optional, carried through for display/tracking)
+    description: ?[]const u8 = null,
+    url: ?[]const u8 = null,
+    licenses: std.ArrayList([]const u8) = .empty,
+    source_urls: std.ArrayList([]const u8) = .empty,
+
     pub fn init(allocator: std.mem.Allocator) Data {
         return Data{
             .dependencies = .empty,
@@ -92,6 +98,13 @@ pub const Data = struct {
             prov.deinit(self.allocator);
         }
         self.provisions.deinit(self.allocator);
+
+        if (self.description) |d| self.allocator.free(d);
+        if (self.url) |u| self.allocator.free(u);
+        for (self.licenses.items) |l| self.allocator.free(l);
+        self.licenses.deinit(self.allocator);
+        for (self.source_urls.items) |s| self.allocator.free(s);
+        self.source_urls.deinit(self.allocator);
     }
 
     pub fn addDependency(self: *Data, dep_type: DependencyType, value: []const u8) MetaError!void {
@@ -146,6 +159,31 @@ pub const Data = struct {
                 .bin => .bin,
             };
             try self.addProvision(prov_type, prov.resource);
+        }
+    }
+
+    /// Populate recipe-level metadata (description, homepage, licenses, source URLs).
+    /// This data is carried through to repo.db for display and upstream tracking.
+    pub fn populateRecipeMetadata(
+        self: *Data,
+        description: []const u8,
+        url: ?[]const u8,
+        licenses: []const []const u8,
+        source_urls: []const []const u8,
+    ) MetaError!void {
+        if (description.len > 0) {
+            self.description = self.allocator.dupe(u8, description) catch return MetaError.OutOfMemory;
+        }
+        if (url) |u| {
+            self.url = self.allocator.dupe(u8, u) catch return MetaError.OutOfMemory;
+        }
+        for (licenses) |l| {
+            const copy = self.allocator.dupe(u8, l) catch return MetaError.OutOfMemory;
+            self.licenses.append(self.allocator, copy) catch return MetaError.OutOfMemory;
+        }
+        for (source_urls) |s| {
+            const copy = self.allocator.dupe(u8, s) catch return MetaError.OutOfMemory;
+            self.source_urls.append(self.allocator, copy) catch return MetaError.OutOfMemory;
         }
     }
 
@@ -215,6 +253,43 @@ pub const Data = struct {
             buffer.appendSlice(allocator, "}\n") catch return MetaError.OutOfMemory;
         }
 
+        // Encode recipe metadata if any fields are populated.
+        const has_metadata = self.description != null or self.url != null or
+            self.licenses.items.len > 0 or self.source_urls.items.len > 0;
+        if (has_metadata) {
+            if (self.dependencies.items.len > 0 or self.provisions.items.len > 0) {
+                buffer.append(allocator, '\n') catch return MetaError.OutOfMemory;
+            }
+
+            buffer.appendSlice(allocator, "metadata {\n") catch return MetaError.OutOfMemory;
+
+            if (self.description) |desc| {
+                buffer.appendSlice(allocator, "    description \"") catch return MetaError.OutOfMemory;
+                try appendEscaped(&buffer, allocator, desc);
+                buffer.appendSlice(allocator, "\"\n") catch return MetaError.OutOfMemory;
+            }
+
+            if (self.url) |u| {
+                buffer.appendSlice(allocator, "    url \"") catch return MetaError.OutOfMemory;
+                try appendEscaped(&buffer, allocator, u);
+                buffer.appendSlice(allocator, "\"\n") catch return MetaError.OutOfMemory;
+            }
+
+            for (self.licenses.items) |l| {
+                buffer.appendSlice(allocator, "    license \"") catch return MetaError.OutOfMemory;
+                try appendEscaped(&buffer, allocator, l);
+                buffer.appendSlice(allocator, "\"\n") catch return MetaError.OutOfMemory;
+            }
+
+            for (self.source_urls.items) |s| {
+                buffer.appendSlice(allocator, "    source \"") catch return MetaError.OutOfMemory;
+                try appendEscaped(&buffer, allocator, s);
+                buffer.appendSlice(allocator, "\"\n") catch return MetaError.OutOfMemory;
+            }
+
+            buffer.appendSlice(allocator, "}\n") catch return MetaError.OutOfMemory;
+        }
+
         return buffer.toOwnedSlice(allocator) catch return MetaError.OutOfMemory;
     }
 
@@ -256,12 +331,47 @@ pub const Data = struct {
                         }
                     }
                 }
+            } else if (std.mem.eql(u8, node.name, "metadata")) {
+                for (node.children.items) |*child| {
+                    if (std.mem.eql(u8, child.name, "description")) {
+                        if (child.getFirstArgString()) |value| {
+                            meta.description = allocator.dupe(u8, value) catch return MetaError.OutOfMemory;
+                        }
+                    } else if (std.mem.eql(u8, child.name, "url")) {
+                        if (child.getFirstArgString()) |value| {
+                            meta.url = allocator.dupe(u8, value) catch return MetaError.OutOfMemory;
+                        }
+                    } else if (std.mem.eql(u8, child.name, "license")) {
+                        if (child.getFirstArgString()) |value| {
+                            const copy = allocator.dupe(u8, value) catch return MetaError.OutOfMemory;
+                            meta.licenses.append(allocator, copy) catch return MetaError.OutOfMemory;
+                        }
+                    } else if (std.mem.eql(u8, child.name, "source")) {
+                        if (child.getFirstArgString()) |value| {
+                            const copy = allocator.dupe(u8, value) catch return MetaError.OutOfMemory;
+                            meta.source_urls.append(allocator, copy) catch return MetaError.OutOfMemory;
+                        }
+                    }
+                }
             }
         }
 
         return meta;
     }
 };
+
+/// Append a string to a buffer, escaping KDL special characters.
+fn appendEscaped(buffer: *std.ArrayList(u8), allocator: std.mem.Allocator, value: []const u8) MetaError!void {
+    for (value) |c| {
+        if (c == '"') {
+            buffer.appendSlice(allocator, "\\\"") catch return MetaError.OutOfMemory;
+        } else if (c == '\\') {
+            buffer.appendSlice(allocator, "\\\\") catch return MetaError.OutOfMemory;
+        } else {
+            buffer.append(allocator, c) catch return MetaError.OutOfMemory;
+        }
+    }
+}
 
 pub fn readFile(allocator: std.mem.Allocator, dir_path: []const u8) MetaError!Data {
     const meta_path = std.fs.path.join(allocator, &.{ dir_path, manifest.META_KDL_FILENAME }) catch {

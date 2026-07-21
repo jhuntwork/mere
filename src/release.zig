@@ -380,7 +380,17 @@ pub fn publish(ctx: *Context, dev_repo_dir: []const u8, output_dir: []const u8) 
         };
         ctx.allocator.free(dest_path);
 
-        _ = staged.db.insertPackageTransaction(pkg) catch |err| {
+        // Carry properties from dev repo through to the release output DB.
+        const properties = dev_repo.db.getPackageProperties(
+            ctx.allocator,
+            pkg.name orelse "",
+            pkg.version orelse "",
+            pkg.release orelse 0,
+            pkg.arch orelse "",
+        ) catch null;
+        defer if (properties) |props| ctx.allocator.free(props);
+
+        _ = staged.db.insertPackageTransaction(pkg, properties) catch |err| {
             return switch (err) {
                 error.OutOfMemory => ReleaseError.OutOfMemory,
                 error.InvalidInput => ctx.fail(ReleaseError.InvalidInput, pkg.name orelse "unknown", "package data is invalid; cannot insert into release output database"),
@@ -482,7 +492,7 @@ fn insertFakeDevPackage(
     pkg.archive_hash = try ctx.allocator.dupe(u8, archive_hash_hex);
     pkg.signature = try ctx.allocator.dupe(u8, "aa" ** 64);
 
-    _ = try repo.db.insertPackageTransaction(&pkg);
+    _ = try repo.db.insertPackageTransaction(&pkg, null);
 
     const packages_dir = try std.fs.path.join(ctx.allocator, &.{ dev_repo_dir, "packages" });
     defer ctx.allocator.free(packages_dir);
@@ -696,4 +706,73 @@ test "publish fails loudly when a selected archive's content does not match its 
     try std.testing.expectError(ReleaseError.ArchiveHashMismatch, publish(ctx, dev_repo_dir, output_dir));
     ctx.resetDiagnostics();
     try std.testing.expectError(error.FileNotFound, std.Io.Dir.accessAbsolute(p.currentIo(), output_dir, .{}));
+}
+
+test "publish carries properties from dev repo through to release output" {
+    const th = @import("test_helpers.zig");
+
+    var test_env = try th.createTestEnv();
+    defer {
+        test_env.cleanup();
+        std.testing.allocator.destroy(test_env);
+    }
+    var ctx = &test_env.ctx;
+
+    const dev_repo_dir = try std.fs.path.join(ctx.allocator, &.{ test_env.path, "mere", "dev", "repo", "import" });
+    defer ctx.allocator.free(dev_repo_dir);
+
+    // Insert a package with properties JSON into the dev repo.
+    const properties_json = "{\"description\":\"Test package\",\"url\":\"https://example.com\",\"licenses\":[\"MIT\"]}";
+    {
+        var repo = try Repository.init(ctx, dev_repo_dir, false);
+        defer repo.deinit();
+
+        const content = "fake archive content for properties test";
+        const archive_hash_hex = try hash.calculateBytesHash(ctx.allocator, content);
+        defer ctx.allocator.free(archive_hash_hex);
+
+        var pkg = package.Package.init(ctx);
+        defer pkg.deinit();
+        pkg.name = try ctx.allocator.dupe(u8, "proptest");
+        pkg.version = try ctx.allocator.dupe(u8, "2.0.0");
+        pkg.release = 1;
+        pkg.arch = try ctx.allocator.dupe(u8, @import("builtin").cpu.arch.genericName());
+        pkg.content_hash = try ctx.allocator.dupe(u8, "deadbeef");
+        pkg.archive_hash = try ctx.allocator.dupe(u8, archive_hash_hex);
+        pkg.signature = try ctx.allocator.dupe(u8, "aa" ** 64);
+
+        _ = try repo.db.insertPackageTransaction(&pkg, properties_json);
+
+        // Place a matching archive file so verifySelectedArchive passes.
+        const packages_dir = try std.fs.path.join(ctx.allocator, &.{ dev_repo_dir, "packages" });
+        defer ctx.allocator.free(packages_dir);
+        try p.ensureDirExists(packages_dir);
+
+        const canonical_name = try pkg.canonicalArchiveName();
+        defer ctx.allocator.free(canonical_name);
+        const archive_path = try std.fs.path.join(ctx.allocator, &.{ packages_dir, canonical_name });
+        defer ctx.allocator.free(archive_path);
+        try p.writeFileAbsolute(archive_path, content);
+    }
+
+    const output_dir = try std.fs.path.join(ctx.allocator, &.{ test_env.path, "release-output" });
+    defer ctx.allocator.free(output_dir);
+
+    try publish(ctx, dev_repo_dir, output_dir);
+
+    // Verify properties arrived in the output repo.db.
+    var out_repo = try Repository.init(ctx, output_dir, true);
+    defer out_repo.deinit();
+
+    const got_props = try out_repo.db.getPackageProperties(
+        ctx.allocator,
+        "proptest",
+        "2.0.0",
+        1,
+        @import("builtin").cpu.arch.genericName(),
+    );
+    defer if (got_props) |gp| ctx.allocator.free(gp);
+
+    try std.testing.expect(got_props != null);
+    try std.testing.expectEqualStrings(properties_json, got_props.?);
 }

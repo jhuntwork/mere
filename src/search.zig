@@ -140,7 +140,7 @@ fn insertSearchTestPackage(ctx: *mere.Context, repo: *Repository, name: []const 
     pkg.signature = try ctx.allocator.dupe(u8, "sig");
     pkg.content_hash = try std.fmt.allocPrint(ctx.allocator, "hash-{s}-{s}", .{ name, arch });
     pkg.archive_hash = try ctx.allocator.dupe(u8, "a" ** 64);
-    _ = try repo.db.insertPackageTransaction(&pkg);
+    _ = try repo.db.insertPackageTransaction(&pkg, null);
 }
 
 fn setupSearchTestRepo(test_env: *th.TestEnv) !th.TestRepoSetup {
