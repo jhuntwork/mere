@@ -2664,6 +2664,34 @@ test "buildProfileResolverRequirements orders explicit roots before existing req
     try std.testing.expectEqualStrings("A", requirements[1].name);
 }
 
+/// Assert a profile entry exists and is backed by a real store object.
+///
+/// Profile symlinks target the *logical* store path (/mere/store/...), which
+/// only resolves where the mere directory is mounted at /mere (inside a build or
+/// shell namespace, or on a booted system) — not on the host under a test root.
+/// So we readlink the entry (which does not follow the link), confirm it points
+/// into the logical store, then confirm the backing object exists at its physical
+/// {root}/mere/store location.
+fn expectProfileEntryBacked(ctx: *Context, link_path: []const u8) !void {
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const n = try std.Io.Dir.readLinkAbsolute(path.currentIo(), link_path, &buf);
+    const target = buf[0..n];
+    try std.testing.expect(std.mem.startsWith(u8, target, "/mere/store/"));
+
+    const physical = try std.fs.path.join(ctx.allocator, &.{ ctx.root_path, target[1..] });
+    defer ctx.allocator.free(physical);
+    try std.Io.Dir.accessAbsolute(path.currentIo(), physical, .{});
+}
+
+/// Assert a profile entry does not exist at all (no symlink present).
+fn expectProfileEntryAbsent(link_path: []const u8) !void {
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    try std.testing.expectError(
+        error.FileNotFound,
+        std.Io.Dir.readLinkAbsolute(path.currentIo(), link_path, &buf),
+    );
+}
+
 test "integration: full install pipeline publishes named profile root" {
     // This test verifies the complete install pipeline:
     // 1. Config loading (simulated)
@@ -2959,11 +2987,11 @@ test "integration: full install pipeline publishes named profile root" {
     // 6. Verify specific files are symlinked in profile
     const profile_hello_a = try std.fs.path.join(ctx.allocator, &.{ profile_usr_bin, "hello-a" });
     defer ctx.allocator.free(profile_hello_a);
-    try std.Io.Dir.accessAbsolute(path.currentIo(), profile_hello_a, .{});
+    try expectProfileEntryBacked(ctx, profile_hello_a);
 
     const profile_libhello = try std.fs.path.join(ctx.allocator, &.{ profile_usr_lib, "libhello.so" });
     defer ctx.allocator.free(profile_libhello);
-    try std.Io.Dir.accessAbsolute(path.currentIo(), profile_libhello, .{});
+    try expectProfileEntryBacked(ctx, profile_libhello);
 
     // 7. Verify named profiles do not expose generation activation state
     const current_link = try std.fs.path.join(ctx.allocator, &.{ profile_dir, "current" });
@@ -3216,20 +3244,20 @@ test "integration: named profile lifecycle replaces root atomically and additive
     // Verify tool-a exists in the published root
     const root_tool_a = try std.fs.path.join(ctx.allocator, &.{ root_dir, "usr", "bin", "tool-a" });
     defer ctx.allocator.free(root_tool_a);
-    try std.Io.Dir.accessAbsolute(path.currentIo(), root_tool_a, .{});
+    try expectProfileEntryBacked(ctx, root_tool_a);
 
     // Verify tool-c does NOT exist before the second publish
     const root_tool_c = try std.fs.path.join(ctx.allocator, &.{ root_dir, "usr", "bin", "tool-c" });
     defer ctx.allocator.free(root_tool_c);
-    try std.testing.expectError(error.FileNotFound, std.Io.Dir.accessAbsolute(path.currentIo(), root_tool_c, .{}));
+    try expectProfileEntryAbsent(root_tool_c);
 
     // Step 2: Install pkgC → republish root
     const pkg_c_names = [_][]const u8{"pkgC"};
     try installPackagesToProfile(ctx, &repocaches, pkg_c_names[0..], client, false, false, false, profile_name, null);
 
     // Additive install: both tools are present in the replacement root
-    try std.Io.Dir.accessAbsolute(path.currentIo(), root_tool_a, .{});
-    try std.Io.Dir.accessAbsolute(path.currentIo(), root_tool_c, .{});
+    try expectProfileEntryBacked(ctx, root_tool_a);
+    try expectProfileEntryBacked(ctx, root_tool_c);
 
     const root_manifest_path = try std.fs.path.join(ctx.allocator, &.{ root_dir, "profile.kdl" });
     defer ctx.allocator.free(root_manifest_path);
@@ -4165,8 +4193,13 @@ test "installPackageToProfile symlinks to target profile" {
     };
     const link_target = link_buf[0..link_len];
 
-    // Verify the symlink points to the store
-    try std.testing.expect(std.mem.startsWith(u8, link_target, store_root));
+    // Verify the symlink points to the store via its logical path
+    // (/mere/store/...), not the physical --root staging path. See
+    // store.toLogicalStorePath.
+    const expected_prefix = try store.toLogicalStorePath(ctx.allocator, ctx.root_path, store_root);
+    defer ctx.allocator.free(expected_prefix);
+    try std.testing.expectEqualStrings("/mere/store", expected_prefix);
+    try std.testing.expect(std.mem.startsWith(u8, link_target, expected_prefix));
     try std.testing.expect(std.mem.indexOf(u8, link_target, "test-tool") != null);
 }
 

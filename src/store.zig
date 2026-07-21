@@ -116,6 +116,52 @@ pub fn parseStorePath(store_path: []const u8) StoreError!StorePathComponents {
     };
 }
 
+/// Translate a physical store path (`{root}/mere/store/...`) into the *logical*
+/// store path (`/mere/store/...`) used inside build and shell namespaces and on
+/// a booted system.
+///
+/// Profile symlink targets must be logical. The build and shell namespaces
+/// bind-mount `{root}/mere` onto `/mere` (see `namespace.buildSyntheticRoot`),
+/// and a booted system has the store at `/mere` directly, so a logical target
+/// resolves in all three contexts. A physical target that embeds the `--root`
+/// staging prefix only resolves on the host: inside the build namespace it
+/// dangles (the `--root` path is under `/home`, which build mode does not mount),
+/// so `execve` of a profile binary fails with ENOENT before producing any output.
+///
+/// The mapping rewrites a leading `{root}/mere` to `/mere`. When `root_path` is
+/// "/" (no `--root`) the physical path is already `/mere/...` and is returned
+/// unchanged. Paths not under `{root}/mere` are returned unchanged. The result
+/// is always newly allocated and owned by the caller.
+pub fn toLogicalStorePath(
+    allocator: std.mem.Allocator,
+    root_path: []const u8,
+    physical: []const u8,
+) error{OutOfMemory}![]u8 {
+    // Normalize away any trailing slashes on the root (but keep a bare "/").
+    var root = root_path;
+    while (root.len > 1 and root[root.len - 1] == '/') root = root[0 .. root.len - 1];
+
+    // With no --root the store already lives at its logical location.
+    if (std.mem.eql(u8, root, "/")) {
+        return allocator.dupe(u8, physical);
+    }
+
+    // Require a true path-boundary match against the root prefix so that a root
+    // of "/root" does not spuriously match "/rootx/...".
+    const under_root = std.mem.startsWith(u8, physical, root) and
+        (physical.len == root.len or physical[root.len] == '/');
+    if (!under_root) return allocator.dupe(u8, physical);
+
+    const rest = physical[root.len..]; // "" or "/..."
+
+    // Only rewrite paths that live under the bind-mounted mere directory.
+    if (!std.mem.eql(u8, rest, "/mere") and !std.mem.startsWith(u8, rest, "/mere/")) {
+        return allocator.dupe(u8, physical);
+    }
+
+    return allocator.dupe(u8, rest);
+}
+
 /// Check if a store path exists and is valid.
 pub fn storePathExists(store_path: []const u8) bool {
     std.Io.Dir.accessAbsolute(path_mod.currentIo(), store_path, .{}) catch {
@@ -450,6 +496,53 @@ test "parseStorePath handles package names with hyphens" {
     try std.testing.expectEqualStrings("b" ** 64, components.content_hash);
     try std.testing.expectEqualStrings("my-package-name", components.name);
     try std.testing.expectEqualStrings("2.0.0", components.version);
+}
+
+test "toLogicalStorePath rewrites a --root store path to /mere" {
+    const a = std.testing.allocator;
+    const r = try toLogicalStorePath(
+        a,
+        "/home/u/.swamp/mere-dev/root",
+        "/home/u/.swamp/mere-dev/root/mere/store/" ++ "a" ** 64 ++ "-busybox-1.37.0/bin/sh",
+    );
+    defer a.free(r);
+    try std.testing.expectEqualStrings("/mere/store/" ++ "a" ** 64 ++ "-busybox-1.37.0/bin/sh", r);
+}
+
+test "toLogicalStorePath is identity when root is /" {
+    const a = std.testing.allocator;
+    const r = try toLogicalStorePath(a, "/", "/mere/store/pkg/bin/sh");
+    defer a.free(r);
+    try std.testing.expectEqualStrings("/mere/store/pkg/bin/sh", r);
+}
+
+test "toLogicalStorePath tolerates a trailing slash on root" {
+    const a = std.testing.allocator;
+    const r = try toLogicalStorePath(a, "/root/", "/root/mere/store/pkg/bin/sh");
+    defer a.free(r);
+    try std.testing.expectEqualStrings("/mere/store/pkg/bin/sh", r);
+}
+
+test "toLogicalStorePath leaves non-mere paths under root unchanged" {
+    const a = std.testing.allocator;
+    const r = try toLogicalStorePath(a, "/root", "/root/store/pkg/bin/sh");
+    defer a.free(r);
+    try std.testing.expectEqualStrings("/root/store/pkg/bin/sh", r);
+}
+
+test "toLogicalStorePath leaves paths outside root unchanged" {
+    const a = std.testing.allocator;
+    const r = try toLogicalStorePath(a, "/root", "/other/mere/store/pkg/bin/sh");
+    defer a.free(r);
+    try std.testing.expectEqualStrings("/other/mere/store/pkg/bin/sh", r);
+}
+
+test "toLogicalStorePath does not match a partial path component" {
+    const a = std.testing.allocator;
+    // "/root" must not be treated as a prefix of "/rootx/...".
+    const r = try toLogicalStorePath(a, "/root", "/rootx/mere/store/pkg/bin/sh");
+    defer a.free(r);
+    try std.testing.expectEqualStrings("/rootx/mere/store/pkg/bin/sh", r);
 }
 
 test "parseStorePath rejects invalid paths" {
