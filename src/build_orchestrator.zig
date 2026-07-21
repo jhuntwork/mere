@@ -1867,6 +1867,11 @@ fn runOneNamespacePhase(
     };
     defer freeCEnvArray(exec_ctx.allocator, envp);
 
+    const mere_root_path = std.fs.path.join(exec_ctx.allocator, &.{ exec_ctx.ctx.root(), "mere" }) catch {
+        return exec_ctx.ctx.fail(BuildError.OutOfMemory, phase_name, "failed to build mere_root path");
+    };
+    defer exec_ctx.allocator.free(mere_root_path);
+
     const opts = namespace.EnvOptions{
         .profile_root = exec_ctx.profile_root,
         .command = &cmd_args,
@@ -1879,6 +1884,7 @@ fn runOneNamespacePhase(
             .ctx = @ptrCast(&exec_ctx.output_capture),
             .handleFn = ScriptOutputCapture.handleChunk,
         },
+        .mere_root = mere_root_path,
     };
 
     const exit_code = state.namespace_runner(exec_ctx.allocator, .build, opts) catch |err| {

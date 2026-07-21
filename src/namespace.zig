@@ -60,6 +60,10 @@ pub const EnvOptions = struct {
     no_etc_overlay: bool = false,
     env: ?[]const [*:0]const u8 = null,
     output_handler: ?OutputHandler = null,
+    // The host path to the mere directory (contains store/, keys/, config.kdl).
+    // Bind-mounted into the namespace so store symlinks resolve.
+    // Defaults to "/mere"; set to "{root}/mere" when using --root.
+    mere_root: []const u8 = "/mere",
 };
 
 pub const OutputHandler = struct {
@@ -191,7 +195,7 @@ pub fn enterEnv(allocator: std.mem.Allocator, mode: EnvMode, opts: EnvOptions) E
     var session = try createSession(allocator, mode);
     defer session.deinit();
 
-    try buildSyntheticRoot(allocator, &session, opts.profile_root);
+    try buildSyntheticRoot(allocator, &session, opts.profile_root, opts.mere_root);
 
     switch (mode) {
         .shell => try applyShellMounts(allocator, &session, opts),
@@ -497,7 +501,7 @@ fn createSession(allocator: std.mem.Allocator, mode: EnvMode) EnvError!SessionIn
     return createSessionAtBase(allocator, mode, tmp_base);
 }
 
-fn buildSyntheticRoot(allocator: std.mem.Allocator, session: *const SessionInfo, profile_root: []const u8) EnvError!void {
+fn buildSyntheticRoot(allocator: std.mem.Allocator, session: *const SessionInfo, profile_root: []const u8, mere_root: []const u8) EnvError!void {
     const io = path_mod.currentIo();
     const root = if (session.root_path.len > 0 and session.root_path[session.root_path.len - 1] == '/')
         session.root_path[0 .. session.root_path.len - 1]
@@ -554,15 +558,16 @@ fn buildSyntheticRoot(allocator: std.mem.Allocator, session: *const SessionInfo,
         try mountBind(source_path, target_path, true);
     }
 
-    // Bind-mount /mere so store symlinks resolve
-    // This is read-write in shell mode so `mere install` etc. work from inside the shell
+    // Bind-mount the mere directory so store symlinks resolve.
+    // Uses the actual mere root (respects --root flag) rather than hardcoded /mere.
+    // This is read-write in shell mode so `mere install` etc. work from inside the shell.
     const mere_target = std.fs.path.join(allocator, &.{ root, "mere" }) catch {
         return EnvError.OutOfMemory;
     };
     defer allocator.free(mere_target);
 
     const read_only_mere = session.mode == .build;
-    try mountBind("/mere", mere_target, read_only_mere);
+    try mountBind(mere_root, mere_target, read_only_mere);
 }
 
 fn applyShellMounts(allocator: std.mem.Allocator, session: *const SessionInfo, opts: EnvOptions) EnvError!void {
@@ -1079,6 +1084,16 @@ test "EnvOptions defaults" {
     try std.testing.expect(opts.workspace == null);
     try std.testing.expect(opts.no_etc_overlay == false);
     try std.testing.expect(opts.env == null);
+    try std.testing.expectEqualStrings("/mere", opts.mere_root);
+}
+
+test "EnvOptions mere_root can be overridden" {
+    const opts = EnvOptions{
+        .profile_root = "/custom/root/mere/profiles/shell-abc123/root",
+        .mere_root = "/custom/root/mere",
+    };
+
+    try std.testing.expectEqualStrings("/custom/root/mere", opts.mere_root);
 }
 
 test "cloneHostEnvWithVar injects requested variable" {

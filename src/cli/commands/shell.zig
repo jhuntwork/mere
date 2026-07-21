@@ -92,6 +92,11 @@ fn handleShell(ctx: *mere.Context, args: *const types.ParsedArgs) MereError!type
         return try command.errorResult(ctx, err, "profile not found");
     };
 
+    const mere_root_path = std.fs.path.join(ctx.allocator, &.{ ctx.root_path, "mere" }) catch |err| {
+        return try command.errorResult(ctx, err, "Failed to build mere root path");
+    };
+    defer ctx.allocator.free(mere_root_path);
+
     const opts = namespace.EnvOptions{
         .profile_root = profile_root,
         .command = if (args.passthrough.len > 0) args.passthrough else null,
@@ -99,6 +104,7 @@ fn handleShell(ctx: *mere.Context, args: *const types.ParsedArgs) MereError!type
         .workspace = null,
         .no_etc_overlay = no_etc_overlay,
         .env = shell_env,
+        .mere_root = mere_root_path,
     };
 
     // Error boundary: catch all errors and map them to user-friendly messages at CLI boundary
