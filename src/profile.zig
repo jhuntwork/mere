@@ -678,8 +678,20 @@ fn applyRealization(
             }
         }
 
-        const store_target = std.fs.path.join(allocator, &.{ pkg.store_path, entry.path }) catch {
+        const physical_target = std.fs.path.join(allocator, &.{ pkg.store_path, entry.path }) catch {
             return ctx.fail(ProfileError.OutOfMemory, pkg.store_path, "failed to construct store target path");
+        };
+        defer allocator.free(physical_target);
+
+        // Profile symlinks must point at the *logical* store path (/mere/store/...),
+        // not the physical `--root` staging path ({root}/mere/store/...). The build
+        // and shell namespaces bind-mount `{root}/mere` onto `/mere`, and a booted
+        // system has the store at `/mere` directly, so a logical target resolves in
+        // all three contexts; a physical target only resolves on the host and dangles
+        // inside the build namespace. When no --root is in effect (root_path == "/")
+        // the logical and physical targets are identical.
+        const store_target = store.toLogicalStorePath(allocator, ctx.root_path, physical_target) catch {
+            return ctx.fail(ProfileError.OutOfMemory, physical_target, "failed to construct logical store target path");
         };
         defer allocator.free(store_target);
 
@@ -1203,6 +1215,63 @@ test "buildProfile creates symlinks for package files" {
     try std.testing.expectEqualStrings(file_path, buf[0..target_len]);
 }
 
+// Regression (mere dev build --root): when the store is staged under
+// {root}/mere/store, profile symlinks must target the logical /mere/store path,
+// not the physical --root path. The build namespace bind-mounts {root}/mere onto
+// /mere and does not expose the host --root path (which lives under /home), so a
+// physical target dangles there and execve of /bin/sh fails with an empty
+// build.log. A logical target resolves in the namespace, in `mere shell`, and on
+// a booted system alike.
+test "buildProfile emits logical /mere/store symlink targets under --root staging" {
+    const th = @import("test_helpers.zig");
+    var test_env = try th.createTestEnv();
+    defer {
+        test_env.cleanup();
+        std.testing.allocator.destroy(test_env);
+    }
+
+    const allocator = test_env.ctx.allocator;
+
+    // Store staged under {root}/mere/store, mirroring a --root build.
+    const store_root = try std.fs.path.join(allocator, &.{ test_env.path, "mere", "store" });
+    defer allocator.free(store_root);
+
+    const pkg_path = try std.fs.path.join(allocator, &.{ store_root, "a" ** 64 ++ "-busybox-1.37.0" });
+    defer allocator.free(pkg_path);
+
+    const bin_dir = try std.fs.path.join(allocator, &.{ pkg_path, "bin" });
+    defer allocator.free(bin_dir);
+    try path.ensureDirExists(bin_dir);
+
+    const file_path = try std.fs.path.join(allocator, &.{ bin_dir, "sh" });
+    defer allocator.free(file_path);
+    {
+        var f = try std.Io.Dir.createFileAbsolute(path.currentIo(), file_path, .{});
+        try f.writeStreamingAll(path.currentIo(), "#!/bin/sh\n");
+        f.close(path.currentIo());
+    }
+
+    try writeProjectionForTestPackage(allocator, pkg_path);
+
+    const profile_root = try std.fs.path.join(allocator, &.{ test_env.path, "profiles", "build" });
+    defer allocator.free(profile_root);
+    try path.ensureDirExists(profile_root);
+
+    var result = try buildProfile(allocator, &test_env.ctx, profile_root, store_root, &.{testPackageEntry("busybox", pkg_path)});
+    defer result.deinit();
+    try std.testing.expect(!result.conflicts.hasConflicts());
+
+    const link = try std.fs.path.join(allocator, &.{ profile_root, "bin", "sh" });
+    defer allocator.free(link);
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const target_len = try std.Io.Dir.readLinkAbsolute(path.currentIo(), link, &buf);
+    const target = buf[0..target_len];
+
+    // The target is the logical store path and must NOT embed the --root prefix.
+    try std.testing.expectEqualStrings("/mere/store/" ++ "a" ** 64 ++ "-busybox-1.37.0/bin/sh", target);
+    try std.testing.expect(std.mem.indexOf(u8, target, test_env.path) == null);
+}
+
 // Spec #19: Path conflicts during profile build are hard errors
 test "buildProfile detects path conflicts" {
     const th = @import("test_helpers.zig");
@@ -1435,7 +1504,12 @@ test "createGeneration creates full generation" {
     defer allocator.free(link_path);
     var buf: [std.fs.max_path_bytes]u8 = undefined;
     const target_len = try std.Io.Dir.readLinkAbsolute(path.currentIo(), link_path, &buf);
-    try std.testing.expectEqualStrings(file_path, buf[0..target_len]);
+    // The on-disk symlink target is the logical store path (/mere/store/...),
+    // independent of the physical --root staging location. See
+    // store.toLogicalStorePath.
+    const expected_target = try store.toLogicalStorePath(allocator, test_env.ctx.root_path, file_path);
+    defer allocator.free(expected_target);
+    try std.testing.expectEqualStrings(expected_target, buf[0..target_len]);
 
     // Verify manifest was written
     var manifest = try generation.readManifest(allocator, store_root, gen_path);
@@ -1592,8 +1666,12 @@ test "createGeneration does not reread projection.v1 for unchanged parent packag
     const gen2_b_link = try std.fs.path.join(allocator, &.{ profile_dir, "gen-2", "bin", "b" });
     defer allocator.free(gen2_b_link);
 
-    try std.testing.expect(path.fileExists(gen2_a_link));
-    try std.testing.expect(path.fileExists(gen2_b_link));
+    // gen-2 carries both entries. Their targets are logical /mere/store paths
+    // that only resolve where the store is mounted at /mere, so assert the
+    // symlinks exist (readlink does not follow) rather than opening them.
+    var link_buf: [std.fs.max_path_bytes]u8 = undefined;
+    _ = try std.Io.Dir.readLinkAbsolute(path.currentIo(), gen2_a_link, &link_buf);
+    _ = try std.Io.Dir.readLinkAbsolute(path.currentIo(), gen2_b_link, &link_buf);
 }
 
 test "createGeneration detects conflicts against retained parent paths" {
