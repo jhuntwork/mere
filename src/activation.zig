@@ -45,6 +45,7 @@ pub const SystemActivationResult = struct {
     etc_copied: usize,
     etc_skipped: usize,
     etc_differing: usize,
+    boot_artifacts_staged: usize,
 };
 
 /// Switch the active generation for a profile and update its GC roots.
@@ -94,6 +95,11 @@ pub fn activateSystemGeneration(
         etc_result.deinit();
     }
 
+    // Boot artifacts are staged under unique names before the generation
+    // pointer changes. A failed activation may leave an unused artifact, but
+    // it cannot leave /boot partially written or replace the selected kernel.
+    const boot_artifacts_staged = try stageBootArtifacts(ctx, &manifest);
+
     try switchProfileGenerationAtPath(ctx, profile_dir, gen_num);
 
     const gc_roots_dir = try getGCRootsDir(ctx.allocator, ctx.root_path);
@@ -110,10 +116,35 @@ pub fn activateSystemGeneration(
         .etc_copied = etc_result.copied,
         .etc_skipped = etc_result.skipped,
         .etc_differing = etc_result.differing,
+        .boot_artifacts_staged = boot_artifacts_staged,
     };
     etc_result.deinit();
 
     return result;
+}
+
+/// Stage boot artifacts for the active system generation without changing the
+/// generation pointer or bootloader selection. This is used by idempotent
+/// installs that otherwise take the profile-up-to-date fast path.
+pub fn stageCurrentSystemBootArtifacts(
+    ctx: *mere.Context,
+    verification: VerificationMode,
+) ActivationError!usize {
+    const profile_dir = try getProfileDir(ctx.allocator, ctx.root_path, "system");
+    defer ctx.allocator.free(profile_dir);
+
+    const gen_num = generation.getCurrentGeneration(profile_dir) catch |err| {
+        return switch (err) {
+            generation.GenerationError.OutOfMemory => ActivationError.OutOfMemory,
+            generation.GenerationError.PermissionDenied => ActivationError.PermissionDenied,
+            generation.GenerationError.ProfilesNotFound => ActivationError.GenerationNotFound,
+            else => ActivationError.FileSystem,
+        };
+    } orelse return ActivationError.GenerationNotFound;
+
+    var manifest = try loadValidatedTargetManifest(ctx, profile_dir, gen_num, verificationEnabled(verification));
+    defer manifest.deinit();
+    return stageBootArtifacts(ctx, &manifest);
 }
 
 /// Activate a specific generation atomically.
@@ -271,6 +302,180 @@ fn getGCRootsDir(allocator: std.mem.Allocator, root_path: []const u8) ![]u8 {
 
 fn getEtcDir(allocator: std.mem.Allocator, root_path: []const u8) ![]u8 {
     return std.fs.path.join(allocator, &.{ root_path, "etc" });
+}
+
+const BOOT_ARTIFACT_HASH_PREFIX_LEN: usize = 16;
+
+/// Stage the boot payload of the selected Linux package without changing the
+/// bootloader selection. Names include the package content hash so a new
+/// payload never overwrites an older same-version kernel.
+fn stageBootArtifacts(
+    ctx: *mere.Context,
+    manifest: *const generation.GenerationManifest,
+) ActivationError!usize {
+    const boot_dir = std.fs.path.join(ctx.allocator, &.{ ctx.root_path, "boot" }) catch {
+        return ActivationError.OutOfMemory;
+    };
+    defer ctx.allocator.free(boot_dir);
+
+    var staged: usize = 0;
+    for (manifest.packages.items) |pkg| {
+        // Boot projection is intentionally explicit. Other packages may carry
+        // a boot/ directory for their own purposes, but only linux owns the
+        // host kernel staging contract.
+        if (!std.mem.eql(u8, pkg.name, "linux")) continue;
+        if (pkg.version.len == 0 or pkg.content_hash.len < BOOT_ARTIFACT_HASH_PREFIX_LEN) {
+            return ctx.fail(ActivationError.InvalidInput, pkg.store_path, "invalid linux package identity for boot staging");
+        }
+        for (pkg.version) |c| {
+            if (!std.ascii.isAlphanumeric(c) and c != '.' and c != '-' and c != '_' and c != '+') {
+                return ctx.fail(ActivationError.InvalidInput, pkg.version, "unsafe linux version for boot artifact name");
+            }
+        }
+        for (pkg.content_hash[0..BOOT_ARTIFACT_HASH_PREFIX_LEN]) |c| {
+            if (!std.ascii.isHex(c)) {
+                return ctx.fail(ActivationError.InvalidInput, pkg.content_hash, "invalid linux content hash for boot artifact name");
+            }
+        }
+
+        const source_vmlinux = std.fs.path.join(ctx.allocator, &.{ pkg.store_path, "boot", "vmlinux" }) catch {
+            return ActivationError.OutOfMemory;
+        };
+        defer ctx.allocator.free(source_vmlinux);
+        const source_config = std.fs.path.join(ctx.allocator, &.{ pkg.store_path, "boot", "config" }) catch {
+            return ActivationError.OutOfMemory;
+        };
+        defer ctx.allocator.free(source_config);
+
+        for ([_][]const u8{ source_vmlinux, source_config }) |source| {
+            std.Io.Dir.accessAbsolute(path_mod.currentIo(), source, .{}) catch {
+                return ctx.fail(ActivationError.FileSystem, source, "linux package is missing a boot artifact");
+            };
+        }
+
+        path_mod.ensureDirExists(boot_dir) catch |err| {
+            return ctx.fail(switch (err) {
+                error.AccessDenied => ActivationError.PermissionDenied,
+                else => ActivationError.FileSystem,
+            }, boot_dir, "failed to create boot directory");
+        };
+
+        const hash_prefix = pkg.content_hash[0..BOOT_ARTIFACT_HASH_PREFIX_LEN];
+        const vmlinux_name = std.fmt.allocPrint(ctx.allocator, "vmlinux-{s}-{s}", .{ pkg.version, hash_prefix }) catch {
+            return ActivationError.OutOfMemory;
+        };
+        defer ctx.allocator.free(vmlinux_name);
+        const config_name = std.fmt.allocPrint(ctx.allocator, "config-{s}-{s}", .{ pkg.version, hash_prefix }) catch {
+            return ActivationError.OutOfMemory;
+        };
+        defer ctx.allocator.free(config_name);
+
+        staged += try stageOneBootArtifact(ctx, boot_dir, source_vmlinux, vmlinux_name);
+        staged += try stageOneBootArtifact(ctx, boot_dir, source_config, config_name);
+    }
+
+    return staged;
+}
+
+fn stageOneBootArtifact(
+    ctx: *mere.Context,
+    boot_dir: []const u8,
+    source: []const u8,
+    name: []const u8,
+) ActivationError!usize {
+    const destination = std.fs.path.join(ctx.allocator, &.{ boot_dir, name }) catch {
+        return ActivationError.OutOfMemory;
+    };
+    defer ctx.allocator.free(destination);
+
+    // Content-addressed naming makes this idempotent and preserves all older
+    // kernel payloads. Do not replace an existing artifact merely because a
+    // same-version package was selected again.
+    if (path_mod.fileExists(destination)) return 0;
+
+    var random_bytes: [8]u8 = undefined;
+    path_mod.currentIo().random(&random_bytes);
+    const temp_name = std.fmt.allocPrint(ctx.allocator, ".mere-{s}-{s}", .{ name, std.fmt.bytesToHex(random_bytes, .lower) }) catch {
+        return ActivationError.OutOfMemory;
+    };
+    defer ctx.allocator.free(temp_name);
+    const temp_path = std.fs.path.join(ctx.allocator, &.{ boot_dir, temp_name }) catch {
+        return ActivationError.OutOfMemory;
+    };
+    defer ctx.allocator.free(temp_path);
+
+    path_mod.copyFile(source, temp_path) catch |err| {
+        return ctx.fail(switch (err) {
+            error.AccessDenied => ActivationError.PermissionDenied,
+            else => ActivationError.FileSystem,
+        }, source, "failed to copy boot artifact");
+    };
+    errdefer std.Io.Dir.deleteFileAbsolute(path_mod.currentIo(), temp_path) catch {};
+
+    std.Io.Dir.renameAbsolute(temp_path, destination, path_mod.currentIo()) catch |err| {
+        // Another activation may have staged the same content concurrently.
+        // Preserve that winner and discard only our temporary file.
+        if (err == error.PathAlreadyExists or err == error.AccessDenied) {
+            if (path_mod.fileExists(destination)) return 0;
+        }
+        return ctx.fail(switch (err) {
+            error.AccessDenied => ActivationError.PermissionDenied,
+            else => ActivationError.FileSystem,
+        }, destination, "failed to publish boot artifact");
+    };
+
+    return 1;
+}
+
+// Stage boot artifacts for the selected Linux package. This deliberately
+// leaves bootloader configuration and the currently selected entry alone.
+test "stageBootArtifacts publishes versioned linux payloads idempotently" {
+    const th = @import("test_helpers.zig");
+    var test_env = try th.createTestEnv();
+    defer {
+        test_env.cleanup();
+        std.testing.allocator.destroy(test_env);
+    }
+
+    const allocator = test_env.ctx.allocator;
+    const store_path = try std.fs.path.join(allocator, &.{ test_env.path, "mere", "store", "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789-linux-1.2.3" });
+    defer allocator.free(store_path);
+    const package_boot = try std.fs.path.join(allocator, &.{ store_path, "boot" });
+    defer allocator.free(package_boot);
+    try path_mod.ensureDirExists(package_boot);
+
+    const source_vmlinux = try std.fs.path.join(allocator, &.{ package_boot, "vmlinux" });
+    defer allocator.free(source_vmlinux);
+    var vmlinux = try std.Io.Dir.createFileAbsolute(path_mod.currentIo(), source_vmlinux, .{});
+    try vmlinux.writeStreamingAll(path_mod.currentIo(), "kernel");
+    vmlinux.close(path_mod.currentIo());
+
+    const source_config = try std.fs.path.join(allocator, &.{ package_boot, "config" });
+    defer allocator.free(source_config);
+    var config = try std.Io.Dir.createFileAbsolute(path_mod.currentIo(), source_config, .{});
+    try config.writeStreamingAll(path_mod.currentIo(), "CONFIG_TUN=y\\n");
+    config.close(path_mod.currentIo());
+
+    var manifest = generation.GenerationManifest.init(allocator, 1);
+    defer manifest.deinit();
+    try manifest.addPackage(
+        "linux",
+        "1.2.3",
+        1,
+        "x86_64",
+        store_path,
+        "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789",
+    );
+
+    try std.testing.expectEqual(@as(usize, 2), try stageBootArtifacts(&test_env.ctx, &manifest));
+    try std.testing.expectEqual(@as(usize, 0), try stageBootArtifacts(&test_env.ctx, &manifest));
+
+    const staged_vmlinux = try std.fs.path.join(allocator, &.{ test_env.path, "boot", "vmlinux-1.2.3-abcdef0123456789" });
+    defer allocator.free(staged_vmlinux);
+    const staged_config = try std.fs.path.join(allocator, &.{ test_env.path, "boot", "config-1.2.3-abcdef0123456789" });
+    defer allocator.free(staged_config);
+    try std.testing.expect(path_mod.fileExists(staged_vmlinux));
+    try std.testing.expect(path_mod.fileExists(staged_config));
 }
 
 fn mapEtcError(err: etc.EtcError) ActivationError {

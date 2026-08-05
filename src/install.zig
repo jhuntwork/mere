@@ -1257,6 +1257,17 @@ pub fn realizeProfile(
     if (!reinstall and target_profile_path == null) {
         if (profile_name) |prof_name| {
             if (profileMatchesResolution(ctx, prof_name, resolution.plan.sorted)) {
+                if (std.mem.eql(u8, prof_name, "system") and store.isPrivileged()) {
+                    const staged = activation.stageCurrentSystemBootArtifacts(
+                        ctx,
+                        if (verify_store) .full_store else .fast,
+                    ) catch |err| {
+                        return ctx.fail(mapActivationError(err), "boot", "failed to stage boot artifacts");
+                    };
+                    if (staged > 0) {
+                        emit.logLineSeverity(ctx, phase, .info, "staged boot artifacts for active system generation");
+                    }
+                }
                 emit.logLineSeverity(ctx, phase, .info, "profile is already up to date");
                 return target_behavior;
             }
@@ -1683,10 +1694,12 @@ fn applyProfileRealization(ctx: *Context, prof_name: []const u8, installed_packa
         var copied_buf: [32]u8 = undefined;
         var unchanged_buf: [32]u8 = undefined;
         var differing_buf: [32]u8 = undefined;
+        var boot_buf: [32]u8 = undefined;
         const gen_text = std.fmt.bufPrint(&gen_buf, "{d}", .{gen_num}) catch return error.OutOfMemory;
         const copied_text = std.fmt.bufPrint(&copied_buf, "{d}", .{result.etc_copied}) catch return error.OutOfMemory;
         const unchanged_text = std.fmt.bufPrint(&unchanged_buf, "{d}", .{result.etc_skipped}) catch return error.OutOfMemory;
         const differing_text = std.fmt.bufPrint(&differing_buf, "{d}", .{result.etc_differing}) catch return error.OutOfMemory;
+        const boot_text = std.fmt.bufPrint(&boot_buf, "{d}", .{result.boot_artifacts_staged}) catch return error.OutOfMemory;
         const segments = [_]mere.ui.Segment{
             .{ .text = "generation ", .kind = .normal },
             .{ .text = "activated", .kind = .success },
@@ -1698,7 +1711,9 @@ fn applyProfileRealization(ctx: *Context, prof_name: []const u8, installed_packa
             .{ .text = unchanged_text, .kind = .detail },
             .{ .text = " unchanged, ", .kind = .normal },
             .{ .text = differing_text, .kind = .detail },
-            .{ .text = " differing; run 'mere etc status')", .kind = .normal },
+            .{ .text = " differing, ", .kind = .normal },
+            .{ .text = boot_text, .kind = .detail },
+            .{ .text = " boot artifacts staged; run 'mere etc status')", .kind = .normal },
         };
         emit.logSegmentsSeverity(ctx, phase, .info, &segments);
     } else {
