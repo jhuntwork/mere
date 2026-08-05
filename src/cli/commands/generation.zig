@@ -17,6 +17,7 @@ fn emitGenerationActivationStatus(
     etc_copied: ?usize,
     etc_unchanged: ?usize,
     etc_differing: ?usize,
+    boot_artifacts_staged: ?usize,
 ) void {
     var gen_buf: [32]u8 = undefined;
     const gen_text = std.fmt.bufPrint(&gen_buf, "{d}", .{gen_num}) catch return;
@@ -25,9 +26,11 @@ fn emitGenerationActivationStatus(
         var copied_buf: [32]u8 = undefined;
         var unchanged_buf: [32]u8 = undefined;
         var differing_buf: [32]u8 = undefined;
+        var boot_buf: [32]u8 = undefined;
         const copied_text = std.fmt.bufPrint(&copied_buf, "{d}", .{etc_copied.?}) catch return;
         const unchanged_text = std.fmt.bufPrint(&unchanged_buf, "{d}", .{etc_unchanged.?}) catch return;
         const differing_text = std.fmt.bufPrint(&differing_buf, "{d}", .{etc_differing.?}) catch return;
+        const boot_text = std.fmt.bufPrint(&boot_buf, "{d}", .{boot_artifacts_staged.?}) catch return;
         const segments = [_]mere.ui.Segment{
             .{ .text = "generation ", .kind = .normal },
             .{ .text = "activated", .kind = .success },
@@ -39,7 +42,9 @@ fn emitGenerationActivationStatus(
             .{ .text = unchanged_text, .kind = .detail },
             .{ .text = " unchanged, ", .kind = .normal },
             .{ .text = differing_text, .kind = .detail },
-            .{ .text = " differing; run 'mere etc status')", .kind = .normal },
+            .{ .text = " differing, ", .kind = .normal },
+            .{ .text = boot_text, .kind = .detail },
+            .{ .text = " boot artifacts staged; run 'mere etc status')", .kind = .normal },
         };
         emit.logSegmentsSeverity(ctx, .generation, .info, &segments);
         return;
@@ -459,7 +464,7 @@ pub fn handleActivate(ctx: *mere.Context, args: *const types.ParsedArgs) MereErr
         return try command.errorResult(ctx, err, msg);
     };
 
-    emitGenerationActivationStatus(ctx, gen_num, result.etc_copied, result.etc_skipped, result.etc_differing);
+    emitGenerationActivationStatus(ctx, gen_num, result.etc_copied, result.etc_skipped, result.etc_differing, result.boot_artifacts_staged);
     return types.CommandResult{ .success = true };
 }
 
