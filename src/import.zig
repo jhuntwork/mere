@@ -1493,7 +1493,8 @@ test "packages with multiple ELF files" {
     const src2_path = try p.resolveToAbsolutePath("test/testdata/libsoname.so", &src_buf);
     try p.copyFile(src2_path, lib2_path);
 
-    // Create .mere directory for meta.kdl (content hash is computed without .mere/)
+    // Create .mere directory for meta.kdl (content hash includes canonical meta.kdl,
+    // while manifest and projection files remain excluded).
     const mere_dir_path = try std.fs.path.join(std.testing.allocator, &.{ content_dir, manifest.META_DIR });
     defer std.testing.allocator.free(mere_dir_path);
     try p.ensureDirExists(mere_dir_path);
