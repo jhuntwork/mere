@@ -69,6 +69,60 @@ pub const Provision = struct {
     }
 };
 
+pub const ServiceType = enum {
+    daemon,
+    oneshot,
+
+    pub fn label(self: ServiceType) []const u8 {
+        return switch (self) {
+            .daemon => "daemon",
+            .oneshot => "oneshot",
+        };
+    }
+
+    pub fn fromString(value: []const u8) ?ServiceType {
+        if (std.mem.eql(u8, value, "daemon")) return .daemon;
+        if (std.mem.eql(u8, value, "oneshot")) return .oneshot;
+        return null;
+    }
+};
+
+pub const Service = struct {
+    name: []const u8,
+    service_type: ServiceType,
+    command: std.ArrayList([]const u8),
+    up: std.ArrayList([]const u8),
+    down: std.ArrayList([]const u8),
+    depends_on: std.ArrayList([]const u8),
+    ready_notification: ?i64 = null,
+    essential: bool = false,
+    log: bool = true,
+
+    pub fn init(allocator: std.mem.Allocator) Service {
+        _ = allocator;
+        return .{
+            .name = "",
+            .service_type = .daemon,
+            .command = .empty,
+            .up = .empty,
+            .down = .empty,
+            .depends_on = .empty,
+        };
+    }
+
+    pub fn deinit(self: *Service, allocator: std.mem.Allocator) void {
+        if (self.name.len > 0) allocator.free(self.name);
+        for (self.command.items) |value| allocator.free(value);
+        self.command.deinit(allocator);
+        for (self.up.items) |value| allocator.free(value);
+        self.up.deinit(allocator);
+        for (self.down.items) |value| allocator.free(value);
+        self.down.deinit(allocator);
+        for (self.depends_on.items) |value| allocator.free(value);
+        self.depends_on.deinit(allocator);
+    }
+};
+
 pub const Data = struct {
     dependencies: std.ArrayList(Dependency),
     provisions: std.ArrayList(Provision),
@@ -79,6 +133,7 @@ pub const Data = struct {
     url: ?[]const u8 = null,
     licenses: std.ArrayList([]const u8) = .empty,
     source_urls: std.ArrayList([]const u8) = .empty,
+    services: std.ArrayList(Service) = .empty,
 
     pub fn init(allocator: std.mem.Allocator) Data {
         return Data{
@@ -105,6 +160,8 @@ pub const Data = struct {
         self.licenses.deinit(self.allocator);
         for (self.source_urls.items) |s| self.allocator.free(s);
         self.source_urls.deinit(self.allocator);
+        for (self.services.items) |*service| service.deinit(self.allocator);
+        self.services.deinit(self.allocator);
     }
 
     pub fn addDependency(self: *Data, dep_type: DependencyType, value: []const u8) MetaError!void {
@@ -160,6 +217,35 @@ pub const Data = struct {
             };
             try self.addProvision(prov_type, prov.resource);
         }
+    }
+
+    pub fn addService(self: *Data, source: anytype) MetaError!void {
+        var service = Service.init(self.allocator);
+        errdefer service.deinit(self.allocator);
+
+        service.name = self.allocator.dupe(u8, source.name) catch return MetaError.OutOfMemory;
+        service.service_type = switch (source.service_type) {
+            .daemon => .daemon,
+            .oneshot => .oneshot,
+        };
+        service.ready_notification = source.ready_notification;
+        service.essential = source.essential;
+        service.log = source.log;
+
+        for (source.command.items) |value| {
+            try service.command.append(self.allocator, try self.allocator.dupe(u8, value));
+        }
+        for (source.up.items) |value| {
+            try service.up.append(self.allocator, try self.allocator.dupe(u8, value));
+        }
+        for (source.down.items) |value| {
+            try service.down.append(self.allocator, try self.allocator.dupe(u8, value));
+        }
+        for (source.depends_on.items) |value| {
+            try service.depends_on.append(self.allocator, try self.allocator.dupe(u8, value));
+        }
+
+        try self.services.append(self.allocator, service);
     }
 
     /// Populate recipe-level metadata (description, homepage, licenses, source URLs).
@@ -290,6 +376,37 @@ pub const Data = struct {
             buffer.appendSlice(allocator, "}\n") catch return MetaError.OutOfMemory;
         }
 
+        if (self.services.items.len > 0) {
+            if (self.dependencies.items.len > 0 or self.provisions.items.len > 0 or self.description != null or
+                self.url != null or self.licenses.items.len > 0 or self.source_urls.items.len > 0)
+            {
+                buffer.append(allocator, '\n') catch return MetaError.OutOfMemory;
+            }
+
+            buffer.appendSlice(allocator, "services {\n") catch return MetaError.OutOfMemory;
+            for (self.services.items) |service| {
+                buffer.appendSlice(allocator, "    service \"") catch return MetaError.OutOfMemory;
+                try appendEscaped(&buffer, allocator, service.name);
+                buffer.appendSlice(allocator, "\" {\n        type \"") catch return MetaError.OutOfMemory;
+                buffer.appendSlice(allocator, service.service_type.label()) catch return MetaError.OutOfMemory;
+                buffer.appendSlice(allocator, "\"\n") catch return MetaError.OutOfMemory;
+                try appendMetaArgs(&buffer, allocator, "command", service.command.items, 8);
+                try appendMetaArgs(&buffer, allocator, "up", service.up.items, 8);
+                try appendMetaArgs(&buffer, allocator, "down", service.down.items, 8);
+                try appendMetaArgs(&buffer, allocator, "depends-on", service.depends_on.items, 8);
+                if (service.ready_notification) |fd| {
+                    var fd_buf: [64]u8 = undefined;
+                    const fd_line = std.fmt.bufPrint(&fd_buf, "        ready-notification {d}\n", .{fd}) catch
+                        return MetaError.OutOfMemory;
+                    buffer.appendSlice(allocator, fd_line) catch return MetaError.OutOfMemory;
+                }
+                if (service.essential) buffer.appendSlice(allocator, "        essential true\n") catch return MetaError.OutOfMemory;
+                if (!service.log) buffer.appendSlice(allocator, "        log false\n") catch return MetaError.OutOfMemory;
+                buffer.appendSlice(allocator, "    }\n") catch return MetaError.OutOfMemory;
+            }
+            buffer.appendSlice(allocator, "}\n") catch return MetaError.OutOfMemory;
+        }
+
         return buffer.toOwnedSlice(allocator) catch return MetaError.OutOfMemory;
     }
 
@@ -331,6 +448,23 @@ pub const Data = struct {
                         }
                     }
                 }
+            } else if (std.mem.eql(u8, node.name, "services")) {
+                for (node.children.items) |*child| {
+                    if (!std.mem.eql(u8, child.name, "service")) continue;
+                    var service = Service.init(allocator);
+                    errdefer service.deinit(allocator);
+                    service.name = allocator.dupe(u8, child.getFirstArgString() orelse return MetaError.InvalidInput) catch return MetaError.OutOfMemory;
+                    const type_name = child.getChildString("type") orelse return MetaError.InvalidInput;
+                    service.service_type = ServiceType.fromString(type_name) orelse return MetaError.InvalidInput;
+                    service.ready_notification = child.getChildInt("ready-notification");
+                    service.essential = child.getChildBool("essential") orelse false;
+                    service.log = child.getChildBool("log") orelse true;
+                    try parseServiceArgs(allocator, child, "command", &service.command);
+                    try parseServiceArgs(allocator, child, "up", &service.up);
+                    try parseServiceArgs(allocator, child, "down", &service.down);
+                    try parseServiceArgs(allocator, child, "depends-on", &service.depends_on);
+                    try meta.services.append(allocator, service);
+                }
             } else if (std.mem.eql(u8, node.name, "metadata")) {
                 for (node.children.items) |*child| {
                     if (std.mem.eql(u8, child.name, "description")) {
@@ -359,6 +493,44 @@ pub const Data = struct {
         return meta;
     }
 };
+
+fn appendMetaArgs(
+    buffer: *std.ArrayList(u8),
+    allocator: std.mem.Allocator,
+    name: []const u8,
+    values: []const []const u8,
+    indent: usize,
+) MetaError!void {
+    if (values.len == 0) return;
+    try appendIndent(buffer, allocator, indent);
+    buffer.appendSlice(allocator, name) catch return MetaError.OutOfMemory;
+    for (values) |value| {
+        buffer.append(allocator, ' ') catch return MetaError.OutOfMemory;
+        buffer.append(allocator, '"') catch return MetaError.OutOfMemory;
+        try appendEscaped(buffer, allocator, value);
+        buffer.append(allocator, '"') catch return MetaError.OutOfMemory;
+    }
+    buffer.append(allocator, '\n') catch return MetaError.OutOfMemory;
+}
+
+fn appendIndent(buffer: *std.ArrayList(u8), allocator: std.mem.Allocator, count: usize) MetaError!void {
+    var i: usize = 0;
+    while (i < count) : (i += 1) buffer.append(allocator, ' ') catch return MetaError.OutOfMemory;
+}
+
+fn parseServiceArgs(
+    allocator: std.mem.Allocator,
+    node: *const kdl.Node,
+    name: []const u8,
+    values: *std.ArrayList([]const u8),
+) MetaError!void {
+    if (node.findChild(name)) |child| {
+        for (child.arguments.items) |arg| {
+            const value = arg.getString() orelse return MetaError.InvalidInput;
+            try values.append(allocator, try allocator.dupe(u8, value));
+        }
+    }
+}
 
 /// Append a string to a buffer, escaping KDL special characters.
 fn appendEscaped(buffer: *std.ArrayList(u8), allocator: std.mem.Allocator, value: []const u8) MetaError!void {
@@ -583,6 +755,42 @@ test "Data parse roundtrip" {
 
     try std.testing.expectEqual(ProvisionType.bin, meta.provisions.items[1].prov_type);
     try std.testing.expectEqualStrings("myprogram", meta.provisions.items[1].value);
+}
+
+test "Data service metadata roundtrip" {
+    const allocator = std.testing.allocator;
+
+    var meta = Data.init(allocator);
+    defer meta.deinit();
+
+    var service = Service.init(allocator);
+    service.name = try allocator.dupe(u8, "ntpd");
+    service.service_type = .daemon;
+    service.ready_notification = 3;
+    service.essential = true;
+    service.log = false;
+    try service.command.append(allocator, try allocator.dupe(u8, "/usr/bin/ntpd"));
+    try service.command.append(allocator, try allocator.dupe(u8, "-n"));
+    try service.depends_on.append(allocator, try allocator.dupe(u8, "network"));
+    try meta.services.append(allocator, service);
+
+    const encoded = try meta.encode(allocator);
+    defer allocator.free(encoded);
+
+    var parsed = try Data.parse(allocator, encoded);
+    defer parsed.deinit();
+
+    try std.testing.expectEqual(@as(usize, 1), parsed.services.items.len);
+    const parsed_service = parsed.services.items[0];
+    try std.testing.expectEqualStrings("ntpd", parsed_service.name);
+    try std.testing.expectEqual(ServiceType.daemon, parsed_service.service_type);
+    try std.testing.expectEqual(@as(?i64, 3), parsed_service.ready_notification);
+    try std.testing.expect(parsed_service.essential);
+    try std.testing.expect(!parsed_service.log);
+    try std.testing.expectEqual(@as(usize, 2), parsed_service.command.items.len);
+    try std.testing.expectEqualStrings("/usr/bin/ntpd", parsed_service.command.items[0]);
+    try std.testing.expectEqualStrings("-n", parsed_service.command.items[1]);
+    try std.testing.expectEqualStrings("network", parsed_service.depends_on.items[0]);
 }
 
 test "Data parse empty input" {

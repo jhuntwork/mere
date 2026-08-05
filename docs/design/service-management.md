@@ -7,20 +7,28 @@ surface and recipe format are provider-neutral; runtime service operations go
 through `services.zig`, and package-time service metadata is translated by the
 active artifact generator.
 
-The default and currently implemented provider is s6-rc. Service definitions
-in recipes are pure KDL metadata. Mere's packager translates them into raw
-s6-rc source directories at build time when the active provider is s6-rc.
+The default provider is s6-rc. dinit is also supported for lifecycle
+operations, status/list/logs, and system-profile service reconciliation.
 
 The active provider is configured in `/mere/config.kdl`:
 
 ```kdl
 settings {
-    init-provider "s6-rc"
+    init-provider "s6-rc" // or "dinit"
 }
 ```
 
-`dinit` is a recognized provider name for the provider-selection boundary, but
-its runtime commands and package artifact generator are not implemented yet.
+Packages carry normalized service intent in `.mere/meta.kdl`. This keeps the
+package artifact independent of the target init provider. During system
+profile realization, the configured provider consumes that metadata. dinit
+materializes package-owned files under `/usr/share/dinit.d`; administrator
+files under `/etc/dinit.d` are not modified. s6-rc continues to use its
+existing source-store/repository path.
+
+Provider-specific build-time generators remain as transitional compatibility
+output. The eventual steady state is to remove those generators after all
+install-time materialization paths and provider-switch reconciliation are
+covered.
 
 ## Command Semantics
 
@@ -56,24 +64,15 @@ prescriptions. No command does both.
 ## What the Commands Do
 
 **`mere enable ntpd`**:
-1. Scan both source paths, assemble into store (admin overrides win)
-2. Sync repo (`s6-rc-repo-sync`)
-3. Set prescription to active (`s6-rc-set-change`)
-4. Commit (`s6-rc-set-commit`)
-5. Does NOT install to live db — ntpd starts at next boot or via `mere start`
+1. For s6-rc, assemble sources, sync the repo, and set the active prescription.
+2. For dinit, add the service to the `boot` bundle with `dinitctl enable`.
+3. Neither provider starts the service as a side effect.
 
-**`mere start ntpd`**:
-1. Ensure live db is current (assemble, sync, commit, install if needed)
-2. `s6-rc -u change ntpd`
-
-**`mere disable ntpd`**:
-1. Set prescription to latent
-2. Commit
-3. Service keeps running if it was running — use `mere stop` to bring it down
-
-**`mere stop ntpd`**:
-1. Ensure live db is current
-2. `s6-rc -d change ntpd`
+**`mere start ntpd`** changes live state only; **`mere disable ntpd`** removes
+boot intent but leaves a running service alone; **`mere stop ntpd`** changes
+live state only. dinit status/list/logs use its native `dinitctl` protocol;
+when buffered output is unavailable, logs fall back to the configured service
+log file.
 
 ## Recipe Service Definitions
 
@@ -88,9 +87,12 @@ service "ntpd" {
 }
 ```
 
-The packager generates run scripts, logging pipelines, dependency dirs, and
-notification-fd files from this metadata. The result is a standard s6-rc source
-directory at `usr/share/s6-rc/sources/ntpd/` inside the package.
+The packager records service intent in `.mere/meta.kdl`; it does not need to
+preserve provider-specific recipe KDL. During system profile realization, dinit
+reads that metadata and reconciles package-owned files in
+`usr/share/dinit.d/`. Service additions, upgrades, and removals are handled;
+conflicting service names are rejected. Administrator overrides in
+`/etc/dinit.d/` are not overwritten.
 
-For features beyond what KDL expresses, ship raw s6-rc source directories
-directly — they're used as-is with no translation.
+The existing build-time native generators are transitional compatibility output
+while the remaining install-time/provider-switch coverage is completed.

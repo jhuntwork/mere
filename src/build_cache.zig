@@ -347,6 +347,18 @@ pub fn computePackageArchiveKey(
     out.print("release={d}\n", .{parsed_recipe.release}) catch return error.OutOfMemory;
     out.print("arch={s}\n", .{parsed_recipe.arch orelse "any"}) catch return error.OutOfMemory;
 
+    for (artifact.services.items, 0..) |service, index| {
+        out.print("service[{d}].name={s}\n", .{ index, service.name }) catch return error.OutOfMemory;
+        out.print("service[{d}].type={s}\n", .{ index, @tagName(service.service_type) }) catch return error.OutOfMemory;
+        out.print("service[{d}].essential={}\n", .{ index, service.essential }) catch return error.OutOfMemory;
+        out.print("service[{d}].log={}\n", .{ index, service.log }) catch return error.OutOfMemory;
+        out.print("service[{d}].ready-notification={d}\n", .{ index, service.ready_notification orelse -1 }) catch return error.OutOfMemory;
+        for (service.command.items) |value| out.print("service[{d}].command={s}\n", .{ index, value }) catch return error.OutOfMemory;
+        for (service.up.items) |value| out.print("service[{d}].up={s}\n", .{ index, value }) catch return error.OutOfMemory;
+        for (service.down.items) |value| out.print("service[{d}].down={s}\n", .{ index, value }) catch return error.OutOfMemory;
+        for (service.depends_on.items) |value| out.print("service[{d}].depends-on={s}\n", .{ index, value }) catch return error.OutOfMemory;
+    }
+
     const signing_key_hash = try computeSigningKeyHash(ctx);
     defer ctx.allocator.free(signing_key_hash);
     out.print("signing_key={s}\n", .{signing_key_hash}) catch return error.OutOfMemory;
