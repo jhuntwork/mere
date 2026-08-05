@@ -113,7 +113,14 @@ mere store verify
 ## Service Management
 
 On a native Mere system, `mere` provides integrated service management as
-top-level commands. The current implemented provider is s6-rc:
+top-level commands. The active provider is selected in `/mere/config.kdl`;
+s6-rc and dinit both have lifecycle and introspection adapters.
+
+```kdl
+settings {
+    init-provider "dinit" // or "s6-rc"
+}
+```
 
 ```sh
 mere status              # show all services with status
@@ -127,11 +134,14 @@ mere disable nginx       # remove from boot set
 mere logs nginx          # view service logs
 ```
 
-Service definitions are generated at build time from recipe metadata and
-installed for the configured init provider. The default and currently
-implemented provider is s6-rc. `mere enable` assembles definitions, syncs the
-repository, and updates the boot prescription. `mere start/stop` operate on
-live state only — the two concerns are cleanly separated.
+Recipe service declarations are normalized into `.mere/meta.kdl` and carried
+in packages independently of the target init provider. During system profile
+realization, dinit materializes the configured package-owned service files
+under `/usr/share/dinit.d`; `/etc/dinit.d` remains administrator-owned.
+Provider-specific build-time service artifacts are retained temporarily for
+backward compatibility while profile reconciliation is completed. `mere
+enable/disable` change boot intent only; `mere start/stop` operate on live
+state only.
 
 ## Building from Source
 
@@ -154,4 +164,4 @@ Linux system, but the CLI surface and some subsystems are still stabilizing.
 
 - [Specification Details](docs/design/specification-details.md) — full system specification
 - [Recipe Specification](docs/design/recipe_spec.md) — guide to writing build recipes
-- [Service Management](docs/design/service-management.md) — service architecture and s6-rc integration
+- [Service Management](docs/design/service-management.md) — service architecture, s6-rc, and dinit integration

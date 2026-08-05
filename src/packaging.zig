@@ -303,6 +303,15 @@ pub const Packager = struct {
             };
         }
 
+        if (config.artifact.services.items.len > 0) {
+            for (config.artifact.services.items) |service| {
+                pkg_meta.addService(service) catch {
+                    self.ctx.allocator.free(content_hash);
+                    return self.fail(config.staging_dir, "failed to populate service metadata", PackagingError.CreationFailed);
+                };
+            }
+        }
+
         meta.writeFile(self.ctx.allocator, config.staging_dir, &pkg_meta) catch {
             self.ctx.allocator.free(content_hash);
             return self.fail(config.staging_dir, "failed to write meta.kdl", PackagingError.FileSystem);

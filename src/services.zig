@@ -8,6 +8,7 @@ const mere = @import("mere.zig");
 const errors = @import("errors.zig");
 const path_mod = @import("path.zig");
 const s6rc = @import("s6rc.zig");
+const dinit = @import("dinit.zig");
 
 const Std = errors.StandardErrors;
 pub const ServiceError = Std.OutOfMemory || Std.FileSystem || Std.PermissionDenied || error{
@@ -85,46 +86,70 @@ pub fn freeList(ctx: *mere.Context, entries: []ListEntry) void {
 }
 
 pub fn start(ctx: *mere.Context, name: []const u8) ServiceError!void {
-    try requireS6RcProvider(ctx);
-    try s6rc.startService(ctx.allocator, name);
+    switch (try activeProvider(ctx)) {
+        .s6rc => try s6rc.startService(ctx.allocator, name),
+        .dinit => try dinit.startService(ctx.allocator, name),
+    }
 }
 
 pub fn stop(ctx: *mere.Context, name: []const u8) ServiceError!void {
-    try requireS6RcProvider(ctx);
-    try s6rc.stopService(ctx.allocator, name);
+    switch (try activeProvider(ctx)) {
+        .s6rc => try s6rc.stopService(ctx.allocator, name),
+        .dinit => try dinit.stopService(ctx.allocator, name),
+    }
 }
 
 pub fn restart(ctx: *mere.Context, name: []const u8) ServiceError!void {
-    try requireS6RcProvider(ctx);
-    s6rc.stopService(ctx.allocator, name) catch {};
-    try s6rc.startService(ctx.allocator, name);
+    switch (try activeProvider(ctx)) {
+        .s6rc => {
+            s6rc.stopService(ctx.allocator, name) catch {};
+            try s6rc.startService(ctx.allocator, name);
+        },
+        .dinit => try dinit.restartService(ctx.allocator, name),
+    }
 }
 
 pub fn enable(ctx: *mere.Context, name: []const u8) ServiceError!void {
-    try requireS6RcProvider(ctx);
-    const allocator = ctx.allocator;
-    try s6rc.ensureRepo(allocator);
-    try s6rc.repoSync(allocator);
-    try s6rc.setChange(allocator, "active", name);
-    try s6rc.setCommit(allocator);
-    try s6rc.setInstall(allocator);
+    switch (try activeProvider(ctx)) {
+        .s6rc => {
+            const allocator = ctx.allocator;
+            try s6rc.ensureRepo(allocator);
+            try s6rc.repoSync(allocator);
+            try s6rc.setChange(allocator, "active", name);
+            try s6rc.setCommit(allocator);
+            try s6rc.setInstall(allocator);
+        },
+        .dinit => try dinit.enableService(ctx.allocator, name),
+    }
 }
 
 pub fn disable(ctx: *mere.Context, name: []const u8) ServiceError!void {
-    try requireS6RcProvider(ctx);
-    const allocator = ctx.allocator;
-    try s6rc.setChange(allocator, "latent", name);
-    try s6rc.setCommit(allocator);
-    try s6rc.setInstall(allocator);
+    switch (try activeProvider(ctx)) {
+        .s6rc => {
+            const allocator = ctx.allocator;
+            try s6rc.setChange(allocator, "latent", name);
+            try s6rc.setCommit(allocator);
+            try s6rc.setInstall(allocator);
+        },
+        .dinit => try dinit.disableService(ctx.allocator, name),
+    }
 }
 
 pub fn reload(ctx: *mere.Context, name: []const u8) ServiceError!void {
-    try requireS6RcProvider(ctx);
-    try s6rc.reloadService(ctx.allocator, name);
+    switch (try activeProvider(ctx)) {
+        .s6rc => try s6rc.reloadService(ctx.allocator, name),
+        .dinit => try dinit.reloadService(ctx.allocator, name),
+    }
 }
 
 pub fn status(ctx: *mere.Context, name: []const u8) ServiceError!StatusDetail {
-    try requireS6RcProvider(ctx);
+    switch (try activeProvider(ctx)) {
+        .s6rc => return statusS6Rc(ctx, name),
+        .dinit => return statusDinit(ctx, name),
+    }
+}
+
+fn statusS6Rc(ctx: *mere.Context, name: []const u8) ServiceError!StatusDetail {
     const kind = queryKind(ctx, name);
     const is_up = isUp(ctx, name);
 
@@ -147,9 +172,51 @@ pub fn status(ctx: *mere.Context, name: []const u8) ServiceError!StatusDetail {
     return detail;
 }
 
+fn statusDinit(ctx: *mere.Context, name: []const u8) ServiceError!StatusDetail {
+    const allocator = ctx.allocator;
+    const raw = dinit.status(allocator, name) catch return error.ProcessFailed;
+    defer allocator.free(raw);
+
+    const kind = dinit.serviceKind(allocator, name) catch .daemon;
+    const state = try dinitState(allocator, raw);
+    const boot_state: BootState = if (dinit.isBootEnabled(allocator, name) catch false) .enabled else .disabled;
+    const is_daemon = kind == .daemon;
+
+    return .{
+        .name = name,
+        .kind = if (is_daemon) .daemon else .oneshot,
+        .boot_state = boot_state,
+        .state = state,
+        .dependencies = .empty,
+        .log_dir = if (is_daemon) try dinitLogPath(allocator, name) else null,
+    };
+}
+
+fn dinitState(allocator: std.mem.Allocator, raw: []const u8) ServiceError![]const u8 {
+    var lines = std.mem.splitScalar(u8, raw, '\n');
+    while (lines.next()) |line| {
+        const trimmed = std.mem.trim(u8, line, " \t");
+        if (std.mem.startsWith(u8, trimmed, "State:")) {
+            return allocator.dupe(u8, std.mem.trim(u8, trimmed["State:".len..], " \t")) catch error.OutOfMemory;
+        }
+    }
+    return allocator.dupe(u8, "unknown") catch error.OutOfMemory;
+}
+
+fn dinitLogPath(allocator: std.mem.Allocator, name: []const u8) ServiceError!?[]const u8 {
+    if (name.len == 0 or std.mem.indexOfAny(u8, name, "/\\") != null) return null;
+    return std.fmt.allocPrint(allocator, "/var/log/{s}.log", .{name}) catch error.OutOfMemory;
+}
+
 /// Caller owns the returned slice and each entry name; free with `freeList`.
 pub fn list(ctx: *mere.Context) ServiceError![]ListEntry {
-    try requireS6RcProvider(ctx);
+    switch (try activeProvider(ctx)) {
+        .s6rc => return listS6Rc(ctx),
+        .dinit => return listDinit(ctx),
+    }
+}
+
+fn listS6Rc(ctx: *mere.Context) ServiceError![]ListEntry {
     const allocator = ctx.allocator;
     const all_names = try s6rc.scanSourceNames(allocator);
     defer allocator.free(all_names);
@@ -183,9 +250,58 @@ pub fn list(ctx: *mere.Context) ServiceError![]ListEntry {
     return try entries.toOwnedSlice(allocator);
 }
 
+fn listDinit(ctx: *mere.Context) ServiceError![]ListEntry {
+    const allocator = ctx.allocator;
+    const all_names = try dinit.scanSourceNames(allocator);
+    var entries: std.ArrayList(ListEntry) = .empty;
+    errdefer {
+        for (entries.items) |entry| allocator.free(entry.name);
+        entries.deinit(allocator);
+    }
+
+    for (all_names) |name| {
+        const owned_name = name;
+        const failed = dinit.isFailed(allocator, name) catch false;
+        const started = dinit.isStarted(allocator, name) catch false;
+        try entries.append(allocator, .{
+            .name = owned_name,
+            .boot_state = if (dinit.isBootEnabled(allocator, name) catch false) .enabled else .disabled,
+            .state = if (failed) "failed" else if (started) "started" else "stopped",
+        });
+    }
+
+    std.mem.sort(ListEntry, entries.items, {}, struct {
+        fn lessThan(_: void, a: ListEntry, b: ListEntry) bool {
+            return std.mem.order(u8, a.name, b.name) == .lt;
+        }
+    }.lessThan);
+    return try entries.toOwnedSlice(allocator);
+}
+
 /// Caller owns returned log output and must free it with `ctx.allocator`.
 pub fn readLogs(ctx: *mere.Context, name: []const u8) ServiceError![]const u8 {
-    try requireS6RcProvider(ctx);
+    switch (try activeProvider(ctx)) {
+        .s6rc => return readLogsS6Rc(ctx, name),
+        .dinit => {
+            const output = dinit.catlog(ctx.allocator, name) catch {
+                const log_path = try dinitLogPath(ctx.allocator, name) orelse return error.NoLogFile;
+                defer ctx.allocator.free(log_path);
+                const file = path_mod.openExistingFile(log_path) catch return error.NoLogFile;
+                defer file.close(path_mod.currentIo());
+                const stat = file.stat(path_mod.currentIo()) catch return error.FileSystem;
+                if (stat.size > 16 * 1024 * 1024) return error.FileSystem;
+                const content = ctx.allocator.alloc(u8, @intCast(stat.size)) catch return error.OutOfMemory;
+                errdefer ctx.allocator.free(content);
+                const read = file.readPositionalAll(path_mod.currentIo(), content, 0) catch return error.FileSystem;
+                if (read != stat.size) return error.FileSystem;
+                return content;
+            };
+            return output;
+        },
+    }
+}
+
+fn readLogsS6Rc(ctx: *mere.Context, name: []const u8) ServiceError![]const u8 {
     const allocator = ctx.allocator;
     const log_dir = try logDirPath(allocator, name);
     defer allocator.free(log_dir);
@@ -224,6 +340,16 @@ fn requireS6RcProvider(ctx: *mere.Context) ServiceError!void {
         .s6rc => {},
         .dinit => return error.UnsupportedProvider,
     }
+}
+
+/// Resolve the active init provider, surfacing config-load errors in
+/// the ServiceError vocabulary.
+fn activeProvider(ctx: *mere.Context) ServiceError!mere.config.InitProvider {
+    const cfg = ctx.getConfig() catch |err| switch (err) {
+        error.InvalidConfig => return error.InvalidConfig,
+        error.ResourceLimitReached => return error.OutOfMemory,
+    };
+    return cfg.effectiveInitProvider();
 }
 
 fn queryBootState(ctx: *mere.Context, name: []const u8) BootState {
@@ -355,7 +481,7 @@ fn logDirPath(allocator: std.mem.Allocator, name: []const u8) ![]const u8 {
     return std.fmt.allocPrint(allocator, "{s}/{s}", .{ s6rc.paths.log_root, name });
 }
 
-test "service operations reject unimplemented dinit provider" {
+test "dinit service operations use the provider adapter" {
     const th = @import("test_helpers.zig");
     var test_env = try th.createTestEnv();
     defer {
@@ -367,7 +493,9 @@ test "service operations reject unimplemented dinit provider" {
     cfg.init_provider = .dinit;
     test_env.ctx.configuration = cfg;
 
-    try std.testing.expectError(error.UnsupportedProvider, start(&test_env.ctx, "ntpd"));
+    // A nonexistent service reaches dinit rather than the old s6-rc-only
+    // guard. The adapter reports the daemon's failure through ServiceError.
+    try std.testing.expectError(error.ProcessFailed, status(&test_env.ctx, "definitely-not-loaded"));
 }
 
 test "service operations preserve config load diagnostics" {

@@ -326,7 +326,7 @@ fn generateServiceArtifactsForActiveProvider(
     const provider = if (ctx.configuration) |*cfg| cfg.effectiveInitProvider() else .s6rc;
     switch (provider) {
         .s6rc => try generateS6RcServiceArtifacts(allocator, ctx, staging_dir, services),
-        .dinit => return ctx.fail(error.PackageCreationFailed, staging_dir, "dinit service artifacts are not implemented"),
+        .dinit => try generateDinitServiceArtifacts(allocator, ctx, staging_dir, services),
     }
 }
 
@@ -339,6 +339,106 @@ fn generateS6RcServiceArtifacts(
     for (services) |*svc| {
         try generateS6RcServiceSourceDir(allocator, ctx, staging_dir, svc);
     }
+}
+
+fn generateDinitServiceArtifacts(
+    allocator: std.mem.Allocator,
+    ctx: *mere.Context,
+    staging_dir: []const u8,
+    services: []const recipe.ServiceDef,
+) PackageError!void {
+    for (services) |*svc| {
+        try generateDinitServiceFile(allocator, ctx, staging_dir, svc);
+    }
+}
+
+/// Write a single dinit service file at
+/// `<staging_dir>/usr/share/dinit.d/<name>`. See dinit-service(5).
+fn generateDinitServiceFile(
+    allocator: std.mem.Allocator,
+    ctx: *mere.Context,
+    staging_dir: []const u8,
+    svc: *const recipe.ServiceDef,
+) PackageError!void {
+    const io = path_mod.currentIo();
+
+    const svc_root = std.fs.path.join(allocator, &.{ staging_dir, "usr", "share", "dinit.d" }) catch
+        return ctx.fail(error.OutOfMemory, staging_dir, "failed to build dinit source path");
+    defer allocator.free(svc_root);
+    path_mod.ensureDirExists(svc_root) catch |err|
+        return ctx.fail(mapPackageFsError(err), svc_root, "failed to create dinit source directory");
+
+    var dir = std.Io.Dir.openDirAbsolute(io, svc_root, .{}) catch |err|
+        return ctx.fail(mapPackageFsError(err), svc_root, "failed to open dinit source directory");
+    defer dir.close(io);
+
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(allocator);
+
+    // type — daemon becomes `process`, oneshot becomes `scripted`.
+    const type_line = switch (svc.service_type) {
+        .daemon => "type = process\n",
+        .oneshot => "type = scripted\n",
+    };
+    buf.appendSlice(allocator, type_line) catch return error.OutOfMemory;
+
+    switch (svc.service_type) {
+        .daemon => {
+            if (svc.command.items.len > 0) {
+                buf.appendSlice(allocator, "command = ") catch return error.OutOfMemory;
+                for (svc.command.items, 0..) |arg, i| {
+                    if (i > 0) buf.append(allocator, ' ') catch return error.OutOfMemory;
+                    buf.appendSlice(allocator, arg) catch return error.OutOfMemory;
+                }
+                buf.append(allocator, '\n') catch return error.OutOfMemory;
+            }
+            if (svc.ready_notification) |fd| {
+                var fd_buf: [64]u8 = undefined;
+                const fd_line = std.fmt.bufPrint(&fd_buf, "ready-notification = pipefd:{d}\n", .{fd}) catch
+                    return error.OutOfMemory;
+                buf.appendSlice(allocator, fd_line) catch return error.OutOfMemory;
+            }
+            if (svc.log) {
+                var line_buf: [512]u8 = undefined;
+                const log_line = std.fmt.bufPrint(&line_buf, "logfile = /var/log/{s}.log\n", .{svc.name}) catch
+                    return error.OutOfMemory;
+                buf.appendSlice(allocator, log_line) catch return error.OutOfMemory;
+            }
+        },
+        .oneshot => {
+            if (svc.up.items.len > 0) {
+                buf.appendSlice(allocator, "command = ") catch return error.OutOfMemory;
+                for (svc.up.items, 0..) |arg, i| {
+                    if (i > 0) buf.append(allocator, ' ') catch return error.OutOfMemory;
+                    buf.appendSlice(allocator, arg) catch return error.OutOfMemory;
+                }
+                buf.append(allocator, '\n') catch return error.OutOfMemory;
+            }
+            if (svc.down.items.len > 0) {
+                buf.appendSlice(allocator, "stop-command = ") catch return error.OutOfMemory;
+                for (svc.down.items, 0..) |arg, i| {
+                    if (i > 0) buf.append(allocator, ' ') catch return error.OutOfMemory;
+                    buf.appendSlice(allocator, arg) catch return error.OutOfMemory;
+                }
+                buf.append(allocator, '\n') catch return error.OutOfMemory;
+            }
+        },
+    }
+
+    for (svc.depends_on.items) |dep| {
+        buf.appendSlice(allocator, "depends-on = ") catch return error.OutOfMemory;
+        buf.appendSlice(allocator, dep) catch return error.OutOfMemory;
+        buf.append(allocator, '\n') catch return error.OutOfMemory;
+    }
+
+    if (svc.essential) {
+        buf.appendSlice(allocator, "# mere: essential = true\n") catch return error.OutOfMemory;
+    }
+
+    writeServiceFile(ctx, dir, io, svc.name, buf.items) catch |err|
+        return ctx.fail(err, svc_root, "failed to write dinit service file");
+
+    ctx.debug("generated dinit service file: {s}", .{svc.name});
 }
 
 fn generateS6RcServiceSourceDir(
@@ -822,41 +922,151 @@ fn buildInjectedDependenciesForSplit(
         }
 
         for (staged.copied_files) |rel_path| {
-            const interface_stem = buildInterfaceStemForPath(rel_path) orelse continue;
-            const owner_idx = runtime_owner_by_stem.get(interface_stem) orelse continue;
-            if (owner_idx == staged.pkg_index) continue;
-
-            const runtime_pkg_name = parsed_recipe.packages.items[owner_idx].name;
-            if (runtime_pkg_name.len == 0) {
-                return ctx.fail(error.InvalidInput, interface_stem, "runtime package name is empty");
+            // File-name signals: static archive `libfoo.a`, unversioned linker
+            // symlink `libfoo.so`, or a pkg-config file literally named
+            // `libfoo.pc`.
+            if (buildInterfaceStemForPath(rel_path)) |interface_stem| {
+                try injectRuntimeDepForStem(
+                    allocator,
+                    ctx,
+                    parsed_recipe,
+                    &runtime_owner_by_stem,
+                    &seen_runtime_pkgs,
+                    &injected[staged.pkg_index],
+                    staged.pkg_index,
+                    interface_stem,
+                );
             }
-            if (seen_runtime_pkgs.contains(runtime_pkg_name)) continue;
-            const runtime_pkg_name_copy = allocator.dupe(u8, runtime_pkg_name) catch {
-                return ctx.fail(error.OutOfMemory, runtime_pkg_name, "failed to track injected runtime dependency");
-            };
-            seen_runtime_pkgs.put(runtime_pkg_name_copy, {}) catch {
-                allocator.free(runtime_pkg_name_copy);
-                return ctx.fail(error.OutOfMemory, runtime_pkg_name, "failed to track injected runtime dependency");
-            };
-            const exact_constraint = std.fmt.allocPrint(allocator, "={s}-{d}", .{
-                parsed_recipe.version,
-                parsed_recipe.release,
-            }) catch {
-                return ctx.fail(error.OutOfMemory, runtime_pkg_name, "failed to format injected dependency constraint");
-            };
-            defer allocator.free(exact_constraint);
 
-            try appendInjectedDependency(
-                allocator,
-                &injected[staged.pkg_index],
-                .split_runtime,
-                runtime_pkg_name,
-                exact_constraint,
-            );
+            // Content signal: a pkg-config file's `Libs:` names the sibling
+            // runtime libraries this package links against. `-lfcft` maps to
+            // stem `fcft`, the owner of `libfcft.so.N`. This catches the common
+            // case where the .pc is named `fcft.pc` (not `libfcft.pc`), which
+            // the file-name heuristic above cannot see.
+            if (isPkgConfigPath(rel_path)) {
+                var libs_stems: std.ArrayList([]u8) = .empty;
+                defer {
+                    for (libs_stems.items) |stem| allocator.free(stem);
+                    libs_stems.deinit(allocator);
+                }
+                try appendPkgConfigLinkerStems(allocator, ctx, staged.staging_dir, rel_path, &libs_stems);
+                for (libs_stems.items) |stem| {
+                    try injectRuntimeDepForStem(
+                        allocator,
+                        ctx,
+                        parsed_recipe,
+                        &runtime_owner_by_stem,
+                        &seen_runtime_pkgs,
+                        &injected[staged.pkg_index],
+                        staged.pkg_index,
+                        stem,
+                    );
+                }
+            }
         }
     }
 
     return injected;
+}
+
+/// Inject a split_runtime dependency on the sibling runtime package that owns
+/// `stem`, pinned to this recipe's exact version-release. No-op if the stem is
+/// unowned, owned by this same package, or its runtime package was already
+/// recorded for this consumer.
+fn injectRuntimeDepForStem(
+    allocator: std.mem.Allocator,
+    ctx: *mere.Context,
+    parsed_recipe: *const recipe.Recipe,
+    runtime_owner_by_stem: *const std.StringHashMap(usize),
+    seen_runtime_pkgs: *std.StringHashMap(void),
+    injected: *InjectedDepsForPackage,
+    consumer_pkg_index: usize,
+    stem: []const u8,
+) PackageError!void {
+    const owner_idx = runtime_owner_by_stem.get(stem) orelse return;
+    if (owner_idx == consumer_pkg_index) return;
+
+    const runtime_pkg_name = parsed_recipe.packages.items[owner_idx].name;
+    if (runtime_pkg_name.len == 0) {
+        return ctx.fail(error.InvalidInput, stem, "runtime package name is empty");
+    }
+    if (seen_runtime_pkgs.contains(runtime_pkg_name)) return;
+    const runtime_pkg_name_copy = allocator.dupe(u8, runtime_pkg_name) catch {
+        return ctx.fail(error.OutOfMemory, runtime_pkg_name, "failed to track injected runtime dependency");
+    };
+    seen_runtime_pkgs.put(runtime_pkg_name_copy, {}) catch {
+        allocator.free(runtime_pkg_name_copy);
+        return ctx.fail(error.OutOfMemory, runtime_pkg_name, "failed to track injected runtime dependency");
+    };
+    const exact_constraint = std.fmt.allocPrint(allocator, "={s}-{d}", .{
+        parsed_recipe.version,
+        parsed_recipe.release,
+    }) catch {
+        return ctx.fail(error.OutOfMemory, runtime_pkg_name, "failed to format injected dependency constraint");
+    };
+    defer allocator.free(exact_constraint);
+
+    try appendInjectedDependency(
+        allocator,
+        injected,
+        .split_runtime,
+        runtime_pkg_name,
+        exact_constraint,
+    );
+}
+
+fn isPkgConfigPath(rel_path: []const u8) bool {
+    if (!std.mem.startsWith(u8, rel_path, "usr/lib/pkgconfig/") and
+        !std.mem.startsWith(u8, rel_path, "usr/lib64/pkgconfig/") and
+        !std.mem.startsWith(u8, rel_path, "usr/share/pkgconfig/"))
+    {
+        return false;
+    }
+    return std.mem.endsWith(u8, rel_path, ".pc");
+}
+
+/// Read a staged pkg-config file and append the library stems named in its
+/// `Libs:` line (each `-lNAME` yields stem `NAME`). Only the public `Libs:`
+/// key is parsed; `Libs.private:` and `Requires*` are intentionally ignored,
+/// and the same-recipe owner lookup filters any token that is not a sibling.
+/// An unreadable .pc is skipped rather than failing the build.
+fn appendPkgConfigLinkerStems(
+    allocator: std.mem.Allocator,
+    ctx: *mere.Context,
+    staging_dir: []const u8,
+    rel_path: []const u8,
+    out: *std.ArrayList([]u8),
+) PackageError!void {
+    const abs_path = std.fs.path.join(allocator, &.{ staging_dir, rel_path }) catch return error.OutOfMemory;
+    defer allocator.free(abs_path);
+
+    const content = std.Io.Dir.readFileAlloc(std.Io.Dir.cwd(), path_mod.currentIo(), abs_path, allocator, .limited(1 << 20)) catch |err| {
+        ctx.debug("pkg-config read failed for {s}: {}", .{ abs_path, err });
+        return;
+    };
+    defer allocator.free(content);
+
+    var lines = std.mem.splitScalar(u8, content, '\n');
+    while (lines.next()) |raw_line| {
+        const line = std.mem.trim(u8, raw_line, " \t\r");
+        // Match the public "Libs:" key case-insensitively. "Libs.private:"
+        // begins "Libs." so it never matches here.
+        if (line.len < 5) continue;
+        if (!std.ascii.eqlIgnoreCase(line[0..5], "libs:")) continue;
+
+        var tokens = std.mem.tokenizeAny(u8, line[5..], " \t");
+        while (tokens.next()) |token| {
+            if (token.len <= 2) continue;
+            if (!std.mem.startsWith(u8, token, "-l")) continue;
+            if (token[2] == ':') continue; // skip the -l:libfoo.so.N form
+            const name = token[2..];
+            const name_copy = allocator.dupe(u8, name) catch return error.OutOfMemory;
+            out.append(allocator, name_copy) catch {
+                allocator.free(name_copy);
+                return error.OutOfMemory;
+            };
+        }
+    }
 }
 
 fn appendInjectedDependency(
@@ -1740,6 +1950,118 @@ test "buildInjectedDependenciesForSplit injects exact split runtime dependency f
     try std.testing.expectEqualStrings("=1.2.3-7", injected[1].items.items[0].version_constraint.?);
 }
 
+test "buildInjectedDependenciesForSplit injects sibling dep from pkg-config Libs when .pc is not named libNAME.pc" {
+    const th = @import("../test_helpers.zig");
+
+    var test_env = try th.createTestEnv();
+    defer {
+        test_env.cleanup();
+        std.testing.allocator.destroy(test_env);
+    }
+
+    // Reproduces the fcft case: the runtime lib is `libfcft.so.N`, but the
+    // -dev package ships only headers and `fcft.pc` (not `libfcft.pc`) with no
+    // static archive and no linker symlink. The file-name heuristics miss it;
+    // the `Libs: -lfcft` content signal must supply the sibling dep.
+    const kdl_text =
+        \\recipe {
+        \\    name "fcft"
+        \\    version "3.3.3"
+        \\    release 1
+        \\    archs "x86_64" "aarch64"
+        \\}
+        \\build { script "true" }
+        \\package "fcft" { files "usr/lib/libfcft.so*" }
+        \\package "fcft-dev" { files "usr/include/fcft.h" "usr/lib/pkgconfig/fcft.pc" }
+    ;
+
+    var parsed = try recipe.parse(&test_env.ctx, kdl_text);
+    defer parsed.deinit();
+
+    const runtime_staging = try std.fs.path.join(test_env.ctx.allocator, &.{ test_env.path, "staging-runtime" });
+    defer test_env.ctx.allocator.free(runtime_staging);
+    const dev_staging = try std.fs.path.join(test_env.ctx.allocator, &.{ test_env.path, "staging-dev" });
+    defer test_env.ctx.allocator.free(dev_staging);
+
+    const runtime_lib_dir = try std.fs.path.join(test_env.ctx.allocator, &.{ runtime_staging, "usr/lib" });
+    defer test_env.ctx.allocator.free(runtime_lib_dir);
+    var runtime_lib_dir_handle = try path_mod.makePathAndOpenDir(runtime_lib_dir);
+    runtime_lib_dir_handle.close(path_mod.currentIo());
+
+    const runtime_lib = try std.fs.path.join(test_env.ctx.allocator, &.{ runtime_staging, "usr/lib/libfcft.so.4.3.3" });
+    defer test_env.ctx.allocator.free(runtime_lib);
+    try std.Io.Dir.cwd().writeFile(path_mod.currentIo(), .{ .sub_path = runtime_lib, .data = "x" });
+
+    const dev_include_dir = try std.fs.path.join(test_env.ctx.allocator, &.{ dev_staging, "usr/include" });
+    defer test_env.ctx.allocator.free(dev_include_dir);
+    var dev_include_dir_handle = try path_mod.makePathAndOpenDir(dev_include_dir);
+    dev_include_dir_handle.close(path_mod.currentIo());
+    const dev_header = try std.fs.path.join(test_env.ctx.allocator, &.{ dev_staging, "usr/include/fcft.h" });
+    defer test_env.ctx.allocator.free(dev_header);
+    try std.Io.Dir.cwd().writeFile(path_mod.currentIo(), .{ .sub_path = dev_header, .data = "h" });
+
+    const dev_pkgconfig_dir = try std.fs.path.join(test_env.ctx.allocator, &.{ dev_staging, "usr/lib/pkgconfig" });
+    defer test_env.ctx.allocator.free(dev_pkgconfig_dir);
+    var dev_pkgconfig_dir_handle = try path_mod.makePathAndOpenDir(dev_pkgconfig_dir);
+    dev_pkgconfig_dir_handle.close(path_mod.currentIo());
+    const dev_pkgconfig = try std.fs.path.join(test_env.ctx.allocator, &.{ dev_pkgconfig_dir, "fcft.pc" });
+    defer test_env.ctx.allocator.free(dev_pkgconfig);
+    try std.Io.Dir.cwd().writeFile(path_mod.currentIo(), .{
+        .sub_path = dev_pkgconfig,
+        .data =
+        \\prefix=/usr
+        \\libdir=${prefix}/lib
+        \\
+        \\Name: fcft
+        \\Version: 3.3.3
+        \\Libs: -L${libdir} -lfcft
+        \\Cflags: -I${prefix}/include
+        \\
+        ,
+    });
+
+    const runtime_files = try test_env.ctx.allocator.alloc([]const u8, 1);
+    runtime_files[0] = try test_env.ctx.allocator.dupe(u8, "usr/lib/libfcft.so.4.3.3");
+    const dev_files = try test_env.ctx.allocator.alloc([]const u8, 2);
+    dev_files[0] = try test_env.ctx.allocator.dupe(u8, "usr/include/fcft.h");
+    dev_files[1] = try test_env.ctx.allocator.dupe(u8, "usr/lib/pkgconfig/fcft.pc");
+
+    const staged_packages = [_]split_staging.StagedPackage{
+        .{
+            .pkg_index = 0,
+            .staging_dir = try test_env.ctx.allocator.dupe(u8, runtime_staging),
+            .copied_files = runtime_files,
+        },
+        .{
+            .pkg_index = 1,
+            .staging_dir = try test_env.ctx.allocator.dupe(u8, dev_staging),
+            .copied_files = dev_files,
+        },
+    };
+    defer {
+        staged_packages[0].deinit(test_env.ctx.allocator);
+        staged_packages[1].deinit(test_env.ctx.allocator);
+    }
+
+    const injected = try buildInjectedDependenciesForSplit(
+        test_env.ctx.allocator,
+        &test_env.ctx,
+        &parsed,
+        &staged_packages,
+    );
+    defer {
+        for (injected) |*entry| entry.deinit(test_env.ctx.allocator);
+        test_env.ctx.allocator.free(injected);
+    }
+
+    // Runtime package needs nothing; -dev gains exactly the sibling dep.
+    try std.testing.expectEqual(@as(usize, 0), injected[0].items.items.len);
+    try std.testing.expectEqual(@as(usize, 1), injected[1].items.items.len);
+    try std.testing.expectEqual(meta.DependencyType.split_runtime, injected[1].items.items[0].dep_type);
+    try std.testing.expectEqualStrings("fcft", injected[1].items.items[0].value);
+    try std.testing.expectEqualStrings("=3.3.3-1", injected[1].items.items[0].version_constraint.?);
+}
+
 test "buildInjectedDependenciesForSplit rejects ambiguous sibling runtime owners for same library stem" {
     const th = @import("../test_helpers.zig");
 
@@ -2025,7 +2347,7 @@ test "generateS6RcServiceSourceDir creates notification-fd for ready daemons" {
     try std.testing.expectEqualStrings("3\n", nfd_content);
 }
 
-test "generateServiceArtifactsForActiveProvider rejects unimplemented dinit provider" {
+test "generateServiceArtifactsForActiveProvider writes dinit service file when provider is dinit" {
     const th = @import("../test_helpers.zig");
     var test_env = try th.createTestEnv();
     defer {
@@ -2052,11 +2374,20 @@ test "generateServiceArtifactsForActiveProvider rejects unimplemented dinit prov
     svc.name = try allocator.dupe(u8, "ntpd");
     svc.service_type = .daemon;
     try svc.command.append(allocator, try allocator.dupe(u8, "/usr/bin/ntpd"));
+    try svc.command.append(allocator, try allocator.dupe(u8, "-n"));
+    try svc.depends_on.append(allocator, try allocator.dupe(u8, "network"));
 
-    try std.testing.expectError(
-        error.PackageCreationFailed,
-        generateServiceArtifactsForActiveProvider(allocator, &test_env.ctx, staging_dir, &.{svc}),
-    );
+    try generateServiceArtifactsForActiveProvider(allocator, &test_env.ctx, staging_dir, &.{svc});
+
+    const svc_file = try std.fs.path.join(allocator, &.{ staging_dir, "usr", "share", "dinit.d", "ntpd" });
+    defer allocator.free(svc_file);
+    const content = try readTestFile(allocator, io, svc_file);
+    defer allocator.free(content);
+
+    try std.testing.expect(std.mem.indexOf(u8, content, "type = process") != null);
+    try std.testing.expect(std.mem.indexOf(u8, content, "command = /usr/bin/ntpd -n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, content, "depends-on = network") != null);
+    try std.testing.expect(std.mem.indexOf(u8, content, "logfile = /var/log/ntpd.log") != null);
 }
 
 fn readTestFile(allocator: std.mem.Allocator, io: std.Io, file_path: []const u8) ![]const u8 {
