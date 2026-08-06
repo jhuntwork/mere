@@ -8,9 +8,9 @@ permissions:
 
 jobs:
   test:
-    runs-on: ubuntu-24.04-arm
+    runs-on: ubuntu-24.04
     container:
-      image: mere/ci:v0.15.0
+      image: mere/ci:v0.18.1
     steps:
       - name: Git checkout
         run: |
