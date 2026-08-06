@@ -48,7 +48,8 @@ pub fn detect(file: *const std.Io.File) FileTypeError!Kind {
 }
 
 test "detect ELF" {
-    const elf_file = try std.Io.Dir.cwd().openFile(p.currentIo(), "test/testdata/libtest.so", .{});
+    const th = @import("test_helpers.zig");
+    const elf_file = try std.Io.Dir.cwd().openFile(p.currentIo(), th.elfFixture("libtest.so"), .{});
     defer elf_file.close(p.currentIo());
 
     const kind = try detect(&elf_file);

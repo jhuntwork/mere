@@ -213,8 +213,9 @@ test "classifyElf returns null for nonexistent file" {
 }
 
 test "classifyElf detects ELF executable" {
-    // Use the test ELF shared lib from testdata (it's ET_DYN)
-    const kind = classifyElf("test/testdata/libtest.so");
+    const th = @import("test_helpers.zig");
+    // Use the target-matching test ELF shared lib (it's ET_DYN)
+    const kind = classifyElf(th.elfFixture("libtest.so"));
     if (kind) |k| {
         try std.testing.expectEqual(ElfKind.shared_lib, k);
     }
