@@ -11,8 +11,6 @@ jobs:
     runs-on: ubuntu-24.04-arm
     container:
       image: mere/ci:v0.15.0
-    env:
-      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
     steps:
       - name: Git checkout
         run: |
@@ -20,8 +18,7 @@ jobs:
           git init "$GITHUB_WORKSPACE"
           cd "$GITHUB_WORKSPACE"
           git remote add origin "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY.git"
-          git -c http.extraHeader="Authorization: Bearer $GH_TOKEN" \
-            fetch --depth=1 origin "$GITHUB_REF"
+          git fetch --depth=1 origin "$GITHUB_REF"
           git checkout --detach FETCH_HEAD
       - name: Test
         run: |
