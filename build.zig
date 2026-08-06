@@ -86,7 +86,7 @@ fn detectCrossToolchain(b: *std.Build, target: std.Build.ResolvedTarget) ?CrossT
     // Cmake needs CMAKE_C_COMPILER to be a single executable path, so we
     // create wrapper scripts. Autotools/make are fine with spaces in CC.
     const setup = b.addSystemCommand(&.{
-        "sh", "-ceu",
+        "sh",             "-ceu",
         b.fmt(
             \\dir="$1"
             \\mkdir -p "$dir"
@@ -781,9 +781,9 @@ fn bootstrapMbedTls(b: *std.Build, cross: ?CrossToolchain) BootstrappedPrefix {
 /// than this project's. So this keeps the old curl+sha256sum fetch,
 /// inlined here rather than as a shared helper since it's a one-off.
 fn bootstrapLibsodium(b: *std.Build, cross: ?CrossToolchain) BootstrappedPrefix {
-    const url = "https://download.libsodium.org/libsodium/releases/libsodium-1.0.21.tar.gz";
-    const sha256 = "9e4285c7a419e82dedb0be63a72eea357d6943bc3e28e6735bf600dd4883feaf";
-    const source_dirname = "libsodium-1.0.21";
+    const url = "https://github.com/jedisct1/libsodium/archive/refs/tags/1.0.21-RELEASE.tar.gz";
+    const sha256 = "42e0ca94faaec901f4fbeda84b1b94b18f5309c360c66345cf52a7ab515b245b";
+    const source_dirname = "libsodium-1.0.21-RELEASE";
 
     const download = b.addSystemCommand(&.{
         "sh",
@@ -825,7 +825,7 @@ fn bootstrapLibsodium(b: *std.Build, cross: ?CrossToolchain) BootstrappedPrefix 
     });
     download.addArg(url);
     download.addArg(sha256);
-    const tarball = download.addOutputFileArg("libsodium-1.0.21.tar.gz");
+    const tarball = download.addOutputFileArg("libsodium-1.0.21-RELEASE.tar.gz");
 
     const configure_args = appendShellSetArgs(b, &.{
         "--disable-shared",
