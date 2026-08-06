@@ -21,7 +21,7 @@ jobs:
           cd "$GITHUB_WORKSPACE"
           git remote add origin "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY.git"
           git -c http.extraHeader="Authorization: Bearer $GH_TOKEN" \
-            fetch --depth=1 origin "$GITHUB_SHA"
+            fetch --depth=1 origin "$GITHUB_REF"
           git checkout --detach FETCH_HEAD
       - name: Test
         run: |
