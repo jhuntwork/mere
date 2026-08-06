@@ -52,7 +52,7 @@ fn makeWritable(dir_path: []const u8) void {
 
 /// Simple test env struct that holds a temporary directory and its path
 pub const fixture_arch = if (builtin.cpu.arch == .aarch64) "aarch64" else "x86_64";
-pub const fixture_interpreter = if (builtin.cpu.arch == .aarch64) "/lib/ld-musl-aarch64.so" else "/lib/ld-musl-x86_64.so.1";
+pub const fixture_interpreter = if (builtin.cpu.arch == .aarch64) "/lib/ld-musl-aarch64.so.1" else "/lib/ld-musl-x86_64.so.1";
 
 pub fn elfFixture(comptime name: []const u8) []const u8 {
     return if (builtin.cpu.arch == .aarch64)
