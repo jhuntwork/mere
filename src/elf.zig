@@ -209,10 +209,11 @@ pub fn scanElfMetadata(ctx: *Context, path: []const u8) !ElfScanResult {
             var section_header: std.elf.Elf64_Shdr = undefined;
             _ = try file.readPositionalAll(io, std.mem.asBytes(&section_header), total_offset);
 
-            const section_name = readSectionName(&file, file_size, shstr_header.sh_offset, section_header.sh_name) catch |err| switch (err) {
+            const section_name = readSectionName(allocator, &file, file_size, shstr_header.sh_offset, section_header.sh_name) catch |err| switch (err) {
                 ElfError.SectionHeaderOverflow, ElfError.CorruptData => continue,
                 else => return ctx.fail(err, path, "failed to read section name"),
             };
+            defer allocator.free(section_name);
             if (std.mem.eql(u8, section_name, ".dynamic")) {
                 ctx.debug(".dynamic section at offset {d} size {d}", .{ section_header.sh_offset, section_header.sh_size });
                 dynamic_section_offset = section_header.sh_offset;
@@ -371,7 +372,13 @@ fn isSharedObjectBasename(name: []const u8) bool {
     return std.mem.indexOf(u8, name, ".so.") != null;
 }
 
-fn readSectionName(file: *const std.Io.File, file_size: u64, shstr_offset: u64, name_offset: u32) ![]const u8 {
+fn readSectionName(
+    allocator: std.mem.Allocator,
+    file: *const std.Io.File,
+    file_size: u64,
+    shstr_offset: u64,
+    name_offset: u32,
+) ![]u8 {
     if (shstr_offset >= file_size or name_offset >= file_size) {
         return ElfError.SectionHeaderOverflow;
     }
@@ -390,7 +397,7 @@ fn readSectionName(file: *const std.Io.File, file_size: u64, shstr_offset: u64, 
 
     if (end == bytes_read) return ElfError.CorruptData;
 
-    return name_buf[0..end];
+    return allocator.dupe(u8, name_buf[0..end]);
 }
 
 /// Load an ELF string table safely from file
@@ -680,8 +687,6 @@ test "scanElfMetadata with actual dependencies and sonames" {
     // Test case 1: Library with multiple dependencies (libtest.so)
     {
         const libtest_path = test_helpers.elfFixture("libtest.so");
-        const fixture_header = try readElfHeaderInfo(libtest_path);
-        std.debug.print("fixture={s} machine={d}\n", .{ libtest_path, fixture_header.machine });
         var result = try scanElfMetadata(&test_env.ctx, libtest_path);
         defer {
             for (result.deps.items) |item| {
