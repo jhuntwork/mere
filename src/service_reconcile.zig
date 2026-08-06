@@ -61,18 +61,18 @@ pub const StagedDinit = struct {
 
 /// Prepare dinit's package-owned service tree for a system profile.
 ///
-/// Package-owned files live below `<root>/usr/share/dinit.d`; administrator
-/// overrides remain in `<root>/etc/dinit.d` and are never touched here.
-/// The returned tree is staged and must be committed after the corresponding
-/// profile generation is activated.
+/// Package-owned files live below `<generation>/usr/share/dinit.d` so the
+/// complete tree becomes visible with the generation switch. Administrator
+/// overrides under `<root>/etc/dinit.d` remain untouched.
 pub fn stageDinit(
     ctx: *mere.Context,
+    generation_root: []const u8,
     packages: []const generation.PackageEntry,
     previous_packages: []const generation.PackageEntry,
 ) ReconcileError!StagedDinit {
     _ = previous_packages;
     const allocator = ctx.allocator;
-    const service_root = std.fs.path.join(allocator, &.{ ctx.root_path, "usr", "share", "dinit.d" }) catch
+    const service_root = std.fs.path.join(allocator, &.{ generation_root, "usr", "share", "dinit.d" }) catch
         return error.OutOfMemory;
     errdefer allocator.free(service_root);
     const stage_root = std.fmt.allocPrint(allocator, "{s}.mere-new", .{service_root}) catch return error.OutOfMemory;
@@ -108,7 +108,7 @@ pub fn reconcileDinit(
     packages: []const generation.PackageEntry,
     previous_packages: []const generation.PackageEntry,
 ) ReconcileError!void {
-    var staged = try stageDinit(ctx, packages, previous_packages);
+    var staged = try stageDinit(ctx, ctx.root_path, packages, previous_packages);
     staged.commit() catch |err| {
         staged.discard();
         return err;
