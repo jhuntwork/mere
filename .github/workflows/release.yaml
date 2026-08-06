@@ -167,14 +167,7 @@ jobs:
               ;;
             404)
               python3 .forgejo/scripts/release-body.py > release-create.json
-              python3 - <<'PY'
-          import json
-          from pathlib import Path
-          path = Path("release-create.json")
-          body = json.loads(path.read_text())
-          body["draft"] = True
-          path.write_text(json.dumps(body))
-          PY
+              python3 -c 'import json; from pathlib import Path; path = Path("release-create.json"); body = json.loads(path.read_text()); body["draft"] = True; path.write_text(json.dumps(body))'
               curl -fsS \
                 -X POST \
                 -H "$auth_header" \
