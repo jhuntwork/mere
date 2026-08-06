@@ -1662,8 +1662,13 @@ fn applyProfileRealization(ctx: *Context, prof_name: []const u8, installed_packa
         var staged_dinit: ?service_reconcile.StagedDinit = null;
         defer if (staged_dinit) |*staged| staged.discard();
         if (provider == .dinit) {
+            const generation_path = generation.getGenerationPath(ctx.allocator, profile_dir, gen_num) catch {
+                return ctx.fail(error.OutOfMemory, profile_dir, "failed to construct generation path for dinit services");
+            };
+            defer ctx.allocator.free(generation_path);
             staged_dinit = try service_reconcile.stageDinit(
                 ctx,
+                generation_path,
                 installed_packages,
                 if (previous_manifest) |*manifest_data| manifest_data.packages.items else &.{},
             );

@@ -21,6 +21,7 @@ const etc = @import("etc.zig");
 const mere = @import("mere.zig");
 const errors = @import("errors.zig");
 const hash = @import("hash.zig");
+const package_manifest = @import("manifest.zig");
 const path_mod = @import("path.zig");
 const path_safety = @import("path_safety.zig");
 const store = @import("store.zig");
@@ -552,7 +553,19 @@ fn validateGenerationStorePaths(
                 return ctx.fail(ActivationError.InvalidInput, pkg.store_path, "invalid content hash length in manifest");
             }
 
-            const computed = hash.calculateStoreContentHash(ctx.allocator, pkg.store_path, null) catch |err| {
+            const is_v2 = blk: {
+                const v2_manifest_path = std.fs.path.join(ctx.allocator, &.{ pkg.store_path, package_manifest.MANIFEST_V2_FILENAME }) catch {
+                    return ctx.fail(ActivationError.OutOfMemory, pkg.store_path, "failed to construct v2 manifest path");
+                };
+                defer ctx.allocator.free(v2_manifest_path);
+                std.Io.Dir.accessAbsolute(path_mod.currentIo(), v2_manifest_path, .{}) catch break :blk false;
+                break :blk true;
+            };
+            const computed = if (is_v2)
+                hash.calculateStoreContentHashV2(ctx.allocator, pkg.store_path, null)
+            else
+                hash.calculateStoreContentHash(ctx.allocator, pkg.store_path, null);
+            const computed_hash = computed catch |err| {
                 return ctx.fail(switch (err) {
                     hash.HashError.OutOfMemory => ActivationError.OutOfMemory,
                     hash.HashError.PermissionDenied => ActivationError.PermissionDenied,
@@ -560,10 +573,20 @@ fn validateGenerationStorePaths(
                     else => ActivationError.FileSystem,
                 }, pkg.store_path, "failed to compute store content hash");
             };
-            defer ctx.allocator.free(computed);
+            defer ctx.allocator.free(computed_hash);
 
-            if (!std.mem.eql(u8, computed, pkg.content_hash)) {
-                return ctx.fail(ActivationError.InvalidInput, pkg.store_path, "store content hash mismatch");
+            if (!std.mem.eql(u8, computed_hash, pkg.content_hash)) {
+                var accepted_transitional = false;
+                if (!is_v2) {
+                    const transitional = hash.calculateTransitionalMetadataContentHash(ctx.allocator, pkg.store_path, null) catch null;
+                    if (transitional) |transitional_hash| {
+                        accepted_transitional = std.mem.eql(u8, transitional_hash, pkg.content_hash);
+                        ctx.allocator.free(transitional_hash);
+                    }
+                }
+                if (!accepted_transitional) {
+                    return ctx.fail(ActivationError.InvalidInput, pkg.store_path, "store content hash mismatch");
+                }
             }
         }
     }
