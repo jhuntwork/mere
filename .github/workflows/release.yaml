@@ -7,6 +7,12 @@ on:
     paths:
       - build.zig.zon
   workflow_dispatch:
+    inputs:
+      force_release:
+        description: Force the detected version to release (used for recovery)
+        required: false
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -49,8 +55,14 @@ jobs:
             previous_file=previous-build.zig.zon
           fi
 
+          metadata=$(mktemp)
           sh .forgejo/scripts/release-ci.sh detect-version-change build.zig.zon "$previous_file" \
-            >> "$GITHUB_OUTPUT"
+            > "$metadata"
+          cat "$metadata" >> "$GITHUB_OUTPUT"
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ] && \
+             [ "${{ inputs.force_release }}" = "true" ]; then
+            printf 'version_changed=true\n' >> "$GITHUB_OUTPUT"
+          fi
 
           changelog=$(sh .forgejo/scripts/release-ci.sh changelog)
           {
