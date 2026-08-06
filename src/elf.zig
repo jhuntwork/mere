@@ -680,6 +680,8 @@ test "scanElfMetadata with actual dependencies and sonames" {
     // Test case 1: Library with multiple dependencies (libtest.so)
     {
         const libtest_path = test_helpers.elfFixture("libtest.so");
+        const fixture_header = try readElfHeaderInfo(libtest_path);
+        std.debug.print("fixture={s} machine={d}\n", .{ libtest_path, fixture_header.machine });
         var result = try scanElfMetadata(&test_env.ctx, libtest_path);
         defer {
             for (result.deps.items) |item| {
