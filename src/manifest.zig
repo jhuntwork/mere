@@ -9,11 +9,31 @@ pub const ManifestError = Std.OutOfMemory || Std.FileSystem || Std.PermissionDen
 
 pub const MAGIC: *const [8]u8 = "MEREMFST";
 pub const SCHEMA_VERSION: u32 = 1;
+pub const SCHEMA_VERSION_V2: u32 = 2;
 pub const META_DIR = ".mere";
 pub const MANIFEST_FILENAME = ".mere/manifest.v1";
 pub const MANIFEST_SIG_FILENAME = ".mere/manifest.v1.sig";
+pub const MANIFEST_V2_FILENAME = ".mere/manifest.v2";
+pub const MANIFEST_V2_SIG_FILENAME = ".mere/manifest.v2.sig";
 pub const META_KDL_FILENAME = ".mere/meta.kdl";
 pub const PROJECTION_FILENAME = ".mere/projection.v1";
+
+pub const Format = enum {
+    v1,
+    v2,
+
+    pub fn manifestFilename(self: Format) []const u8 {
+        return if (self == .v1) MANIFEST_FILENAME else MANIFEST_V2_FILENAME;
+    }
+
+    pub fn signatureFilename(self: Format) []const u8 {
+        return if (self == .v1) MANIFEST_SIG_FILENAME else MANIFEST_V2_SIG_FILENAME;
+    }
+
+    pub fn schemaVersion(self: Format) u32 {
+        return if (self == .v1) SCHEMA_VERSION else SCHEMA_VERSION_V2;
+    }
+};
 
 pub const PackageManifestV1 = struct {
     schema_version: u32,
@@ -77,6 +97,14 @@ pub const PackageManifestV1 = struct {
     }
 
     pub fn decode(data: []const u8) ManifestError!PackageManifestV1 {
+        return decodeForSchema(data, SCHEMA_VERSION);
+    }
+
+    pub fn decodeV2(data: []const u8) ManifestError!PackageManifestV1 {
+        return decodeForSchema(data, SCHEMA_VERSION_V2);
+    }
+
+    pub fn decodeForSchema(data: []const u8, expected_schema_version: u32) ManifestError!PackageManifestV1 {
         if (data.len < 8 + 4 + 8 + 4 + 4 + 4 + 4 + 32) {
             return ManifestError.InvalidInput;
         }
@@ -89,7 +117,7 @@ pub const PackageManifestV1 = struct {
         offset += 8;
 
         const schema_version = std.mem.readInt(u32, data[offset..][0..4], .little);
-        if (schema_version != SCHEMA_VERSION) {
+        if (schema_version != expected_schema_version) {
             return ManifestError.InvalidInput;
         }
         offset += 4;
@@ -144,7 +172,11 @@ pub const PackageManifestV1 = struct {
 };
 
 pub fn readManifestFile(ctx: *Context, dir_path: []const u8) ManifestError![]u8 {
-    const manifest_path = std.fs.path.join(ctx.allocator, &.{ dir_path, MANIFEST_FILENAME }) catch {
+    return readManifestFileForFormat(ctx, dir_path, .v1);
+}
+
+pub fn readManifestFileForFormat(ctx: *Context, dir_path: []const u8, format: Format) ManifestError![]u8 {
+    const manifest_path = std.fs.path.join(ctx.allocator, &.{ dir_path, format.manifestFilename() }) catch {
         return ManifestError.OutOfMemory;
     };
     defer ctx.allocator.free(manifest_path);
@@ -190,6 +222,17 @@ pub fn readManifestFile(ctx: *Context, dir_path: []const u8) ManifestError![]u8 
 }
 
 pub fn writeManifest(ctx: *Context, dir_path: []const u8, manifest: *const PackageManifestV1, secret_key: []const u8) ManifestError!void {
+    return writeManifestForFormat(ctx, dir_path, manifest, secret_key, .v1);
+}
+
+pub fn writeManifestV2(ctx: *Context, dir_path: []const u8, manifest: *const PackageManifestV1, secret_key: []const u8) ManifestError!void {
+    return writeManifestForFormat(ctx, dir_path, manifest, secret_key, .v2);
+}
+
+fn writeManifestForFormat(ctx: *Context, dir_path: []const u8, input: *const PackageManifestV1, secret_key: []const u8, format: Format) ManifestError!void {
+    var manifest_copy = input.*;
+    manifest_copy.schema_version = format.schemaVersion();
+    const manifest = &manifest_copy;
     const io = path.currentIo();
     const manifest_bytes = try manifest.encode(ctx.allocator);
     defer ctx.allocator.free(manifest_bytes);
@@ -209,7 +252,7 @@ pub fn writeManifest(ctx: *Context, dir_path: []const u8, manifest: *const Packa
         };
     };
 
-    const manifest_path = std.fs.path.join(ctx.allocator, &.{ dir_path, MANIFEST_FILENAME }) catch {
+    const manifest_path = std.fs.path.join(ctx.allocator, &.{ dir_path, format.manifestFilename() }) catch {
         return ManifestError.OutOfMemory;
     };
     defer ctx.allocator.free(manifest_path);
@@ -230,7 +273,7 @@ pub fn writeManifest(ctx: *Context, dir_path: []const u8, manifest: *const Packa
         };
     }
 
-    const sig_path = std.fs.path.join(ctx.allocator, &.{ dir_path, MANIFEST_SIG_FILENAME }) catch {
+    const sig_path = std.fs.path.join(ctx.allocator, &.{ dir_path, format.signatureFilename() }) catch {
         return ManifestError.OutOfMemory;
     };
     defer ctx.allocator.free(sig_path);

@@ -317,12 +317,11 @@ pub const Packager = struct {
             return self.fail(config.staging_dir, "failed to write meta.kdl", PackagingError.FileSystem);
         };
 
-        // meta.kdl is part of store identity. Recompute after writing it,
-        // replacing the provisional payload-only hash used while assembling
-        // the package metadata and manifest.
+        // meta.kdl is part of the versioned v2 store identity. Compute the
+        // v2 hash only after writing canonical metadata.
         self.ctx.allocator.free(content_hash);
-        content_hash = hash.calculateStoreContentHash(self.ctx.allocator, config.staging_dir, null) catch {
-            return self.fail(config.staging_dir, "failed to compute content hash", PackagingError.CreationFailed);
+        content_hash = hash.calculateStoreContentHashV2(self.ctx.allocator, config.staging_dir, null) catch {
+            return self.fail(config.staging_dir, "failed to compute v2 content hash", PackagingError.CreationFailed);
         };
         if (pkg.content_hash.len > 0) self.ctx.allocator.free(pkg.content_hash);
         pkg.content_hash = self.ctx.allocator.dupe(u8, content_hash) catch |err| {
@@ -336,7 +335,7 @@ pub const Packager = struct {
             return self.fail(content_hash, "invalid content hash hex", PackagingError.InvalidInput);
         };
         pkg_manifest.content_hash = final_content_hash_bytes;
-        manifest.writeManifest(self.ctx, config.staging_dir, &pkg_manifest, &secret_key.key) catch {
+        manifest.writeManifestV2(self.ctx, config.staging_dir, &pkg_manifest, &secret_key.key) catch {
             self.ctx.allocator.free(content_hash);
             return self.fail(config.staging_dir, "failed to write final manifest", PackagingError.FileSystem);
         };

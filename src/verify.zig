@@ -228,38 +228,46 @@ fn verifyStore(
             continue;
         };
 
-        const manifest_path = std.fs.path.join(ctx.allocator, &.{ entry_path, manifest.MANIFEST_FILENAME }) catch {
+        const format: manifest.Format = blk: {
+            const v2_path = std.fs.path.join(ctx.allocator, &.{ entry_path, manifest.MANIFEST_V2_FILENAME }) catch {
+                return ctx.fail(VerifyError.OutOfMemory, entry_path, "failed to construct v2 manifest path");
+            };
+            defer ctx.allocator.free(v2_path);
+            std.Io.Dir.accessAbsolute(path_mod.currentIo(), v2_path, .{}) catch break :blk .v1;
+            break :blk .v2;
+        };
+        const manifest_path = std.fs.path.join(ctx.allocator, &.{ entry_path, format.manifestFilename() }) catch {
             return ctx.fail(VerifyError.OutOfMemory, entry_path, "failed to construct manifest path");
         };
         defer ctx.allocator.free(manifest_path);
 
-        const sig_path = std.fs.path.join(ctx.allocator, &.{ entry_path, manifest.MANIFEST_SIG_FILENAME }) catch {
+        const sig_path = std.fs.path.join(ctx.allocator, &.{ entry_path, format.signatureFilename() }) catch {
             return ctx.fail(VerifyError.OutOfMemory, entry_path, "failed to construct manifest signature path");
         };
         defer ctx.allocator.free(sig_path);
 
         std.Io.Dir.accessAbsolute(path_mod.currentIo(), manifest_path, .{}) catch {
             result.store_issues += 1;
-            try addIssue(ctx, result, .store, entry_path, "manifest.v1 missing");
+            try addIssue(ctx, result, .store, entry_path, if (format == .v2) "manifest.v2 missing" else "manifest.v1 missing");
             continue;
         };
 
         std.Io.Dir.accessAbsolute(path_mod.currentIo(), sig_path, .{}) catch {
             result.store_issues += 1;
-            try addIssue(ctx, result, .store, entry_path, "manifest.v1.sig missing");
+            try addIssue(ctx, result, .store, entry_path, if (format == .v2) "manifest.v2.sig missing" else "manifest.v1.sig missing");
             continue;
         };
 
-        const manifest_bytes = manifest.readManifestFile(ctx, entry_path) catch {
+        const manifest_bytes = manifest.readManifestFileForFormat(ctx, entry_path, format) catch {
             result.store_issues += 1;
-            try addIssue(ctx, result, .store, entry_path, "failed to read manifest.v1");
+            try addIssue(ctx, result, .store, entry_path, if (format == .v2) "failed to read manifest.v2" else "failed to read manifest.v1");
             continue;
         };
         defer ctx.allocator.free(manifest_bytes);
 
-        const pkg_manifest = manifest.PackageManifestV1.decode(manifest_bytes) catch {
+        const pkg_manifest = manifest.PackageManifestV1.decodeForSchema(manifest_bytes, format.schemaVersion()) catch {
             result.store_issues += 1;
-            try addIssue(ctx, result, .store, entry_path, "failed to decode manifest.v1");
+            try addIssue(ctx, result, .store, entry_path, if (format == .v2) "failed to decode manifest.v2" else "failed to decode manifest.v1");
             continue;
         };
 
@@ -309,16 +317,30 @@ fn verifyStore(
         };
 
         if (full_hash) {
-            const computed = hash.calculateStoreContentHash(ctx.allocator, entry_path, null) catch {
+            const computed = if (format == .v2)
+                hash.calculateStoreContentHashV2(ctx.allocator, entry_path, null)
+            else
+                hash.calculateStoreContentHash(ctx.allocator, entry_path, null);
+            const computed_hash = computed catch {
                 result.store_issues += 1;
                 try addIssue(ctx, result, .store, entry_path, "failed to compute store content hash");
                 continue;
             };
-            defer ctx.allocator.free(computed);
+            defer ctx.allocator.free(computed_hash);
 
-            if (!std.mem.eql(u8, computed, manifest_hash)) {
-                result.store_issues += 1;
-                try addIssue(ctx, result, .store, entry_path, "computed store hash does not match manifest content hash");
+            if (!std.mem.eql(u8, computed_hash, manifest_hash)) {
+                var accepted_transitional = false;
+                if (format == .v1) {
+                    const transitional = hash.calculateTransitionalMetadataContentHash(ctx.allocator, entry_path, null) catch null;
+                    if (transitional) |transitional_hash| {
+                        accepted_transitional = std.mem.eql(u8, transitional_hash, manifest_hash);
+                        ctx.allocator.free(transitional_hash);
+                    }
+                }
+                if (!accepted_transitional) {
+                    result.store_issues += 1;
+                    try addIssue(ctx, result, .store, entry_path, "computed store hash does not match manifest content hash");
+                }
             }
         }
     }
@@ -488,16 +510,40 @@ fn verifyProfileManifestPackages(
         }
 
         if (full_hash) {
-            const computed = hash.calculateStoreContentHash(ctx.allocator, pkg.store_path, null) catch {
+            const v2_manifest_path = std.fs.path.join(ctx.allocator, &.{ pkg.store_path, manifest.MANIFEST_V2_FILENAME }) catch {
+                result.profile_issues += 1;
+                try addProfileIssue(ctx, result, pkg.store_path, profile_name, realization_name, "failed to construct manifest path");
+                continue;
+            };
+            defer ctx.allocator.free(v2_manifest_path);
+            const is_v2 = blk: {
+                std.Io.Dir.accessAbsolute(path_mod.currentIo(), v2_manifest_path, .{}) catch break :blk false;
+                break :blk true;
+            };
+            const computed = if (is_v2)
+                hash.calculateStoreContentHashV2(ctx.allocator, pkg.store_path, null)
+            else
+                hash.calculateStoreContentHash(ctx.allocator, pkg.store_path, null);
+            const computed_hash = computed catch {
                 result.profile_issues += 1;
                 try addProfileIssue(ctx, result, pkg.store_path, profile_name, realization_name, "failed to compute store content hash");
                 continue;
             };
-            defer ctx.allocator.free(computed);
+            defer ctx.allocator.free(computed_hash);
 
-            if (!std.mem.eql(u8, computed, pkg.content_hash)) {
-                result.profile_issues += 1;
-                try addProfileIssue(ctx, result, pkg.store_path, profile_name, realization_name, "computed store hash does not match profile manifest");
+            if (!std.mem.eql(u8, computed_hash, pkg.content_hash)) {
+                var accepted_transitional = false;
+                if (!is_v2) {
+                    const transitional = hash.calculateTransitionalMetadataContentHash(ctx.allocator, pkg.store_path, null) catch null;
+                    if (transitional) |transitional_hash| {
+                        accepted_transitional = std.mem.eql(u8, transitional_hash, pkg.content_hash);
+                        ctx.allocator.free(transitional_hash);
+                    }
+                }
+                if (!accepted_transitional) {
+                    result.profile_issues += 1;
+                    try addProfileIssue(ctx, result, pkg.store_path, profile_name, realization_name, "computed store hash does not match profile manifest");
+                }
             }
         }
 

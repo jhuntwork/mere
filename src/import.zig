@@ -170,13 +170,14 @@ fn verifyManifestSignatureAndGetBytes(
     temp_dir: []const u8,
     trusted_fingerprints: []const []const u8,
     loaded_keys: []const sign.LoadedKey,
+    format: manifest.Format,
 ) !sign.VerifyManifestResult {
-    const manifest_path = std.fs.path.join(ctx.allocator, &.{ temp_dir, manifest.MANIFEST_FILENAME }) catch {
+    const manifest_path = std.fs.path.join(ctx.allocator, &.{ temp_dir, format.manifestFilename() }) catch {
         return ctx.fail(ImportError.OutOfMemory, temp_dir, "failed to construct manifest path");
     };
     defer ctx.allocator.free(manifest_path);
 
-    const sig_path = std.fs.path.join(ctx.allocator, &.{ temp_dir, manifest.MANIFEST_SIG_FILENAME }) catch {
+    const sig_path = std.fs.path.join(ctx.allocator, &.{ temp_dir, format.signatureFilename() }) catch {
         return ctx.fail(ImportError.OutOfMemory, temp_dir, "failed to construct manifest sig path");
     };
     defer ctx.allocator.free(sig_path);
@@ -200,12 +201,19 @@ fn verifyManifestSignatureAndGetBytes(
     return result;
 }
 
-const ManifestResult = struct {
+pub const ManifestResult = struct {
     manifest_data: []const u8,
     pkg_manifest: manifest.PackageManifestV1,
     pkg: package.Package,
+    format: manifest.Format,
 };
 
+fn detectManifestFormat(ctx: *Context, temp_dir: []const u8) !manifest.Format {
+    const v2_path = try std.fs.path.join(ctx.allocator, &.{ temp_dir, manifest.MANIFEST_V2_FILENAME });
+    defer ctx.allocator.free(v2_path);
+    std.Io.Dir.accessAbsolute(p.currentIo(), v2_path, .{}) catch return .v1;
+    return .v2;
+}
 const PreparedImport = struct {
     extract: ExtractResult,
     manifest: ManifestResult,
@@ -221,12 +229,11 @@ const PreparedImport = struct {
 /// Builds a Package from already-verified manifest bytes. Takes ownership of
 /// manifest_bytes on success (stored as ManifestResult.manifest_data); the
 /// caller must free it on failure, since ownership has not transferred yet.
-fn createPackageFromManifest(ctx: *Context, temp_dir: []const u8, manifest_bytes: []u8) !ManifestResult {
-    const pkg_manifest = manifest.PackageManifestV1.decode(manifest_bytes) catch {
+fn createPackageFromManifest(ctx: *Context, temp_dir: []const u8, manifest_bytes: []u8, format: manifest.Format) !ManifestResult {
+    const pkg_manifest = manifest.PackageManifestV1.decodeForSchema(manifest_bytes, format.schemaVersion()) catch {
         return ctx.fail(ImportError.InvalidInput, temp_dir, "failed to decode manifest");
     };
 
-    // Create a Package from the manifest
     var pkg = package.Package.init(ctx);
     errdefer pkg.deinit();
 
@@ -240,13 +247,11 @@ fn createPackageFromManifest(ctx: *Context, temp_dir: []const u8, manifest_bytes
         return ctx.fail(ImportError.OutOfMemory, temp_dir, "out of memory allocating package arch");
     };
     pkg.release = pkg_manifest.release;
-
-    // Format content_hash as hex string
     pkg.content_hash = pkg_manifest.contentHashHex(ctx.allocator) catch {
         return ctx.fail(ImportError.OutOfMemory, temp_dir, "failed to format content hash (allocation)");
     };
 
-    return ManifestResult{ .manifest_data = manifest_bytes, .pkg_manifest = pkg_manifest, .pkg = pkg };
+    return ManifestResult{ .manifest_data = manifest_bytes, .pkg_manifest = pkg_manifest, .pkg = pkg, .format = format };
 }
 
 fn readMetaAndPopulatePackage(ctx: *Context, temp_dir: []const u8, pkg: *package.Package) !void {
@@ -377,14 +382,25 @@ fn appendJsonEscaped(buf: *std.ArrayList(u8), allocator: std.mem.Allocator, valu
     }
 }
 
-fn computeAndVerifyContentHash(ctx: *Context, temp_dir: []const u8, pkg_manifest: *const manifest.PackageManifestV1) !void {
-    const computed_hash = try hash.calculateStoreContentHash(ctx.allocator, temp_dir, null);
+fn computeAndVerifyContentHash(ctx: *Context, temp_dir: []const u8, pkg_manifest: *const manifest.PackageManifestV1, format: manifest.Format) !void {
+    const computed_hash = if (format == .v2)
+        try hash.calculateStoreContentHashV2(ctx.allocator, temp_dir, null)
+    else
+        try hash.calculateStoreContentHash(ctx.allocator, temp_dir, null);
     defer ctx.allocator.free(computed_hash);
 
     const declared_hash = try pkg_manifest.contentHashHex(ctx.allocator);
     defer ctx.allocator.free(declared_hash);
 
     if (!std.mem.eql(u8, declared_hash, computed_hash)) {
+        if (format == .v1) {
+            const transitional_hash = try hash.calculateTransitionalMetadataContentHash(ctx.allocator, temp_dir, null);
+            defer ctx.allocator.free(transitional_hash);
+            if (std.mem.eql(u8, declared_hash, transitional_hash)) {
+                ctx.debug("declared content_hash matches transitional v0.18.0 metadata identity", .{});
+                return;
+            }
+        }
         ctx.debug("content_hash mismatch: declared={s}, computed={s}", .{ declared_hash, computed_hash });
         return ctx.fail(ImportError.InvalidInput, temp_dir, "content_hash mismatch between manifest and computed hash");
     }
@@ -537,8 +553,8 @@ fn packageTupleExists(db: *repodb.RepoDB, pkg: *const package.Package) !bool {
     return repodb.RepoDBError.CorruptData;
 }
 
-fn attachManifestSignature(ctx: *Context, temp_dir: []const u8, pkg: *package.Package) !void {
-    const sig_path = std.fs.path.join(ctx.allocator, &.{ temp_dir, manifest.MANIFEST_SIG_FILENAME }) catch {
+fn attachManifestSignature(ctx: *Context, temp_dir: []const u8, pkg: *package.Package, format: manifest.Format) !void {
+    const sig_path = std.fs.path.join(ctx.allocator, &.{ temp_dir, format.signatureFilename() }) catch {
         return ctx.fail(ImportError.OutOfMemory, temp_dir, "failed to construct signature path");
     };
     defer ctx.allocator.free(sig_path);
@@ -600,8 +616,9 @@ fn prepareVerifiedImport(ctx: *Context, final_pkg_path: []const u8) !PreparedImp
     // from the verified bytes below — nothing gets parsed or trusted before
     // its signature has actually been checked, and there's no second,
     // unverified read of manifest.v1 from disk.
-    const verify_result = try verifyManifestSignatureAndGetBytes(ctx, extract_res.temp_dir, trusted_fingerprints.items, loaded_keys.items);
-    var manifest_res = createPackageFromManifest(ctx, extract_res.temp_dir, verify_result.manifest_bytes) catch |err| {
+    const format = try detectManifestFormat(ctx, extract_res.temp_dir);
+    const verify_result = try verifyManifestSignatureAndGetBytes(ctx, extract_res.temp_dir, trusted_fingerprints.items, loaded_keys.items, format);
+    var manifest_res = createPackageFromManifest(ctx, extract_res.temp_dir, verify_result.manifest_bytes, format) catch |err| {
         ctx.allocator.free(verify_result.verifying_fingerprint);
         ctx.allocator.free(verify_result.manifest_bytes);
         return err;
@@ -614,10 +631,10 @@ fn prepareVerifiedImport(ctx: *Context, final_pkg_path: []const u8) !PreparedImp
 
     try readMetaAndPopulatePackage(ctx, extract_res.temp_dir, &manifest_res.pkg);
 
-    try computeAndVerifyContentHash(ctx, extract_res.temp_dir, &manifest_res.pkg_manifest);
+    try computeAndVerifyContentHash(ctx, extract_res.temp_dir, &manifest_res.pkg_manifest, manifest_res.format);
     try validateProjectionIndex(ctx, extract_res.temp_dir);
 
-    try attachManifestSignature(ctx, extract_res.temp_dir, &manifest_res.pkg);
+    try attachManifestSignature(ctx, extract_res.temp_dir, &manifest_res.pkg, manifest_res.format);
     manifest_res.pkg.archive_hash = hash.calculateFileHash(ctx, final_pkg_path) catch |err| {
         return ctx.fail(err, final_pkg_path, "failed to compute package archive hash");
     };

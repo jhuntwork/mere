@@ -108,12 +108,34 @@ const EntryType = enum(u8) {
 
 const ENTRY_TAG: u8 = 0x01;
 
+/// The v1 store identity: realized payload only. This is retained for
+/// compatibility with all packages published before metadata-aware identity.
 pub fn calculateStoreContentHash(
     allocator: std.mem.Allocator,
     dir_path: []const u8,
     diag: ?*HashDiag,
 ) HashError![]const u8 {
-    return calculateTreeHashInternal(allocator, dir_path, diag, false);
+    return calculateTreeHashInternal(allocator, dir_path, diag, false, false, null);
+}
+
+/// The transitional v0.18.0 identity: payload plus meta.kdl, without a
+/// domain marker. It is read-only compatibility for packages produced by the
+/// released but unversioned metadata-aware implementation.
+pub fn calculateTransitionalMetadataContentHash(
+    allocator: std.mem.Allocator,
+    dir_path: []const u8,
+    diag: ?*HashDiag,
+) HashError![]const u8 {
+    return calculateTreeHashInternal(allocator, dir_path, diag, false, true, null);
+}
+
+/// The versioned metadata-aware store identity used by new packages.
+pub fn calculateStoreContentHashV2(
+    allocator: std.mem.Allocator,
+    dir_path: []const u8,
+    diag: ?*HashDiag,
+) HashError![]const u8 {
+    return calculateTreeHashInternal(allocator, dir_path, diag, false, true, "mere-store-content-v2\x00");
 }
 
 pub fn calculateBuildSnapshotHash(
@@ -121,7 +143,7 @@ pub fn calculateBuildSnapshotHash(
     dir_path: []const u8,
     diag: ?*HashDiag,
 ) HashError![]const u8 {
-    return calculateTreeHashInternal(allocator, dir_path, diag, true);
+    return calculateTreeHashInternal(allocator, dir_path, diag, true, false, null);
 }
 
 fn calculateTreeHashInternal(
@@ -129,6 +151,8 @@ fn calculateTreeHashInternal(
     dir_path: []const u8,
     diag: ?*HashDiag,
     include_mtime: bool,
+    include_metadata: bool,
+    domain: ?[]const u8,
 ) HashError![]const u8 {
     if (!path.isValidInputPath(dir_path)) {
         setDiag(allocator, diag, dir_path, "invalid input path", null);
@@ -165,7 +189,7 @@ fn calculateTreeHashInternal(
             return mapHashFsError(err);
         };
         if (entry == null) break;
-        if (isExcludedStoreHashPath(entry.?.path)) continue;
+        if (isExcludedStoreHashPath(entry.?.path, include_metadata)) continue;
         const e = entry.?;
 
         const path_copy = allocator.dupe(u8, e.path) catch {
@@ -209,6 +233,7 @@ fn calculateTreeHashInternal(
     }.lessThan);
 
     var hasher = std.crypto.hash.Blake3.init(.{});
+    if (domain) |prefix| hasher.update(prefix);
     if (include_mtime) hasher.update("build-snapshot-v1");
 
     for (entries.items) |entry| {
@@ -288,13 +313,19 @@ fn calculateTreeHashInternal(
     };
 }
 
-fn isExcludedStoreHashPath(entry_path: []const u8) bool {
-    // The .mere directory itself is structural. Canonical package metadata
-    // below it participates in store identity; only self-referential or
-    // derived files are excluded.
+fn isExcludedStoreHashPath(entry_path: []const u8, include_metadata: bool) bool {
+    if (!include_metadata) {
+        return std.mem.eql(u8, entry_path, ".mere") or
+            std.mem.startsWith(u8, entry_path, ".mere/");
+    }
+
+    // In metadata-aware identity, only self-referential and derived files
+    // are excluded. Canonical meta.kdl participates in the hash.
     if (std.mem.eql(u8, entry_path, ".mere")) return true;
     return std.mem.eql(u8, entry_path, ".mere/manifest.v1") or
         std.mem.eql(u8, entry_path, ".mere/manifest.v1.sig") or
+        std.mem.eql(u8, entry_path, ".mere/manifest.v2") or
+        std.mem.eql(u8, entry_path, ".mere/manifest.v2.sig") or
         std.mem.eql(u8, entry_path, ".mere/projection.v1");
 }
 
@@ -362,9 +393,9 @@ test "calculateStoreContentHash computes deterministic hash for directory" {
     try std.testing.expect(!std.mem.eql(u8, hash1, hash3));
 }
 
-// Spec #4: Manifest and derived projection files are excluded; canonical
-// package metadata participates in store identity.
-test "calculateStoreContentHash includes meta but excludes derived metadata" {
+// Spec #4: Manifest and derived projection files are excluded from v2;
+// canonical package metadata participates in the versioned store identity.
+test "calculateStoreContentHashV2 includes meta but excludes derived metadata" {
     const th = @import("test_helpers.zig");
     var test_env = try th.createTestEnv();
     defer {
@@ -392,7 +423,7 @@ test "calculateStoreContentHash includes meta but excludes derived metadata" {
         f.close(path.currentIo());
     }
 
-    const hash1 = try calculateStoreContentHash(test_env.ctx.allocator, test_env.path, null);
+    const hash1 = try calculateStoreContentHashV2(test_env.ctx.allocator, test_env.path, null);
     defer test_env.ctx.allocator.free(hash1);
 
     const manifest_path = try std.fs.path.join(std.testing.allocator, &.{ mere_dir, "manifest.v1" });
@@ -407,7 +438,7 @@ test "calculateStoreContentHash includes meta but excludes derived metadata" {
         f.close(path.currentIo());
     }
 
-    const hash2 = try calculateStoreContentHash(test_env.ctx.allocator, test_env.path, null);
+    const hash2 = try calculateStoreContentHashV2(test_env.ctx.allocator, test_env.path, null);
     defer test_env.ctx.allocator.free(hash2);
     try std.testing.expectEqualStrings(hash1, hash2);
 
@@ -418,9 +449,56 @@ test "calculateStoreContentHash includes meta but excludes derived metadata" {
         f.close(path.currentIo());
     }
 
-    const hash3 = try calculateStoreContentHash(test_env.ctx.allocator, test_env.path, null);
+    const hash3 = try calculateStoreContentHashV2(test_env.ctx.allocator, test_env.path, null);
     defer test_env.ctx.allocator.free(hash3);
     try std.testing.expect(!std.mem.eql(u8, hash1, hash3));
+}
+
+
+test "store hash formats preserve v1 and distinguish transitional and v2 identities" {
+    const th = @import("test_helpers.zig");
+    var test_env = try th.createTestEnv();
+    defer {
+        test_env.cleanup();
+        std.testing.allocator.destroy(test_env);
+    }
+
+    const content_path = try std.fs.path.join(std.testing.allocator, &.{ test_env.path, "content.txt" });
+    defer std.testing.allocator.free(content_path);
+    var content = try std.Io.Dir.createFileAbsolute(path.currentIo(), content_path, .{});
+    try content.writeStreamingAll(path.currentIo(), "package content");
+    content.close(path.currentIo());
+
+    const mere_dir = try std.fs.path.join(std.testing.allocator, &.{ test_env.path, ".mere" });
+    defer std.testing.allocator.free(mere_dir);
+    try path.ensureDirExists(mere_dir);
+    const meta_path = try std.fs.path.join(std.testing.allocator, &.{ mere_dir, "meta.kdl" });
+    defer std.testing.allocator.free(meta_path);
+    var metadata = try std.Io.Dir.createFileAbsolute(path.currentIo(), meta_path, .{});
+    try metadata.writeStreamingAll(path.currentIo(), "dependencies { }\n");
+    metadata.close(path.currentIo());
+
+    const v1 = try calculateStoreContentHash(test_env.ctx.allocator, test_env.path, null);
+    defer test_env.ctx.allocator.free(v1);
+    const transitional = try calculateTransitionalMetadataContentHash(test_env.ctx.allocator, test_env.path, null);
+    defer test_env.ctx.allocator.free(transitional);
+    const v2 = try calculateStoreContentHashV2(test_env.ctx.allocator, test_env.path, null);
+    defer test_env.ctx.allocator.free(v2);
+
+    try std.testing.expect(!std.mem.eql(u8, v1, transitional));
+    try std.testing.expect(!std.mem.eql(u8, transitional, v2));
+
+    try std.Io.Dir.deleteFileAbsolute(path.currentIo(), meta_path);
+    metadata = try std.Io.Dir.createFileAbsolute(path.currentIo(), meta_path, .{});
+    try metadata.writeStreamingAll(path.currentIo(), "dependencies { elf-needed \"libc.so\" }\n");
+    metadata.close(path.currentIo());
+
+    const v1_after_metadata_change = try calculateStoreContentHash(test_env.ctx.allocator, test_env.path, null);
+    defer test_env.ctx.allocator.free(v1_after_metadata_change);
+    const transitional_after_metadata_change = try calculateTransitionalMetadataContentHash(test_env.ctx.allocator, test_env.path, null);
+    defer test_env.ctx.allocator.free(transitional_after_metadata_change);
+    try std.testing.expectEqualStrings(v1, v1_after_metadata_change);
+    try std.testing.expect(!std.mem.eql(u8, transitional, transitional_after_metadata_change));
 }
 
 // Spec #1.1: Executable bit incorporated into hash
