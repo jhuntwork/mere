@@ -1828,7 +1828,7 @@ fn installSinglePackageToStore(
         };
     }
 
-    const staging = try stageAndValidatePayload(ctx, pkg, cache_path, preverify.manifest_content_hash);
+    const staging = try stageAndValidatePayload(ctx, pkg, cache_path, preverify.manifest_content_hash, preverify.parsed.format);
     errdefer path.deleteTreeAbsolute(staging.staging_dir) catch {};
     defer ctx.allocator.free(staging.staging_dir);
 
@@ -1957,6 +1957,7 @@ fn setDirectoryReadOnly(dir_path: []const u8) !void {
 const ParsedManifest = struct {
     data: []u8,
     manifest: manifest.PackageManifestV1,
+    format: manifest.Format,
 
     pub fn deinit(self: *ParsedManifest, allocator: std.mem.Allocator) void {
         allocator.free(self.data);
@@ -2032,12 +2033,19 @@ fn preVerifyManifest(
     const verify_dir = verify_path_buf[0..verify_dir_len];
 
     ctx.debug("partial-extracting manifest for pre-verification", .{});
-    try extract.fileInto(ctx, cache_path, verify_dir, manifest.MANIFEST_FILENAME);
-    try extract.fileInto(ctx, cache_path, verify_dir, manifest.MANIFEST_SIG_FILENAME);
+    var format: manifest.Format = .v1;
+    const v2_probe_dir = verify_dir;
+    extract.fileInto(ctx, cache_path, v2_probe_dir, manifest.MANIFEST_V2_FILENAME) catch {};
+    const v2_probe_path = try std.fs.path.join(ctx.allocator, &.{ verify_dir, manifest.MANIFEST_V2_FILENAME });
+    defer ctx.allocator.free(v2_probe_path);
+    if (path.fileExists(v2_probe_path)) format = .v2;
 
-    const manifest_path = try std.fs.path.join(ctx.allocator, &.{ verify_dir, manifest.MANIFEST_FILENAME });
+    try extract.fileInto(ctx, cache_path, verify_dir, format.manifestFilename());
+    try extract.fileInto(ctx, cache_path, verify_dir, format.signatureFilename());
+
+    const manifest_path = try std.fs.path.join(ctx.allocator, &.{ verify_dir, format.manifestFilename() });
     defer ctx.allocator.free(manifest_path);
-    const sig_path = try std.fs.path.join(ctx.allocator, &.{ verify_dir, manifest.MANIFEST_SIG_FILENAME });
+    const sig_path = try std.fs.path.join(ctx.allocator, &.{ verify_dir, format.signatureFilename() });
     defer ctx.allocator.free(sig_path);
 
     if (repo_cache.trusted_fingerprints.len == 0) {
@@ -2054,7 +2062,7 @@ fn preVerifyManifest(
     // Decode directly from the bytes that were just verified, rather than
     // re-reading manifest_path from disk a second time (avoids a
     // verify-then-reread TOCTOU window).
-    const pkg_manifest = manifest.PackageManifestV1.decode(result.manifest_bytes) catch {
+    const pkg_manifest = manifest.PackageManifestV1.decodeForSchema(result.manifest_bytes, format.schemaVersion()) catch {
         ctx.allocator.free(result.manifest_bytes);
         ctx.setDiagnosticContext(verify_dir, "manifest.v1 invalid or failed to decode");
         return error.InvalidInput;
@@ -2062,6 +2070,7 @@ fn preVerifyManifest(
     var parsed_manifest = ParsedManifest{
         .data = result.manifest_bytes,
         .manifest = pkg_manifest,
+        .format = format,
     };
     errdefer parsed_manifest.deinit(ctx.allocator);
 
@@ -2107,6 +2116,7 @@ fn stageAndValidatePayload(
     pkg: *package.Package,
     cache_path: []const u8,
     manifest_content_hash: []const u8,
+    format: manifest.Format,
 ) !StagingResult {
     // === Step 2: Stage in /mere/store/.incoming/<rand>/ ===
     const store_root = try std.fs.path.join(ctx.allocator, &.{ ctx.root_path, "mere", "store" });
@@ -2161,23 +2171,53 @@ fn stageAndValidatePayload(
     // Compute content hash from realized payload and canonical package metadata (spec #1/#4)
     var hash_diag: hash.HashDiag = .{};
     defer hash_diag.deinit(ctx.allocator);
-    const content_hash = hash.calculateStoreContentHash(ctx.allocator, staging_dir, &hash_diag) catch |err| {
-        const action = hash_diag.action orelse "compute content hash";
-        const path_label = hash_diag.path orelse staging_dir;
-        const os_err = if (hash_diag.os_error) |oe| @errorName(oe) else "unknown";
-        ctx.setDiagnosticContextFmt(staging_dir, "failed to compute content hash from payload and metadata: {s}: {s} ({s})", .{ action, path_label, os_err });
-        return switch (err) {
-            hash.HashError.OutOfMemory => error.OutOfMemory,
-            hash.HashError.PermissionDenied => error.PermissionDenied,
-            hash.HashError.InvalidInput => error.InvalidInput,
-            else => error.FileSystem,
+    var content_hash: []const u8 = undefined;
+    if (format == .v2) {
+        content_hash = hash.calculateStoreContentHashV2(ctx.allocator, staging_dir, &hash_diag) catch |err| {
+            const action = hash_diag.action orelse "compute content hash";
+            const path_label = hash_diag.path orelse staging_dir;
+            const os_err = if (hash_diag.os_error) |oe| @errorName(oe) else "unknown";
+            ctx.setDiagnosticContextFmt(staging_dir, "failed to compute content hash from payload and metadata: {s}: {s} ({s})", .{ action, path_label, os_err });
+            return switch (err) {
+                hash.HashError.OutOfMemory => error.OutOfMemory,
+                hash.HashError.PermissionDenied => error.PermissionDenied,
+                hash.HashError.InvalidInput => error.InvalidInput,
+                else => error.FileSystem,
+            };
         };
-    };
+    } else {
+        content_hash = hash.calculateStoreContentHash(ctx.allocator, staging_dir, &hash_diag) catch |err| {
+            const action = hash_diag.action orelse "compute content hash";
+            const path_label = hash_diag.path orelse staging_dir;
+            const os_err = if (hash_diag.os_error) |oe| @errorName(oe) else "unknown";
+            ctx.setDiagnosticContextFmt(staging_dir, "failed to compute content hash from payload and metadata: {s}: {s} ({s})", .{ action, path_label, os_err });
+            return switch (err) {
+                hash.HashError.OutOfMemory => error.OutOfMemory,
+                hash.HashError.PermissionDenied => error.PermissionDenied,
+                hash.HashError.InvalidInput => error.InvalidInput,
+                else => error.FileSystem,
+            };
+        };
+    }
     errdefer ctx.allocator.free(content_hash);
     ctx.debug("content hash from payload and metadata: {s}", .{content_hash});
 
     if (!std.mem.eql(u8, content_hash, manifest_content_hash)) {
-        return ctx.fail(error.CorruptData, staging_dir, "manifest content hash does not match payload and metadata");
+        if (format == .v1) {
+            const transitional_hash = hash.calculateTransitionalMetadataContentHash(ctx.allocator, staging_dir, null) catch {
+                ctx.allocator.free(content_hash);
+                return ctx.fail(error.FileSystem, staging_dir, "failed to compute transitional content hash");
+            };
+            if (std.mem.eql(u8, transitional_hash, manifest_content_hash)) {
+                ctx.allocator.free(content_hash);
+                content_hash = transitional_hash;
+            } else {
+                ctx.allocator.free(transitional_hash);
+                return ctx.fail(error.CorruptData, staging_dir, "manifest content hash does not match payload");
+            }
+        } else {
+            return ctx.fail(error.CorruptData, staging_dir, "manifest v2 content hash does not match payload and metadata");
+        }
     }
 
     const install_dir = store.constructStorePath(ctx, content_hash, pkg.name.?, pkg.version.?) catch |err| {
@@ -4426,6 +4466,7 @@ test "enforceRepoMetadataBinding rejects content hash mismatch" {
             .arch = th.host_arch,
             .content_hash = manifest_hash_bytes,
         },
+        .format = .v1,
     };
     errdefer parsed.deinit(ctx.allocator);
 
@@ -4473,6 +4514,7 @@ test "enforceRepoMetadataBinding rejects manifest identity mismatch" {
             .arch = th.host_arch,
             .content_hash = hash_bytes,
         },
+        .format = .v1,
     };
     errdefer parsed.deinit(ctx.allocator);
 
