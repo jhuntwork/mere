@@ -32,11 +32,9 @@ jobs:
           git init "$GITHUB_WORKSPACE"
           git config --global --add safe.directory "$GITHUB_WORKSPACE"
           cd "$GITHUB_WORKSPACE"
-          git remote add origin "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY.git"
-          git -c http.extraHeader="Authorization: Bearer $GH_TOKEN" \
-            fetch --tags origin
-          git -c http.extraHeader="Authorization: Bearer $GH_TOKEN" \
-            fetch --depth=50 origin "$GITHUB_SHA"
+          git remote add origin "https://x-access-token:${GH_TOKEN}@${GITHUB_SERVER_URL#https://}/$GITHUB_REPOSITORY.git"
+          git fetch --tags origin
+          git fetch --depth=50 origin "$GITHUB_SHA"
           git checkout --detach FETCH_HEAD
 
       - name: Detect version change
@@ -80,9 +78,8 @@ jobs:
           git init "$GITHUB_WORKSPACE"
           git config --global --add safe.directory "$GITHUB_WORKSPACE"
           cd "$GITHUB_WORKSPACE"
-          git remote add origin "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY.git"
-          git -c http.extraHeader="Authorization: Bearer $GH_TOKEN" \
-            fetch --depth=1 origin "$GITHUB_SHA"
+          git remote add origin "https://x-access-token:${GH_TOKEN}@${GITHUB_SERVER_URL#https://}/$GITHUB_REPOSITORY.git"
+          git fetch --depth=1 origin "$GITHUB_SHA"
           git checkout --detach FETCH_HEAD
       - name: Test
         run: |
@@ -108,9 +105,8 @@ jobs:
           git init "$GITHUB_WORKSPACE"
           git config --global --add safe.directory "$GITHUB_WORKSPACE"
           cd "$GITHUB_WORKSPACE"
-          git remote add origin "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY.git"
-          git -c http.extraHeader="Authorization: Bearer $GH_TOKEN" \
-            fetch --depth=50 --tags origin "$GITHUB_SHA"
+          git remote add origin "https://x-access-token:${GH_TOKEN}@${GITHUB_SERVER_URL#https://}/$GITHUB_REPOSITORY.git"
+          git fetch --depth=50 --tags origin "$GITHUB_SHA"
           git checkout --detach FETCH_HEAD
 
       - name: Build and package
@@ -145,8 +141,7 @@ jobs:
           fi
 
           git tag -a "$tag" -m "${{ needs.detect.outputs.release_name }}" "$GITHUB_SHA"
-          git -c http.extraHeader="Authorization: Bearer $GH_TOKEN" \
-            push origin "refs/tags/${tag}"
+          git push origin "refs/tags/${tag}"
 
       - name: Create release and upload assets
         env:
@@ -251,9 +246,8 @@ jobs:
           git init "$GITHUB_WORKSPACE"
           git config --global --add safe.directory "$GITHUB_WORKSPACE"
           cd "$GITHUB_WORKSPACE"
-          git remote add origin "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY.git"
-          git -c http.extraHeader="Authorization: Bearer $GH_TOKEN" \
-            fetch --depth=50 --tags origin "$GITHUB_SHA"
+          git remote add origin "https://x-access-token:${GH_TOKEN}@${GITHUB_SERVER_URL#https://}/$GITHUB_REPOSITORY.git"
+          git fetch --depth=50 --tags origin "$GITHUB_SHA"
           git checkout --detach FETCH_HEAD
 
       - name: Build and package
