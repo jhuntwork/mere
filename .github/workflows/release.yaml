@@ -110,6 +110,9 @@ jobs:
   create-release:
     needs: [detect, test]
     if: needs.detect.outputs.version_changed == 'true'
+    outputs:
+      release_id: ${{ steps.release.outputs.release_id }}
+      upload_url: ${{ steps.release.outputs.upload_url }}
     runs-on: ubuntu-24.04
     container:
       image: mere/ci:v0.15.0
@@ -145,6 +148,7 @@ jobs:
           fi
 
       - name: Create draft release
+        id: release
         env:
           CHANGELOG: ${{ needs.detect.outputs.changelog }}
           TAG: ${{ needs.detect.outputs.tag }}
@@ -178,16 +182,43 @@ jobs:
               printf 'Draft release %s already exists; reusing it.\n' "$tag"
               ;;
             404)
-              python3 .forgejo/scripts/release-body.py > release-create.json
-              python3 -c 'import json; from pathlib import Path; path = Path("release-create.json"); body = json.loads(path.read_text()); body["draft"] = True; path.write_text(json.dumps(body))'
-              curl -fsS \
-                -X POST \
-                -H "$auth_header" \
-                -H "Accept: application/vnd.github+json" \
-                -H "Content-Type: application/json" \
-                --data-binary @release-create.json \
-                "$api_base" > release.json
-              printf 'Created draft release %s.\n' "$tag"
+              releases_status=$(
+                curl -sS \
+                  -o releases.json \
+                  -w '%{http_code}' \
+                  -H "$auth_header" \
+                  -H "Accept: application/vnd.github+json" \
+                  "$api_base?per_page=100"
+              )
+              if [ "$releases_status" = "200" ]; then
+                draft_id=$(python3 -c 'import json,sys; tag=sys.argv[1]; releases=json.load(open("releases.json")); matches=[r for r in releases if r.get("tag_name") == tag]; print(matches[0]["id"] if matches else "")' "$tag")
+              else
+                draft_id=
+              fi
+              if [ -n "$draft_id" ]; then
+                curl -fsS \
+                  -H "$auth_header" \
+                  -H "Accept: application/vnd.github+json" \
+                  "$api_base/$draft_id" > release.json
+                immutable=$(python3 -c 'import json; print(json.load(open("release.json")).get("immutable", False))')
+                draft=$(python3 -c 'import json; print(json.load(open("release.json"))["draft"])')
+                if [ "$immutable" = "True" ] || [ "$draft" != "True" ]; then
+                  printf 'Release %s exists but is not a mutable draft.\n' "$tag" >&2
+                  exit 1
+                fi
+                printf 'Found existing draft release %s; reusing it.\n' "$tag"
+              else
+                python3 .forgejo/scripts/release-body.py > release-create.json
+                python3 -c 'import json; from pathlib import Path; path = Path("release-create.json"); body = json.loads(path.read_text()); body["draft"] = True; path.write_text(json.dumps(body))'
+                curl -fsS \
+                  -X POST \
+                  -H "$auth_header" \
+                  -H "Accept: application/vnd.github+json" \
+                  -H "Content-Type: application/json" \
+                  --data-binary @release-create.json \
+                  "$api_base" > release.json
+                printf 'Created draft release %s.\n' "$tag"
+              fi
               ;;
             *)
               printf 'Failed to query release %s (HTTP %s).\n' "$tag" "$release_status" >&2
@@ -195,6 +226,11 @@ jobs:
               exit 1
               ;;
           esac
+
+          release_id=$(python3 -c 'import json; print(json.load(open("release.json"))["id"])')
+          upload_url=$(python3 -c 'import json; print(json.load(open("release.json"))["upload_url"].split("{")[0])')
+          printf 'release_id=%s\n' "$release_id" >> "$GITHUB_OUTPUT"
+          printf 'upload_url=%s\n' "$upload_url" >> "$GITHUB_OUTPUT"
 
   release-x86_64:
     needs: [detect, test, create-release]
@@ -243,13 +279,13 @@ jobs:
 
           api_base="$GITHUB_API_URL/repos/$GITHUB_REPOSITORY/releases"
           auth_header="Authorization: Bearer $GH_TOKEN"
-          tag="${{ needs.detect.outputs.tag }}"
+          release_id="${{ needs.create-release.outputs.release_id }}"
+          upload_url="${{ needs.create-release.outputs.upload_url }}"
           curl -fsS \
             -H "$auth_header" \
             -H "Accept: application/vnd.github+json" \
-            "$api_base/tags/$tag" > release.json
+            "$api_base/$release_id" > release.json
 
-          upload_url=$(python3 -c 'import json; print(json.load(open("release.json"))["upload_url"].split("{")[0])')
           asset="dist/$(basename dist/*)"
           name=$(basename "$asset")
           existing=$(python3 -c 'import json,sys; print(any(a["name"] == sys.argv[1] for a in json.load(open("release.json"))["assets"]))' "$name")
@@ -322,13 +358,13 @@ jobs:
 
           api_base="$GITHUB_API_URL/repos/$GITHUB_REPOSITORY/releases"
           auth_header="Authorization: Bearer $GH_TOKEN"
-          tag="${{ needs.detect.outputs.tag }}"
+          release_id="${{ needs.create-release.outputs.release_id }}"
+          upload_url="${{ needs.create-release.outputs.upload_url }}"
           curl -fsS \
             -H "$auth_header" \
             -H "Accept: application/vnd.github+json" \
-            "$api_base/tags/$tag" > release.json
+            "$api_base/$release_id" > release.json
 
-          upload_url=$(python3 -c 'import json; print(json.load(open("release.json"))["upload_url"].split("{")[0])')
           asset="dist/$(basename dist/*)"
           name=$(basename "$asset")
           existing=$(python3 -c 'import json,sys; print(any(a["name"] == sys.argv[1] for a in json.load(open("release.json"))["assets"]))' "$name")
@@ -376,13 +412,13 @@ jobs:
 
           api_base="$GITHUB_API_URL/repos/$GITHUB_REPOSITORY/releases"
           auth_header="Authorization: Bearer $GH_TOKEN"
-          tag="${{ needs.detect.outputs.tag }}"
+          release_id="${{ needs.create-release.outputs.release_id }}"
+          upload_url="${{ needs.create-release.outputs.upload_url }}"
           curl -fsS \
             -H "$auth_header" \
             -H "Accept: application/vnd.github+json" \
-            "$api_base/tags/$tag" > release.json
+            "$api_base/$release_id" > release.json
 
-          upload_url=$(python3 -c 'import json; print(json.load(open("release.json"))["upload_url"].split("{")[0])')
           existing=$(python3 -c 'import json; print(any(a["name"] == "SHA256SUMS" for a in json.load(open("release.json"))["assets"]))')
           if [ "$existing" = "True" ]; then
             printf '%s\n' 'SHA256SUMS already exists in draft release; keeping it.'
@@ -407,7 +443,7 @@ jobs:
           esac
 
   publish:
-    needs: [detect, checksums]
+    needs: [detect, create-release, checksums]
     if: needs.detect.outputs.version_changed == 'true'
     runs-on: ubuntu-24.04-arm
     container:
@@ -424,10 +460,11 @@ jobs:
           api_base="$GITHUB_API_URL/repos/$GITHUB_REPOSITORY/releases"
           auth_header="Authorization: Bearer $GH_TOKEN"
           tag="${{ needs.detect.outputs.tag }}"
+          release_id="${{ needs.create-release.outputs.release_id }}"
           curl -fsS \
             -H "$auth_header" \
             -H "Accept: application/vnd.github+json" \
-            "$api_base/tags/$tag" > release.json
+            "$api_base/$release_id" > release.json
 
           immutable=$(python3 -c 'import json; print(json.load(open("release.json")).get("immutable", False))')
           draft=$(python3 -c 'import json; print(json.load(open("release.json"))["draft"])')
@@ -446,5 +483,5 @@ jobs:
             -H "Accept: application/vnd.github+json" \
             -H "Content-Type: application/json" \
             --data '{"draft":false}' \
-            "$api_base/$(python3 -c 'import json; print(json.load(open("release.json"))["id"])')" >/dev/null
+            "$api_base/$release_id" >/dev/null
           printf 'Published complete release %s.\n' "$tag"
