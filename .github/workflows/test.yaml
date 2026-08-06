@@ -15,11 +15,14 @@ jobs:
       - name: Git checkout
         run: |
           set -eu
-          git init "$GITHUB_WORKSPACE"
-          cd "$GITHUB_WORKSPACE"
-          git remote add origin "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY.git"
-          git fetch --depth=1 origin "$GITHUB_REF"
-          git checkout --detach FETCH_HEAD
+          mkdir -p "$GITHUB_WORKSPACE"
+          archive="$RUNNER_TEMP/mere-source.tar.gz"
+          curl -fsSL \
+            "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/archive/$GITHUB_REF.tar.gz" \
+            -o "$archive"
+          tar -xzf "$archive" \
+            --strip-components=1 \
+            -C "$GITHUB_WORKSPACE"
       - name: Test
         run: |
           cd "$GITHUB_WORKSPACE"
