@@ -47,7 +47,9 @@ If dir (0x11):
 
 **Metadata location**:
 - `.mere/manifest.v1` (binary) and `.mere/manifest.v1.sig` (signature) in the `.mere/` subdirectory
-- Both are **excluded from the content hash** (see spec #4)
+- Both manifest files are **excluded from the content hash** (see spec #4) because the manifest contains the hash it describes and the signature authenticates that manifest
+- `.mere/meta.kdl` is canonical package intent metadata and **is included in the content hash**
+- `.mere/projection.v1` is a derived index and **is excluded from the content hash**; it is regenerated and validated from the package contents and metadata
 - The `content_hash` field in the manifest and the hash in the store path are **identical** (same 32 bytes, displayed as 64 hex chars in path)
 
 #### 1.1 Content Identity Invariants
@@ -79,7 +81,7 @@ Package filenames are `<name>-<version>-<release>-<arch>-<archive_hash>.pkg.tar.
 **Normative rules**:
 - Hyphens are allowed in package names and versions
 - No parsing ambiguity exists because we don't parse filenames
-- Tools read `manifest.v1` for name, version, release, arch, and payload `content_hash`
+- Tools read `manifest.v1` for name, version, release, arch, and the complete package `content_hash`
 
 ---
 
@@ -113,14 +115,22 @@ Package filenames are `<name>-<version>-<release>-<arch>-<archive_hash>.pkg.tar.
 
 ### 4. Content Hash and Metadata
 
-The store content hash identifies the package payload. Metadata (`manifest.v1`) binds to that hash but is not part of it.
+The store content hash identifies the complete immutable Mere store object: its realized payload plus canonical package intent metadata. Metadata (`manifest.v1`) binds to that hash but is not part of it.
 
-**Rule**: Compute `content_hash` over the realized store payload, **excluding** the manifest files. Metadata binds to the payload hash; it does not participate in the payload hash.
+**Rule**: Compute `content_hash` over the realized package payload and `.mere/meta.kdl`, excluding the self-referential manifest files and the derived projection index. This prevents metadata-only changes—such as adding or changing dependencies, provisions, or service definitions—from colliding with an earlier immutable store object and silently retaining stale behavior.
+
+**Included in content hash**:
+- All realized payload entries
+- `.mere/meta.kdl`, in its canonical serialized form
 
 **Excluded from content hash**:
-- `.mere/manifest.v1` (package manifest)
-- `.mere/manifest.v1.sig` (manifest signature)
-- Any other files in the `.mere/` directory
+- `.mere/manifest.v1` (package manifest, which contains `content_hash`)
+- `.mere/manifest.v1.sig` (signature over the excluded manifest)
+- `.mere/projection.v1` (derived projection index)
+
+Only these explicitly listed derived/authentication files are excluded. Other unexpected files under `.mere/` are included, so adding package metadata requires an intentional, specified format rather than silently bypassing store identity.
+
+The package metadata must be generated before the final content hash is computed. The manifest and signature are written afterward or rewritten with that final hash.
 
 ---
 
@@ -155,12 +165,13 @@ For unprivileged `mere install` or `mere dev build`:
 3. **Extract payload and validate**:
    - Extract package contents to temp dir
    - Enforce symlink boundary rules (no escapes outside package root)
-   - Compute content hash from realized temp dir using canonical hashing algorithm
+   - Read and validate canonical `.mere/meta.kdl`
+   - Compute content hash from the realized payload and `.mere/meta.kdl`
 
 4. **Write manifest files to temp dir's `.mere/` subdirectory**:
    - Create `.mere/` directory in temp dir
    - Copy `manifest.v1` and `manifest.v1.sig` into `.mere/`
-   - These are excluded from content hash by design
+   - These files are excluded from content hash by design
 
 5. **Atomically admit to final path**:
    - Final path: `/mere/store/<hash>-<name>-<version>/`
@@ -181,12 +192,13 @@ For unprivileged `mere install` or `mere dev build`:
 
 If `/mere/store/<hash>-<name>-<version>/` already exists and `reinstall` is false:
 
-- Skip payload extraction, symlink validation, and payload hash computation
-- Use the manifest content hash to compute the store path
+- The object is reusable only for the same complete content identity, including canonical `.mere/meta.kdl`
+- A package with changed metadata produces a different `content_hash` and therefore a different immutable store path
+- The existing object is never overwritten or augmented with metadata from a later package revision
 - **Unprivileged**: No further verification required (user is only affecting their own profile)
 - **Privileged**: MUST harden the existing store object before referencing it in a system profile. An unprivileged user may have admitted this object previously; the privileged fast-path ensures it is root-owned, read-only, has valid symlink boundaries, has verified content hash, and has filesystem immutable flags set before any system generation uses it. If the object is already hardened (root-owned with immutable flags set), verification and hardening are skipped — the object was verified when first admitted.
 
-This keeps installs fast for already-admitted content while enforcing the trust boundary for system profiles.
+This keeps installs fast for already-admitted complete identities while enforcing the trust boundary for system profiles.
 
 #### Privileged Publication Steps
 
@@ -1854,7 +1866,7 @@ The package manifest is the authoritative source of package metadata, using a de
 - `version`: Package version (UTF-8, no null bytes)
 - `release`: Release number (positive integer)
 - `arch`: Architecture string (`x86_64`, `aarch64`, `any`)
-- `content_hash`: 32-byte BLAKE3 hash of package payload
+- `content_hash`: 32-byte BLAKE3 hash of the realized payload plus canonical `.mere/meta.kdl`
 - `created_at`: Unix timestamp when package was built (informational; surfaced in metadata for auditing and display)
 
 **Signature file** (`manifest.v1.sig`):

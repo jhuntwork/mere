@@ -2158,14 +2158,14 @@ fn stageAndValidatePayload(
     };
     ctx.debug("symlink validation passed", .{});
 
-    // Compute content hash from realized payload (spec #1)
+    // Compute content hash from realized payload and canonical package metadata (spec #1/#4)
     var hash_diag: hash.HashDiag = .{};
     defer hash_diag.deinit(ctx.allocator);
     const content_hash = hash.calculateStoreContentHash(ctx.allocator, staging_dir, &hash_diag) catch |err| {
         const action = hash_diag.action orelse "compute content hash";
         const path_label = hash_diag.path orelse staging_dir;
         const os_err = if (hash_diag.os_error) |oe| @errorName(oe) else "unknown";
-        ctx.setDiagnosticContextFmt(staging_dir, "failed to compute content hash from payload: {s}: {s} ({s})", .{ action, path_label, os_err });
+        ctx.setDiagnosticContextFmt(staging_dir, "failed to compute content hash from payload and metadata: {s}: {s} ({s})", .{ action, path_label, os_err });
         return switch (err) {
             hash.HashError.OutOfMemory => error.OutOfMemory,
             hash.HashError.PermissionDenied => error.PermissionDenied,
@@ -2174,10 +2174,10 @@ fn stageAndValidatePayload(
         };
     };
     errdefer ctx.allocator.free(content_hash);
-    ctx.debug("content hash from payload: {s}", .{content_hash});
+    ctx.debug("content hash from payload and metadata: {s}", .{content_hash});
 
     if (!std.mem.eql(u8, content_hash, manifest_content_hash)) {
-        return ctx.fail(error.CorruptData, staging_dir, "manifest content hash does not match payload");
+        return ctx.fail(error.CorruptData, staging_dir, "manifest content hash does not match payload and metadata");
     }
 
     const install_dir = store.constructStorePath(ctx, content_hash, pkg.name.?, pkg.version.?) catch |err| {

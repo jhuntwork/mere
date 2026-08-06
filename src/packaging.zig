@@ -114,7 +114,7 @@ pub const Packager = struct {
             return self.fail(config.staging_dir, "failed to deduplicate staging directory", PackagingError.CreationFailed);
         };
 
-        const content_hash = hash.calculateStoreContentHash(self.ctx.allocator, config.staging_dir, null) catch {
+        var content_hash = hash.calculateStoreContentHash(self.ctx.allocator, config.staging_dir, null) catch {
             return self.fail(config.staging_dir, "failed to compute content hash", PackagingError.CreationFailed);
         };
 
@@ -193,7 +193,7 @@ pub const Packager = struct {
             return self.fail(content_hash, "invalid content hash hex", PackagingError.InvalidInput);
         };
 
-        const pkg_manifest = manifest.PackageManifestV1{
+        var pkg_manifest = manifest.PackageManifestV1{
             .schema_version = manifest.SCHEMA_VERSION,
             .created_at = @intCast(std.Io.Clock.Timestamp.now(io, .real).raw.toSeconds()),
             .release = pkg.release orelse 1,
@@ -315,6 +315,30 @@ pub const Packager = struct {
         meta.writeFile(self.ctx.allocator, config.staging_dir, &pkg_meta) catch {
             self.ctx.allocator.free(content_hash);
             return self.fail(config.staging_dir, "failed to write meta.kdl", PackagingError.FileSystem);
+        };
+
+        // meta.kdl is part of store identity. Recompute after writing it,
+        // replacing the provisional payload-only hash used while assembling
+        // the package metadata and manifest.
+        self.ctx.allocator.free(content_hash);
+        content_hash = hash.calculateStoreContentHash(self.ctx.allocator, config.staging_dir, null) catch {
+            return self.fail(config.staging_dir, "failed to compute content hash", PackagingError.CreationFailed);
+        };
+        if (pkg.content_hash.len > 0) self.ctx.allocator.free(pkg.content_hash);
+        pkg.content_hash = self.ctx.allocator.dupe(u8, content_hash) catch |err| {
+            self.ctx.allocator.free(content_hash);
+            return self.fail(config.staging_dir, "failed to copy content hash", if (err == error.OutOfMemory) PackagingError.OutOfMemory else PackagingError.CreationFailed);
+        };
+
+        var final_content_hash_bytes: [32]u8 = undefined;
+        _ = std.fmt.hexToBytes(&final_content_hash_bytes, content_hash) catch {
+            self.ctx.allocator.free(content_hash);
+            return self.fail(content_hash, "invalid content hash hex", PackagingError.InvalidInput);
+        };
+        pkg_manifest.content_hash = final_content_hash_bytes;
+        manifest.writeManifest(self.ctx, config.staging_dir, &pkg_manifest, &secret_key.key) catch {
+            self.ctx.allocator.free(content_hash);
+            return self.fail(config.staging_dir, "failed to write final manifest", PackagingError.FileSystem);
         };
 
         var projection = projection_index.deriveFromPayload(self.ctx.allocator, config.staging_dir) catch |err| {

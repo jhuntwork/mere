@@ -165,11 +165,7 @@ fn calculateTreeHashInternal(
             return mapHashFsError(err);
         };
         if (entry == null) break;
-        if (std.mem.eql(u8, entry.?.path, ".mere") or
-            std.mem.startsWith(u8, entry.?.path, ".mere/"))
-        {
-            continue;
-        }
+        if (isExcludedStoreHashPath(entry.?.path)) continue;
         const e = entry.?;
 
         const path_copy = allocator.dupe(u8, e.path) catch {
@@ -292,6 +288,16 @@ fn calculateTreeHashInternal(
     };
 }
 
+fn isExcludedStoreHashPath(entry_path: []const u8) bool {
+    // The .mere directory itself is structural. Canonical package metadata
+    // below it participates in store identity; only self-referential or
+    // derived files are excluded.
+    if (std.mem.eql(u8, entry_path, ".mere")) return true;
+    return std.mem.eql(u8, entry_path, ".mere/manifest.v1") or
+        std.mem.eql(u8, entry_path, ".mere/manifest.v1.sig") or
+        std.mem.eql(u8, entry_path, ".mere/projection.v1");
+}
+
 fn setDiag(
     allocator: std.mem.Allocator,
     diag: ?*HashDiag,
@@ -356,8 +362,9 @@ test "calculateStoreContentHash computes deterministic hash for directory" {
     try std.testing.expect(!std.mem.eql(u8, hash1, hash3));
 }
 
-// Spec #4: .mere/ excluded from content hash
-test "calculateStoreContentHash excludes .mere directory" {
+// Spec #4: Manifest and derived projection files are excluded; canonical
+// package metadata participates in store identity.
+test "calculateStoreContentHash includes meta but excludes derived metadata" {
     const th = @import("test_helpers.zig");
     var test_env = try th.createTestEnv();
     defer {
@@ -365,7 +372,6 @@ test "calculateStoreContentHash excludes .mere directory" {
         std.testing.allocator.destroy(test_env);
     }
 
-    // Create a content file
     const content_path = try std.fs.path.join(std.testing.allocator, &.{ test_env.path, "content.txt" });
     defer std.testing.allocator.free(content_path);
     {
@@ -374,40 +380,10 @@ test "calculateStoreContentHash excludes .mere directory" {
         f.close(path.currentIo());
     }
 
-    // Compute hash without .mere directory
-    const hash1 = try calculateStoreContentHash(test_env.ctx.allocator, test_env.path, null);
-    defer test_env.ctx.allocator.free(hash1);
-
-    // Create .mere directory with manifest.v1
     const mere_dir = try std.fs.path.join(std.testing.allocator, &.{ test_env.path, ".mere" });
     defer std.testing.allocator.free(mere_dir);
     try path.ensureDirExists(mere_dir);
 
-    const manifest_path = try std.fs.path.join(std.testing.allocator, &.{ mere_dir, "manifest.v1" });
-    defer std.testing.allocator.free(manifest_path);
-    {
-        var f = try std.Io.Dir.createFileAbsolute(path.currentIo(), manifest_path, .{});
-        try f.writeStreamingAll(path.currentIo(), "MEREMFST" ++ [_]u8{0} ** 100);
-        f.close(path.currentIo());
-    }
-
-    // Compute hash with .mere/manifest.v1 present
-    const hash2 = try calculateStoreContentHash(test_env.ctx.allocator, test_env.path, null);
-    defer test_env.ctx.allocator.free(hash2);
-
-    // Hashes should be identical (.mere directory excluded)
-    try std.testing.expectEqualStrings(hash1, hash2);
-
-    // Add manifest.v1.sig to .mere directory
-    const sig_path = try std.fs.path.join(std.testing.allocator, &.{ mere_dir, "manifest.v1.sig" });
-    defer std.testing.allocator.free(sig_path);
-    {
-        var f = try std.Io.Dir.createFileAbsolute(path.currentIo(), sig_path, .{});
-        try f.writeStreamingAll(path.currentIo(), &[_]u8{0} ** 64);
-        f.close(path.currentIo());
-    }
-
-    // Add meta.kdl to .mere directory
     const meta_path = try std.fs.path.join(std.testing.allocator, &.{ mere_dir, "meta.kdl" });
     defer std.testing.allocator.free(meta_path);
     {
@@ -416,12 +392,35 @@ test "calculateStoreContentHash excludes .mere directory" {
         f.close(path.currentIo());
     }
 
-    // Compute hash with all .mere files present
+    const hash1 = try calculateStoreContentHash(test_env.ctx.allocator, test_env.path, null);
+    defer test_env.ctx.allocator.free(hash1);
+
+    const manifest_path = try std.fs.path.join(std.testing.allocator, &.{ mere_dir, "manifest.v1" });
+    defer std.testing.allocator.free(manifest_path);
+    const sig_path = try std.fs.path.join(std.testing.allocator, &.{ mere_dir, "manifest.v1.sig" });
+    defer std.testing.allocator.free(sig_path);
+    const projection_path = try std.fs.path.join(std.testing.allocator, &.{ mere_dir, "projection.v1" });
+    defer std.testing.allocator.free(projection_path);
+    for ([_][]const u8{ manifest_path, sig_path, projection_path }) |file_path| {
+        var f = try std.Io.Dir.createFileAbsolute(path.currentIo(), file_path, .{});
+        try f.writeStreamingAll(path.currentIo(), "derived data");
+        f.close(path.currentIo());
+    }
+
+    const hash2 = try calculateStoreContentHash(test_env.ctx.allocator, test_env.path, null);
+    defer test_env.ctx.allocator.free(hash2);
+    try std.testing.expectEqualStrings(hash1, hash2);
+
+    try std.Io.Dir.deleteFileAbsolute(path.currentIo(), meta_path);
+    {
+        var f = try std.Io.Dir.createFileAbsolute(path.currentIo(), meta_path, .{});
+        try f.writeStreamingAll(path.currentIo(), "dependencies {\n    elf-needed \"libc.so\"\n}\n");
+        f.close(path.currentIo());
+    }
+
     const hash3 = try calculateStoreContentHash(test_env.ctx.allocator, test_env.path, null);
     defer test_env.ctx.allocator.free(hash3);
-
-    // Hashes should still be identical (entire .mere directory excluded)
-    try std.testing.expectEqualStrings(hash1, hash3);
+    try std.testing.expect(!std.mem.eql(u8, hash1, hash3));
 }
 
 // Spec #1.1: Executable bit incorporated into hash
@@ -813,6 +812,15 @@ test "calculateStoreContentHash is order-independent" {
         try f.writeStreamingAll(path.currentIo(), "alpha");
         f.close(path.currentIo());
     }
+
+    // The test environment contains random signing keys under .mere/keys;
+    // remove them so this fixture compares package trees, not test homes.
+    const keys1 = try std.fs.path.join(std.testing.allocator, &.{ test_env1.path, ".mere", "keys" });
+    defer std.testing.allocator.free(keys1);
+    const keys2 = try std.fs.path.join(std.testing.allocator, &.{ test_env2.path, ".mere", "keys" });
+    defer std.testing.allocator.free(keys2);
+    try path.deleteTreeAbsolute(keys1);
+    try path.deleteTreeAbsolute(keys2);
 
     const hash1 = try calculateStoreContentHash(test_env1.ctx.allocator, test_env1.path, null);
     defer test_env1.ctx.allocator.free(hash1);
