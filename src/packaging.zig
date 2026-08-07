@@ -281,12 +281,24 @@ pub const Packager = struct {
 
         // Populate recipe-level metadata for downstream display and tracking.
         {
-            // Collect source URL strings from the recipe.
+            // Source URLs are stored in recipe form, so expand them at the
+            // metadata boundary just as the download and cache paths do.
+            var source_arena = std.heap.ArenaAllocator.init(self.ctx.allocator);
+            defer source_arena.deinit();
+            const source_allocator = source_arena.allocator();
             var source_urls: std.ArrayList([]const u8) = .empty;
             defer source_urls.deinit(self.ctx.allocator);
+            const vars_ptr = if (config.recipe.vars.items.len > 0) &config.recipe.vars else null;
             for (config.recipe.sources.items) |src| {
                 if (src.url.len > 0) {
-                    source_urls.append(self.ctx.allocator, src.url) catch {
+                    const expanded = recipe.interpolate(source_allocator, self.ctx, src.url, config.recipe, vars_ptr) catch |err| {
+                        self.ctx.allocator.free(content_hash);
+                        return switch (err) {
+                            error.OutOfMemory => self.fail(config.staging_dir, "failed to expand source URL", PackagingError.OutOfMemory),
+                            else => self.fail(config.staging_dir, "failed to expand source URL", PackagingError.InvalidInput),
+                        };
+                    };
+                    source_urls.append(self.ctx.allocator, expanded) catch {
                         self.ctx.allocator.free(content_hash);
                         return self.fail(config.staging_dir, "failed to collect source URLs", PackagingError.OutOfMemory);
                     };
@@ -640,6 +652,11 @@ test "Packager handles signing and metadata generation" {
     test_recipe.version = try test_env.ctx.allocator.dupe(u8, "2.1.0");
     test_recipe.release = 3;
     test_recipe.arch = "x86_64"; // This is a string literal reference, not allocated
+    try test_recipe.sources.append(test_env.ctx.allocator, .{
+        .url = try test_env.ctx.allocator.dupe(u8, "https://example.org/source-${recipe.version}.tar.xz"),
+        .blake3 = null,
+        .save_as = null,
+    });
 
     var test_artifact = try recipe.BuildArtifact.init(test_env.ctx.allocator);
     defer test_artifact.deinit(test_env.ctx.allocator);
@@ -675,6 +692,11 @@ test "Packager handles signing and metadata generation" {
     defer test_env.ctx.allocator.free(expected_filename_prefix);
     const filename = std.fs.path.basename(result.archive_path);
     try testing.expectEqualStrings(expected_filename_prefix, filename);
+
+    var generated_meta = try meta.readFile(test_env.ctx.allocator, staging_dir);
+    defer generated_meta.deinit();
+    try testing.expectEqual(@as(usize, 1), generated_meta.source_urls.items.len);
+    try testing.expectEqualStrings("https://example.org/source-2.1.0.tar.xz", generated_meta.source_urls.items[0]);
 
     // Verify manifest.v1.sig exists in staging (was written before archiving)
     const manifest_sig_path = try std.fs.path.join(test_env.ctx.allocator, &.{ staging_dir, manifest.MANIFEST_SIG_FILENAME });
