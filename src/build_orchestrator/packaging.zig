@@ -55,6 +55,7 @@ const PackageArchiveJob = struct {
     staged: split_staging.StagedPackage,
     output_dir: []const u8,
     package_cache_key: []const u8,
+    has_package_cache_key: bool,
     injected_dependencies: []const packaging.InjectedDependency,
 };
 
@@ -687,24 +688,28 @@ fn packageStagedPackage(
         .staged = staged,
         .output_dir = output_dir,
         .package_cache_key = undefined,
+        .has_package_cache_key = false,
         .injected_dependencies = injected_by_pkg[staged.pkg_index].items.items,
     });
-    const package_key = cache_solver.packageArchiveKey(
-        job_state.arena.allocator(),
-        ctx,
-        parsed_recipe,
-        artifact,
-        staging_dir,
-        injected_by_pkg[staged.pkg_index].items.items,
-    ) catch |err| {
-        packaging_errors_encountered.* = true;
-        return switch (err) {
-            error.OutOfMemory => ctx.fail(error.OutOfMemory, artifact.name, "failed to compute package cache key"),
-            error.PermissionDenied => ctx.fail(error.PermissionDenied, artifact.name, "failed to compute package cache key"),
-            else => ctx.fail(error.PackageCreationFailed, artifact.name, "failed to compute package cache key"),
+    if (cache) {
+        const package_key = cache_solver.packageArchiveKey(
+            job_state.arena.allocator(),
+            ctx,
+            parsed_recipe,
+            artifact,
+            staging_dir,
+            injected_by_pkg[staged.pkg_index].items.items,
+        ) catch |err| {
+            packaging_errors_encountered.* = true;
+            return switch (err) {
+                error.OutOfMemory => ctx.fail(error.OutOfMemory, artifact.name, "failed to compute package cache key"),
+                error.PermissionDenied => ctx.fail(error.PermissionDenied, artifact.name, "failed to compute package cache key"),
+                else => ctx.fail(error.PackageCreationFailed, artifact.name, "failed to compute package cache key"),
+            };
         };
-    };
-    job_state.job.package_cache_key = package_key;
+        job_state.job.package_cache_key = package_key;
+        job_state.job.has_package_cache_key = true;
+    }
     try package_jobs.append(allocator, job_state);
 
     return true;
@@ -808,6 +813,30 @@ fn finalizePackageArchiveJob(
     emit_package_metadata_report: EmitPackageMetadataReportFn,
     package_archive_node_recorder: ?PackageArchiveNodeRecorder,
 ) PackageError!void {
+    var owned_package_cache_key: ?[]const u8 = null;
+    defer if (owned_package_cache_key) |key| allocator.free(key);
+    const package_cache_key = if (job.has_package_cache_key)
+        job.package_cache_key
+    else blk: {
+        const key = cache_solver.packageArchiveKey(
+            allocator,
+            ctx,
+            parsed_recipe,
+            job.artifact,
+            job.staged.staging_dir,
+            job.injected_dependencies,
+        ) catch |err| {
+            packaging_errors_encountered.* = true;
+            return switch (err) {
+                error.OutOfMemory => ctx.fail(error.OutOfMemory, job.artifact.name, "failed to compute package cache key"),
+                error.PermissionDenied => ctx.fail(error.PermissionDenied, job.artifact.name, "failed to compute package cache key"),
+                else => ctx.fail(error.PackageCreationFailed, job.artifact.name, "failed to compute package cache key"),
+            };
+        };
+        owned_package_cache_key = key;
+        break :blk key;
+    };
+
     job.artifact.markBuilt(allocator, result.archive_path, result.content_hash, result.archive_hash, result.signature) catch {
         packaging_errors_encountered.* = true;
         return ctx.fail(error.PackageCreationFailed, job.artifact.name, "failed to record package metadata");
@@ -859,7 +888,7 @@ fn finalizePackageArchiveJob(
     );
 
     if (package_archive_node_recorder) |recorder| {
-        recorder.record(.executed, job.package_cache_key, result.archive_hash) catch {
+        recorder.record(.executed, package_cache_key, result.archive_hash) catch {
             packaging_errors_encountered.* = true;
             return ctx.fail(error.OutOfMemory, job.artifact.name, "failed to record package archive node");
         };
