@@ -13,6 +13,11 @@ on:
         required: false
         type: boolean
         default: false
+      tag_override:
+        description: Override the release tag (used for recovery)
+        required: false
+        type: string
+        default: ""
 
 permissions:
   contents: read
@@ -62,6 +67,9 @@ jobs:
           if [ "${{ github.event_name }}" = "workflow_dispatch" ] && \
              [ "${{ inputs.force_release }}" = "true" ]; then
             printf 'version_changed=true\n' >> "$GITHUB_OUTPUT"
+          fi
+          if [ -n "${{ inputs.tag_override }}" ]; then
+            printf 'tag=%s\n' "${{ inputs.tag_override }}" >> "$GITHUB_OUTPUT"
           fi
 
           changelog=$(sh .forgejo/scripts/release-ci.sh changelog)
@@ -288,10 +296,13 @@ jobs:
 
           asset="dist/$(basename dist/*)"
           name=$(basename "$asset")
-          existing=$(python3 -c 'import json,sys; print(any(a["name"] == sys.argv[1] for a in json.load(open("release.json"))["assets"]))' "$name")
-          if [ "$existing" = "True" ]; then
-            printf 'Asset %s already exists in draft release; keeping it.\n' "$name"
-            exit 0
+          existing_id=$(python3 -c 'import json,sys; assets=json.load(open("release.json"))["assets"]; print(next((str(a["id"]) for a in assets if a["name"] == sys.argv[1]), ""))' "$name")
+          if [ -n "$existing_id" ]; then
+            printf 'Replacing existing draft asset %s.\n' "$name"
+            curl -fsS -X DELETE \
+              -H "$auth_header" \
+              -H "Accept: application/vnd.github+json" \
+              "$api_base/assets/$existing_id"
           fi
 
           status=$(
@@ -367,10 +378,13 @@ jobs:
 
           asset="dist/$(basename dist/*)"
           name=$(basename "$asset")
-          existing=$(python3 -c 'import json,sys; print(any(a["name"] == sys.argv[1] for a in json.load(open("release.json"))["assets"]))' "$name")
-          if [ "$existing" = "True" ]; then
-            printf 'Asset %s already exists in draft release; keeping it.\n' "$name"
-            exit 0
+          existing_id=$(python3 -c 'import json,sys; assets=json.load(open("release.json"))["assets"]; print(next((str(a["id"]) for a in assets if a["name"] == sys.argv[1]), ""))' "$name")
+          if [ -n "$existing_id" ]; then
+            printf 'Replacing existing draft asset %s.\n' "$name"
+            curl -fsS -X DELETE \
+              -H "$auth_header" \
+              -H "Accept: application/vnd.github+json" \
+              "$api_base/assets/$existing_id"
           fi
 
           status=$(
@@ -419,10 +433,13 @@ jobs:
             -H "Accept: application/vnd.github+json" \
             "$api_base/$release_id" > release.json
 
-          existing=$(python3 -c 'import json; print(any(a["name"] == "SHA256SUMS" for a in json.load(open("release.json"))["assets"]))')
-          if [ "$existing" = "True" ]; then
-            printf '%s\n' 'SHA256SUMS already exists in draft release; keeping it.'
-            exit 0
+          existing_id=$(python3 -c 'import json; assets=json.load(open("release.json"))["assets"]; print(next((str(a["id"]) for a in assets if a["name"] == "SHA256SUMS"), ""))')
+          if [ -n "$existing_id" ]; then
+            printf '%s\n' 'Replacing existing draft SHA256SUMS.'
+            curl -fsS -X DELETE \
+              -H "$auth_header" \
+              -H "Accept: application/vnd.github+json" \
+              "$api_base/assets/$existing_id"
           fi
 
           status=$(
