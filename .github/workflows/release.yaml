@@ -26,7 +26,7 @@ jobs:
   detect:
     runs-on: ubuntu-24.04-arm
     container:
-      image: mere/ci:v0.15.0
+      image: mere/ci:v0.18.6
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
     outputs:
@@ -61,7 +61,7 @@ jobs:
           fi
 
           metadata=$(mktemp)
-          sh .forgejo/scripts/release-ci.sh detect-version-change build.zig.zon "$previous_file" \
+          sh .github/scripts/release-ci.sh detect-version-change build.zig.zon "$previous_file" \
             > "$metadata"
           cat "$metadata" >> "$GITHUB_OUTPUT"
           if [ "${{ github.event_name }}" = "workflow_dispatch" ] && \
@@ -72,7 +72,7 @@ jobs:
             printf 'tag=%s\n' "${{ inputs.tag_override }}" >> "$GITHUB_OUTPUT"
           fi
 
-          changelog=$(sh .forgejo/scripts/release-ci.sh changelog)
+          changelog=$(sh .github/scripts/release-ci.sh changelog)
           {
             printf 'changelog<<EOF\n'
             printf '%s\n' "$changelog"
@@ -97,7 +97,7 @@ jobs:
             runs-on: ubuntu-24.04-arm
     runs-on: ${{ matrix.runs-on }}
     container:
-      image: mere/ci:v0.18.1
+      image: mere/ci:v0.18.6
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
     steps:
@@ -123,7 +123,7 @@ jobs:
       upload_url: ${{ steps.release.outputs.upload_url }}
     runs-on: ubuntu-24.04
     container:
-      image: mere/ci:v0.15.0
+      image: mere/ci:v0.18.6
     permissions:
       contents: write
     env:
@@ -216,7 +216,7 @@ jobs:
                 fi
                 printf 'Found existing draft release %s; reusing it.\n' "$tag"
               else
-                python3 .forgejo/scripts/release-body.py > release-create.json
+                python3 .github/scripts/release-body.py > release-create.json
                 python3 -c 'import json; from pathlib import Path; path = Path("release-create.json"); body = json.loads(path.read_text()); body["draft"] = True; path.write_text(json.dumps(body))'
                 curl -fsS \
                   -X POST \
@@ -245,7 +245,7 @@ jobs:
     if: needs.detect.outputs.version_changed == 'true'
     runs-on: ubuntu-24.04
     container:
-      image: mere/ci:v0.15.0
+      image: mere/ci:v0.18.6
     permissions:
       contents: write
     env:
@@ -271,7 +271,7 @@ jobs:
 
           version="${{ needs.detect.outputs.version }}"
           arch=$(uname -m)
-          base=$(sh .forgejo/scripts/release-ci.sh asset-base "$version" linux "$arch")
+          base=$(sh .github/scripts/release-ci.sh asset-base "$version" linux "$arch")
 
           zig build -Doptimize=ReleaseSmall
           mkdir -p dist
@@ -327,7 +327,7 @@ jobs:
     if: needs.detect.outputs.version_changed == 'true'
     runs-on: ubuntu-24.04-arm
     container:
-      image: mere/ci:v0.15.0
+      image: mere/ci:v0.18.6
     permissions:
       contents: write
     env:
@@ -353,7 +353,7 @@ jobs:
 
           version="${{ needs.detect.outputs.version }}"
           arch=$(uname -m)
-          base=$(sh .forgejo/scripts/release-ci.sh asset-base "$version" linux "$arch")
+          base=$(sh .github/scripts/release-ci.sh asset-base "$version" linux "$arch")
 
           zig build -Doptimize=ReleaseSmall
           mkdir -p dist
@@ -409,7 +409,7 @@ jobs:
     if: needs.detect.outputs.version_changed == 'true'
     runs-on: ubuntu-24.04-arm
     container:
-      image: mere/ci:v0.15.0
+      image: mere/ci:v0.18.6
     permissions:
       contents: write
     env:
@@ -464,7 +464,7 @@ jobs:
     if: needs.detect.outputs.version_changed == 'true'
     runs-on: ubuntu-24.04-arm
     container:
-      image: mere/ci:v0.15.0
+      image: mere/ci:v0.18.6
     permissions:
       contents: write
     env:
