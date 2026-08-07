@@ -64,11 +64,20 @@ jobs:
         run: echo "build.zig.zon changed, but .version did not change."
 
   test:
+    name: Release test (${{ matrix.arch }})
     needs: detect
     if: needs.detect.outputs.version_changed == 'true'
-    runs-on: ubuntu-24.04-arm
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            runs-on: ubuntu-24.04
+          - arch: aarch64
+            runs-on: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runs-on }}
     container:
-      image: mere/ci:v0.15.0
+      image: mere/ci:v0.18.1
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
     steps:

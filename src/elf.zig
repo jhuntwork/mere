@@ -209,10 +209,11 @@ pub fn scanElfMetadata(ctx: *Context, path: []const u8) !ElfScanResult {
             var section_header: std.elf.Elf64_Shdr = undefined;
             _ = try file.readPositionalAll(io, std.mem.asBytes(&section_header), total_offset);
 
-            const section_name = readSectionName(&file, file_size, shstr_header.sh_offset, section_header.sh_name) catch |err| switch (err) {
+            const section_name = readSectionName(allocator, &file, file_size, shstr_header.sh_offset, section_header.sh_name) catch |err| switch (err) {
                 ElfError.SectionHeaderOverflow, ElfError.CorruptData => continue,
                 else => return ctx.fail(err, path, "failed to read section name"),
             };
+            defer allocator.free(section_name);
             if (std.mem.eql(u8, section_name, ".dynamic")) {
                 ctx.debug(".dynamic section at offset {d} size {d}", .{ section_header.sh_offset, section_header.sh_size });
                 dynamic_section_offset = section_header.sh_offset;
@@ -371,7 +372,13 @@ fn isSharedObjectBasename(name: []const u8) bool {
     return std.mem.indexOf(u8, name, ".so.") != null;
 }
 
-fn readSectionName(file: *const std.Io.File, file_size: u64, shstr_offset: u64, name_offset: u32) ![]const u8 {
+fn readSectionName(
+    allocator: std.mem.Allocator,
+    file: *const std.Io.File,
+    file_size: u64,
+    shstr_offset: u64,
+    name_offset: u32,
+) ![]u8 {
     if (shstr_offset >= file_size or name_offset >= file_size) {
         return ElfError.SectionHeaderOverflow;
     }
@@ -390,7 +397,7 @@ fn readSectionName(file: *const std.Io.File, file_size: u64, shstr_offset: u64, 
 
     if (end == bytes_read) return ElfError.CorruptData;
 
-    return name_buf[0..end];
+    return allocator.dupe(u8, name_buf[0..end]);
 }
 
 /// Load an ELF string table safely from file
@@ -679,7 +686,7 @@ test "scanElfMetadata with actual dependencies and sonames" {
     }
     // Test case 1: Library with multiple dependencies (libtest.so)
     {
-        const libtest_path = "test/testdata/libtest.so";
+        const libtest_path = test_helpers.elfFixture("libtest.so");
         var result = try scanElfMetadata(&test_env.ctx, libtest_path);
         defer {
             for (result.deps.items) |item| {
@@ -714,7 +721,7 @@ test "scanElfMetadata with actual dependencies and sonames" {
 
     // Test case 2: Library with a SONAME (libsoname.so)
     {
-        const libsoname_path = "test/testdata/libsoname.so";
+        const libsoname_path = test_helpers.elfFixture("libsoname.so");
         var result = try scanElfMetadata(&test_env.ctx, libsoname_path);
         defer {
             for (result.deps.items) |item| {
@@ -743,7 +750,7 @@ test "scanElfMetadata with actual dependencies and sonames" {
 
     // Test case 3: Library with minimal dependencies (libempty.so)
     {
-        const libempty_path = "test/testdata/libempty.so";
+        const libempty_path = test_helpers.elfFixture("libempty.so");
         var result = try scanElfMetadata(&test_env.ctx, libempty_path);
         defer {
             for (result.deps.items) |item| {
@@ -772,7 +779,7 @@ test "scanElfMetadata with actual dependencies and sonames" {
 
     // Test case 4: Binary with interpreter (dummy)
     {
-        const dummy_path = "test/testdata/dummy";
+        const dummy_path = test_helpers.elfFixture("dummy");
         var result = try scanElfMetadata(&test_env.ctx, dummy_path);
         defer {
             for (result.deps.items) |item| {
@@ -799,7 +806,7 @@ test "scanElfMetadata with actual dependencies and sonames" {
             if (std.mem.eql(u8, dep.resource, "libc.so")) {
                 found_libc = true;
                 try std.testing.expectEqual(pkg.DependencyType.elf_needed, dep.dep_type);
-            } else if (std.mem.eql(u8, dep.resource, "/lib/ld-musl-x86_64.so.1")) {
+            } else if (std.mem.eql(u8, dep.resource, test_helpers.fixture_interpreter)) {
                 found_interpreter = true;
                 try std.testing.expectEqual(pkg.DependencyType.elf_interpreter, dep.dep_type);
             }
@@ -811,12 +818,17 @@ test "scanElfMetadata with actual dependencies and sonames" {
 }
 
 test "readElfMachineAt returns machine for valid ELF" {
+    const test_helpers = @import("test_helpers.zig");
     const io = path_mod.currentIo();
-    var file = path_mod.openExistingFile("test/testdata/dummy") catch return;
+    var file = path_mod.openExistingFile(test_helpers.elfFixture("dummy")) catch return;
     defer file.close(io);
     const machine = readElfMachineAt(&file, 0);
     try std.testing.expect(machine != null);
-    try std.testing.expectEqual(@intFromEnum(std.elf.EM.X86_64), machine.?);
+    const expected_machine = if (@import("builtin").cpu.arch == .aarch64)
+        std.elf.EM.AARCH64
+    else
+        std.elf.EM.X86_64;
+    try std.testing.expectEqual(@intFromEnum(expected_machine), machine.?);
 }
 
 test "readElfMachineAt returns null for non-ELF offset" {

@@ -789,7 +789,7 @@ test "Package scanDirectory" {
     // Create a package
     var pkg = Package.init(&ctx);
     defer pkg.deinit();
-    pkg.arch = try ctx.allocator.dupe(u8, "x86_64");
+    pkg.arch = try ctx.allocator.dupe(u8, th.fixture_arch);
 
     // Copy test ELF library to temp dir
     const lib_name = "libtest.so";
@@ -798,7 +798,7 @@ test "Package scanDirectory" {
 
     // Get absolute path to source test file and verify it
     var src_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const src_path = try p.resolveToAbsolutePath("test/testdata/libtest.so", &src_buf);
+    const src_path = try p.resolveToAbsolutePath(th.elfFixture("libtest.so"), &src_buf);
 
     try p.copyFile(src_path, lib_path);
 
@@ -831,7 +831,7 @@ test "Package scanDirectory" {
 
     // Get absolute path to source test file and verify it
     var dummy_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const dummy_src_path = try p.resolveToAbsolutePath("test/testdata/dummy", &dummy_buf);
+    const dummy_src_path = try p.resolveToAbsolutePath(th.elfFixture("dummy"), &dummy_buf);
 
     try p.copyFile(dummy_src_path, dummy_path);
 
@@ -841,7 +841,7 @@ test "Package scanDirectory" {
     // Verify interpreter was found
     var found_interpreter = false;
     for (pkg.dependencies.items) |dep| {
-        if (std.mem.eql(u8, dep.resource, "/lib/ld-musl-x86_64.so.1")) {
+        if (std.mem.eql(u8, dep.resource, th.fixture_interpreter)) {
             found_interpreter = true;
             const dep_type = dep.getType();
             try std.testing.expectEqual(DependencyType.elf_interpreter, dep_type);
@@ -949,29 +949,32 @@ test "scanDirectory handles musl absolute symlink in package tree" {
     try p.ensureDirExists(lib_dir);
 
     var src_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const src_lib = try p.resolveToAbsolutePath("test/testdata/libtest.so", &src_buf);
+    const src_lib = try p.resolveToAbsolutePath(th.elfFixture("libtest.so"), &src_buf);
     const dest_lib = try std.fs.path.join(std.testing.allocator, &.{ lib_dir, "libc.so" });
     defer std.testing.allocator.free(dest_lib);
     try p.copyFile(src_lib, dest_lib);
 
     // Create an absolute symlink that points to /lib/libc.so (as found in some archives)
-    const symlink_path = try std.fs.path.join(std.testing.allocator, &.{ lib_dir, "ld-musl-x86_64.so.1" });
+    const symlink_name = if (std.mem.eql(u8, th.fixture_arch, "aarch64")) "ld-musl-aarch64.so.1" else "ld-musl-x86_64.so.1";
+    const symlink_path = try std.fs.path.join(std.testing.allocator, &.{ lib_dir, symlink_name });
     defer std.testing.allocator.free(symlink_path);
     {
         var lib_dir_handle = try p.openExistingDir(lib_dir);
         defer lib_dir_handle.close(p.currentIo());
-        try lib_dir_handle.symLink(p.currentIo(), "/lib/libc.so", "ld-musl-x86_64.so.1", .{});
+        try lib_dir_handle.symLink(p.currentIo(), "/lib/libc.so", symlink_name, .{});
     }
 
     var pkg = Package.init(&ctx);
     defer pkg.deinit();
-    pkg.arch = try ctx.allocator.dupe(u8, "x86_64");
+    pkg.arch = try ctx.allocator.dupe(u8, th.fixture_arch);
     try pkg.scanDirectory(test_env.path);
 
-    // Expect a provision for "/lib/ld-musl-x86_64.so.1"
+    // Expect a provision for the architecture-specific interpreter symlink.
     var found = false;
+    var expected_symlink_buf: [64]u8 = undefined;
+    const expected_symlink = try std.fmt.bufPrint(&expected_symlink_buf, "/lib/{s}", .{symlink_name});
     for (pkg.provisions.items) |prov| {
-        if (std.mem.eql(u8, prov.resource, "/lib/ld-musl-x86_64.so.1")) {
+        if (std.mem.eql(u8, prov.resource, expected_symlink)) {
             found = true;
             break;
         }
@@ -993,7 +996,7 @@ test "scanDirectory treats shared-library symlink name as elf soname provide" {
     try p.ensureDirExists(lib_dir);
 
     var src_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const src_lib = try p.resolveToAbsolutePath("test/testdata/libtest.so", &src_buf);
+    const src_lib = try p.resolveToAbsolutePath(th.elfFixture("libtest.so"), &src_buf);
     const dest_lib = try std.fs.path.join(std.testing.allocator, &.{ lib_dir, "libtest.so" });
     defer std.testing.allocator.free(dest_lib);
     try p.copyFile(src_lib, dest_lib);
@@ -1008,7 +1011,7 @@ test "scanDirectory treats shared-library symlink name as elf soname provide" {
 
     var pkg = Package.init(&ctx);
     defer pkg.deinit();
-    pkg.arch = try ctx.allocator.dupe(u8, "x86_64");
+    pkg.arch = try ctx.allocator.dupe(u8, th.fixture_arch);
     try pkg.scanDirectory(test_env.path);
 
     var found = false;

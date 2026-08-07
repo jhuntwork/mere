@@ -1024,7 +1024,7 @@ test "packages with ELF library" {
     pkg.name = try ctx.allocator.dupe(u8, pkg_name);
     pkg.version = try ctx.allocator.dupe(u8, "1.0.0");
     pkg.release = 1;
-    pkg.arch = try ctx.allocator.dupe(u8, "x86_64");
+    pkg.arch = try ctx.allocator.dupe(u8, th.fixture_arch);
     pkg.content_hash = try ctx.allocator.dupe(u8, "dummyhash");
     pkg.archive_hash = try ctx.allocator.dupe(u8, "a" ** 64);
     // Note: Dependencies are not stored in manifest.v1 format - they are extracted
@@ -1504,10 +1504,10 @@ test "packages with multiple ELF files" {
 
     // Copy test ELF libraries to content dir
     var src_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const src1_path = try p.resolveToAbsolutePath("test/testdata/libtest.so", &src_buf);
+    const src1_path = try p.resolveToAbsolutePath(th.elfFixture("libtest.so"), &src_buf);
     try p.copyFile(src1_path, lib1_path);
 
-    const src2_path = try p.resolveToAbsolutePath("test/testdata/libsoname.so", &src_buf);
+    const src2_path = try p.resolveToAbsolutePath(th.elfFixture("libsoname.so"), &src_buf);
     try p.copyFile(src2_path, lib2_path);
 
     // Create .mere directory for meta.kdl (content hash includes canonical meta.kdl,
@@ -1552,7 +1552,7 @@ test "packages with multiple ELF files" {
         .schema_version = 1,
         .created_at = @intCast(std.Io.Clock.real.now(p.currentIo()).toSeconds()),
         .release = 1,
-        .arch = "x86_64",
+        .arch = th.fixture_arch,
         .name = pkg_name,
         .version = "1.0.0",
         .content_hash = content_hash_bytes,
@@ -2131,7 +2131,7 @@ test "packages rejects missing projection.v1" {
         .schema_version = 1,
         .created_at = @intCast(std.Io.Clock.real.now(p.currentIo()).toSeconds()),
         .release = 1,
-        .arch = "x86_64",
+        .arch = th.fixture_arch,
         .name = pkg_name,
         .version = "1.0.0",
         .content_hash = content_hash_bytes,
