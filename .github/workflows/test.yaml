@@ -22,9 +22,16 @@ jobs:
       image: mere/ci:v0.18.6
     steps:
       - name: Git checkout
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 1
+        run: |
+          set -eu
+          mkdir -p "$GITHUB_WORKSPACE"
+          archive="$RUNNER_TEMP/mere-source.tar.gz"
+          curl -fsSL \
+            "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/archive/$GITHUB_REF.tar.gz" \
+            -o "$archive"
+          tar -xzf "$archive" \
+            --strip-components=1 \
+            -C "$GITHUB_WORKSPACE"
       - name: Test
         run: |
           cd "$GITHUB_WORKSPACE"
