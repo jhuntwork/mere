@@ -591,6 +591,8 @@ pub fn restore(
         else
             null,
         .package_archive => |req| {
+            if (!req.cache) return null;
+
             const key_hex = try packageArchiveKey(allocator, ctx, req.parsed_recipe, req.artifact, req.staging_dir, req.injected_dependencies);
             defer allocator.free(key_hex);
             if (try restorePackageArchive(allocator, ctx, req.cache, key_hex, req.staging_dir, req.output_dir)) |archive| {
@@ -1184,6 +1186,41 @@ test "ExecutionTrace formats readable summary" {
     defer std.testing.allocator.free(summary);
 
     try std.testing.expectEqualStrings("source_fetch(cache) -> build(exec)", summary);
+}
+
+test "package archive restore skips staging access when cache reads are disabled" {
+    const test_helpers = @import("../test_helpers.zig");
+
+    var test_env = try test_helpers.createTestEnv();
+    defer {
+        test_env.cleanup();
+        std.testing.allocator.destroy(test_env);
+    }
+
+    var parsed_recipe = try recipe.parse(&test_env.ctx,
+        \\recipe {
+        \\  name "demo"
+        \\  version "1.0.0"
+        \\  release 1
+        \\}
+        \\build { script "true" }
+        \\package "demo" {
+        \\  files "usr/share/demo/*"
+        \\}
+    );
+    defer parsed_recipe.deinit();
+
+    const request = restorePackageArchiveRequest(
+        false,
+        &parsed_recipe,
+        &parsed_recipe.packages.items[0],
+        "/path/that/does/not/exist",
+        &.{},
+        test_env.path,
+    );
+
+    const restored = try restore(test_env.ctx.allocator, &test_env.ctx, request);
+    try std.testing.expect(restored == null);
 }
 
 test "restoreUnpackedSources does not depend on fetch key record" {
