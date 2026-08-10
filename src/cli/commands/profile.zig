@@ -166,7 +166,10 @@ pub fn handleList(ctx: *mere.Context, args: *const types.ParsedArgs) MereError!t
         const kind_str = if (is_system) " [system]" else "";
 
         if (is_system) {
-            const current_gen = generation_mod.getCurrentGeneration(profile_path) catch null;
+            const current_gen = generation_mod.getCurrentGeneration(profile_path) catch |err| {
+                ctx.setDiagnosticContextFmt(profile_path, "failed to read current generation: {s}", .{@errorName(err)});
+                return try command.errorResult(ctx, err, "failed to read current generation");
+            };
             const store_root = std.fs.path.join(ctx.allocator, &.{ ctx.root_path, "mere", "store" }) catch {
                 return MereError.OutOfMemory;
             };

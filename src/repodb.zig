@@ -236,11 +236,21 @@ pub const RepoDB = struct {
             return RepoDBError.CorruptData;
         }
 
-        // Set initial schema version if not already set
-        const set_version_sql = "INSERT OR IGNORE INTO schema_version (version) VALUES (1);";
-        const version_rc = c.sqlite3_exec(self.db, set_version_sql, null, null, &err_msg);
+        // Normalize databases created before schema_version had a uniqueness
+        // constraint, then enforce the invariant for future initializations.
+        // Keep the first row for each version so this is safe for existing DBs.
+        const schema_version_migration =
+            "BEGIN IMMEDIATE;" ++
+            "DELETE FROM schema_version WHERE rowid NOT IN (" ++
+            "SELECT MIN(rowid) FROM schema_version GROUP BY version);" ++
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_schema_version_version " ++
+            "ON schema_version(version);" ++
+            "INSERT OR IGNORE INTO schema_version (version) VALUES (1);" ++
+            "COMMIT;";
+        const version_rc = c.sqlite3_exec(self.db, schema_version_migration, null, null, &err_msg);
         if (version_rc != c.SQLITE_OK) {
             if (err_msg != null) c.sqlite3_free(err_msg);
+            _ = c.sqlite3_exec(self.db, "ROLLBACK;", null, null, null);
             return RepoDBError.CorruptData;
         }
 
@@ -1757,6 +1767,55 @@ test "RepoDB basic usage: init, schema, prepareStatement" {
     try std.testing.expectEqual(c.SQLITE_ROW, rc);
     const version = c.sqlite3_column_int(stmt, 0);
     try std.testing.expectEqual(@as(c_int, 1), version);
+}
+
+test "RepoDB init repairs duplicate schema versions and stays idempotent" {
+    const th = @import("test_helpers.zig");
+
+    var test_env = try th.createTestEnv();
+    defer {
+        test_env.cleanup();
+        std.testing.allocator.destroy(test_env);
+    }
+
+    const allocator = test_env.ctx.allocator;
+    const db_path = try std.fs.path.join(allocator, &.{ test_env.path, "duplicate_schema_version.db" });
+    defer allocator.free(db_path);
+
+    const c_db_path = try allocator.alloc(u8, db_path.len + 1);
+    defer allocator.free(c_db_path);
+    @memcpy(c_db_path[0..db_path.len], db_path);
+    c_db_path[db_path.len] = 0;
+
+    var sqlite_db: ?*c.sqlite3 = null;
+    try std.testing.expectEqual(@as(c_int, c.SQLITE_OK), c.sqlite3_open(c_db_path.ptr, &sqlite_db));
+    const legacy_schema =
+        "CREATE TABLE schema_version (version INTEGER NOT NULL);" ++
+        "INSERT INTO schema_version (version) VALUES (1);" ++
+        "INSERT INTO schema_version (version) VALUES (1);";
+    var err_msg: [*c]u8 = null;
+    try std.testing.expectEqual(@as(c_int, c.SQLITE_OK), c.sqlite3_exec(sqlite_db, legacy_schema, null, null, &err_msg));
+    if (err_msg != null) c.sqlite3_free(err_msg);
+    _ = c.sqlite3_close(sqlite_db);
+    sqlite_db = null;
+
+    var db = try RepoDB.init(&test_env.ctx, db_path, false);
+    const count_stmt = try db.prepareStatement("SELECT COUNT(*) FROM schema_version");
+    try std.testing.expectEqual(c.SQLITE_ROW, c.sqlite3_step(count_stmt));
+    try std.testing.expectEqual(@as(c_int, 1), c.sqlite3_column_int(count_stmt, 0));
+    _ = c.sqlite3_finalize(count_stmt);
+    db.deinit();
+    allocator.destroy(db);
+
+    var reopened = try RepoDB.init(&test_env.ctx, db_path, false);
+    defer {
+        reopened.deinit();
+        allocator.destroy(reopened);
+    }
+    const reopened_stmt = try reopened.prepareStatement("SELECT COUNT(*) FROM schema_version");
+    defer _ = c.sqlite3_finalize(reopened_stmt);
+    try std.testing.expectEqual(c.SQLITE_ROW, c.sqlite3_step(reopened_stmt));
+    try std.testing.expectEqual(@as(c_int, 1), c.sqlite3_column_int(reopened_stmt, 0));
 }
 
 test "RepoDB init rejects outdated packages schema missing archive_hash" {

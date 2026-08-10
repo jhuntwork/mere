@@ -149,7 +149,7 @@ fn profileMatchesResolution(ctx: *Context, profile_name: []const u8, sorted: []c
     const profile_dir = getProfileDir(ctx, profile_name) catch return false;
     defer ctx.allocator.free(profile_dir);
 
-    const current = loadCurrentManifest(ctx, profile_name, profile_dir) orelse return false;
+    const current = (loadCurrentManifest(ctx, profile_name, profile_dir) catch return false) orelse return false;
     defer {
         var m = current;
         m.deinit();
@@ -179,7 +179,7 @@ fn emitResolutionDiff(
     const profile_dir = getProfileDir(ctx, profile_name) catch return;
     defer ctx.allocator.free(profile_dir);
 
-    const current = loadCurrentManifest(ctx, profile_name, profile_dir) orelse {
+    const current = (loadCurrentManifest(ctx, profile_name, profile_dir) catch null) orelse {
         var buf: [32]u8 = undefined;
         const count_text = std.fmt.bufPrint(&buf, "{d}", .{sorted.len}) catch return;
         const segments = [_]mere.ui.Segment{
@@ -245,7 +245,7 @@ fn emitProfileDiff(
     const profile_dir = getProfileDir(ctx, profile_name) catch return;
     defer ctx.allocator.free(profile_dir);
 
-    const current = loadCurrentManifest(ctx, profile_name, profile_dir) orelse {
+    const current = (loadCurrentManifest(ctx, profile_name, profile_dir) catch null) orelse {
         var buf: [32]u8 = undefined;
         const count_text = std.fmt.bufPrint(&buf, "{d}", .{new_packages.len}) catch return;
         const segments = [_]mere.ui.Segment{
@@ -784,7 +784,9 @@ fn loadRequestedRootsState(ctx: *Context, profile_name: []const u8) !RequestedRo
         packages.deinit(ctx.allocator);
     }
 
-    const manifest_opt = loadCurrentManifest(ctx, profile_name, profile_dir);
+    const manifest_opt = loadCurrentManifest(ctx, profile_name, profile_dir) catch |err| {
+        return failCurrentStateRead(ctx, profile_dir, "failed to read current profile manifest", err);
+    };
     if (manifest_opt) |manifest_data| {
         var current = manifest_data;
         defer current.deinit();
@@ -803,20 +805,24 @@ fn loadRequestedRootsState(ctx: *Context, profile_name: []const u8) !RequestedRo
     };
 }
 
-fn loadCurrentManifest(ctx: *Context, profile_name: []const u8, profile_dir: []const u8) ?generation.GenerationManifest {
-    const store_root = std.fs.path.join(ctx.allocator, &.{ ctx.root_path, "mere", "store" }) catch return null;
+fn loadCurrentManifest(ctx: *Context, profile_name: []const u8, profile_dir: []const u8) generation.GenerationError!?generation.GenerationManifest {
+    const store_root = std.fs.path.join(ctx.allocator, &.{ ctx.root_path, "mere", "store" }) catch return generation.GenerationError.OutOfMemory;
     defer ctx.allocator.free(store_root);
 
     if (std.mem.eql(u8, profile_name, "system")) {
-        const current_gen = generation.getCurrentGeneration(profile_dir) catch return null;
+        const current_gen = try generation.getCurrentGeneration(profile_dir);
         const gen_num = current_gen orelse return null;
-        const gen_path = generation.getGenerationPath(ctx.allocator, profile_dir, gen_num) catch return null;
+        const gen_path = try generation.getGenerationPath(ctx.allocator, profile_dir, gen_num);
         defer ctx.allocator.free(gen_path);
-        return generation.readManifest(ctx.allocator, store_root, gen_path) catch null;
+        const loaded_manifest = try generation.readManifest(ctx.allocator, store_root, gen_path);
+        return @as(?generation.GenerationManifest, loaded_manifest);
     } else {
-        const root_path = profile.getRootPath(ctx.allocator, profile_dir) catch return null;
+        const root_path = profile.getRootPath(ctx.allocator, profile_dir) catch return generation.GenerationError.OutOfMemory;
         defer ctx.allocator.free(root_path);
-        return generation.readManifest(ctx.allocator, store_root, root_path) catch null;
+        return generation.readManifest(ctx.allocator, store_root, root_path) catch |err| switch (err) {
+            generation.GenerationError.GenerationNotFound => null,
+            else => err,
+        };
     }
 }
 
@@ -925,6 +931,11 @@ fn preferredSelectionsFromManifest(
     };
 }
 
+fn failCurrentStateRead(ctx: *Context, subject: []const u8, operation: []const u8, err: generation.GenerationError) anyerror {
+    ctx.setDiagnosticContextFmt(subject, "{s}: {s}", .{ operation, @errorName(err) });
+    return mapGenerationError(err);
+}
+
 fn loadCurrentGenerationPreferences(ctx: *Context, profile_name: []const u8) !PreferredSelectionsState {
     const profile_dir = try getProfileDir(ctx, profile_name);
     defer ctx.allocator.free(profile_dir);
@@ -945,19 +956,7 @@ fn loadCurrentGenerationPreferences(ctx: *Context, profile_name: []const u8) !Pr
         };
 
         var manifest_data = generation.readManifest(ctx.allocator, store_root, root_path) catch |err| {
-            return switch (err) {
-                generation.GenerationError.OutOfMemory => error.OutOfMemory,
-                generation.GenerationError.PermissionDenied => error.PermissionDenied,
-                generation.GenerationError.InvalidManifest,
-                generation.GenerationError.ParseError,
-                generation.GenerationError.InvalidInput,
-                generation.GenerationError.GenerationNotFound,
-                generation.GenerationError.NoCurrentGeneration,
-                generation.GenerationError.NoPreviousGeneration,
-                generation.GenerationError.ProfilesNotFound,
-                => error.InvalidInput,
-                else => error.FileSystem,
-            };
+            return failCurrentStateRead(ctx, root_path, "failed to read current profile manifest", err);
         };
         errdefer manifest_data.deinit();
 
@@ -966,10 +965,8 @@ fn loadCurrentGenerationPreferences(ctx: *Context, profile_name: []const u8) !Pr
 
     const current_generation = generation.getCurrentGeneration(profile_dir) catch |err| {
         return switch (err) {
-            generation.GenerationError.PermissionDenied => error.PermissionDenied,
-            generation.GenerationError.OutOfMemory => error.OutOfMemory,
             generation.GenerationError.ProfilesNotFound => PreferredSelectionsState.initEmpty(ctx.allocator),
-            else => error.FileSystem,
+            else => failCurrentStateRead(ctx, profile_dir, "failed to read current generation", err),
         };
     } orelse return PreferredSelectionsState.initEmpty(ctx.allocator);
 
@@ -984,19 +981,7 @@ fn loadCurrentGenerationPreferences(ctx: *Context, profile_name: []const u8) !Pr
     defer ctx.allocator.free(gen_path);
 
     var manifest_data = generation.readManifest(ctx.allocator, store_root, gen_path) catch |err| {
-        return switch (err) {
-            generation.GenerationError.OutOfMemory => error.OutOfMemory,
-            generation.GenerationError.PermissionDenied => error.PermissionDenied,
-            generation.GenerationError.InvalidManifest,
-            generation.GenerationError.ParseError,
-            generation.GenerationError.InvalidInput,
-            generation.GenerationError.GenerationNotFound,
-            generation.GenerationError.NoCurrentGeneration,
-            generation.GenerationError.NoPreviousGeneration,
-            generation.GenerationError.ProfilesNotFound,
-            => error.InvalidInput,
-            else => error.FileSystem,
-        };
+        return failCurrentStateRead(ctx, gen_path, "failed to read current generation manifest", err);
     };
     errdefer manifest_data.deinit();
 
@@ -1623,16 +1608,20 @@ fn applyProfileRealization(ctx: *Context, prof_name: []const u8, installed_packa
     };
 
     if (std.mem.eql(u8, prof_name, "system")) {
-        const current_gen = generation.getCurrentGeneration(profile_dir) catch null;
+        const current_gen = generation.getCurrentGeneration(profile_dir) catch |err| {
+            return ctx.failFmt(mapGenerationError(err), profile_dir, "failed to read current generation: {s}", .{@errorName(err)});
+        };
         var previous_manifest: ?generation.GenerationManifest = null;
         defer if (previous_manifest) |*manifest_data| manifest_data.deinit();
 
         if (current_gen) |gen_num| {
-            const previous_path = generation.getGenerationPath(ctx.allocator, profile_dir, gen_num) catch null;
-            if (previous_path) |path_name| {
-                defer ctx.allocator.free(path_name);
-                previous_manifest = generation.readManifest(ctx.allocator, store_root, path_name) catch null;
-            }
+            const previous_path = generation.getGenerationPath(ctx.allocator, profile_dir, gen_num) catch |err| {
+                return ctx.failFmt(mapGenerationError(err), profile_dir, "failed to construct current generation path: {s}", .{@errorName(err)});
+            };
+            defer ctx.allocator.free(previous_path);
+            previous_manifest = generation.readManifest(ctx.allocator, store_root, previous_path) catch |err| {
+                return ctx.failFmt(mapGenerationError(err), previous_path, "failed to read current generation manifest: {s}", .{@errorName(err)});
+            };
         }
 
         const gen_num = profile.createGeneration(
@@ -4599,6 +4588,38 @@ test "determineInstallTargetBehavior defers non-privileged system installs" {
         InstallTargetBehavior.activate_profile,
         determineInstallTargetBehavior("system", null, true),
     );
+}
+
+test "loadCurrentGenerationPreferences reports corrupt current manifest details" {
+    const th = @import("test_helpers.zig");
+    var test_env = try th.createTestEnv();
+    defer {
+        test_env.cleanup();
+        std.testing.allocator.destroy(test_env);
+    }
+
+    const ctx = &test_env.ctx;
+    const allocator = ctx.allocator;
+    const profile_dir = try std.fs.path.join(allocator, &.{ ctx.root_path, "mere", "profiles", "system" });
+    defer allocator.free(profile_dir);
+    try path.ensureDirExists(profile_dir);
+
+    const gen_path = try std.fs.path.join(allocator, &.{ profile_dir, "gen-1" });
+    defer allocator.free(gen_path);
+    try path.ensureDirExists(gen_path);
+    const manifest_path = try std.fs.path.join(allocator, &.{ gen_path, generation.MANIFEST_FILENAME });
+    defer allocator.free(manifest_path);
+    var manifest_file = try std.Io.Dir.createFileAbsolute(path.currentIo(), manifest_path, .{ .truncate = true });
+    manifest_file.close(path.currentIo());
+
+    var profile_handle = try std.Io.Dir.openDirAbsolute(path.currentIo(), profile_dir, .{});
+    defer profile_handle.close(path.currentIo());
+    try profile_handle.symLink(path.currentIo(), "gen-1", generation.CURRENT_SYMLINK, .{});
+
+    try std.testing.expectError(error.InvalidInput, loadCurrentGenerationPreferences(ctx, "system"));
+    const diagnostic = ctx.getDiagnosticContext();
+    try std.testing.expectEqualStrings(gen_path, diagnostic.subject.?);
+    try std.testing.expect(std.mem.containsAtLeast(u8, diagnostic.details.?, 1, "InvalidManifest"));
 }
 
 fn writeProjectionForPackageDir(allocator: std.mem.Allocator, package_dir: []const u8) !void {
