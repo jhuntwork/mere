@@ -1028,12 +1028,25 @@ pub fn createGeneration(
     };
     defer ctx.allocator.free(gen_path);
 
-    path.ensureDirExists(gen_path) catch |err| {
+    // Build outside the visible gen-N namespace. The final rename is the
+    // publication point; an interrupted realization can leave only a staging
+    // directory, never a generation that activation may select.
+    const stage_path = std.fmt.allocPrint(ctx.allocator, "{s}.staging", .{gen_path}) catch {
+        return ProfileError.OutOfMemory;
+    };
+    defer ctx.allocator.free(stage_path);
+    path.deleteTreeAbsolute(stage_path) catch |err| {
+        if (err != error.FileNotFound) {
+            return ctx.fail(ProfileError.FileSystem, stage_path, "failed to remove stale generation staging directory");
+        }
+    };
+    path.ensureDirExists(stage_path) catch |err| {
         return ctx.fail(switch (err) {
             error.AccessDenied => ProfileError.PermissionDenied,
             else => ProfileError.FileSystem,
-        }, gen_path, "failed to create generation directory");
+        }, stage_path, "failed to create generation staging directory");
     };
+    errdefer path.deleteTreeAbsolute(stage_path) catch {};
 
     if (isSystemProfile(profile_dir)) {
         try ensureRootOwnedPackages(ctx, sorted_packages);
@@ -1051,7 +1064,7 @@ pub fn createGeneration(
     var result = try planProfileRealization(
         ctx.allocator,
         ctx,
-        gen_path,
+        stage_path,
         store_root,
         sorted_packages,
         if (parent_state) |*state| state else null,
@@ -1068,7 +1081,7 @@ pub fn createGeneration(
     const apply_stats = try applyRealization(
         ctx.allocator,
         ctx,
-        gen_path,
+        stage_path,
         sorted_packages,
         &result.realization,
         if (parent_state) |*state| state else null,
@@ -1086,21 +1099,28 @@ pub fn createGeneration(
     );
     defer manifest.deinit();
 
-    generation.writeRealization(ctx.allocator, gen_path, &result.realization) catch |err| {
+    generation.writeRealization(ctx.allocator, stage_path, &result.realization) catch |err| {
         return ctx.fail(switch (err) {
             generation.GenerationError.PermissionDenied => ProfileError.PermissionDenied,
             generation.GenerationError.OutOfMemory => ProfileError.OutOfMemory,
             generation.GenerationError.InvalidManifest => ProfileError.InvalidInput,
             else => ProfileError.FileSystem,
-        }, gen_path, "failed to write generation realization");
+        }, stage_path, "failed to write generation realization");
     };
 
-    generation.writeManifest(ctx.allocator, gen_path, &manifest) catch |err| {
+    generation.writeManifest(ctx.allocator, stage_path, &manifest) catch |err| {
         return ctx.fail(switch (err) {
             generation.GenerationError.PermissionDenied => ProfileError.PermissionDenied,
             generation.GenerationError.OutOfMemory => ProfileError.OutOfMemory,
             else => ProfileError.FileSystem,
-        }, gen_path, "failed to write generation manifest");
+        }, stage_path, "failed to write generation manifest");
+    };
+
+    std.Io.Dir.renameAbsolute(stage_path, gen_path, path.currentIo()) catch |err| {
+        return ctx.fail(switch (err) {
+            error.AccessDenied => ProfileError.PermissionDenied,
+            else => ProfileError.FileSystem,
+        }, gen_path, "failed to publish completed generation");
     };
 
     ctx.debug(
@@ -1732,6 +1752,14 @@ test "createGeneration detects conflicts against retained parent paths" {
         ProfileError.PathConflict,
         createGeneration(&test_env.ctx, profile_dir, store_root, &gen2_packages, 1),
     );
+
+    const abandoned_generation = try std.fs.path.join(allocator, &.{ profile_dir, "gen-2" });
+    defer allocator.free(abandoned_generation);
+    try std.testing.expect(!path.fileExists(abandoned_generation));
+
+    const abandoned_staging = try std.fmt.allocPrint(allocator, "{s}.staging", .{abandoned_generation});
+    defer allocator.free(abandoned_staging);
+    try std.testing.expect(!path.fileExists(abandoned_staging));
 }
 
 test "createGeneration realization indices match manifest package order" {

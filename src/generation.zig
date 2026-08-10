@@ -612,7 +612,7 @@ pub fn getCurrentGeneration(profile_dir: []const u8) GenerationError!?u32 {
         };
     };
 
-    return parseGenerationNumber(target_buf[0..target_len]);
+    return parseGenerationNumber(target_buf[0..target_len]) orelse GenerationError.InvalidInput;
 }
 
 pub fn listGenerations(
@@ -796,6 +796,24 @@ test "getCurrentGeneration returns null when no active generation" {
     try std.testing.expectEqual(@as(?u32, null), current);
 }
 
+test "getCurrentGeneration rejects malformed active generation target" {
+    const th = @import("test_helpers.zig");
+    var test_env = try th.createTestEnv();
+    defer {
+        test_env.cleanup();
+        std.testing.allocator.destroy(test_env);
+    }
+
+    const allocator = test_env.ctx.allocator;
+    const profile_dir = try std.fs.path.join(allocator, &.{ test_env.path, "mere", "profiles", "system" });
+    defer allocator.free(profile_dir);
+    var profile_dir_handle = try path_mod.makePathAndOpenDir(profile_dir);
+    defer profile_dir_handle.close(path_mod.currentIo());
+    try profile_dir_handle.symLink(path_mod.currentIo(), "not-a-generation", CURRENT_SYMLINK, .{});
+
+    try std.testing.expectError(GenerationError.InvalidInput, getCurrentGeneration(profile_dir));
+}
+
 test "findPreviousGeneration returns previous generation" {
     const th = @import("test_helpers.zig");
     var test_env = try th.createTestEnv();
@@ -932,6 +950,42 @@ pub fn readManifest(allocator: std.mem.Allocator, store_root: []const u8, genera
     return GenerationManifest.parse(allocator, store_root, buffer);
 }
 
+fn writeMetadataFileAtomically(allocator: std.mem.Allocator, destination: []const u8, content: []const u8) GenerationError!void {
+    const temporary = std.fmt.allocPrint(allocator, "{s}.tmp", .{destination}) catch {
+        return GenerationError.OutOfMemory;
+    };
+    defer allocator.free(temporary);
+
+    var published = false;
+    defer if (!published) std.Io.Dir.deleteFileAbsolute(path_mod.currentIo(), temporary) catch {};
+
+    const io = path_mod.currentIo();
+    {
+        var file = std.Io.Dir.createFileAbsolute(io, temporary, .{ .truncate = true }) catch |err| {
+            return switch (err) {
+                error.AccessDenied => GenerationError.PermissionDenied,
+                else => GenerationError.FileSystem,
+            };
+        };
+        defer file.close(io);
+
+        file.writeStreamingAll(io, content) catch |err| {
+            return switch (err) {
+                error.AccessDenied => GenerationError.PermissionDenied,
+                else => GenerationError.FileSystem,
+            };
+        };
+    }
+
+    std.Io.Dir.renameAbsolute(temporary, destination, io) catch |err| {
+        return switch (err) {
+            error.AccessDenied => GenerationError.PermissionDenied,
+            else => GenerationError.FileSystem,
+        };
+    };
+    published = true;
+}
+
 pub fn writeManifest(allocator: std.mem.Allocator, generation_dir: []const u8, manifest: *const GenerationManifest) GenerationError!void {
     const manifest_path = std.fs.path.join(allocator, &.{ generation_dir, MANIFEST_FILENAME }) catch {
         return GenerationError.OutOfMemory;
@@ -941,21 +995,7 @@ pub fn writeManifest(allocator: std.mem.Allocator, generation_dir: []const u8, m
     const content = try manifest.encode(allocator);
     defer allocator.free(content);
 
-    const io = path_mod.currentIo();
-    var file = std.Io.Dir.createFileAbsolute(io, manifest_path, .{}) catch |err| {
-        return switch (err) {
-            error.AccessDenied => GenerationError.PermissionDenied,
-            else => GenerationError.FileSystem,
-        };
-    };
-    defer file.close(io);
-
-    file.writeStreamingAll(io, content) catch |err| {
-        return switch (err) {
-            error.AccessDenied => GenerationError.PermissionDenied,
-            else => GenerationError.FileSystem,
-        };
-    };
+    try writeMetadataFileAtomically(allocator, manifest_path, content);
 }
 
 pub fn readRealization(allocator: std.mem.Allocator, generation_dir: []const u8) GenerationError!RealizationData {
@@ -1012,21 +1052,7 @@ pub fn writeRealization(
     const content = try realization.encode(allocator);
     defer allocator.free(content);
 
-    const io = path_mod.currentIo();
-    var file = std.Io.Dir.createFileAbsolute(io, realization_path, .{}) catch |err| {
-        return switch (err) {
-            error.AccessDenied => GenerationError.PermissionDenied,
-            else => GenerationError.FileSystem,
-        };
-    };
-    defer file.close(io);
-
-    file.writeStreamingAll(io, content) catch |err| {
-        return switch (err) {
-            error.AccessDenied => GenerationError.PermissionDenied,
-            else => GenerationError.FileSystem,
-        };
-    };
+    try writeMetadataFileAtomically(allocator, realization_path, content);
 }
 
 // Tests
