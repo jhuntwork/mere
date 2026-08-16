@@ -273,7 +273,14 @@ pub fn forkAndEnterEnv(allocator: std.mem.Allocator, mode: EnvMode, opts: EnvOpt
 
     while (open_streams > 0) {
         const poll_rc = c.poll(&poll_fds, poll_fds.len, -1);
-        if (poll_rc <= 0) continue;
+        if (poll_rc < 0) {
+            // EINTR is a legitimate retry; anything else would spin this loop
+            // at full CPU forever, so give up on streaming and go collect the
+            // child's status instead.
+            if (std.c._errno().* == c.EINTR) continue;
+            break;
+        }
+        if (poll_rc == 0) continue;
 
         var i: usize = 0;
         while (i < poll_fds.len) : (i += 1) {
@@ -282,6 +289,9 @@ pub fn forkAndEnterEnv(allocator: std.mem.Allocator, mode: EnvMode, opts: EnvOpt
             if ((pfd.revents & (c.POLLIN | c.POLLHUP | c.POLLERR)) == 0) continue;
 
             const n = c.read(pfd.fd, &read_buf, read_buf.len);
+            // A signal-interrupted read is not end-of-stream; closing here
+            // would silently truncate the child's output.
+            if (n < 0 and std.c._errno().* == c.EINTR) continue;
             if (n > 0) {
                 const data = read_buf[0..@intCast(n)];
                 const is_stderr = i == 1;
@@ -302,16 +312,17 @@ pub fn forkAndEnterEnv(allocator: std.mem.Allocator, mode: EnvMode, opts: EnvOpt
         }
     }
 
-    var wait_status: c_int = 0;
-    if (c.waitpid(@intCast(pid), &wait_status, 0) < 0) return 128;
-    // Decode the wait status: exit code is in bits 8-15 if exited normally
-    const status: u32 = @bitCast(wait_status);
-    if (status & 0x7f == 0) {
-        // Normal exit: extract exit code from bits 8-15
-        return @truncate(status >> 8);
+    // Any fds still open at this point (the poll loop bailed out) must be
+    // released before waiting, or the child could block writing into a pipe
+    // nobody is draining.
+    for (&poll_fds) |*pfd| {
+        if (pfd.fd >= 0) {
+            _ = c.close(pfd.fd);
+            pfd.fd = -1;
+        }
     }
-    // Killed by signal
-    return 128;
+
+    return waitForExitStatus(@intCast(pid));
 }
 
 fn validateInputs(opts: EnvOptions, mode: EnvMode) EnvError!void {
@@ -1099,13 +1110,17 @@ fn resolveExecutablePath(
     const path_value = findEnvValue(env_opt, "PATH") orelse "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
     var it = std.mem.tokenizeScalar(u8, path_value, ':');
     while (it.next()) |entry| {
-        const candidate = if (entry.len == 0)
-            std.fmt.allocPrint(allocator, "./{s}", .{arg0}) catch return EnvError.OutOfMemory
-        else
-            std.fmt.allocPrint(allocator, "{s}/{s}", .{ entry, arg0 }) catch return EnvError.OutOfMemory;
+        // Only absolute PATH entries can be probed here. accessAbsolute
+        // asserts an absolute path, so passing a relative entry through would
+        // abort the process instead of just failing to find the executable -
+        // and PATH is attacker-adjacent input (recipe env, inherited env).
+        if (!std.fs.path.isAbsolute(entry)) continue;
+
+        const candidate = std.fmt.allocPrint(allocator, "{s}/{s}", .{ entry, arg0 }) catch return EnvError.OutOfMemory;
         errdefer allocator.free(candidate);
 
         std.Io.Dir.accessAbsolute(path_mod.currentIo(), candidate, .{}) catch {
+            allocator.free(candidate);
             continue;
         };
         return candidate;
@@ -1450,3 +1465,45 @@ test "createSessionAtBase creates a session under the requested base" {
     try std.testing.expect(std.mem.startsWith(u8, session.base_path, base));
     try std.testing.expect(std.fs.path.isAbsolute(session.root_path));
 }
+
+// Regression: resolveExecutablePath built candidates from PATH entries and
+// handed them to std.Io.Dir.accessAbsolute, which asserts the path is
+// absolute. A single relative PATH element therefore aborted the process
+// ("reached unreachable code") rather than just failing the lookup - and PATH
+// here comes from the recipe/inherited environment.
+test "resolveExecutablePath skips relative PATH entries instead of aborting" {
+    const alloc = std.testing.allocator;
+    const env = [_][*:0]const u8{"PATH=relative/dir:/bin"};
+
+    // Must not panic. Either it finds /bin/sh on this host or it reports
+    // ExecError; both are acceptable, aborting is not.
+    if (resolveExecutablePath(alloc, "sh", env[0..])) |resolved| {
+        defer alloc.free(resolved);
+        try std.testing.expect(std.fs.path.isAbsolute(resolved));
+    } else |err| {
+        try std.testing.expectEqual(EnvError.ExecError, err);
+    }
+}
+
+test "resolveExecutablePath reports ExecError when PATH has only relative entries" {
+    const alloc = std.testing.allocator;
+    const env = [_][*:0]const u8{"PATH=bin:./sbin:../usr/bin"};
+    try std.testing.expectError(EnvError.ExecError, resolveExecutablePath(alloc, "sh", env[0..]));
+}
+
+test "resolveExecutablePath honors an explicit path in arg0" {
+    const alloc = std.testing.allocator;
+    const env = [_][*:0]const u8{"PATH=/nonexistent"};
+    const resolved = try resolveExecutablePath(alloc, "/bin/sh", env[0..]);
+    defer alloc.free(resolved);
+    try std.testing.expectEqualStrings("/bin/sh", resolved);
+}
+
+test "waitForExitStatus decodes a normal exit code" {
+    // 0x0500 is the wait status for exit(5): low 7 bits clear, code in 8-15.
+    try std.testing.expectEqual(@as(u8, 5), decodeWaitStatus(0x0500));
+    try std.testing.expectEqual(@as(u8, 0), decodeWaitStatus(0x0000));
+    // Killed by SIGKILL (9): low bits non-zero, reported as 128.
+    try std.testing.expectEqual(@as(u8, 128), decodeWaitStatus(9));
+}
+
