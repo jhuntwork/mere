@@ -83,7 +83,11 @@ pub const CurlTransferClient = struct {
         http_client.* = CurlTransferClient{
             .ctx = ctx,
             .curl = curl,
-            .error_buffer = undefined,
+            // Zeroed, not undefined: libcurl only writes CURLOPT_ERRORBUFFER
+            // when it has a message, so reading it after a failure that
+            // produced none would surface uninitialized memory as the error
+            // text. Documented as the caller's responsibility to clear.
+            .error_buffer = @splat(0),
         };
 
         // No pushCleanup in Context; cleanup must be handled manually by the caller.
@@ -358,6 +362,9 @@ fn downloadFileWithCurl(
     _ = c.curl_easy_setopt(client.curl, c.CURLOPT_URL, url.ptr);
     _ = c.curl_easy_setopt(client.curl, c.CURLOPT_WRITEFUNCTION, curlWriteToFileCallback);
     _ = c.curl_easy_setopt(client.curl, c.CURLOPT_WRITEDATA, &session);
+    // Cleared per transfer so a message left over from an earlier request is
+    // never attributed to this one.
+    @memset(&client.error_buffer, 0);
     _ = c.curl_easy_setopt(client.curl, c.CURLOPT_ERRORBUFFER, &client.error_buffer);
     _ = c.curl_easy_setopt(client.curl, c.CURLOPT_FOLLOWLOCATION, @as(c_long, 1));
     _ = c.curl_easy_setopt(client.curl, c.CURLOPT_MAXREDIRS, @as(c_long, 10));
@@ -412,7 +419,8 @@ const MultiDownloadSession = struct {
     expected_hash: ?[]const u8,
     expected_bytes: [std.crypto.hash.Blake3.digest_length]u8 = undefined,
     force: bool,
-    error_buffer: [c.CURL_ERROR_SIZE]u8 = undefined,
+    // See CurlTransferClient.error_buffer: cleared, never undefined.
+    error_buffer: [c.CURL_ERROR_SIZE]u8 = @splat(0),
     easy: ?*c.CURL = null,
     file_open: bool = true,
     last_emit_ms: i64 = 0,
@@ -635,6 +643,7 @@ pub fn downloadBatch(
         _ = c.curl_easy_setopt(easy, c.CURLOPT_URL, req.url.ptr);
         _ = c.curl_easy_setopt(easy, c.CURLOPT_WRITEFUNCTION, multiWriteToFileCallback);
         _ = c.curl_easy_setopt(easy, c.CURLOPT_WRITEDATA, session);
+        @memset(&session.error_buffer, 0);
         _ = c.curl_easy_setopt(easy, c.CURLOPT_ERRORBUFFER, &session.error_buffer);
         _ = c.curl_easy_setopt(easy, c.CURLOPT_FOLLOWLOCATION, @as(c_long, 1));
         _ = c.curl_easy_setopt(easy, c.CURLOPT_MAXREDIRS, @as(c_long, 10));
