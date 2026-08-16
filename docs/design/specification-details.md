@@ -289,19 +289,17 @@ Several operations create directories that are meaningful only while their creat
 
 Abnormal termination — a crash, `SIGKILL`, a cancelled or timed-out invocation — leaves these behind. Mere MUST treat abandonment as an expected outcome rather than an exceptional one, because a consumer that is killed mid-operation is normal, not rare: automated and agent-driven callers are routinely interrupted, and each interruption otherwise leaks a directory tree permanently. Without reclamation `.incoming` grows without bound in a world-writable directory that garbage collection never inspects.
 
-**Ownership protocol**. A scratch directory `<base>/<id>` is claimed by a sibling lock file `<base>/<id>.owner`. The creating process MUST create that file and hold an exclusive `flock(2)` on it for as long as the directory is in use. The lock is held on the open file description, so it survives `execve` and is released by the kernel when the owning process exits for any reason. Liveness therefore requires no heartbeat, timeout, or pid check, and is immune to pid reuse.
+**Ownership protocol**. A process claims a scratch directory by holding an exclusive `flock(2)` on **the directory's own file descriptor**, opened `O_DIRECTORY | O_NOFOLLOW`. The claim exists only as long as that descriptor does: it is held on the open file description, so it survives `execve` and is released by the kernel when the owning process exits for any reason. Liveness therefore requires no heartbeat, timeout, or pid check, and is immune to pid reuse.
 
-The lock file MUST be a sibling rather than live inside the claimed directory. A store staging directory *becomes* the store object via `rename(2)`, and its content hash is computed over exactly what it contains; a marker placed inside would enter the payload and change the object's identity. Keeping it outside means a claimed directory holds nothing but its owner's content.
+The claim MUST NOT be represented by anything on disk — no lock file, no state file. A store staging directory *becomes* the store object via `rename(2)`, and its content hash is computed over exactly what it contains, so a marker inside it would enter the payload and change the object's identity; a marker beside it would be debris requiring its own reclamation. Locking the directory itself has neither problem, and the lock follows the inode across the rename that admits the object.
 
 For namespace sessions the claim is made inheritable across `execve` (`FD_CLOEXEC` cleared), because the session remains in use for as long as the shell or build command runs and that command replaces the claiming process.
 
 **Reclamation**. A process sweeping a scratch base directory MUST, for each child directory:
 
 1. Skip it unless it is owned by the sweeping user, or the sweeper is privileged. Scratch bases may be world-writable and MUST NOT become a route to deleting another user's in-flight work. Ownership MUST be determined without following symlinks.
-2. If the sibling lock file is present, attempt a non-blocking exclusive `flock`. Acquiring it proves the owner is gone and the directory MAY be removed. Failure to acquire means the owner is live and the directory MUST be left alone.
-3. If the sibling lock file is absent, the directory MAY be removed only once its mtime is older than a grace period. This covers directories created before this protocol existed, and processes that died between creating the directory and claiming it.
-
-A lock file whose directory no longer exists is itself debris and SHOULD be removed, subject to the same liveness check — a claim taken moments before its directory is created MUST NOT be destroyed.
+2. Attempt a non-blocking exclusive `flock` on the directory. Failure to acquire means the owner is live, and the directory MUST be left alone regardless of its age — a long extraction can leave a staging directory's own mtime well behind while the install is still running.
+3. Acquiring the lock means no process owns the directory. It MAY then be removed, but only once its mtime is older than a grace period. Without an on-disk marker there is nothing to distinguish "abandoned" from "created moments ago and not yet claimed", so age closes that window.
 
 Reclamation is opportunistic and MUST NOT fail the operation that triggers it: a directory that cannot be swept is left for a later sweep.
 

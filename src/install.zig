@@ -1828,7 +1828,7 @@ fn installSinglePackageToStore(
     defer ctx.allocator.free(staging.staging_dir);
     // Held across the rename below, so a concurrent sweep cannot mistake
     // in-flight staging for debris.
-    defer staging.claim.releaseAndRemove();
+    defer staging.claim.release();
 
     if (staging.content_exists and !reinstall) {
         ctx.debug("content already exists in store: {s}", .{staging.install_dir});
@@ -2152,7 +2152,7 @@ fn stageAndValidatePayload(
     var staging_claim = scratch.claim(ctx.allocator, staging_dir, false) catch |err| {
         return ctx.fail(mapInstallFsError(err), staging_dir, "failed to claim staging directory");
     };
-    errdefer staging_claim.releaseAndRemove();
+    errdefer staging_claim.release();
 
     // === Step 3: Extract payload and validate ===
     extract.intoPreservingSpecialBits(ctx, cache_path, staging_dir) catch |err| {

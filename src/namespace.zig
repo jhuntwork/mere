@@ -588,7 +588,7 @@ fn createSessionAtBase(allocator: std.mem.Allocator, mode: EnvMode, env_base: []
     var session_claim = scratch.claim(allocator, session_dir, true) catch {
         return EnvError.SessionSetupError;
     };
-    errdefer session_claim.releaseAndRemove();
+    errdefer session_claim.release();
 
     if (mode == .shell) {
         const etc_upper = std.fmt.allocPrint(allocator, "{s}etc-upper", .{base_path}) catch {
@@ -1292,7 +1292,7 @@ test "SessionInfo deinit frees memory" {
         .mode = .shell,
         .allocator = allocator,
         // fd -1 is the released state, so deinit is a no-op on the claim.
-        .claim = .{ .fd = -1, .lock_path = &.{}, .allocator = allocator },
+        .claim = .{ .fd = -1 },
     };
 
     session.deinit();
