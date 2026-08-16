@@ -446,7 +446,18 @@ fn buildSortedPackageOrder(
                 return std.mem.lessThan(u8, a.name, b.name);
             }
 
-            const version_order = version.comparePackageVersions(a.version, a.release, b.version, b.release) catch unreachable;
+            // comparePackageVersions rejects malformed epochs ("1.0:",
+            // "abc:1.0", an epoch overflowing u32). Those strings can reach
+            // here from a package manifest, so `catch unreachable` turned a bad
+            // version into a process abort. Fall back to a byte ordering, which
+            // is deterministic and total for any input; this pass only needs a
+            // stable order, not a semantically correct one.
+            const version_order = version.comparePackageVersions(a.version, a.release, b.version, b.release) catch
+                switch (std.mem.order(u8, a.version, b.version)) {
+                    .lt => version.Order.less,
+                    .eq => version.Order.equal,
+                    .gt => version.Order.greater,
+                };
             if (version_order != .equal) {
                 return version_order == .less;
             }
