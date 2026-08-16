@@ -75,6 +75,13 @@ fn applyArchivedSpecialBits(
     target_dir: []const u8,
     pending_special_bits: *const PendingSpecialBitMap,
 ) ExtractError!void {
+    if (pending_special_bits.count() == 0) return;
+
+    var target_root = std.Io.Dir.openDirAbsolute(p.currentIo(), target_dir, .{ .iterate = true }) catch |err| {
+        return ctx.fail(mapFsError(err), target_dir, "failed to open target directory for special-bit restore");
+    };
+    defer target_root.close(p.currentIo());
+
     var directory_paths: std.ArrayList([]const u8) = .empty;
     defer directory_paths.deinit(ctx.allocator);
 
@@ -88,7 +95,7 @@ fn applyArchivedSpecialBits(
             };
             continue;
         }
-        try applyArchivedSpecialBitsAtPath(ctx, target_dir, rel_path, restore);
+        try applyArchivedSpecialBitsAtPath(ctx, target_root, rel_path, restore);
     }
 
     std.mem.sort([]const u8, directory_paths.items, {}, struct {
@@ -106,48 +113,67 @@ fn applyArchivedSpecialBits(
 
     for (directory_paths.items) |rel_path| {
         const restore = pending_special_bits.get(rel_path).?;
-        try applyArchivedSpecialBitsAtPath(ctx, target_dir, rel_path, restore);
+        try applyArchivedSpecialBitsAtPath(ctx, target_root, rel_path, restore);
     }
 }
 
+// Re-apply setuid/setgid/sticky bits that the archive declared.
+//
+// This resolves the destination the same no-follow way the merge does, and
+// opens the leaf itself with follow_symlinks = false. Doing it by absolute path
+// would mean chmod'ing whatever a symlink pointed at, which for setuid bits is
+// the difference between "restore the package's own mode" and "make an
+// arbitrary host binary setuid".
 fn applyArchivedSpecialBitsAtPath(
     ctx: *Context,
-    target_dir: []const u8,
+    target_root: std.Io.Dir,
     rel_path: []const u8,
     restore: PendingSpecialBits,
 ) ExtractError!void {
-    const full_path = std.fs.path.join(ctx.allocator, &.{ target_dir, rel_path }) catch {
-        return ctx.fail(ExtractError.OutOfMemory, rel_path, "failed to allocate special-bit restore path");
-    };
-    defer ctx.allocator.free(full_path);
+    const io = p.currentIo();
+    var slot = try openDestSlot(ctx, target_root, rel_path, false);
+    defer slot.close();
 
     switch (restore.kind) {
         .directory => {
-            var dir = std.Io.Dir.openDirAbsolute(p.currentIo(), full_path, .{ .iterate = true }) catch |err| {
-                return ctx.fail(mapFsError(err), full_path, "failed to open directory for special-bit restore");
+            var dir = slot.dir.openDir(io, slot.name, .{
+                .iterate = true,
+                .follow_symlinks = false,
+            }) catch |err| switch (err) {
+                error.SymLinkLoop => return ctx.fail(
+                    ExtractError.InvalidInput,
+                    rel_path,
+                    "special-bit restore target is a symlink",
+                ),
+                else => return ctx.fail(mapFsError(err), rel_path, "failed to open directory for special-bit restore"),
             };
-            defer dir.close(p.currentIo());
+            defer dir.close(io);
 
-            const stat = dir.stat(p.currentIo()) catch |err| {
-                return ctx.fail(mapFsError(err), full_path, "failed to stat directory for special-bit restore");
+            const stat = dir.stat(io) catch |err| {
+                return ctx.fail(mapFsError(err), rel_path, "failed to stat directory for special-bit restore");
             };
             const new_mode = (stat.permissions.toMode() & ~@as(std.posix.mode_t, 0o7000)) | restore.special_bits.toMode();
-            dir.setPermissions(p.currentIo(), std.Io.File.Permissions.fromMode(new_mode)) catch |err| {
-                return ctx.fail(mapFsError(err), full_path, "failed to restore directory special bits");
+            dir.setPermissions(io, std.Io.File.Permissions.fromMode(new_mode)) catch |err| {
+                return ctx.fail(mapFsError(err), rel_path, "failed to restore directory special bits");
             };
         },
         .file => {
-            var file = std.Io.Dir.openFileAbsolute(p.currentIo(), full_path, .{}) catch |err| {
-                return ctx.fail(mapFsError(err), full_path, "failed to open file for special-bit restore");
+            var file = slot.dir.openFile(io, slot.name, .{ .follow_symlinks = false }) catch |err| switch (err) {
+                error.SymLinkLoop => return ctx.fail(
+                    ExtractError.InvalidInput,
+                    rel_path,
+                    "special-bit restore target is a symlink",
+                ),
+                else => return ctx.fail(mapFsError(err), rel_path, "failed to open file for special-bit restore"),
             };
-            defer file.close(p.currentIo());
+            defer file.close(io);
 
-            const stat = file.stat(p.currentIo()) catch |err| {
-                return ctx.fail(mapFsError(err), full_path, "failed to stat file for special-bit restore");
+            const stat = file.stat(io) catch |err| {
+                return ctx.fail(mapFsError(err), rel_path, "failed to stat file for special-bit restore");
             };
             const new_mode = (stat.permissions.toMode() & ~@as(std.posix.mode_t, 0o7000)) | restore.special_bits.toMode();
-            file.setPermissions(p.currentIo(), std.Io.File.Permissions.fromMode(new_mode)) catch |err| {
-                return ctx.fail(mapFsError(err), full_path, "failed to restore file special bits");
+            file.setPermissions(io, std.Io.File.Permissions.fromMode(new_mode)) catch |err| {
+                return ctx.fail(mapFsError(err), rel_path, "failed to restore file special bits");
             };
         },
     }
@@ -402,11 +428,123 @@ fn createExtractionStageDir(ctx: *Context, target_abs: []const u8) ![]const u8 {
     };
 }
 
+// Walk `rel_path`'s components downward from `root`, returning an open handle
+// to the directory named by the final component.
+//
+// Every component is opened with `follow_symlinks = false`, so a component
+// that is a symlink fails with SymLinkLoop instead of being traversed. This is
+// what keeps the merge inside `target_abs`: libarchive's
+// ARCHIVE_EXTRACT_SECURE_SYMLINKS only guards the staging tree it writes, and
+// the merge below places those entries into a destination that may already
+// contain symlinks from an earlier extraction. Resolving destination paths as
+// strings and letting the kernel follow them would let `d/pwned` land outside
+// the target whenever `d` is a symlink - see the regression test
+// "merge does not follow a pre-existing symlink in the target".
+//
+// With `create_missing` set, absent components are created; otherwise an
+// absent component is an error.
+fn openDirNoFollow(
+    ctx: *Context,
+    root: std.Io.Dir,
+    rel_path: []const u8,
+    create_missing: bool,
+    diag_path: []const u8,
+) ExtractError!std.Io.Dir {
+    const io = p.currentIo();
+    var current = root.openDir(io, ".", .{ .iterate = true }) catch |err| {
+        return ctx.fail(mapFsError(err), diag_path, "failed to reopen destination root");
+    };
+    errdefer current.close(io);
+
+    var it = std.mem.tokenizeScalar(u8, rel_path, '/');
+    while (it.next()) |component| {
+        if (std.mem.eql(u8, component, ".") or std.mem.eql(u8, component, "..")) {
+            return ctx.fail(ExtractError.InvalidInput, diag_path, "destination path contains a relative component");
+        }
+
+        const next = current.openDir(io, component, .{
+            .iterate = true,
+            .follow_symlinks = false,
+        }) catch |err| switch (err) {
+            error.SymLinkLoop => return ctx.fail(
+                ExtractError.InvalidInput,
+                diag_path,
+                "destination path traverses a symlink",
+            ),
+            error.NotDir => return ctx.fail(
+                ExtractError.InvalidInput,
+                diag_path,
+                "destination path traverses a non-directory",
+            ),
+            error.FileNotFound => blk: {
+                if (!create_missing) {
+                    return ctx.fail(ExtractError.FileSystem, diag_path, "destination directory does not exist");
+                }
+                current.createDir(io, component, .default_dir) catch |mk_err| switch (mk_err) {
+                    // Lost a race, or something appeared here meanwhile; the
+                    // reopen below re-applies the no-follow check to it.
+                    error.PathAlreadyExists => {},
+                    else => return ctx.fail(mapFsError(mk_err), diag_path, "failed to create destination directory"),
+                };
+                break :blk current.openDir(io, component, .{
+                    .iterate = true,
+                    .follow_symlinks = false,
+                }) catch |open_err| switch (open_err) {
+                    error.SymLinkLoop => return ctx.fail(
+                        ExtractError.InvalidInput,
+                        diag_path,
+                        "destination path traverses a symlink",
+                    ),
+                    else => return ctx.fail(mapFsError(open_err), diag_path, "failed to open destination directory"),
+                };
+            },
+            else => return ctx.fail(mapFsError(err), diag_path, "failed to open destination directory"),
+        };
+
+        current.close(io);
+        current = next;
+    }
+
+    return current;
+}
+
+// Open the directory holding `rel_path`'s final component, plus that
+// component's name. Callers use the returned handle for *at-style operations
+// so the leaf is acted on without re-resolving the path as a string.
+const DestSlot = struct {
+    dir: std.Io.Dir,
+    name: []const u8,
+
+    fn close(self: *DestSlot) void {
+        self.dir.close(p.currentIo());
+    }
+};
+
+fn openDestSlot(
+    ctx: *Context,
+    root: std.Io.Dir,
+    rel_path: []const u8,
+    create_missing: bool,
+) ExtractError!DestSlot {
+    const name = std.fs.path.basename(rel_path);
+    if (name.len == 0 or std.mem.eql(u8, name, ".") or std.mem.eql(u8, name, "..")) {
+        return ctx.fail(ExtractError.InvalidInput, rel_path, "invalid destination entry name");
+    }
+    const parent_rel = std.fs.path.dirname(rel_path) orelse "";
+    const dir = try openDirNoFollow(ctx, root, parent_rel, create_missing, rel_path);
+    return .{ .dir = dir, .name = name };
+}
+
 fn mergeStagedTree(ctx: *Context, staged_dir: []const u8, target_abs: []const u8) ExtractError!void {
     var stage_root = std.Io.Dir.openDirAbsolute(p.currentIo(), staged_dir, .{ .iterate = true }) catch |err| {
         return ctx.fail(mapFsError(err), staged_dir, "failed to open staged extraction directory");
     };
     defer stage_root.close(p.currentIo());
+
+    var target_root = std.Io.Dir.openDirAbsolute(p.currentIo(), target_abs, .{ .iterate = true }) catch |err| {
+        return ctx.fail(mapFsError(err), target_abs, "failed to open extraction target directory");
+    };
+    defer target_root.close(p.currentIo());
 
     var walker = stage_root.walk(ctx.allocator) catch |err| {
         return ctx.fail(mapFsError(err), staged_dir, "failed to initialize staged extraction walker");
@@ -447,44 +585,43 @@ fn mergeStagedTree(ctx: *Context, staged_dir: []const u8, target_abs: []const u8
         }
     }.lessThan);
 
+    const io = p.currentIo();
     for (entries.items) |entry| {
         const rel_path = entry.path;
-        const src_path = std.fs.path.join(ctx.allocator, &.{ staged_dir, rel_path }) catch {
-            return ctx.fail(ExtractError.OutOfMemory, rel_path, "failed to allocate staged source path");
-        };
-        defer ctx.allocator.free(src_path);
-        const dst_path = std.fs.path.join(ctx.allocator, &.{ target_abs, rel_path }) catch {
-            return ctx.fail(ExtractError.OutOfMemory, rel_path, "failed to allocate staged destination path");
-        };
-        defer ctx.allocator.free(dst_path);
 
         switch (entry.kind) {
             .directory => {
-                var dir = p.makePathAndOpenDir(dst_path) catch |err| {
-                    return ctx.fail(mapFsError(err), dst_path, "failed to create destination directory");
-                };
-                dir.close(p.currentIo());
+                // Walking every component (including the leaf) with
+                // create_missing both creates the directory and rejects the
+                // case where the leaf already exists as a symlink.
+                var dir = try openDirNoFollow(ctx, target_root, rel_path, true, rel_path);
+                dir.close(io);
             },
             .file, .sym_link => {
-                if (std.fs.path.dirname(dst_path)) |dst_parent| {
-                    var dir = p.makePathAndOpenDir(dst_parent) catch |err| {
-                        return ctx.fail(mapFsError(err), dst_parent, "failed to create destination parent directory");
-                    };
-                    dir.close(p.currentIo());
-                }
+                var slot = try openDestSlot(ctx, target_root, rel_path, true);
+                defer slot.close();
 
-                std.Io.Dir.deleteFileAbsolute(p.currentIo(), dst_path) catch |err| switch (err) {
+                slot.dir.deleteFile(io, slot.name) catch |err| switch (err) {
                     error.FileNotFound => {},
                     error.IsDir => {
-                        std.Io.Dir.cwd().deleteTree(p.currentIo(), dst_path) catch |del_err| {
-                            return ctx.fail(mapFsError(del_err), dst_path, "failed to replace destination directory");
+                        slot.dir.deleteTree(io, slot.name) catch |del_err| {
+                            return ctx.fail(mapFsError(del_err), rel_path, "failed to replace destination directory");
                         };
                     },
-                    else => return ctx.fail(mapFsError(err), dst_path, "failed to replace destination entry"),
+                    else => return ctx.fail(mapFsError(err), rel_path, "failed to replace destination entry"),
                 };
 
-                std.Io.Dir.renameAbsolute(src_path, dst_path, p.currentIo()) catch |err| {
-                    return ctx.fail(mapFsError(err), dst_path, "failed to move staged entry into destination");
+                // The staging tree is ours and was written by libarchive under
+                // ARCHIVE_EXTRACT_SECURE_SYMLINKS, so resolving the source by
+                // absolute path is safe; only the destination side needs the
+                // no-follow treatment, and it gets it via slot.dir.
+                const src_path = std.fs.path.join(ctx.allocator, &.{ staged_dir, rel_path }) catch {
+                    return ctx.fail(ExtractError.OutOfMemory, rel_path, "failed to allocate staged source path");
+                };
+                defer ctx.allocator.free(src_path);
+
+                std.Io.Dir.rename(std.Io.Dir.cwd(), src_path, slot.dir, slot.name, io) catch |err| {
+                    return ctx.fail(mapFsError(err), rel_path, "failed to move staged entry into destination");
                 };
             },
             else => {},
@@ -499,15 +636,18 @@ fn mergeStagedTree(ctx: *Context, staged_dir: []const u8, target_abs: []const u8
             return ctx.fail(ExtractError.OutOfMemory, rel_path, "failed to allocate staged directory path");
         };
         defer ctx.allocator.free(src_path);
-        const dst_path = std.fs.path.join(ctx.allocator, &.{ target_abs, rel_path }) catch {
-            return ctx.fail(ExtractError.OutOfMemory, rel_path, "failed to allocate destination directory path");
-        };
-        defer ctx.allocator.free(dst_path);
-        try copyDirectoryTimes(ctx, src_path, dst_path);
+        var slot = try openDestSlot(ctx, target_root, rel_path, false);
+        defer slot.close();
+        try copyDirectoryTimes(ctx, src_path, slot, rel_path);
     }
 }
 
-fn copyDirectoryTimes(ctx: *Context, src_path: []const u8, dst_path: []const u8) ExtractError!void {
+fn copyDirectoryTimes(
+    ctx: *Context,
+    src_path: []const u8,
+    dst: DestSlot,
+    diag_path: []const u8,
+) ExtractError!void {
     var src_dir = std.Io.Dir.openDirAbsolute(p.currentIo(), src_path, .{}) catch |err| {
         return ctx.fail(mapFsError(err), src_path, "failed to open staged directory for timestamp copy");
     };
@@ -516,21 +656,24 @@ fn copyDirectoryTimes(ctx: *Context, src_path: []const u8, dst_path: []const u8)
         return ctx.fail(mapFsError(err), src_path, "failed to stat staged directory for timestamp copy");
     };
 
-    const dst_path_z = ctx.allocator.dupeZ(u8, dst_path) catch {
-        return ctx.fail(ExtractError.OutOfMemory, dst_path, "failed to allocate destination timestamp path");
+    const name_z = ctx.allocator.dupeZ(u8, dst.name) catch {
+        return ctx.fail(ExtractError.OutOfMemory, diag_path, "failed to allocate destination timestamp path");
     };
-    defer ctx.allocator.free(dst_path_z);
+    defer ctx.allocator.free(name_z);
 
     const times = [2]std.posix.timespec{
         nsToTimespec((stat.atime orelse stat.mtime).nanoseconds),
         nsToTimespec(stat.mtime.nanoseconds),
     };
-    switch (std.posix.errno(std.c.utimensat(std.posix.AT.FDCWD, dst_path_z, @constCast(&times), 0))) {
+    // Relative to the already-validated parent handle, and NOFOLLOW so a
+    // symlink at the leaf is stamped rather than its target.
+    const rc = std.c.utimensat(dst.dir.handle, name_z, @constCast(&times), std.posix.AT.SYMLINK_NOFOLLOW);
+    switch (std.posix.errno(rc)) {
         .SUCCESS => {},
-        .ACCES, .PERM, .ROFS => return ctx.fail(ExtractError.PermissionDenied, dst_path, "failed to restore directory timestamps"),
-        .BADF, .INVAL, .NOENT, .NOTDIR => return ctx.fail(ExtractError.InvalidInput, dst_path, "failed to restore directory timestamps"),
+        .ACCES, .PERM, .ROFS => return ctx.fail(ExtractError.PermissionDenied, diag_path, "failed to restore directory timestamps"),
+        .BADF, .INVAL, .NOENT, .NOTDIR => return ctx.fail(ExtractError.InvalidInput, diag_path, "failed to restore directory timestamps"),
         .FAULT => unreachable,
-        else => return ctx.fail(ExtractError.FileSystem, dst_path, "failed to restore directory timestamps"),
+        else => return ctx.fail(ExtractError.FileSystem, diag_path, "failed to restore directory timestamps"),
     }
 }
 
@@ -1567,4 +1710,131 @@ test "transactional extraction preserves preexisting target files on failure" {
     std.Io.Dir.accessAbsolute(p.currentIo(), new_path, .{}) catch |err| {
         try std.testing.expectEqual(error.FileNotFound, err);
     };
+}
+
+// Regression: libarchive extracts into the staging tree under
+// ARCHIVE_EXTRACT_SECURE_SYMLINKS, but mergeStagedTree used to place those
+// entries with plain path joins plus makePath/rename. When the target already
+// contained a symlinked directory - e.g. a second archive unpacked over the
+// same directory - the kernel followed it and the merge wrote outside the
+// target, silently undoing the flag set during extraction.
+test "merge does not follow a pre-existing symlink in the target" {
+    const th = @import("test_helpers.zig");
+    var test_env = try th.createTestEnv();
+    defer {
+        test_env.cleanup();
+        std.testing.allocator.destroy(test_env);
+    }
+    const alloc = std.testing.allocator;
+
+    // Stands in for a directory outside the extraction target, e.g. /etc.
+    const outside = try std.fs.path.join(alloc, &.{ test_env.path, "outside" });
+    defer alloc.free(outside);
+    try p.ensureDirExists(outside);
+
+    const target = try std.fs.path.join(alloc, &.{ test_env.path, "target" });
+    defer alloc.free(target);
+    try p.ensureDirExists(target);
+    {
+        var td = try p.openExistingDir(target);
+        defer td.close(p.currentIo());
+        try td.symLink(p.currentIo(), outside, "d", .{});
+    }
+
+    const tar_path = try std.fs.path.join(alloc, &.{ test_env.path, "evil.tar" });
+    defer alloc.free(tar_path);
+    try th.createTestTarFile(&test_env.ctx, "d/pwned", tar_path);
+
+    try std.testing.expectError(error.InvalidInput, into(&test_env.ctx, tar_path, target));
+
+    const escaped = try std.fs.path.join(alloc, &.{ outside, "pwned" });
+    defer alloc.free(escaped);
+    try std.testing.expect(!p.fileExists(escaped));
+}
+
+test "merge rejects a symlinked directory nested below the target root" {
+    const th = @import("test_helpers.zig");
+    var test_env = try th.createTestEnv();
+    defer {
+        test_env.cleanup();
+        std.testing.allocator.destroy(test_env);
+    }
+    const alloc = std.testing.allocator;
+
+    const outside = try std.fs.path.join(alloc, &.{ test_env.path, "outside" });
+    defer alloc.free(outside);
+    try p.ensureDirExists(outside);
+
+    // target/a is a real directory; only target/a/b is the symlink, so the
+    // escape is one level down and the component walk has to keep checking.
+    const target = try std.fs.path.join(alloc, &.{ test_env.path, "target" });
+    defer alloc.free(target);
+    const target_a = try std.fs.path.join(alloc, &.{ target, "a" });
+    defer alloc.free(target_a);
+    try p.ensureDirExists(target_a);
+    {
+        var ad = try p.openExistingDir(target_a);
+        defer ad.close(p.currentIo());
+        try ad.symLink(p.currentIo(), outside, "b", .{});
+    }
+
+    const tar_path = try std.fs.path.join(alloc, &.{ test_env.path, "nested.tar" });
+    defer alloc.free(tar_path);
+    try th.createTestTarFile(&test_env.ctx, "a/b/c", tar_path);
+
+    try std.testing.expectError(error.InvalidInput, into(&test_env.ctx, tar_path, target));
+
+    const escaped = try std.fs.path.join(alloc, &.{ outside, "c" });
+    defer alloc.free(escaped);
+    try std.testing.expect(!p.fileExists(escaped));
+}
+
+// The no-follow walk must not break the ordinary case it guards: merging into
+// a target that already holds real directories, and replacing existing files.
+test "merge still overlays onto pre-existing real directories and files" {
+    const th = @import("test_helpers.zig");
+    var test_env = try th.createTestEnv();
+    defer {
+        test_env.cleanup();
+        std.testing.allocator.destroy(test_env);
+    }
+    const alloc = std.testing.allocator;
+
+    const target = try std.fs.path.join(alloc, &.{ test_env.path, "target" });
+    defer alloc.free(target);
+    const target_d = try std.fs.path.join(alloc, &.{ target, "d" });
+    defer alloc.free(target_d);
+    try p.ensureDirExists(target_d);
+
+    // A pre-existing file at the same path the archive will deliver, plus a
+    // sibling the merge must leave alone.
+    const victim = try std.fs.path.join(alloc, &.{ target_d, "file" });
+    defer alloc.free(victim);
+    {
+        var f = try std.Io.Dir.createFileAbsolute(p.currentIo(), victim, .{});
+        try f.writeStreamingAll(p.currentIo(), "stale");
+        f.close(p.currentIo());
+    }
+    const bystander = try std.fs.path.join(alloc, &.{ target_d, "keep" });
+    defer alloc.free(bystander);
+    {
+        var f = try std.Io.Dir.createFileAbsolute(p.currentIo(), bystander, .{});
+        try f.writeStreamingAll(p.currentIo(), "keep");
+        f.close(p.currentIo());
+    }
+
+    const tar_path = try std.fs.path.join(alloc, &.{ test_env.path, "ok.tar" });
+    defer alloc.free(tar_path);
+    try th.createTestTarFile(&test_env.ctx, "d/file", tar_path);
+
+    try into(&test_env.ctx, tar_path, target);
+
+    // Overwritten with the archive's content ("test content" per the helper).
+    var f = try std.Io.Dir.openFileAbsolute(p.currentIo(), victim, .{});
+    defer f.close(p.currentIo());
+    var buf: [32]u8 = undefined;
+    const n = try f.readPositionalAll(p.currentIo(), &buf, 0);
+    try std.testing.expectEqualStrings("test content", buf[0..n]);
+
+    try std.testing.expect(p.fileExists(bystander));
 }
