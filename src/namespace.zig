@@ -38,11 +38,54 @@ const DEV_URANDOM_MINOR: u32 = 9;
 const DEV_TTY_MAJOR: u32 = 5;
 const DEV_TTY_MINOR: u32 = 0;
 
+// Where session trees live. Both forms are a single directory under a parent we
+// did not create, so exactly one directory needs the ownership and mode checks
+// in `ensurePrivateBaseDir`.
+//
+// The fallback is uid-scoped rather than a shared "/tmp/mere": a shared name in
+// a world-writable directory belongs to whichever user runs mere first, which
+// both locks every other user out and lets that user (or anyone who wins the
+// race to create it) choose where another user's session tree - including the
+// overlayfs upperdir backing /etc inside `mere shell` - is stored.
 fn buildEnvBasePath(allocator: std.mem.Allocator, xdg_runtime: ?[]const u8) ![]const u8 {
     if (xdg_runtime) |runtime| {
-        return std.fs.path.join(allocator, &.{ runtime, "mere", "env" });
+        return std.fs.path.join(allocator, &.{ runtime, "mere-env" });
     }
-    return allocator.dupe(u8, "/tmp/mere/env");
+    return std.fmt.allocPrint(allocator, "/tmp/mere-env-{d}", .{c.geteuid()});
+}
+
+// Create the session base directory owned by us and reachable only by us, or
+// refuse to use it. Anything already at that path that is a symlink, is owned
+// by someone else, or grants group/other access is treated as hostile rather
+// than reused.
+fn ensurePrivateBaseDir(base: []const u8) EnvError!void {
+    const base_c = toCString(base) catch return EnvError.OutOfMemory;
+    defer std.heap.page_allocator.free(base_c);
+
+    if (c.mkdir(base_c.ptr, 0o700) != 0 and std.c._errno().* != c.EEXIST) {
+        return EnvError.SessionSetupError;
+    }
+
+    // AT_SYMLINK_NOFOLLOW: a symlink planted at this path must be rejected,
+    // not followed. (Zig does not expose stat/lstat on Linux; statx is the
+    // supported route.)
+    var stx: std.os.linux.Statx = undefined;
+    const want: std.os.linux.STATX = .{ .TYPE = true, .MODE = true, .UID = true };
+    const rc = std.os.linux.statx(
+        std.posix.AT.FDCWD,
+        base_c.ptr,
+        @bitCast(@as(u32, std.posix.AT.SYMLINK_NOFOLLOW)),
+        want,
+        &stx,
+    );
+    if (std.posix.errno(rc) != .SUCCESS) return EnvError.SessionSetupError;
+    // Support varies by filesystem, so confirm the kernel actually filled the
+    // fields we are about to make a trust decision on.
+    if (!stx.mask.TYPE or !stx.mask.MODE or !stx.mask.UID) return EnvError.SessionSetupError;
+
+    if (stx.mode & std.os.linux.S.IFMT != std.os.linux.S.IFDIR) return EnvError.SessionSetupError;
+    if (stx.uid != c.geteuid()) return EnvError.SessionSetupError;
+    if (stx.mode & 0o077 != 0) return EnvError.SessionSetupError;
 }
 
 pub const EnvMode = enum {
@@ -490,6 +533,11 @@ fn generateSessionId() [32]u8 {
 
 fn createSessionAtBase(allocator: std.mem.Allocator, mode: EnvMode, env_base: []const u8) EnvError!SessionInfo {
     const io = path_mod.currentIo();
+
+    // Validate the base before deriving anything under it, so a hostile or
+    // wrongly-owned base is rejected rather than populated.
+    try ensurePrivateBaseDir(env_base);
+
     const id = generateSessionId();
 
     const base_path = std.fmt.allocPrint(allocator, "{s}/{s}/", .{ env_base, id }) catch {
@@ -1437,7 +1485,7 @@ test "buildEnvBasePath uses explicit XDG runtime dir when provided" {
     const path = try buildEnvBasePath(allocator, "/tmp/xdg-runtime");
     defer allocator.free(path);
 
-    try std.testing.expectEqualStrings("/tmp/xdg-runtime/mere/env", path);
+    try std.testing.expectEqualStrings("/tmp/xdg-runtime/mere-env", path);
 }
 
 test "buildEnvBasePath falls back to /tmp when XDG runtime dir is missing" {
@@ -1446,7 +1494,11 @@ test "buildEnvBasePath falls back to /tmp when XDG runtime dir is missing" {
     const path = try buildEnvBasePath(allocator, null);
     defer allocator.free(path);
 
-    try std.testing.expectEqualStrings("/tmp/mere/env", path);
+    // uid-scoped so the fallback in world-writable /tmp cannot be claimed by
+    // whichever user happens to run mere first.
+    const expected = try std.fmt.allocPrint(allocator, "/tmp/mere-env-{d}", .{c.geteuid()});
+    defer allocator.free(expected);
+    try std.testing.expectEqualStrings(expected, path);
 }
 
 test "createSessionAtBase creates a session under the requested base" {
@@ -1456,7 +1508,7 @@ test "createSessionAtBase creates a session under the requested base" {
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const tmp_path_len = try tmp_dir.dir.realPath(path_mod.currentIo(), &path_buf);
     const tmp_path = path_buf[0..tmp_path_len];
-    const base = try std.fs.path.join(std.testing.allocator, &.{ tmp_path, "mere", "env" });
+    const base = try std.fs.path.join(std.testing.allocator, &.{ tmp_path, "mere-env" });
     defer std.testing.allocator.free(base);
 
     var session = try createSessionAtBase(std.testing.allocator, .shell, base);
@@ -1507,3 +1559,88 @@ test "waitForExitStatus decodes a normal exit code" {
     try std.testing.expectEqual(@as(u8, 128), decodeWaitStatus(9));
 }
 
+// Regression: the session base used to be a shared "/tmp/mere/env" created
+// with default 0755 permissions. In a world-writable directory that means the
+// first user to run mere owns the tree and every other user is locked out, and
+// whoever creates it first chooses where other users' session trees live -
+// including the overlayfs upperdir that backs /etc inside `mere shell`.
+test "ensurePrivateBaseDir creates the base owner-only" {
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const tmp_len = try tmp_dir.dir.realPath(path_mod.currentIo(), &buf);
+    const base = try std.fs.path.join(std.testing.allocator, &.{ buf[0..tmp_len], "mere-env" });
+    defer std.testing.allocator.free(base);
+
+    try ensurePrivateBaseDir(base);
+
+    var dir = try path_mod.openExistingDir(base);
+    defer dir.close(path_mod.currentIo());
+    const stat = try dir.stat(path_mod.currentIo());
+    try std.testing.expectEqual(@as(u32, 0o700), stat.permissions.toMode() & 0o777);
+
+    // Idempotent: a second call on our own correctly-moded directory succeeds.
+    try ensurePrivateBaseDir(base);
+}
+
+test "ensurePrivateBaseDir rejects a group- or world-accessible base" {
+    if (std.os.linux.geteuid() == 0) return error.SkipZigTest;
+
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const tmp_len = try tmp_dir.dir.realPath(path_mod.currentIo(), &buf);
+    const base = try std.fs.path.join(std.testing.allocator, &.{ buf[0..tmp_len], "loose" });
+    defer std.testing.allocator.free(base);
+
+    try tmp_dir.dir.createDirPath(path_mod.currentIo(), "loose");
+    var loose = try tmp_dir.dir.openDir(path_mod.currentIo(), "loose", .{ .iterate = true });
+    defer loose.close(path_mod.currentIo());
+    try loose.setPermissions(path_mod.currentIo(), .fromMode(0o777));
+
+    try std.testing.expectError(EnvError.SessionSetupError, ensurePrivateBaseDir(base));
+}
+
+test "ensurePrivateBaseDir rejects a symlink standing in for the base" {
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const tmp_len = try tmp_dir.dir.realPath(path_mod.currentIo(), &buf);
+    const tmp_path = buf[0..tmp_len];
+
+    const real = try std.fs.path.join(std.testing.allocator, &.{ tmp_path, "elsewhere" });
+    defer std.testing.allocator.free(real);
+    try path_mod.ensureDirExists(real);
+
+    try tmp_dir.dir.symLink(path_mod.currentIo(), real, "mere-env", .{});
+
+    const base = try std.fs.path.join(std.testing.allocator, &.{ tmp_path, "mere-env" });
+    defer std.testing.allocator.free(base);
+
+    try std.testing.expectError(EnvError.SessionSetupError, ensurePrivateBaseDir(base));
+}
+
+test "createSessionAtBase refuses a base it does not own the permissions on" {
+    if (std.os.linux.geteuid() == 0) return error.SkipZigTest;
+
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const tmp_len = try tmp_dir.dir.realPath(path_mod.currentIo(), &buf);
+    const base = try std.fs.path.join(std.testing.allocator, &.{ buf[0..tmp_len], "shared" });
+    defer std.testing.allocator.free(base);
+
+    try tmp_dir.dir.createDirPath(path_mod.currentIo(), "shared");
+    var shared = try tmp_dir.dir.openDir(path_mod.currentIo(), "shared", .{ .iterate = true });
+    defer shared.close(path_mod.currentIo());
+    try shared.setPermissions(path_mod.currentIo(), .fromMode(0o777));
+
+    try std.testing.expectError(
+        EnvError.SessionSetupError,
+        createSessionAtBase(std.testing.allocator, .shell, base),
+    );
+}
