@@ -298,6 +298,7 @@ pub fn build(b: *std.Build) void {
         .{ .name = "store", .path = "src/store.zig" },
         .{ .name = "strip", .path = "src/strip.zig" },
         .{ .name = "path_safety", .path = "src/path_safety.zig" },
+        .{ .name = "scratch", .path = "src/scratch.zig" },
         .{ .name = "verify", .path = "src/verify.zig" },
         .{ .name = "version", .path = "src/version.zig" },
         .{ .name = "workspace_manager", .path = "src/workspace_manager.zig" },

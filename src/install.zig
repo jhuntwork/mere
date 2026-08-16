@@ -25,6 +25,7 @@ const generation = @import("generation.zig");
 const activation = @import("activation.zig");
 const service_reconcile = @import("service_reconcile.zig");
 const gcroots = @import("gcroots.zig");
+const scratch = @import("scratch.zig");
 const version_mod = @import("version.zig");
 const version_constraint = @import("version_constraint.zig");
 const ui = mere.ui;
@@ -1822,9 +1823,12 @@ fn installSinglePackageToStore(
         };
     }
 
-    const staging = try stageAndValidatePayload(ctx, pkg, cache_path, preverify.manifest_content_hash, preverify.parsed.format);
+    var staging = try stageAndValidatePayload(ctx, pkg, cache_path, preverify.manifest_content_hash, preverify.parsed.format);
     errdefer path.deleteTreeAbsolute(staging.staging_dir) catch {};
     defer ctx.allocator.free(staging.staging_dir);
+    // Held across the rename below, so a concurrent sweep cannot mistake
+    // in-flight staging for debris.
+    defer staging.claim.releaseAndRemove();
 
     if (staging.content_exists and !reinstall) {
         ctx.debug("content already exists in store: {s}", .{staging.install_dir});
@@ -1977,6 +1981,9 @@ const StagingResult = struct {
     content_hash: []const u8,
     install_dir: []const u8,
     content_exists: bool,
+    /// Held until the caller has renamed the staging directory into the store
+    /// or deleted it (spec §4.3).
+    claim: scratch.Claim,
 };
 
 fn mapInstallFsError(err: anyerror) anyerror {
@@ -2138,6 +2145,15 @@ fn stageAndValidatePayload(
     };
     errdefer path.deleteTreeAbsolute(staging_dir) catch {};
 
+    // Claim it (spec §4.3) so that if this process dies before admission, the
+    // half-extracted tree is reclaimable instead of sitting in .incoming/
+    // forever. Not inheritable: nothing here execs, and the claim is dropped by
+    // the caller once the directory has been renamed away or removed.
+    var staging_claim = scratch.claim(ctx.allocator, staging_dir, false) catch |err| {
+        return ctx.fail(mapInstallFsError(err), staging_dir, "failed to claim staging directory");
+    };
+    errdefer staging_claim.releaseAndRemove();
+
     // === Step 3: Extract payload and validate ===
     extract.intoPreservingSpecialBits(ctx, cache_path, staging_dir) catch |err| {
         return ctx.fail(err, cache_path, "failed to extract package to staging directory");
@@ -2236,6 +2252,7 @@ fn stageAndValidatePayload(
         .content_hash = content_hash,
         .install_dir = install_dir,
         .content_exists = content_exists,
+        .claim = staging_claim,
     };
 }
 

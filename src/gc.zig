@@ -16,6 +16,7 @@
 const std = @import("std");
 const generation = @import("generation.zig");
 const gcroots = @import("gcroots.zig");
+const scratch = @import("scratch.zig");
 const mere = @import("mere.zig");
 const errors = @import("errors.zig");
 const package_mod = @import("package.zig");
@@ -42,6 +43,9 @@ fn mapGcFsError(err: anyerror) GCError {
 /// Result of a GC operation
 pub const GCResult = struct {
     deleted_paths: std.ArrayList([]const u8),
+    /// Abandoned store staging directories reclaimed under spec §4.3. Counted
+    /// rather than listed: their names are random and mean nothing to a reader.
+    reclaimed_staging: usize = 0,
 
     allocator: std.mem.Allocator,
 
@@ -175,7 +179,10 @@ fn collectGarbageAtPathsWithPackagePool(
             // Only consider directories (don't follow symlinks)
             if (e.kind != .directory) continue;
 
-            // Skip the .incoming staging directory (used during package installation)
+            // .incoming holds staging directories, not store objects, so it is
+            // never a deletion candidate here. It is swept separately below -
+            // it used to be skipped outright, which meant a process killed
+            // mid-install leaked its staging tree permanently.
             if (std.mem.eql(u8, e.name, ".incoming")) continue;
 
             // Build full store path
@@ -207,6 +214,24 @@ fn collectGarbageAtPathsWithPackagePool(
                     }
                 };
             }
+        }
+    }
+
+    // Step 5 (spec §12): reclaim staging directories whose owner is gone.
+    // Live staging keeps its claim, so this cannot disturb an install that is
+    // in flight - including one belonging to another user.
+    if (!options.dry_run) {
+        const incoming_dir = std.fs.path.join(allocator, &.{ store_dir, ".incoming" }) catch {
+            return ctx.fail(GCError.OutOfMemory, store_dir, "out of memory building incoming path");
+        };
+        defer allocator.free(incoming_dir);
+        const swept = scratch.sweep(allocator, incoming_dir, scratch.DEFAULT_GRACE_SECONDS);
+        result.reclaimed_staging = swept.reclaimed;
+        if (swept.reclaimed > 0) {
+            ctx.debug("reclaimed {d} abandoned staging director{s}", .{
+                swept.reclaimed,
+                if (swept.reclaimed == 1) @as([]const u8, "y") else "ies",
+            });
         }
     }
 

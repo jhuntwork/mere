@@ -56,6 +56,7 @@ test {
     _ = @import("store.zig");
     _ = @import("strip.zig");
     _ = @import("path_safety.zig");
+    _ = @import("scratch.zig");
     _ = @import("verify.zig");
     _ = @import("version.zig");
     _ = @import("workspace_manager.zig");

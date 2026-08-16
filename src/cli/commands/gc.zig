@@ -74,6 +74,19 @@ pub fn handleGC(ctx: *mere.Context, args: *const types.ParsedArgs) MereError!typ
     };
     defer result.deinit();
 
+    // Reported separately from deleted store paths: reclaimed staging is debris
+    // from interrupted installs, not an object anyone chose to keep, and its
+    // random name would mean nothing to the reader.
+    if (result.reclaimed_staging > 0) {
+        var buf: [96]u8 = undefined;
+        const text = std.fmt.bufPrint(
+            &buf,
+            "reclaimed {d} abandoned staging director{s}",
+            .{ result.reclaimed_staging, if (result.reclaimed_staging == 1) @as([]const u8, "y") else "ies" },
+        ) catch "reclaimed abandoned staging directories";
+        emit.logLineSeverity(ctx, .gc, .info, text);
+    }
+
     if (result.deleted_paths.items.len == 0) {
         if (dry_run) {
             emit.logLineSeverity(ctx, .gc, .info, "nothing to delete.");

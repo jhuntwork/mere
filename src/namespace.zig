@@ -1,6 +1,7 @@
 const std = @import("std");
 const errors = @import("errors.zig");
 const path_mod = @import("path.zig");
+const scratch = @import("scratch.zig");
 const posix = std.posix;
 
 const c = @cImport({
@@ -175,8 +176,14 @@ const SessionInfo = struct {
     root_path: []const u8,
     mode: EnvMode,
     allocator: std.mem.Allocator,
+    /// Liveness claim on the session tree (spec §4.3). On the success path we
+    /// never get here: execve replaces us and the inherited lock is released by
+    /// the kernel when the command exits. On an error path, dropping the claim
+    /// is what makes the half-built tree reclaimable by the next sweep.
+    claim: scratch.Claim,
 
     pub fn deinit(self: *SessionInfo) void {
+        self.claim.release();
         self.allocator.free(self.base_path);
         self.allocator.free(self.root_path);
     }
@@ -538,6 +545,16 @@ fn createSessionAtBase(allocator: std.mem.Allocator, mode: EnvMode, env_base: []
     // wrongly-owned base is rejected rather than populated.
     try ensurePrivateBaseDir(env_base);
 
+    // Reclaim sessions whose owner is gone (spec §4.3). Doing it here keeps the
+    // base self-limiting without a separate command: every new session pays a
+    // bounded sweep instead of the tree growing once per shell or build for the
+    // life of the machine. Opportunistic - a failure here must not stop us
+    // creating this session.
+    const swept = scratch.sweep(allocator, env_base, scratch.DEFAULT_GRACE_SECONDS);
+    if (swept.reclaimed > 0) {
+        std.log.debug("reclaimed {d} abandoned namespace session(s)", .{swept.reclaimed});
+    }
+
     const id = generateSessionId();
 
     const base_path = std.fmt.allocPrint(allocator, "{s}/{s}/", .{ env_base, id }) catch {
@@ -562,6 +579,16 @@ fn createSessionAtBase(allocator: std.mem.Allocator, mode: EnvMode, env_base: []
             return EnvError.SessionSetupError;
         };
     }
+
+    // Claim the session (spec §4.3). Inheritable, because the session stays in
+    // use for as long as the shell or build command runs and that command
+    // replaces us via execve - the kernel drops the lock when it exits, which
+    // is exactly when the tree becomes garbage.
+    const session_dir = base_path[0 .. base_path.len - 1]; // drop trailing '/'
+    var session_claim = scratch.claim(allocator, session_dir, true) catch {
+        return EnvError.SessionSetupError;
+    };
+    errdefer session_claim.releaseAndRemove();
 
     if (mode == .shell) {
         const etc_upper = std.fmt.allocPrint(allocator, "{s}etc-upper", .{base_path}) catch {
@@ -591,6 +618,7 @@ fn createSessionAtBase(allocator: std.mem.Allocator, mode: EnvMode, env_base: []
         .root_path = root_path,
         .mode = mode,
         .allocator = allocator,
+        .claim = session_claim,
     };
 }
 
@@ -1263,6 +1291,8 @@ test "SessionInfo deinit frees memory" {
         .root_path = try allocator.dupe(u8, "/tmp/mere/env/test/root/"),
         .mode = .shell,
         .allocator = allocator,
+        // fd -1 is the released state, so deinit is a no-op on the claim.
+        .claim = .{ .fd = -1, .lock_path = &.{}, .allocator = allocator },
     };
 
     session.deinit();
