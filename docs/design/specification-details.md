@@ -62,6 +62,34 @@ One deliberate exception to "state is inspectable via filesystem": scratch owner
 
 ---
 
+## Format Versions and Compatibility
+
+Mere persists a number of formats, several of which are signed or content-addressed and therefore cannot be reinterpreted after the fact. This section records what exists, which variants are still written, and which are accepted only for reading, so that the cost of supporting each is visible in one place rather than distributed across fallback branches.
+
+| Format | Location | Discriminator | Written | Accepted |
+| --- | --- | --- | --- | --- |
+| Store content hash (§1) | store path name | variant is implied, not recorded | v2 | v1, transitional, v2 |
+| Package manifest (§17) | `.mere/manifest.v1`, `.mere/manifest.v2` | `schema_version` field and filename | v2 | v1, v2 |
+| Manifest signature (§5) | `.mere/manifest.vN.sig` | **none** | raw Ed25519 | raw Ed25519 |
+| Key file | `*.pub`, `*.key` | `MEREKEY` magic, version and algorithm bytes | v1 / Ed25519 | v1 / Ed25519 |
+| Generation manifest (§6) | `<generation>/` | `schema_version` field | 2 | 2 only |
+| Realization manifest | named profile `root/` | `schema_version` field | 1 | 1 only |
+| Repository database (§9.4) | `repo.db` | `schema_version` table | 1 | 1 |
+| Projection index | `.mere/projection.v1` | filename | v1 | v1 |
+| GC roots layout (§12) | `/mere/gc-roots/` | **none** | current | current |
+| System layout (§22) | `/mere/` | **none** | current | current |
+
+Requirements:
+
+- A persisted format SHOULD carry an explicit version discriminator. Two do not: manifest signatures are a bare Ed25519 signature with no header, and the directory layouts are structural. A signature file therefore cannot express a different algorithm, even though the key file it verifies against records one.
+- A reader MUST reject a version it does not recognize rather than attempt to interpret it. Generation and realization manifests do this strictly, accepting only the current schema; a store object or package manifest is instead tried against each accepted variant.
+- A variant that is no longer written MUST be recorded here as read-only, together with what produced it. The store hash has two such variants: v1 predates metadata-aware identity, and the transitional variant exists only for packages built by the released but unversioned metadata-aware implementation.
+- Accepting a variant is a standing cost. Every accepted store-hash variant is a fallback that each verification path must carry, and dropping one invalidates store objects on existing systems. Adding or removing acceptance is therefore a deliberate release decision, not an implementation detail.
+
+**Normative invariant**: A content-addressed or signed artifact MUST NOT change meaning under a fixed discriminator. Changing what a hash covers, or what a signature is computed over, requires a new variant rather than a redefinition of the existing one.
+
+---
+
 ## Store and Content Hashing
 
 ### 1. Store Hash Byte-Level Format
