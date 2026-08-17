@@ -45,10 +45,10 @@ Grab the latest release for your architecture:
 
 ```sh
 # x86_64
-curl -Lo mere https://github.com/jhuntwork/mere/releases/download/v0.18.6/mere-0.18.6-linux-x86_64
+curl -Lo mere https://github.com/jhuntwork/mere/releases/download/v0.19.0/mere-0.19.0-linux-x86_64
 
 # aarch64
-curl -Lo mere https://github.com/jhuntwork/mere/releases/download/v0.18.6/mere-0.18.6-linux-aarch64
+curl -Lo mere https://github.com/jhuntwork/mere/releases/download/v0.19.0/mere-0.19.0-linux-aarch64
 
 sudo install -m 755 mere /usr/local/bin/
 ```
