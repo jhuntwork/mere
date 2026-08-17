@@ -1361,6 +1361,7 @@ fn prepareEnvironment(state: *BuildExecutionState, parsed_recipe: *const recipe.
         .sources_dir = workspace.sources_dir,
         .build_dir = src_dir,
         .destdir = workspace.destdir,
+        .tmp_dir = workspace.tmp_dir,
         .recipe_env = parsed_recipe.env.items,
     }) catch |err| {
         return ctx.fail(if (err == error.OutOfMemory) BuildError.OutOfMemory else BuildError.FileSystem, workspace.recipe_root, "failed to build host environment");
@@ -3501,6 +3502,7 @@ test "emitSplitStagingReport logs conflicts and unassigned files" {
         .src_dir = try test_env.ctx.allocator.dupe(u8, workspace_root),
         .destdir = try test_env.ctx.allocator.dupe(u8, workspace_destdir),
         .profile_dir = try test_env.ctx.allocator.dupe(u8, workspace_root),
+        .tmp_dir = try test_env.ctx.allocator.dupe(u8, workspace_root),
         .allocator = test_env.ctx.allocator,
     };
     defer workspace.deinit();
@@ -3721,6 +3723,7 @@ test "restoreOrStageSplitPackages does not cache a partial result under Continue
         .src_dir = try std.fs.path.join(test_env.ctx.allocator, &.{ workspace_root, "src" }),
         .destdir = destdir,
         .profile_dir = try std.fs.path.join(test_env.ctx.allocator, &.{ workspace_root, "profile" }),
+        .tmp_dir = try std.fs.path.join(test_env.ctx.allocator, &.{ workspace_root, "tmp" }),
         .allocator = test_env.ctx.allocator,
     };
     defer workspace.deinit();

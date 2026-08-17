@@ -38,6 +38,10 @@ pub const Workspace = struct {
     src_dir: []const u8,
     destdir: []const u8,
     profile_dir: []const u8,
+    /// Backs TMPDIR for the build. On disk with the rest of the workspace,
+    /// because /tmp inside the namespace is a bounded tmpfs and a large build's
+    /// temporaries do not belong in RAM.
+    tmp_dir: []const u8,
     allocator: std.mem.Allocator,
 
     pub fn deinit(self: *const Workspace) void {
@@ -46,6 +50,7 @@ pub const Workspace = struct {
         self.allocator.free(self.src_dir);
         self.allocator.free(self.destdir);
         self.allocator.free(self.profile_dir);
+        self.allocator.free(self.tmp_dir);
     }
 };
 
@@ -99,6 +104,8 @@ pub const WorkspaceManager = struct {
         errdefer allocator.free(destdir);
         const profile_dir = try std.fs.path.join(allocator, &.{ recipe_root, "profile" });
         errdefer allocator.free(profile_dir);
+        const tmp_dir = try std.fs.path.join(allocator, &.{ recipe_root, "tmp" });
+        errdefer allocator.free(tmp_dir);
 
         const root_dirs = [_][]const u8{
             recipe_root,
@@ -106,6 +113,7 @@ pub const WorkspaceManager = struct {
             src_dir,
             destdir,
             profile_dir,
+            tmp_dir,
         };
         for (root_dirs) |dir_path| {
             path.ensureDirExists(dir_path) catch {
@@ -138,6 +146,7 @@ pub const WorkspaceManager = struct {
             .src_dir = src_dir,
             .destdir = destdir,
             .profile_dir = profile_dir,
+            .tmp_dir = tmp_dir,
             .allocator = allocator,
         };
     }
@@ -270,6 +279,9 @@ test "WorkspaceManager creates directories with Recipe integration" {
     try expectDirExists(workspace.sources_dir);
     try expectDirExists(workspace.src_dir);
     try expectDirExists(workspace.destdir);
+    // Backs TMPDIR, so it has to exist before the build starts rather than
+    // being created on demand by whatever writes there first.
+    try expectDirExists(workspace.tmp_dir);
 
     // Test that package directories were created
     const pkg_root = try std.fs.path.join(test_env.ctx.allocator, &.{ workspace.recipe_root, "pkg" });

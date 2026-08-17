@@ -1392,6 +1392,7 @@ ${root}/mere/dev/build/<name>-<version>-<release>-<uuid>/
 ├── sources/          # MERE_SOURCES_DIR - downloaded/copied source artifacts
 ├── dest/             # MERE_DESTDIR / DESTDIR - install destination root
 ├── profile/          # Build dependency environment (symlinks into store)
+├── tmp/              # TMPDIR - disk-backed scratch for the build
 ├── build.log
 └── build-report.kdl
 ```
@@ -1442,6 +1443,11 @@ Inside the chrooted environment:
 - `MERE_DESTDIR` MUST be `/work/dest`
 - `DESTDIR` MUST be set to `${MERE_DESTDIR}`
 - `PREFIX` MUST be set to `/usr`
+- `TMPDIR` MUST be `/work/tmp`
+
+`TMPDIR` MUST point inside the workspace rather than being left unset. `/tmp` in the synthetic root is a bounded tmpfs (§14.1.5), so an unset `TMPDIR` sends every default-located temporary file into memory; compiling or linking a large package exhausts it and fails with `ENOSPC`. Routing temporaries to the workspace puts them on the same disk as the rest of the build and keeps them inspectable afterwards, alongside the other host-visible build artifacts.
+
+A recipe MAY override `TMPDIR` through its own environment settings. Tools that ignore `TMPDIR` and hardcode `/tmp` remain subject to the tmpfs limit.
 
 The build runner ensures that `/work` in the chroot resolves to the host-visible workspace directory.
 

@@ -7,6 +7,7 @@ pub const BuildEnvironmentConfig = struct {
     sources_dir: []const u8,
     build_dir: []const u8,
     destdir: []const u8,
+    tmp_dir: []const u8,
     recipe_env: []const recipe.KV = &.{},
 };
 
@@ -23,6 +24,12 @@ pub fn createHostBuildEnv(ctx: *mere.Context, config: BuildEnvironmentConfig) !s
     try setVar(ctx, &env, "MERE_SOURCES_DIR", config.sources_dir);
     try setVar(ctx, &env, "MERE_DESTDIR", config.destdir);
     try setVar(ctx, &env, "DESTDIR", config.destdir);
+    // Without TMPDIR, anything using the default temp location writes to /tmp,
+    // which inside the namespace is a 1G tmpfs - i.e. RAM. Linking or LTO on a
+    // large package blows through that and fails with ENOSPC. Point it at the
+    // workspace so temporaries land on disk, and so they survive as a debugging
+    // artifact next to the rest of the build.
+    try setVar(ctx, &env, "TMPDIR", config.tmp_dir);
     try setBuildAppDataDirs(ctx, &env, config.build_dir);
 
     try applyEnvOverrides(ctx, &env, config.recipe_env);
@@ -97,6 +104,7 @@ test "createHostBuildEnv sets deterministic base variables" {
         .sources_dir = "/tmp/sources",
         .build_dir = "/tmp/build-src",
         .destdir = "/tmp/dest",
+        .tmp_dir = "/tmp/tmp",
     });
     defer env.deinit();
 
@@ -130,6 +138,7 @@ test "createHostBuildEnv applies recipe env over defaults" {
         .sources_dir = "/tmp/sources",
         .build_dir = "/tmp/build-src",
         .destdir = "/tmp/dest",
+        .tmp_dir = "/tmp/tmp",
         .recipe_env = &vars,
     });
     defer env.deinit();
@@ -155,6 +164,7 @@ test "createPhaseHostEnv overlays phase env without mutating base env" {
         .sources_dir = "/tmp/sources",
         .build_dir = "/tmp/build-src",
         .destdir = "/tmp/dest",
+        .tmp_dir = "/tmp/tmp",
         .recipe_env = &recipe_vars,
     });
     defer base_env.deinit();
@@ -171,4 +181,48 @@ test "createPhaseHostEnv overlays phase env without mutating base env" {
     try std.testing.expect(phase_env.get("PHASE_ONLY") != null);
     try std.testing.expectEqualStrings("-O0 -g", phase_env.get("CFLAGS").?);
     try std.testing.expectEqualStrings("clang", phase_env.get("CC").?);
+}
+
+// Regression: TMPDIR was never set, so anything using the default temp location
+// wrote to /tmp - which inside the build namespace is a 1G tmpfs, i.e. RAM.
+// Linking or LTO on a large package exhausts that and fails with ENOSPC, so
+// temporaries have to land on the workspace's disk-backed tmp/ instead.
+test "createHostBuildEnv points TMPDIR at the workspace, not the tmpfs /tmp" {
+    const th = @import("../test_helpers.zig");
+    var test_env = try th.createTestEnv();
+    defer {
+        test_env.cleanup();
+        std.testing.allocator.destroy(test_env);
+    }
+
+    var env = try createHostBuildEnv(&test_env.ctx, .{
+        .sources_dir = "/ws/sources",
+        .build_dir = "/ws/build-src",
+        .destdir = "/ws/dest",
+        .tmp_dir = "/ws/tmp",
+    });
+    defer env.deinit();
+
+    try std.testing.expectEqualStrings("/ws/tmp", env.get("TMPDIR").?);
+}
+
+test "a recipe can still override TMPDIR" {
+    const th = @import("../test_helpers.zig");
+    var test_env = try th.createTestEnv();
+    defer {
+        test_env.cleanup();
+        std.testing.allocator.destroy(test_env);
+    }
+
+    const vars = [_]recipe.KV{.{ .key = "TMPDIR", .value = "/ws/build-src/mytmp" }};
+    var env = try createHostBuildEnv(&test_env.ctx, .{
+        .sources_dir = "/ws/sources",
+        .build_dir = "/ws/build-src",
+        .destdir = "/ws/dest",
+        .tmp_dir = "/ws/tmp",
+        .recipe_env = &vars,
+    });
+    defer env.deinit();
+
+    try std.testing.expectEqualStrings("/ws/build-src/mytmp", env.get("TMPDIR").?);
 }
