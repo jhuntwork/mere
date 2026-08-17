@@ -34,13 +34,28 @@ Mere is driven by people at a terminal, by scripts, by CI, and by automated call
 
 Because a consumer may not remember its own past and may not be the only one running, an invocation SHOULD depend only on its arguments and on state it can observe. Behaviour that varies with ambient context — the working directory, elapsed time since some earlier action, what a previous invocation happened to leave behind — makes the same command mean different things on different runs for reasons not visible in the command. Where such conveniences exist for interactive use, they SHOULD be resolvable to an explicit form.
 
+### Self-description
+
+`mere describe` writes a machine-readable description of the command surface to stdout, so a consumer can learn the interface at runtime instead of being told about it out of band. It reports the program name, the running version, global flags, and the command tree with each command's group, positional arguments, and flags — including each flag's type, short form, value name, default, and whether it is required.
+
+The output is JSON. Mere reads KDL but has no KDL writer, and this document exists to be parsed by other tools rather than edited by hand.
+
+Requirements on the output:
+
+- It MUST carry a `schema_version`. Additive fields do not change it; a change that would break a consumer parsing the document MUST bump it.
+- Ordering MUST be deterministic, not hash order. Two runs of the same binary MUST produce byte-identical output, so a consumer diffing it sees only real changes.
+- Hidden commands MUST be omitted, matching `--help`.
+- `describe` MUST describe itself. It is an ordinary registered command rather than a specially intercepted one, so it appears in `--help` and in its own output; a self-description facility that cannot be discovered is of little use.
+
+The description covers the command surface only. Schemas for on-disk artifacts — manifests, profile state, repository databases — are specified in this document and are not yet emitted in machine-readable form.
+
 ### Current conformance
 
 This contract is a design commitment, and Mere does not yet meet all of it. Known gaps, recorded here so they are not mistaken for intent:
 
 - **Ambient state.** `mere shell` resolves a profile from the working directory (§15.12), and repository sync is skipped on a TTL, so `mere install` may resolve against different metadata depending only on elapsed time. Neither is expressible as an explicit argument.
 - **Concurrency granularity.** All mutating operations serialize on one exclusive lock per root. This is correct but coarse: unrelated work blocks, and there is no way to express "apply only if the profile is still at generation N".
-- **Self-description.** The command surface, its flags, and the schemas of on-disk artifacts are documented here but not machine-readable, so a consumer must be told about them out of band.
+- **Self-description.** The command surface is machine-readable via `mere describe`. The schemas of on-disk artifacts are not, so a consumer parsing a manifest or profile state must still be told their shape out of band.
 - **No record of action.** Mere keeps no account of what it did, so a consumer cannot reconstruct its own prior operations, and an operator cannot audit another consumer's.
 
 One deliberate exception to "state is inspectable via filesystem": scratch ownership (§4.3) is an `flock` held on a directory, which is process state rather than on-disk state and is therefore not visible to `ls`. This is accepted because the alternative — a marker file — either enters a store object's payload and changes its identity, or becomes debris needing its own reclamation. Liveness is a property of a running process, and encoding it on disk misrepresents it.
