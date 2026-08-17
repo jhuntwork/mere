@@ -5,6 +5,48 @@ These are authoritative implementation details for specific subsystems.
 
 ---
 
+## Consumers and the Interface Contract
+
+The sections below specify subsystems. This one states what any consumer of Mere may rely on, so that those sections can be read as consequences of a stated model rather than as independent choices.
+
+Mere is driven by people at a terminal, by scripts, by CI, and by automated callers including AI agents. These differ in ways that matter to the interface, and the differences are properties rather than categories — a shell script in a CI job and an agent share most of them, and a human running the same command twice a year shares more of them than one might expect.
+
+**A consumer may have no continuity of memory.** It may arrive knowing nothing of prior invocations, or holding a lossy summary of them. Therefore:
+
+- Current state MUST be discoverable by reading the filesystem, without being told what was true previously. This is what "filesystem as truth" buys, and it is the property most worth protecting.
+- Identifiers that a consumer may record and later act on MUST remain valid when read back. Content hashes and generation numbers qualify; phrases resolved at use time, such as "the current generation" or "the latest version", do not, and MUST NOT be the only way to name a thing.
+- Operations SHOULD be safe to repeat. A consumer that cannot tell whether its previous call took effect will call again.
+
+**Concurrency is normal.** Several consumers may operate against one root at the same time, and one of them may be blocked on something slow and external while holding whatever it holds. Therefore:
+
+- A mutating operation MUST either serialize correctly or fail cleanly. It MUST NOT corrupt state under contention, and it MUST NOT depend on being the only operation running.
+- Contention MUST be reported rather than silently waited out forever or resolved by force.
+- An operation that acts on a state it observed earlier SHOULD be expressible as "apply only if the state is still what I saw", so a loser can re-derive instead of clobbering.
+
+**Abandonment is expected, not exceptional.** Consumers are interrupted, killed, cancelled, and timed out as a matter of course. Therefore in-flight work MUST have a discoverable owner and MUST be reclaimable once that owner is gone — specified for scratch directories in §4.3.
+
+**A consumer's authority is bounded, and its inputs are not trusted.** Every consumer acts partly on text it has read: package names and descriptions, recipe contents, build output, search results. That text is authored elsewhere and may be hostile, and this is true of a shell script parsing output as much as of a model reading it. Therefore:
+
+- What a consumer is permitted to do MUST NOT be derivable from what it has read. Authority comes from where it runs and as whom — the root prefix in use, file ownership, privilege — never from what the operation asks for.
+- Verification MUST NOT be satisfiable by the artifact being verified. Trust is anchored in configured fingerprints and local keys (§9.2, §9.10), and a package cannot nominate the key that admits it.
+
+### Same input, same effect
+
+Because a consumer may not remember its own past and may not be the only one running, an invocation SHOULD depend only on its arguments and on state it can observe. Behaviour that varies with ambient context — the working directory, elapsed time since some earlier action, what a previous invocation happened to leave behind — makes the same command mean different things on different runs for reasons not visible in the command. Where such conveniences exist for interactive use, they SHOULD be resolvable to an explicit form.
+
+### Current conformance
+
+This contract is a design commitment, and Mere does not yet meet all of it. Known gaps, recorded here so they are not mistaken for intent:
+
+- **Ambient state.** `mere shell` resolves a profile from the working directory (§15.12), and repository sync is skipped on a TTL, so `mere install` may resolve against different metadata depending only on elapsed time. Neither is expressible as an explicit argument.
+- **Concurrency granularity.** All mutating operations serialize on one exclusive lock per root. This is correct but coarse: unrelated work blocks, and there is no way to express "apply only if the profile is still at generation N".
+- **Self-description.** The command surface, its flags, and the schemas of on-disk artifacts are documented here but not machine-readable, so a consumer must be told about them out of band.
+- **No record of action.** Mere keeps no account of what it did, so a consumer cannot reconstruct its own prior operations, and an operator cannot audit another consumer's.
+
+One deliberate exception to "state is inspectable via filesystem": scratch ownership (§4.3) is an `flock` held on a directory, which is process state rather than on-disk state and is therefore not visible to `ls`. This is accepted because the alternative — a marker file — either enters a store object's payload and changes its identity, or becomes debris needing its own reclamation. Liveness is a property of a running process, and encoding it on disk misrepresents it.
+
+---
+
 ## Store and Content Hashing
 
 ### 1. Store Hash Byte-Level Format
