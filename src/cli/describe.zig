@@ -24,6 +24,43 @@ const pathmod = mere.path;
 /// consumer parsing it. Additive fields do not require a bump.
 pub const SCHEMA_VERSION: u32 = 1;
 
+// This file writes fields one at a time, so a field added to Flag, Arg, or
+// CommandMeta would be silently left out of the document - the one way describe
+// can drift from the real interface, since commands and flags themselves are
+// read straight from the registered tree.
+//
+// These lists close that gap: adding a field to any of the three breaks the
+// build here until someone either emits it or records that it is internal.
+const emitted_flag_fields = [_][]const u8{
+    "name", "short", "description", "flag_type", "value_name", "value_optional", "required", "default_value",
+};
+const emitted_arg_fields = [_][]const u8{ "name", "description", "required" };
+const emitted_command_fields = [_][]const u8{ "name", "description", "args", "flags", "group" };
+// Read by describe but deliberately absent from the output: `hidden` selects
+// what to emit, and `order` only affects how help lays commands out.
+const internal_command_fields = [_][]const u8{ "hidden", "order" };
+
+comptime {
+    assertAllFieldsAccountedFor(types.Flag, &emitted_flag_fields, &.{});
+    assertAllFieldsAccountedFor(types.Arg, &emitted_arg_fields, &.{});
+    assertAllFieldsAccountedFor(command.CommandMeta, &emitted_command_fields, &internal_command_fields);
+}
+
+fn assertAllFieldsAccountedFor(
+    comptime T: type,
+    comptime emitted: []const []const u8,
+    comptime internal: []const []const u8,
+) void {
+    outer: for (std.meta.fields(T)) |field| {
+        for (emitted) |name| if (std.mem.eql(u8, field.name, name)) continue :outer;
+        for (internal) |name| if (std.mem.eql(u8, field.name, name)) continue :outer;
+        @compileError("`" ++ @typeName(T) ++ "." ++ field.name ++
+            "` is neither emitted by `mere describe` nor listed as internal. Add it to the" ++
+            " output and to `emitted_*_fields`, or to `internal_command_fields` if it should" ++
+            " not be described.");
+    }
+}
+
 /// Stated explicitly rather than inferred: writeCommand and writeSubcommands
 /// are mutually recursive, and inferred error sets cannot resolve a cycle.
 pub const DescribeError = std.Io.Writer.Error || error{ OutOfMemory, NoSpaceLeft };
