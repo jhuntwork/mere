@@ -633,6 +633,7 @@ fn packageStagedPackage(
         return switch (err) {
             error.OutOfMemory => ctx.fail(error.OutOfMemory, artifact.name, "failed to resolve package cache; out of memory"),
             error.PermissionDenied => ctx.fail(error.PermissionDenied, artifact.name, "failed to resolve package cache; permission denied on staging_dir or output_dir"),
+            error.MissingSigningKey => error.PackageCreationFailed,
             error.FileSystem => ctx.fail(error.PackageCreationFailed, artifact.name, "failed to resolve package cache; filesystem error reading staging or output directory"),
             error.InvalidInput => ctx.fail(error.PackageCreationFailed, artifact.name, "failed to resolve package cache; invalid input computing archive key"),
         };
@@ -704,6 +705,7 @@ fn packageStagedPackage(
             return switch (err) {
                 error.OutOfMemory => ctx.fail(error.OutOfMemory, artifact.name, "failed to compute package cache key"),
                 error.PermissionDenied => ctx.fail(error.PermissionDenied, artifact.name, "failed to compute package cache key"),
+                error.MissingSigningKey => error.PackageCreationFailed,
                 else => ctx.fail(error.PackageCreationFailed, artifact.name, "failed to compute package cache key"),
             };
         };
@@ -830,6 +832,7 @@ fn finalizePackageArchiveJob(
             return switch (err) {
                 error.OutOfMemory => ctx.fail(error.OutOfMemory, job.artifact.name, "failed to compute package cache key"),
                 error.PermissionDenied => ctx.fail(error.PermissionDenied, job.artifact.name, "failed to compute package cache key"),
+                error.MissingSigningKey => error.PackageCreationFailed,
                 else => ctx.fail(error.PackageCreationFailed, job.artifact.name, "failed to compute package cache key"),
             };
         };

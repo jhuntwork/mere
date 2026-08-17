@@ -24,6 +24,7 @@ pub const CacheError = error{
     OutOfMemory,
     FileSystem,
     PermissionDenied,
+    MissingSigningKey,
     InvalidInput,
 };
 
@@ -338,6 +339,7 @@ pub fn computePackageArchiveKey(
     var buf: std.ArrayList(u8) = .empty;
     defer buf.deinit(allocator);
     var out_buf: std.Io.Writer.Allocating = .fromArrayList(allocator, &buf);
+    errdefer buf = out_buf.toArrayList();
     const out = &out_buf.writer;
 
     out.writeAll("package-archive-v1\n") catch return error.OutOfMemory;
@@ -1512,9 +1514,62 @@ fn computeSigningKeyHash(ctx: *mere.Context) CacheError![]const u8 {
     };
     const owns_key_path = ctx.signing_key_path == null;
     defer if (owns_key_path) ctx.allocator.free(key_path);
+
+    std.Io.Dir.accessAbsolute(path_mod.currentIo(), key_path, .{}) catch |err| switch (err) {
+        error.FileNotFound => {
+            ctx.setDiagnosticContextFmt(
+                key_path,
+                "development signing key is missing; generate it with `mere dev key generate`",
+                .{},
+            );
+            return error.MissingSigningKey;
+        },
+        else => return mapFsError(err),
+    };
+
     return hash.calculateFileHash(ctx, key_path) catch |err| {
         return mapHashError(err);
     };
+}
+
+test "computePackageArchiveKey reports a missing signing key distinctly" {
+    var test_env = try test_helpers.createTestEnv();
+    defer {
+        test_env.cleanup();
+        std.testing.allocator.destroy(test_env);
+    }
+
+    const ctx = &test_env.ctx;
+    const key_path = try std.fs.path.join(ctx.allocator, &.{ test_env.path, ".mere", "keys", "mere.key" });
+    defer ctx.allocator.free(key_path);
+    try std.Io.Dir.deleteFileAbsolute(path_mod.currentIo(), key_path);
+
+    var parsed_recipe = try recipe.parse(ctx,
+        \\recipe {
+        \\  name "demo"
+        \\  version "1.0.0"
+        \\  release 1
+        \\}
+        \\build { script "true" }
+        \\package "demo" { files "usr/bin/*" }
+    );
+    defer parsed_recipe.deinit();
+
+    try std.testing.expectError(
+        error.MissingSigningKey,
+        computePackageArchiveKey(
+            ctx.allocator,
+            ctx,
+            &parsed_recipe,
+            &parsed_recipe.packages.items[0],
+            "staging-hash",
+            &.{},
+        ),
+    );
+
+    const diagnostic = ctx.getDiagnosticContext();
+    try std.testing.expectEqualStrings(key_path, diagnostic.subject.?);
+    try std.testing.expect(std.mem.indexOf(u8, diagnostic.details.?, "mere dev key generate") != null);
 }
 
 fn copyFileReplace(src_path: []const u8, dest_path: []const u8) CacheError!void {

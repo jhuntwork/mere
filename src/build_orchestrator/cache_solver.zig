@@ -712,7 +712,7 @@ fn restoreUnpackedSources(
 
     var restored = build_cache.restoreDirectoryForKey(allocator, ctx, .source_unpack, unpack_key, workspace_src_dir) catch |err| switch (err) {
         error.OutOfMemory, error.PermissionDenied => return err,
-        error.InvalidInput, error.FileSystem => {
+        error.InvalidInput, error.FileSystem, error.MissingSigningKey => {
             const diag = ctx.getDiagnosticContext();
             if (diag.details) |details| {
                 ctx.debug("source-unpack cache restore failed for key {s}: {s} ({s})", .{
@@ -726,7 +726,7 @@ fn restoreUnpackedSources(
 
             _ = build_cache.invalidateKey(allocator, ctx, .source_unpack, unpack_key) catch |invalidate_err| switch (invalidate_err) {
                 error.OutOfMemory, error.PermissionDenied => return invalidate_err,
-                error.InvalidInput, error.FileSystem => return invalidate_err,
+                error.InvalidInput, error.FileSystem, error.MissingSigningKey => return invalidate_err,
             };
 
             ctx.withDiagnosticContext(mere.errors.DiagnosticContext.init());
