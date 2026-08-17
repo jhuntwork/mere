@@ -16,6 +16,7 @@
 const std = @import("std");
 const generation = @import("generation.zig");
 const gcroots = @import("gcroots.zig");
+const scratch = @import("scratch.zig");
 const mere = @import("mere.zig");
 const errors = @import("errors.zig");
 const package_mod = @import("package.zig");
@@ -42,6 +43,9 @@ fn mapGcFsError(err: anyerror) GCError {
 /// Result of a GC operation
 pub const GCResult = struct {
     deleted_paths: std.ArrayList([]const u8),
+    /// Abandoned store staging directories reclaimed under spec §4.3. Counted
+    /// rather than listed: their names are random and mean nothing to a reader.
+    reclaimed_staging: usize = 0,
 
     allocator: std.mem.Allocator,
 
@@ -175,7 +179,10 @@ fn collectGarbageAtPathsWithPackagePool(
             // Only consider directories (don't follow symlinks)
             if (e.kind != .directory) continue;
 
-            // Skip the .incoming staging directory (used during package installation)
+            // .incoming holds staging directories, not store objects, so it is
+            // never a deletion candidate here. It is swept separately below -
+            // it used to be skipped outright, which meant a process killed
+            // mid-install leaked its staging tree permanently.
             if (std.mem.eql(u8, e.name, ".incoming")) continue;
 
             // Build full store path
@@ -207,6 +214,24 @@ fn collectGarbageAtPathsWithPackagePool(
                     }
                 };
             }
+        }
+    }
+
+    // Step 5 (spec §12): reclaim staging directories whose owner is gone.
+    // Live staging keeps its claim, so this cannot disturb an install that is
+    // in flight - including one belonging to another user.
+    if (!options.dry_run) {
+        const incoming_dir = std.fs.path.join(allocator, &.{ store_dir, ".incoming" }) catch {
+            return ctx.fail(GCError.OutOfMemory, store_dir, "out of memory building incoming path");
+        };
+        defer allocator.free(incoming_dir);
+        const swept = scratch.sweep(allocator, incoming_dir, scratch.DEFAULT_GRACE_SECONDS);
+        result.reclaimed_staging = swept.reclaimed;
+        if (swept.reclaimed > 0) {
+            ctx.debug("reclaimed {d} abandoned staging director{s}", .{
+                swept.reclaimed,
+                if (swept.reclaimed == 1) @as([]const u8, "y") else "ies",
+            });
         }
     }
 
@@ -728,8 +753,25 @@ fn collectFromRoot(
         // Try to resolve further
         var resolve_buf: [std.fs.max_path_bytes]u8 = undefined;
         if (std.Io.Dir.readLinkAbsolute(path_mod.currentIo(), root_target, &resolve_buf)) |resolved_len| {
-            // Recursively collect from the resolved target
-            try collectFromRoot(ctx, resolve_buf[0..resolved_len], reachable);
+            const next_target = resolve_buf[0..resolved_len];
+            // Symlink targets are usually relative - activation writes
+            // `current -> gen-N` - and must be resolved against the link's own
+            // directory before use. Recursing with the raw target reached
+            // accessAbsolute with a relative path, which asserts rather than
+            // erroring: `mere store clean` panicked instead of reporting a
+            // problem, and it does so as root.
+            var next_owned: ?[]const u8 = null;
+            defer if (next_owned) |owned| allocator.free(owned);
+            const resolved_next: []const u8 = if (std.fs.path.isAbsolute(next_target))
+                next_target
+            else blk: {
+                const base_dir = std.fs.path.dirname(root_target) orelse "/";
+                next_owned = std.fs.path.resolvePosix(allocator, &.{ base_dir, next_target }) catch {
+                    return ctx.fail(GCError.OutOfMemory, root_target, "out of memory resolving gc-root symlink target");
+                };
+                break :blk next_owned.?;
+            };
+            try collectFromRoot(ctx, resolved_next, reachable);
         } else |_| {
             // Not a symlink, that's fine
         }
@@ -1674,4 +1716,57 @@ test "collectGarbage prunes unreferenced package pool archives" {
         try std.testing.expectEqual(error.FileNotFound, err);
     };
     std.Io.Dir.accessAbsolute(path_mod.currentIo(), kept_current_path, .{}) catch return error.TestUnexpectedResult;
+}
+
+// Regression: a gc-root can chain through a symlink whose target is relative -
+// activation writes `current -> gen-N` that way - and collectFromRoot recursed
+// with the raw target. The next hop then reached accessAbsolute with a relative
+// path, which asserts instead of returning an error, so `mere store clean`
+// aborted rather than reporting anything. Triggered whenever the chained
+// generation has no readable manifest, e.g. a partially written one.
+test "collectReachable follows a gc-root through a relative symlink without aborting" {
+    const th = @import("test_helpers.zig");
+    var test_env = try th.createTestEnv();
+    defer {
+        test_env.cleanup();
+        std.testing.allocator.destroy(test_env);
+    }
+    const alloc = std.testing.allocator;
+
+    const profiles = try std.fs.path.join(alloc, &.{ test_env.path, "profiles", "system" });
+    defer alloc.free(profiles);
+    const gen_dir = try std.fs.path.join(alloc, &.{ profiles, "gen-1" });
+    defer alloc.free(gen_dir);
+    try path_mod.ensureDirExists(gen_dir);
+
+    // `current -> gen-1`, relative, exactly as activation writes it, and with
+    // no manifest inside gen-1 so the chain is actually walked.
+    {
+        var d = try path_mod.openExistingDir(profiles);
+        defer d.close(path_mod.currentIo());
+        try d.symLink(path_mod.currentIo(), "gen-1", "current", .{});
+    }
+
+    const gc_roots = try std.fs.path.join(alloc, &.{ test_env.path, "gc-roots", "profiles", "system" });
+    defer alloc.free(gc_roots);
+    try path_mod.ensureDirExists(gc_roots);
+    const current_abs = try std.fs.path.join(alloc, &.{ profiles, "current" });
+    defer alloc.free(current_abs);
+    {
+        var d = try path_mod.openExistingDir(gc_roots);
+        defer d.close(path_mod.currentIo());
+        try d.symLink(path_mod.currentIo(), current_abs, "current", .{});
+    }
+
+    const gc_roots_base = try std.fs.path.join(alloc, &.{ test_env.path, "gc-roots" });
+    defer alloc.free(gc_roots_base);
+
+    var reachable = try collectReachable(&test_env.ctx, gc_roots_base);
+    defer {
+        var it = reachable.keyIterator();
+        while (it.next()) |k| test_env.ctx.allocator.free(k.*);
+        reachable.deinit();
+    }
+    // Nothing to reach - the point is that it returns instead of aborting.
+    try std.testing.expectEqual(@as(usize, 0), reachable.count());
 }

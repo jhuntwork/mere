@@ -116,7 +116,7 @@ fn handleShell(ctx: *mere.Context, args: *const types.ParsedArgs) MereError!type
         const details: []const u8 = switch (err) {
             namespace.EnvError.UserNamespacesDisabled => "enable with: sysctl -w kernel.unprivileged_userns_clone=1",
             namespace.EnvError.OverlayFsUnavailable => "try --no-etc-overlay flag",
-            namespace.EnvError.SessionSetupError => "failed to create namespace session directories under XDG_RUNTIME_DIR or /tmp",
+            namespace.EnvError.SessionSetupError => "could not create a session directory under $XDG_RUNTIME_DIR/mere-env or /tmp/mere-env-$UID; if one already exists it must be a directory you own with no group or other access",
             namespace.EnvError.SyntheticRootSetupError => "failed to build synthetic root for the selected profile",
             namespace.EnvError.DeviceSetupError => "failed to set up /dev inside the namespace",
             namespace.EnvError.EtcSetupError => "failed to generate the namespace /etc overlay",

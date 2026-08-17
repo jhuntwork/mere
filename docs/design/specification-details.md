@@ -161,6 +161,7 @@ For unprivileged `mere install` or `mere dev build`:
 2. **Materialize into a temporary directory**:
    - Create a unique temp dir under `/mere/store/.incoming/<rand>/`
    - Using `.incoming/` ensures same-filesystem for atomic rename
+   - Claim the directory under the scratch ownership protocol (§4.3) so it is reclaimable if this process dies before admission
 
 3. **Extract payload and validate**:
    - Extract package contents to temp dir
@@ -276,6 +277,38 @@ For privileged operations, additionally verify ownership:
 **In store objects** (`/mere/store/<hash>-<name>-<version>/`):
 - `.mere/manifest.v1`
 - `.mere/manifest.v1.sig`
+
+---
+
+### 4.3 Scratch Ownership and Reclamation
+
+Several operations create directories that are meaningful only while their creating process is alive:
+
+- store staging directories under `/mere/store/.incoming/<rand>/` (§4.1 step 2)
+- namespace session trees under the session base (§14.1)
+
+Abnormal termination — a crash, `SIGKILL`, a cancelled or timed-out invocation — leaves these behind. Mere MUST treat abandonment as an expected outcome rather than an exceptional one, because a consumer that is killed mid-operation is normal, not rare: automated and agent-driven callers are routinely interrupted, and each interruption otherwise leaks a directory tree permanently. Without reclamation `.incoming` grows without bound in a world-writable directory that garbage collection never inspects.
+
+**Ownership protocol**. A process claims a scratch directory by holding an exclusive `flock(2)` on **the directory's own file descriptor**, opened `O_DIRECTORY | O_NOFOLLOW`. The claim exists only as long as that descriptor does: it is held on the open file description, so it survives `execve` and is released by the kernel when the owning process exits for any reason. Liveness therefore requires no heartbeat, timeout, or pid check, and is immune to pid reuse.
+
+The claim MUST NOT be represented by anything on disk — no lock file, no state file. A store staging directory *becomes* the store object via `rename(2)`, and its content hash is computed over exactly what it contains, so a marker inside it would enter the payload and change the object's identity; a marker beside it would be debris requiring its own reclamation. Locking the directory itself has neither problem, and the lock follows the inode across the rename that admits the object.
+
+For namespace sessions the claim is made inheritable across `execve` (`FD_CLOEXEC` cleared), because the session remains in use for as long as the shell or build command runs and that command replaces the claiming process.
+
+**Reclamation**. A process sweeping a scratch base directory MUST, for each child directory:
+
+1. Skip it unless it is owned by the sweeping user, or the sweeper is privileged. Scratch bases may be world-writable and MUST NOT become a route to deleting another user's in-flight work. Ownership MUST be determined without following symlinks.
+2. Attempt a non-blocking exclusive `flock` on the directory. Failure to acquire means the owner is live, and the directory MUST be left alone regardless of its age — a long extraction can leave a staging directory's own mtime well behind while the install is still running.
+3. Acquiring the lock means no process owns the directory. It MAY then be removed, but only once its mtime is older than a grace period. Without an on-disk marker there is nothing to distinguish "abandoned" from "created moments ago and not yet claimed", so age closes that window.
+
+Reclamation is opportunistic and MUST NOT fail the operation that triggers it: a directory that cannot be swept is left for a later sweep.
+
+**Where sweeping occurs**:
+
+- Garbage collection sweeps `/mere/store/.incoming/`. Store staging is no longer exempt from GC; only *live* staging is exempt, and liveness is determined by the lock rather than by the directory's name.
+- Namespace session creation sweeps its session base before allocating a new session, so the tree is self-limiting without a separate command.
+
+**Normative invariant**: A scratch directory whose owner is not alive is reclaimable by any process entitled to delete it. No scratch directory is permanently exempt from reclamation.
 
 ---
 
@@ -1079,6 +1112,7 @@ Algorithm:
 2. **Enumerate candidates**:
    - Scan `/mere/store/` directory
    - Each direct child directory is a candidate store object
+   - `.incoming/` is not a store object and is not a deletion candidate here; it is swept separately in step 5
    - Don't parse name/version from path; use exact path for reachability
 
 3. **Delete unreachable**:
@@ -1092,6 +1126,11 @@ Algorithm:
    - Enumerate `gen-N/` directories under `/mere/profiles/system/`
    - Determine the kept set using system retention policy (`current`, last K, `.keep`)
    - Delete any system generation directory not in the kept set
+
+5. **Reclaim abandoned store staging**:
+   - Sweep `/mere/store/.incoming/` under the scratch ownership protocol (§4.3)
+   - Live staging directories (owner lock held) are left untouched
+   - Reclaimed directories are reported alongside deleted store paths
 
 System generation pruning is therefore decoupled from activation: switches update the keep-set, and `mere store clean` is the operation that reclaims unkept system generations on disk.
 
@@ -1315,7 +1354,11 @@ All builds execute inside a **mount-namespace-isolated synthetic root** with **b
 
 `mere shell` uses the same namespace mechanism with a different mount policy: host `/home`, `/var`, `/run`, `/dev` are accessible, `/etc` uses overlayfs (with fallback to read-only bind mount), and `/mere` is read-write so `mere install` works from inside.
 
-Session directories are created under `$XDG_RUNTIME_DIR/mere/env/<session-id>/` (or `/tmp/mere/env/<id>/`) and are ephemeral — cleaned up when the mount namespace exits.
+Session directories are created under `$XDG_RUNTIME_DIR/mere-env/<session-id>/`, falling back to `/tmp/mere-env-<uid>/<session-id>/` when `XDG_RUNTIME_DIR` is unset.
+
+The session base directory (`mere-env` / `mere-env-<uid>`) MUST be a directory owned by the invoking user with no group or other access. Mere creates it mode `0700` and, if it already exists, MUST verify ownership and mode before use — refusing to proceed rather than reusing a base that is a symlink, is owned by another user, or is group/world accessible. The base is uid-scoped rather than a single shared name because it lives in a world-writable parent: a shared name belongs to whichever user creates it first, which both locks other users out and lets that user choose where another user's session tree — including the overlayfs upperdir backing `/etc` inside `mere shell` — is stored.
+
+The mounts inside a session tree are private to its mount namespace and disappear when that namespace exits. The **directories do not**: they are reclaimed under the scratch ownership protocol (§4.3), not by namespace teardown.
 
 #### 14.1.1 Build Workspace Root
 
@@ -1349,6 +1392,7 @@ ${root}/mere/dev/build/<name>-<version>-<release>-<uuid>/
 ├── sources/          # MERE_SOURCES_DIR - downloaded/copied source artifacts
 ├── dest/             # MERE_DESTDIR / DESTDIR - install destination root
 ├── profile/          # Build dependency environment (symlinks into store)
+├── tmp/              # TMPDIR - disk-backed scratch for the build
 ├── build.log
 └── build-report.kdl
 ```
@@ -1361,12 +1405,19 @@ Build execution uses the following namespace setup:
 
 1. **User namespace** (`unshare(CLONE_NEWUSER)`) with uid/gid mapping
 2. **Mount namespace** (`unshare(CLONE_NEWNS)`) to isolate all mount changes
-3. **Private mounts** (`mount(MS_REC | MS_PRIVATE)` on `/`) to prevent propagation
-4. **Synthetic root** constructed at a session-specific temporary path
-5. **Bind mounts** of profile directories (`bin`, `sbin`, `lib`, `usr`) into the synthetic root (read-only)
-6. **Bind mount** of `/mere` into the synthetic root (read-only for builds)
-7. **Bind mount** of the workspace directory to `/work` in the synthetic root
-8. **Chroot** into the synthetic root
+3. **PID namespace** (`unshare(CLONE_NEWPID)`) so the environment sees only its own processes
+4. **Private mounts** (`mount(MS_REC | MS_PRIVATE)` on `/`) to prevent propagation
+5. **Fork**, so the child is PID 1 of the new PID namespace and performs all remaining setup
+6. **Synthetic root** constructed at a session-specific temporary path
+7. **Bind mounts** of profile directories (`bin`, `sbin`, `lib`, `usr`) into the synthetic root (read-only)
+8. **Bind mount** of `/mere` into the synthetic root (read-only for builds)
+9. **Bind mount** of the workspace directory to `/work` in the synthetic root
+10. **Private procfs** mounted at `/proc` inside the synthetic root
+11. **Chroot** into the synthetic root
+
+Step 5 is required by step 10, not incidental: `unshare(CLONE_NEWPID)` moves only *children* into the new PID namespace, and mounting procfs requires the mounter to be inside the namespace the procfs will describe. The process that performs the unshare therefore cannot mount it. The forking process reaps its child and exits with the child's status, so callers observe the command's result unchanged.
+
+Because the environment's command runs as PID 1, it does not receive default-action signals sent from inside the namespace, and its exit tears down anything else still running there.
 
 #### 14.1.5 Build Mode Mounts
 
@@ -1376,8 +1427,10 @@ In build mode, the following mounts are applied:
 - tmpfs → `/var` and `/run`
 - Generated minimal `/etc` → `/etc` (bind)
 - tmpfs → `/dev` with essential device nodes (`null`, `zero`, `random`, `urandom`, `tty`)
-- proc → `/proc`
+- A **private procfs** → `/proc`, mounted `nosuid,nodev,noexec`
 - tmpfs → `/tmp`
+
+`/proc` MUST be a procfs mounted for the environment's own PID namespace. It MUST NOT be a bind mount of the host `/proc`, which places the host's entire process table — including other users' and other agents' command lines — inside the environment. If the procfs mount fails, the operation MUST fail; falling back to a host bind mount is prohibited, as it silently reintroduces the exposure.
 
 The host `/etc` is NEVER exposed to build scripts. A minimal `/etc` is generated with basic `passwd`, `group`, `hosts`, and optionally `resolv.conf`.
 
@@ -1390,6 +1443,11 @@ Inside the chrooted environment:
 - `MERE_DESTDIR` MUST be `/work/dest`
 - `DESTDIR` MUST be set to `${MERE_DESTDIR}`
 - `PREFIX` MUST be set to `/usr`
+- `TMPDIR` MUST be `/work/tmp`
+
+`TMPDIR` MUST point inside the workspace rather than being left unset. `/tmp` in the synthetic root is a bounded tmpfs (§14.1.5), so an unset `TMPDIR` sends every default-located temporary file into memory; compiling or linking a large package exhausts it and fails with `ENOSPC`. Routing temporaries to the workspace puts them on the same disk as the rest of the build and keeps them inspectable afterwards, alongside the other host-visible build artifacts.
+
+A recipe MAY override `TMPDIR` through its own environment settings. Tools that ignore `TMPDIR` and hardcode `/tmp` remain subject to the tmpfs limit.
 
 The build runner ensures that `/work` in the chroot resolves to the host-visible workspace directory.
 

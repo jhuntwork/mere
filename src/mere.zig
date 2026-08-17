@@ -17,6 +17,7 @@ pub const init = @import("init.zig");
 pub const install = @import("install.zig");
 pub const namespace = @import("namespace.zig");
 pub const path = @import("path.zig");
+pub const scratch = @import("scratch.zig");
 pub const package = @import("package.zig");
 pub const packaging = @import("packaging.zig");
 pub const pin = @import("pin.zig");

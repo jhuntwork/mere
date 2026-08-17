@@ -1,6 +1,7 @@
 const std = @import("std");
 const errors = @import("errors.zig");
 const path_mod = @import("path.zig");
+const scratch = @import("scratch.zig");
 const posix = std.posix;
 
 const c = @cImport({
@@ -38,11 +39,54 @@ const DEV_URANDOM_MINOR: u32 = 9;
 const DEV_TTY_MAJOR: u32 = 5;
 const DEV_TTY_MINOR: u32 = 0;
 
+// Where session trees live. Both forms are a single directory under a parent we
+// did not create, so exactly one directory needs the ownership and mode checks
+// in `ensurePrivateBaseDir`.
+//
+// The fallback is uid-scoped rather than a shared "/tmp/mere": a shared name in
+// a world-writable directory belongs to whichever user runs mere first, which
+// both locks every other user out and lets that user (or anyone who wins the
+// race to create it) choose where another user's session tree - including the
+// overlayfs upperdir backing /etc inside `mere shell` - is stored.
 fn buildEnvBasePath(allocator: std.mem.Allocator, xdg_runtime: ?[]const u8) ![]const u8 {
     if (xdg_runtime) |runtime| {
-        return std.fs.path.join(allocator, &.{ runtime, "mere", "env" });
+        return std.fs.path.join(allocator, &.{ runtime, "mere-env" });
     }
-    return allocator.dupe(u8, "/tmp/mere/env");
+    return std.fmt.allocPrint(allocator, "/tmp/mere-env-{d}", .{c.geteuid()});
+}
+
+// Create the session base directory owned by us and reachable only by us, or
+// refuse to use it. Anything already at that path that is a symlink, is owned
+// by someone else, or grants group/other access is treated as hostile rather
+// than reused.
+fn ensurePrivateBaseDir(base: []const u8) EnvError!void {
+    const base_c = toCString(base) catch return EnvError.OutOfMemory;
+    defer std.heap.page_allocator.free(base_c);
+
+    if (c.mkdir(base_c.ptr, 0o700) != 0 and std.c._errno().* != c.EEXIST) {
+        return EnvError.SessionSetupError;
+    }
+
+    // AT_SYMLINK_NOFOLLOW: a symlink planted at this path must be rejected,
+    // not followed. (Zig does not expose stat/lstat on Linux; statx is the
+    // supported route.)
+    var stx: std.os.linux.Statx = undefined;
+    const want: std.os.linux.STATX = .{ .TYPE = true, .MODE = true, .UID = true };
+    const rc = std.os.linux.statx(
+        std.posix.AT.FDCWD,
+        base_c.ptr,
+        @bitCast(@as(u32, std.posix.AT.SYMLINK_NOFOLLOW)),
+        want,
+        &stx,
+    );
+    if (std.posix.errno(rc) != .SUCCESS) return EnvError.SessionSetupError;
+    // Support varies by filesystem, so confirm the kernel actually filled the
+    // fields we are about to make a trust decision on.
+    if (!stx.mask.TYPE or !stx.mask.MODE or !stx.mask.UID) return EnvError.SessionSetupError;
+
+    if (stx.mode & std.os.linux.S.IFMT != std.os.linux.S.IFDIR) return EnvError.SessionSetupError;
+    if (stx.uid != c.geteuid()) return EnvError.SessionSetupError;
+    if (stx.mode & 0o077 != 0) return EnvError.SessionSetupError;
 }
 
 pub const EnvMode = enum {
@@ -132,8 +176,14 @@ const SessionInfo = struct {
     root_path: []const u8,
     mode: EnvMode,
     allocator: std.mem.Allocator,
+    /// Liveness claim on the session tree (spec §4.3). On the success path we
+    /// never get here: execve replaces us and the inherited lock is released by
+    /// the kernel when the command exits. On an error path, dropping the claim
+    /// is what makes the half-built tree reclaimable by the next sweep.
+    claim: scratch.Claim,
 
     pub fn deinit(self: *SessionInfo) void {
+        self.claim.release();
         self.allocator.free(self.base_path);
         self.allocator.free(self.root_path);
     }
@@ -190,7 +240,28 @@ pub fn enterEnv(allocator: std.mem.Allocator, mode: EnvMode, opts: EnvOptions) E
     try createUserNamespace();
     try writeIdMappings(original_uid, original_gid, identity);
     try createMountNamespace();
+    try createPidNamespace();
     try makeMountsPrivate();
+
+    // A private procfs can only be mounted by a process that is itself inside
+    // the new PID namespace, and unshare(CLONE_NEWPID) moves only *children*
+    // into it - so everything from here runs in a forked child that is PID 1
+    // there.
+    //
+    // The alternative, bind-mounting the host /proc, leaks the entire host
+    // process table into the environment: measured on a developer machine, 246
+    // host pids visible and 91 host command lines readable from inside a
+    // `mere shell`. It is not a full chroot escape - the user namespace's
+    // ptrace gate already blocks /proc/<pid>/root and /proc/<pid>/environ for
+    // processes outside it - but a build or shell has no business enumerating
+    // what else is running on the machine, and a procfs that reflects this PID
+    // namespace is what "isolated build" is supposed to mean.
+    const child_pid = try forkPidNamespaceInit();
+    if (child_pid != 0) {
+        // Not in the new PID namespace; the child is its init. Reap it and
+        // mirror its status so callers still observe the command's result.
+        std.process.exit(waitForExitStatus(child_pid));
+    }
 
     var session = try createSession(allocator, mode);
     defer session.deinit();
@@ -252,7 +323,14 @@ pub fn forkAndEnterEnv(allocator: std.mem.Allocator, mode: EnvMode, opts: EnvOpt
 
     while (open_streams > 0) {
         const poll_rc = c.poll(&poll_fds, poll_fds.len, -1);
-        if (poll_rc <= 0) continue;
+        if (poll_rc < 0) {
+            // EINTR is a legitimate retry; anything else would spin this loop
+            // at full CPU forever, so give up on streaming and go collect the
+            // child's status instead.
+            if (std.c._errno().* == c.EINTR) continue;
+            break;
+        }
+        if (poll_rc == 0) continue;
 
         var i: usize = 0;
         while (i < poll_fds.len) : (i += 1) {
@@ -261,6 +339,9 @@ pub fn forkAndEnterEnv(allocator: std.mem.Allocator, mode: EnvMode, opts: EnvOpt
             if ((pfd.revents & (c.POLLIN | c.POLLHUP | c.POLLERR)) == 0) continue;
 
             const n = c.read(pfd.fd, &read_buf, read_buf.len);
+            // A signal-interrupted read is not end-of-stream; closing here
+            // would silently truncate the child's output.
+            if (n < 0 and std.c._errno().* == c.EINTR) continue;
             if (n > 0) {
                 const data = read_buf[0..@intCast(n)];
                 const is_stderr = i == 1;
@@ -281,16 +362,17 @@ pub fn forkAndEnterEnv(allocator: std.mem.Allocator, mode: EnvMode, opts: EnvOpt
         }
     }
 
-    var wait_status: c_int = 0;
-    if (c.waitpid(@intCast(pid), &wait_status, 0) < 0) return 128;
-    // Decode the wait status: exit code is in bits 8-15 if exited normally
-    const status: u32 = @bitCast(wait_status);
-    if (status & 0x7f == 0) {
-        // Normal exit: extract exit code from bits 8-15
-        return @truncate(status >> 8);
+    // Any fds still open at this point (the poll loop bailed out) must be
+    // released before waiting, or the child could block writing into a pipe
+    // nobody is draining.
+    for (&poll_fds) |*pfd| {
+        if (pfd.fd >= 0) {
+            _ = c.close(pfd.fd);
+            pfd.fd = -1;
+        }
     }
-    // Killed by signal
-    return 128;
+
+    return waitForExitStatus(@intCast(pid));
 }
 
 fn validateInputs(opts: EnvOptions, mode: EnvMode) EnvError!void {
@@ -400,6 +482,42 @@ fn createMountNamespace() EnvError!void {
     }
 }
 
+fn createPidNamespace() EnvError!void {
+    const rc: c_int = c.unshare(c.CLONE_NEWPID);
+    if (rc != 0) {
+        return EnvError.UnshareError;
+    }
+}
+
+/// Fork so the child becomes PID 1 of the PID namespace created by
+/// `createPidNamespace`. Returns 0 in the child and the child's pid in the
+/// parent.
+fn forkPidNamespaceInit() EnvError!c_int {
+    const pid = c.fork();
+    if (pid < 0) return EnvError.ForkError;
+    return pid;
+}
+
+/// Wait for `pid` and translate its wait status into an exit code, retrying
+/// across EINTR. Signal deaths are reported as 128.
+fn waitForExitStatus(pid: c_int) u8 {
+    var wait_status: c_int = 0;
+    while (true) {
+        if (c.waitpid(pid, &wait_status, 0) >= 0) break;
+        if (std.c._errno().* == c.EINTR) continue;
+        return 128;
+    }
+    return decodeWaitStatus(wait_status);
+}
+
+/// Translate a `waitpid` status into an exit code. The exit code lives in bits
+/// 8-15 when the low 7 bits indicate a normal exit; a signal death reports 128.
+fn decodeWaitStatus(wait_status: c_int) u8 {
+    const status: u32 = @bitCast(wait_status);
+    if (status & 0x7f == 0) return @truncate(status >> 8);
+    return 128;
+}
+
 fn makeMountsPrivate() EnvError!void {
     const rc = c.mount(null, "/", null, MS_REC | MS_PRIVATE, null);
     if (rc != 0) {
@@ -422,6 +540,21 @@ fn generateSessionId() [32]u8 {
 
 fn createSessionAtBase(allocator: std.mem.Allocator, mode: EnvMode, env_base: []const u8) EnvError!SessionInfo {
     const io = path_mod.currentIo();
+
+    // Validate the base before deriving anything under it, so a hostile or
+    // wrongly-owned base is rejected rather than populated.
+    try ensurePrivateBaseDir(env_base);
+
+    // Reclaim sessions whose owner is gone (spec §4.3). Doing it here keeps the
+    // base self-limiting without a separate command: every new session pays a
+    // bounded sweep instead of the tree growing once per shell or build for the
+    // life of the machine. Opportunistic - a failure here must not stop us
+    // creating this session.
+    const swept = scratch.sweep(allocator, env_base, scratch.DEFAULT_GRACE_SECONDS);
+    if (swept.reclaimed > 0) {
+        std.log.debug("reclaimed {d} abandoned namespace session(s)", .{swept.reclaimed});
+    }
+
     const id = generateSessionId();
 
     const base_path = std.fmt.allocPrint(allocator, "{s}/{s}/", .{ env_base, id }) catch {
@@ -446,6 +579,16 @@ fn createSessionAtBase(allocator: std.mem.Allocator, mode: EnvMode, env_base: []
             return EnvError.SessionSetupError;
         };
     }
+
+    // Claim the session (spec §4.3). Inheritable, because the session stays in
+    // use for as long as the shell or build command runs and that command
+    // replaces us via execve - the kernel drops the lock when it exits, which
+    // is exactly when the tree becomes garbage.
+    const session_dir = base_path[0 .. base_path.len - 1]; // drop trailing '/'
+    var session_claim = scratch.claim(allocator, session_dir, true) catch {
+        return EnvError.SessionSetupError;
+    };
+    errdefer session_claim.release();
 
     if (mode == .shell) {
         const etc_upper = std.fmt.allocPrint(allocator, "{s}etc-upper", .{base_path}) catch {
@@ -475,6 +618,7 @@ fn createSessionAtBase(allocator: std.mem.Allocator, mode: EnvMode, env_base: []
         .root_path = root_path,
         .mode = mode,
         .allocator = allocator,
+        .claim = session_claim,
     };
 }
 
@@ -773,10 +917,30 @@ fn mountProc(allocator: std.mem.Allocator, root: []const u8) EnvError!void {
     };
     defer allocator.free(target);
 
-    // Bind mount host /proc rather than mounting a new proc filesystem.
-    // This works in user namespaces where mount -t proc is restricted.
-    // Don't make it read-only - the remount can fail and /proc has its own protections.
-    try mountBind("/proc", target, false);
+    const tgt_c = toCString(target) catch return EnvError.OutOfMemory;
+    defer std.heap.page_allocator.free(tgt_c);
+
+    const fs_type = toCString("proc") catch return EnvError.OutOfMemory;
+    defer std.heap.page_allocator.free(fs_type);
+
+    // A procfs of our own, showing only the processes in this PID namespace.
+    // This is deliberately not a bind mount of the host /proc, which would
+    // expose the host process table and command lines to anything running in
+    // the environment. Mounting proc is permitted here because we hold
+    // CAP_SYS_ADMIN in the user namespace that owns this PID namespace, and
+    // (thanks to the fork in enterEnv) we are inside that namespace.
+    //
+    // This fails closed on purpose: falling back to a host bind mount would
+    // quietly reintroduce the leak it exists to prevent.
+    const flags: c_ulong = MS_NOSUID | MS_NODEV | MS_NOEXEC;
+    const rc = c.mount(fs_type.ptr, tgt_c.ptr, fs_type.ptr, flags, null);
+    if (rc != 0) {
+        switch (std.c._errno().*) {
+            c.EPERM, c.EACCES => return EnvError.MountRestricted,
+            else => {},
+        }
+        return EnvError.MountProcError;
+    }
 }
 
 fn setupMinimalDev(allocator: std.mem.Allocator, dev_path: []const u8) EnvError!void {
@@ -1022,13 +1186,17 @@ fn resolveExecutablePath(
     const path_value = findEnvValue(env_opt, "PATH") orelse "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
     var it = std.mem.tokenizeScalar(u8, path_value, ':');
     while (it.next()) |entry| {
-        const candidate = if (entry.len == 0)
-            std.fmt.allocPrint(allocator, "./{s}", .{arg0}) catch return EnvError.OutOfMemory
-        else
-            std.fmt.allocPrint(allocator, "{s}/{s}", .{ entry, arg0 }) catch return EnvError.OutOfMemory;
+        // Only absolute PATH entries can be probed here. accessAbsolute
+        // asserts an absolute path, so passing a relative entry through would
+        // abort the process instead of just failing to find the executable -
+        // and PATH is attacker-adjacent input (recipe env, inherited env).
+        if (!std.fs.path.isAbsolute(entry)) continue;
+
+        const candidate = std.fmt.allocPrint(allocator, "{s}/{s}", .{ entry, arg0 }) catch return EnvError.OutOfMemory;
         errdefer allocator.free(candidate);
 
         std.Io.Dir.accessAbsolute(path_mod.currentIo(), candidate, .{}) catch {
+            allocator.free(candidate);
             continue;
         };
         return candidate;
@@ -1123,6 +1291,8 @@ test "SessionInfo deinit frees memory" {
         .root_path = try allocator.dupe(u8, "/tmp/mere/env/test/root/"),
         .mode = .shell,
         .allocator = allocator,
+        // fd -1 is the released state, so deinit is a no-op on the claim.
+        .claim = .{ .fd = -1 },
     };
 
     session.deinit();
@@ -1345,7 +1515,7 @@ test "buildEnvBasePath uses explicit XDG runtime dir when provided" {
     const path = try buildEnvBasePath(allocator, "/tmp/xdg-runtime");
     defer allocator.free(path);
 
-    try std.testing.expectEqualStrings("/tmp/xdg-runtime/mere/env", path);
+    try std.testing.expectEqualStrings("/tmp/xdg-runtime/mere-env", path);
 }
 
 test "buildEnvBasePath falls back to /tmp when XDG runtime dir is missing" {
@@ -1354,7 +1524,11 @@ test "buildEnvBasePath falls back to /tmp when XDG runtime dir is missing" {
     const path = try buildEnvBasePath(allocator, null);
     defer allocator.free(path);
 
-    try std.testing.expectEqualStrings("/tmp/mere/env", path);
+    // uid-scoped so the fallback in world-writable /tmp cannot be claimed by
+    // whichever user happens to run mere first.
+    const expected = try std.fmt.allocPrint(allocator, "/tmp/mere-env-{d}", .{c.geteuid()});
+    defer allocator.free(expected);
+    try std.testing.expectEqualStrings(expected, path);
 }
 
 test "createSessionAtBase creates a session under the requested base" {
@@ -1364,7 +1538,7 @@ test "createSessionAtBase creates a session under the requested base" {
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const tmp_path_len = try tmp_dir.dir.realPath(path_mod.currentIo(), &path_buf);
     const tmp_path = path_buf[0..tmp_path_len];
-    const base = try std.fs.path.join(std.testing.allocator, &.{ tmp_path, "mere", "env" });
+    const base = try std.fs.path.join(std.testing.allocator, &.{ tmp_path, "mere-env" });
     defer std.testing.allocator.free(base);
 
     var session = try createSessionAtBase(std.testing.allocator, .shell, base);
@@ -1372,4 +1546,131 @@ test "createSessionAtBase creates a session under the requested base" {
 
     try std.testing.expect(std.mem.startsWith(u8, session.base_path, base));
     try std.testing.expect(std.fs.path.isAbsolute(session.root_path));
+}
+
+// Regression: resolveExecutablePath built candidates from PATH entries and
+// handed them to std.Io.Dir.accessAbsolute, which asserts the path is
+// absolute. A single relative PATH element therefore aborted the process
+// ("reached unreachable code") rather than just failing the lookup - and PATH
+// here comes from the recipe/inherited environment.
+test "resolveExecutablePath skips relative PATH entries instead of aborting" {
+    const alloc = std.testing.allocator;
+    const env = [_][*:0]const u8{"PATH=relative/dir:/bin"};
+
+    // Must not panic. Either it finds /bin/sh on this host or it reports
+    // ExecError; both are acceptable, aborting is not.
+    if (resolveExecutablePath(alloc, "sh", env[0..])) |resolved| {
+        defer alloc.free(resolved);
+        try std.testing.expect(std.fs.path.isAbsolute(resolved));
+    } else |err| {
+        try std.testing.expectEqual(EnvError.ExecError, err);
+    }
+}
+
+test "resolveExecutablePath reports ExecError when PATH has only relative entries" {
+    const alloc = std.testing.allocator;
+    const env = [_][*:0]const u8{"PATH=bin:./sbin:../usr/bin"};
+    try std.testing.expectError(EnvError.ExecError, resolveExecutablePath(alloc, "sh", env[0..]));
+}
+
+test "resolveExecutablePath honors an explicit path in arg0" {
+    const alloc = std.testing.allocator;
+    const env = [_][*:0]const u8{"PATH=/nonexistent"};
+    const resolved = try resolveExecutablePath(alloc, "/bin/sh", env[0..]);
+    defer alloc.free(resolved);
+    try std.testing.expectEqualStrings("/bin/sh", resolved);
+}
+
+test "waitForExitStatus decodes a normal exit code" {
+    // 0x0500 is the wait status for exit(5): low 7 bits clear, code in 8-15.
+    try std.testing.expectEqual(@as(u8, 5), decodeWaitStatus(0x0500));
+    try std.testing.expectEqual(@as(u8, 0), decodeWaitStatus(0x0000));
+    // Killed by SIGKILL (9): low bits non-zero, reported as 128.
+    try std.testing.expectEqual(@as(u8, 128), decodeWaitStatus(9));
+}
+
+// Regression: the session base used to be a shared "/tmp/mere/env" created
+// with default 0755 permissions. In a world-writable directory that means the
+// first user to run mere owns the tree and every other user is locked out, and
+// whoever creates it first chooses where other users' session trees live -
+// including the overlayfs upperdir that backs /etc inside `mere shell`.
+test "ensurePrivateBaseDir creates the base owner-only" {
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const tmp_len = try tmp_dir.dir.realPath(path_mod.currentIo(), &buf);
+    const base = try std.fs.path.join(std.testing.allocator, &.{ buf[0..tmp_len], "mere-env" });
+    defer std.testing.allocator.free(base);
+
+    try ensurePrivateBaseDir(base);
+
+    var dir = try path_mod.openExistingDir(base);
+    defer dir.close(path_mod.currentIo());
+    const stat = try dir.stat(path_mod.currentIo());
+    try std.testing.expectEqual(@as(u32, 0o700), stat.permissions.toMode() & 0o777);
+
+    // Idempotent: a second call on our own correctly-moded directory succeeds.
+    try ensurePrivateBaseDir(base);
+}
+
+test "ensurePrivateBaseDir rejects a group- or world-accessible base" {
+    if (std.os.linux.geteuid() == 0) return error.SkipZigTest;
+
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const tmp_len = try tmp_dir.dir.realPath(path_mod.currentIo(), &buf);
+    const base = try std.fs.path.join(std.testing.allocator, &.{ buf[0..tmp_len], "loose" });
+    defer std.testing.allocator.free(base);
+
+    try tmp_dir.dir.createDirPath(path_mod.currentIo(), "loose");
+    var loose = try tmp_dir.dir.openDir(path_mod.currentIo(), "loose", .{ .iterate = true });
+    defer loose.close(path_mod.currentIo());
+    try loose.setPermissions(path_mod.currentIo(), .fromMode(0o777));
+
+    try std.testing.expectError(EnvError.SessionSetupError, ensurePrivateBaseDir(base));
+}
+
+test "ensurePrivateBaseDir rejects a symlink standing in for the base" {
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const tmp_len = try tmp_dir.dir.realPath(path_mod.currentIo(), &buf);
+    const tmp_path = buf[0..tmp_len];
+
+    const real = try std.fs.path.join(std.testing.allocator, &.{ tmp_path, "elsewhere" });
+    defer std.testing.allocator.free(real);
+    try path_mod.ensureDirExists(real);
+
+    try tmp_dir.dir.symLink(path_mod.currentIo(), real, "mere-env", .{});
+
+    const base = try std.fs.path.join(std.testing.allocator, &.{ tmp_path, "mere-env" });
+    defer std.testing.allocator.free(base);
+
+    try std.testing.expectError(EnvError.SessionSetupError, ensurePrivateBaseDir(base));
+}
+
+test "createSessionAtBase refuses a base it does not own the permissions on" {
+    if (std.os.linux.geteuid() == 0) return error.SkipZigTest;
+
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const tmp_len = try tmp_dir.dir.realPath(path_mod.currentIo(), &buf);
+    const base = try std.fs.path.join(std.testing.allocator, &.{ buf[0..tmp_len], "shared" });
+    defer std.testing.allocator.free(base);
+
+    try tmp_dir.dir.createDirPath(path_mod.currentIo(), "shared");
+    var shared = try tmp_dir.dir.openDir(path_mod.currentIo(), "shared", .{ .iterate = true });
+    defer shared.close(path_mod.currentIo());
+    try shared.setPermissions(path_mod.currentIo(), .fromMode(0o777));
+
+    try std.testing.expectError(
+        EnvError.SessionSetupError,
+        createSessionAtBase(std.testing.allocator, .shell, base),
+    );
 }

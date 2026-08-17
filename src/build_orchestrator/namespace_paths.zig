@@ -12,6 +12,7 @@ fn isNamespaceWorkspacePathVar(key: []const u8) bool {
         std.mem.eql(u8, key, "MERE_SOURCES_DIR") or
         std.mem.eql(u8, key, "MERE_DESTDIR") or
         std.mem.eql(u8, key, "DESTDIR") or
+        std.mem.eql(u8, key, "TMPDIR") or
         std.mem.eql(u8, key, "HOME") or
         std.mem.eql(u8, key, "XDG_CACHE_HOME") or
         std.mem.eql(u8, key, "XDG_CONFIG_HOME") or
@@ -102,4 +103,21 @@ test "createNamespaceEnvMap rewrites only namespace workspace path vars" {
     try std.testing.expectEqualStrings("/tmp/workspace-sibling/project", mapped.get("SIBLING").?);
     try std.testing.expectEqualStrings("/tmp/workspace/project", mapped.get("OTHER").?);
     try std.testing.expectEqualStrings("/usr", mapped.get("PREFIX").?);
+}
+
+// TMPDIR is a workspace path like the others, so it has to be translated for
+// the namespace. Left untranslated it would name a host path that does not
+// exist inside the chroot, and the build would fall back to /tmp - the tmpfs
+// that pointing TMPDIR at the workspace exists to avoid.
+test "createNamespaceEnvMap translates TMPDIR into the namespace" {
+    const allocator = std.testing.allocator;
+    var host = std.process.Environ.Map.init(allocator);
+    defer host.deinit();
+
+    try host.put("TMPDIR", "/tmp/workspace/tmp");
+
+    var mapped = try createNamespaceEnvMap(allocator, &host, "/tmp/workspace");
+    defer mapped.deinit();
+
+    try std.testing.expectEqualStrings("/work/tmp", mapped.get("TMPDIR").?);
 }
