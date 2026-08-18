@@ -16,6 +16,7 @@ const profile_cmd = @import("commands/profile.zig");
 const search_cmd = @import("commands/search.zig");
 const store_cmd = @import("commands/store.zig");
 const service_cmd = @import("commands/service.zig");
+const describe = @import("describe.zig");
 
 /// Global flags available to all commands
 const global_flags = [_]types.Flag{
@@ -120,6 +121,10 @@ pub fn main(init: std.process.Init) !void {
     // Set the root command
     cli_system.setRootCommand(&root_command);
 
+    // describe walks the finished tree, so it can only be handed the surface
+    // once every command is registered.
+    describe.setSurface("mere", &global_flags, &root_command);
+
     // Execute the CLI
     const exit_code = cli_system.execute(args, &ctx);
     _ = stdout_writer.interface.flush() catch {};
@@ -180,4 +185,8 @@ fn registerCommands(allocator: std.mem.Allocator, cli_system: *cli.CLI, root_com
         try cli_system.registerCommand(svc_command);
         try root_command.addSubcommand(svc_command);
     }
+
+    const describe_command = try describe.createCommand(allocator);
+    try cli_system.registerCommand(describe_command);
+    try root_command.addSubcommand(describe_command);
 }
