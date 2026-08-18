@@ -23,20 +23,26 @@ syn match mereComment "//.*$" contains=mereTodo
 syn region mereComment start="/\*" end="\*/" contains=mereTodo
 syn keyword mereTodo TODO FIXME XXX NOTE contained
 
-" Top-level nodes
-syn keyword mereTopNode recipe vars source prepare build check install package nextgroup=mereNodeArg skipwhite
+" Recipe nodes
+syn keyword mereTopNode recipe vars source prepare build check install package service nextgroup=mereNodeArg skipwhite
 
 " Recipe properties
-syn keyword mereRecipeProp name version release description url licenses archs depends env contained
+syn keyword mereRecipeProp name version release description url licenses archs depends contained
 
 " Source properties
 syn keyword mereSourceProp blake3 contained
 
 " Phase properties
-syn keyword merePhaseProp env script contained
+syn keyword merePhaseProp script contained
 
 " Package properties
-syn keyword merePackageProp files install contained
+syn keyword merePackageProp files strip contained
+
+" Service properties
+syn keyword mereServiceProp type command up down depends-on ready-notification essential log env contained
+
+" Environment nodes can appear in recipe, phase, and service blocks.
+syn keyword mereEnvNode env
 
 " Node arguments (strings after node name)
 syn region mereNodeArg start=+"+ skip=+\\"+ end=+"+ contained contains=mereVarInterp
@@ -54,17 +60,10 @@ syn region mereRawString start=+r\z(#*\)"+ end=+"\z1+ contains=mereVarInterp
 syn match mereEscape +\\[nrt"\\]+ contained
 
 " Variable interpolation
-syn match mereVarInterp "\${[^}]\+}" contained contains=mereVarPrefix,mereVarName
 syn match mereVarPrefix "\${" contained
 syn match mereVarName "[a-zA-Z_][a-zA-Z0-9_.-]*" contained
-
-" Built-in recipe variables
-syn keyword mereBuiltinVar recipe.name recipe.version recipe.release contained
-syn keyword mereBuiltinVar vars pkgver srcdir pkgdir DESTDIR SOURCES_DIR contained
-syn keyword mereBuiltinVar MERE_PKG_NAME MERE_PKG_VERSION MERE_PKG_RELEASE contained
-syn keyword mereBuiltinVar MERE_PKG_ARCH MERE_BASE_PKG_NAME MERE_SUBPKG contained
-syn keyword mereBuiltinVar MERE_OUTPUTS MERE_ROOT MERE_BUILD_DIR contained
-syn keyword mereBuiltinVar MERE_SRC_DIR MERE_PKG_DIR MERE_STORE_DIR PREFIX contained
+syn match mereBuiltinVar "\<recipe\.\%(name\|version\|release\)\>\|\<\%(vars\|pkgver\|srcdir\|pkgdir\|DESTDIR\|SOURCES_DIR\|MERE_SOURCES_DIR\|MERE_DESTDIR\|MERE_PKG_NAME\|MERE_PKG_VERSION\|MERE_PKG_RELEASE\|MERE_PKG_ARCH\|MERE_BASE_PKG_NAME\|MERE_SUBPKG\|MERE_OUTPUTS\|MERE_ROOT\|MERE_BUILD_DIR\|MERE_SRC_DIR\|MERE_PKG_DIR\|MERE_STORE_DIR\|PREFIX\)\>" contained
+syn match mereVarInterp "\${[^}]\+}" contained contains=mereVarPrefix,mereVarName,mereBuiltinVar
 
 " Numbers
 syn match mereNumber "\<\d\+\>"
@@ -73,10 +72,11 @@ syn match mereNumber "\<0x[0-9a-fA-F]\+\>"
 " Booleans
 syn keyword mereBoolean true false
 
-" Properties (key=value, key "value", or key <number>)
-syn match mereProp "[a-zA-Z_-]\+\ze\s*=" contains=mereRecipeProp,mereSourceProp,merePhaseProp,merePackageProp
-syn match mereProp "[a-zA-Z_-]\+\ze\s\+\"" contains=mereRecipeProp,mereSourceProp,merePhaseProp,merePackageProp
-syn match mereProp "[a-zA-Z_-]\+\ze\s\+\d" contains=mereRecipeProp,mereSourceProp,merePhaseProp,merePackageProp
+" Properties (key=value, key "value", key <number>, or key <boolean>)
+syn match mereProp "[a-zA-Z_-]\+\ze\s*=" contains=mereRecipeProp,mereSourceProp,merePhaseProp,merePackageProp,mereServiceProp
+syn match mereProp "[a-zA-Z_-]\+\ze\s\+\"" contains=mereRecipeProp,mereSourceProp,merePhaseProp,merePackageProp,mereServiceProp
+syn match mereProp "[a-zA-Z_-]\+\ze\s\+\d" contains=mereRecipeProp,mereSourceProp,merePhaseProp,merePackageProp,mereServiceProp
+syn match mereProp "[a-zA-Z_-]\+\ze\s\+\%(true\|false\)\>" contains=mereRecipeProp,mereSourceProp,merePhaseProp,merePackageProp,mereServiceProp
 
 " Operators
 syn match mereOperator "="
@@ -98,6 +98,8 @@ hi def link mereRecipeProp Identifier
 hi def link mereSourceProp Identifier
 hi def link merePhaseProp Identifier
 hi def link merePackageProp Identifier
+hi def link mereServiceProp Identifier
+hi def link mereEnvNode Identifier
 hi def link mereNodeArg String
 hi def link mereString String
 hi def link mereRawString String
