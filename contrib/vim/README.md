@@ -47,8 +47,8 @@ cp mere-recipe.vim ~/.vim/syntax/
 
 The syntax file provides highlighting for:
 
-- **Top-level nodes**: `recipe`, `vars`, `source`, `prepare`, `build`, `check`, `install`, `package`
-- **Recipe properties**: `name`, `version`, `release`, `description`, `url`, `licenses`, `archs`, `depends`, `env`
+- **Recipe nodes**: `recipe`, `vars`, `source`, `prepare`, `build`, `check`, `install`, `package`, and package child `service`
+- **Recipe/package/service properties**: metadata, `files`, `strip`, service commands, dependencies, logging, and environment blocks
 - **Variable interpolation**: `${recipe.name}`, `${vars.custom}`, `${MERE_PKG_NAME}`, etc.
 - **Shell script highlighting**: Full shell syntax highlighting inside `script` blocks (both `script "..."` and `script r#"..."#`)
 - **Strings**: Regular strings and raw strings (`r#"..."#`)
