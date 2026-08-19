@@ -49,14 +49,34 @@ Requirements on the output:
 
 The description covers the command surface only. Schemas for on-disk artifacts — manifests, profile state, repository databases — are specified in this document and are not yet emitted in machine-readable form.
 
+### Exit status
+
+A consumer branches on exit status before it reads anything, so the codes are part of the interface whether or not they were designed as one. What Mere returns:
+
+| Code | Meaning |
+| --- | --- |
+| 0 | Success. Also returned when help was explicitly requested. |
+| 1 | The operation failed. |
+| 2 | The invocation was wrong: unknown command, missing argument, invalid flag, or an argument that failed validation. |
+| 12 | A resource was exhausted — memory, disk, or file descriptors. |
+| 13 | Permission was denied. |
+
+The two-digit codes are the `errno` values they correspond to, `ENOMEM` and `EACCES`. The mapping is applied at one place rather than at each call site, so an error's identity does not depend on which command surfaced it; a regression test asserts specifically that a permission failure does not collapse into 1.
+
+Requirements:
+
+- A consumer MUST be able to distinguish "the invocation was wrong" from "the operation failed". The first is never worth retrying with the same arguments and the second may be.
+- Adding a code is additive. Changing what an existing code means is not, and deserves the deliberation a format change gets, because a consumer's retry logic is written against it.
+
 ### Current conformance
 
 This contract is a design commitment, and Mere does not yet meet all of it. Known gaps, recorded here so they are not mistaken for intent:
 
 - **Ambient state.** `mere shell` resolves a profile from the working directory (§15.12), and repository sync is skipped on a TTL, so `mere install` may resolve against different metadata depending only on elapsed time. Neither is expressible as an explicit argument.
 - **Concurrency granularity.** All mutating operations serialize on one exclusive lock per root. This is correct but coarse: unrelated work blocks, and there is no way to express "apply only if the profile is still at generation N".
-- **Self-description.** The command surface is machine-readable via `mere describe`. The schemas of on-disk artifacts are not, so a consumer parsing a manifest or profile state must still be told their shape out of band.
+- **Self-description.** The command surface is machine-readable via `mere describe`. The schemas of on-disk artifacts are not, and the gap is uneven. A generation's `profile.kdl` (§6) is KDL, so a consumer can read which packages a generation selected and at which content hashes without being told anything. A package manifest (§17) and a realization manifest are hand-rolled binary encodings behind `MEREMFST` and `MERERLZ1` headers, and neither can be read without being told its shape out of band.
 - **No record of action.** Mere keeps no account of what it did, so a consumer cannot reconstruct its own prior operations, and an operator cannot audit another consumer's.
+- **Failure identity.** Exit status separates a wrong invocation, resource exhaustion, and permission denial, but every remaining failure returns 1. A consumer therefore cannot tell a transient network failure from an invalid signature — the first is worth retrying and the second never is — except by reading the message, which is prose and not contract.
 
 One deliberate exception to "state is inspectable via filesystem": scratch ownership (§4.3) is an `flock` held on a directory, which is process state rather than on-disk state and is therefore not visible to `ls`. This is accepted because the alternative — a marker file — either enters a store object's payload and changes its identity, or becomes debris needing its own reclamation. Liveness is a property of a running process, and encoding it on disk misrepresents it.
 
