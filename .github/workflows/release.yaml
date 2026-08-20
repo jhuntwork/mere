@@ -113,7 +113,7 @@ jobs:
       - name: Test
         run: |
           cd "$GITHUB_WORKSPACE"
-          zig build test --summary all
+          zig build test -Dcpu=baseline --summary all
 
   create-release:
     needs: [detect, test]
@@ -273,7 +273,7 @@ jobs:
           arch=$(uname -m)
           base=$(sh .github/scripts/release-ci.sh asset-base "$version" linux "$arch")
 
-          zig build -Doptimize=ReleaseSmall
+          zig build -Doptimize=ReleaseSmall -Dcpu=baseline
           mkdir -p dist
           cp zig-out/bin/mere "dist/${base}"
 
@@ -355,7 +355,7 @@ jobs:
           arch=$(uname -m)
           base=$(sh .github/scripts/release-ci.sh asset-base "$version" linux "$arch")
 
-          zig build -Doptimize=ReleaseSmall
+          zig build -Doptimize=ReleaseSmall -Dcpu=baseline
           mkdir -p dist
           cp zig-out/bin/mere "dist/${base}"
 
