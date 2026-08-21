@@ -884,7 +884,7 @@ test "harden preserves directory setgid and sticky bits" {
     hardenDir(io, dir, &result);
     defer _ = clearImmutableFlag(dir.handle);
 
-    const mode = (try dir.stat(io)).permissions.toMode();
+    const mode = (try dir.stat(io)).permissions.toMode() & 0o7777;
     try std.testing.expectEqual(@as(std.posix.mode_t, 0o3555), mode);
 }
 
