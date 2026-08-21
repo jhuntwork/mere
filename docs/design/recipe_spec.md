@@ -121,7 +121,7 @@ The `recipe` node defines package metadata. All properties are specified as chil
 | `url` | string | "" | Project homepage URL | `url "http://busybox.net"` |
 | `licenses` | string(s) | [] | License identifiers (multiple allowed) | `licenses "GPL" "MIT"` |
 | `archs` | string(s) | ["x86_64"] | Supported architectures | `archs "aarch64" "x86_64"` |
-| `depends` | string(s) | [] | Build dependencies | `depends "make" "llvm"` |
+| `depends` | string(s) | [] | Build dependencies; repeatable entries may use `arch` to select a target architecture | `depends "make" "llvm"` |
 | `env` | properties | {} | Environment variables for all phases | `env CC="clang"` |
 
 **Example:**
@@ -136,11 +136,29 @@ recipe {
     licenses "BSD"
     archs "x86_64" "aarch64"
     depends "openssl-dev" "pcre2-dev" "zlib-ng-dev"
+    depends "nasm" arch="x86_64"
     env CC="clang" CFLAGS="-O2"
 }
 ```
 
-### `vars` Node (Optional)
+### Architecture-specific build dependencies
+
+A `depends` entry without an `arch` property applies to every architecture supported by the recipe. Add `arch` when a build dependency is needed only for the package target architecture:
+
+```kdl
+recipe {
+    name "libjpeg-turbo"
+    version "3.1.0"
+    release 1
+    archs "x86_64" "aarch64"
+
+    depends "cmake" "ninja"
+    depends "nasm" arch="x86_64"
+}
+```
+
+Here `cmake` and `ninja` are selected for both targets. `nasm` is selected only for the x86_64 package and is omitted for aarch64, where it is unavailable. `arch` always means the package target architecture, not the build host architecture.
+
 
 Define custom variables for use in string interpolation.
 
