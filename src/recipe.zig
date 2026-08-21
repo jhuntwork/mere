@@ -74,6 +74,14 @@ pub fn parse(ctx: *mere.Context, recipe_buf: []const u8) !Recipe {
         };
     }
 
+    // Resolve dependencies after architecture selection so an optional
+    // depends arch="..." selector applies to the recipe target.
+    for (nodes.items) |*node| {
+        if (std.mem.eql(u8, node.name, "recipe")) {
+            try parseKdlDepends(allocator, node, &recipe);
+        }
+    }
+
     // Parse remaining sections that can use interpolation.
     var found_package = false;
     for (nodes.items) |*node| {
@@ -221,20 +229,66 @@ fn parseKdlRecipeNode(allocator: std.mem.Allocator, node: *const kdl.Node, recip
         }
     }
 
-    // depends "cmake" "ninja"
-    if (node.findChild("depends")) |depends_node| {
-        for (depends_node.arguments.items) |arg| {
-            if (arg.getString()) |s| {
-                const dup = try allocator.dupe(u8, s);
-                try recipe.depends.append(allocator, dup);
-            }
-        }
-    }
 
     // env CC="clang" CXX="clang++" (properties on an env child node)
     if (node.findChild("env")) |env_node| {
         try parseKdlEnvProperties(allocator, env_node, &recipe.env);
     }
+}
+
+/// Parse dependencies whose optional arch selector matches the recipe target.
+fn parseKdlDepends(allocator: std.mem.Allocator, node: *const kdl.Node, recipe: *Recipe) !void {
+    for (node.children.items) |*child| {
+        if (!std.mem.eql(u8, child.name, "depends")) continue;
+        const selector = if (child.getProperty("arch")) |property|
+            property.getString() orelse return RecipeError.NonStringValue
+        else
+            null;
+        if (!dependencyAppliesToArch(selector, recipe.arch)) continue;
+        for (child.arguments.items) |arg| {
+            if (arg.getString()) |dependency| {
+                try recipe.depends.append(allocator, try allocator.dupe(u8, dependency));
+            }
+        }
+    }
+}
+
+fn dependencyAppliesToArch(selector: ?[]const u8, recipe_arch: ?[]const u8) bool {
+    if (selector == null) return true;
+    return recipe_arch != null and std.mem.eql(u8, selector.?, recipe_arch.?);
+}
+
+test "parseKdlDepends selects target-specific dependencies" {
+    const th = @import("test_helpers.zig");
+    var test_env = try th.createTestEnv();
+    defer {
+        test_env.cleanup();
+        std.testing.allocator.destroy(test_env);
+    }
+
+    const ctx = &test_env.ctx;
+    var nodes = try kdl.parseDocument(
+        ctx.allocator,
+        "recipe {\n    depends \"cmake\"\n    depends \"nasm\" arch=\"x86_64\"\n}",
+    );
+    defer {
+        for (nodes.items) |*node| node.deinit();
+        nodes.deinit(ctx.allocator);
+    }
+
+    var x86_recipe = try Recipe.init(ctx.allocator, ctx);
+    defer x86_recipe.deinit();
+    x86_recipe.arch = "x86_64";
+    try parseKdlDepends(ctx.allocator, &nodes.items[0], &x86_recipe);
+    try std.testing.expectEqualStrings("cmake", x86_recipe.depends.items[0]);
+    try std.testing.expectEqualStrings("nasm", x86_recipe.depends.items[1]);
+
+    var arm_recipe = try Recipe.init(ctx.allocator, ctx);
+    defer arm_recipe.deinit();
+    arm_recipe.arch = "aarch64";
+    try parseKdlDepends(ctx.allocator, &nodes.items[0], &arm_recipe);
+    try std.testing.expectEqual(@as(usize, 1), arm_recipe.depends.items.len);
+    try std.testing.expectEqualStrings("cmake", arm_recipe.depends.items[0]);
 }
 
 /// Parse a vars {} node

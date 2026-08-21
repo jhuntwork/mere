@@ -466,7 +466,14 @@ const recipe_meta_children = [_]NodeSpec{
     .{ .name = "url", .args = .{ .kind = .string, .min = 1, .max = 1, .label = "value" } },
     .{ .name = "licenses", .args = .{ .kind = .string, .min = 1, .label = "value" } },
     .{ .name = "archs", .args = .{ .kind = .string, .min = 1, .label = "value" } },
-    .{ .name = "depends", .args = .{ .kind = .string, .min = 1, .label = "value" } },
+    .{
+        .name = "depends",
+        .repeatable = true,
+        .args = .{ .kind = .string, .min = 1, .label = "value" },
+        .properties = .{ .fixed = &[_]PropertySpec{
+            .{ .name = "arch", .kind = .string },
+        } },
+    },
     .{ .name = "needs-root", .args = .{ .kind = .boolean, .min = 1, .max = 1, .label = "value" } },
     recipe_env_node,
 };
