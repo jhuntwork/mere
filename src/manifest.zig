@@ -10,28 +10,44 @@ pub const ManifestError = Std.OutOfMemory || Std.FileSystem || Std.PermissionDen
 pub const MAGIC: *const [8]u8 = "MEREMFST";
 pub const SCHEMA_VERSION: u32 = 1;
 pub const SCHEMA_VERSION_V2: u32 = 2;
+pub const SCHEMA_VERSION_V3: u32 = 3;
 pub const META_DIR = ".mere";
 pub const MANIFEST_FILENAME = ".mere/manifest.v1";
 pub const MANIFEST_SIG_FILENAME = ".mere/manifest.v1.sig";
 pub const MANIFEST_V2_FILENAME = ".mere/manifest.v2";
 pub const MANIFEST_V2_SIG_FILENAME = ".mere/manifest.v2.sig";
+pub const MANIFEST_V3_FILENAME = ".mere/manifest.v3";
+pub const MANIFEST_V3_SIG_FILENAME = ".mere/manifest.v3.sig";
 pub const META_KDL_FILENAME = ".mere/meta.kdl";
 pub const PROJECTION_FILENAME = ".mere/projection.v1";
 
 pub const Format = enum {
     v1,
     v2,
+    v3,
 
     pub fn manifestFilename(self: Format) []const u8 {
-        return if (self == .v1) MANIFEST_FILENAME else MANIFEST_V2_FILENAME;
+        return switch (self) {
+            .v1 => MANIFEST_FILENAME,
+            .v2 => MANIFEST_V2_FILENAME,
+            .v3 => MANIFEST_V3_FILENAME,
+        };
     }
 
     pub fn signatureFilename(self: Format) []const u8 {
-        return if (self == .v1) MANIFEST_SIG_FILENAME else MANIFEST_V2_SIG_FILENAME;
+        return switch (self) {
+            .v1 => MANIFEST_SIG_FILENAME,
+            .v2 => MANIFEST_V2_SIG_FILENAME,
+            .v3 => MANIFEST_V3_SIG_FILENAME,
+        };
     }
 
     pub fn schemaVersion(self: Format) u32 {
-        return if (self == .v1) SCHEMA_VERSION else SCHEMA_VERSION_V2;
+        return switch (self) {
+            .v1 => SCHEMA_VERSION,
+            .v2 => SCHEMA_VERSION_V2,
+            .v3 => SCHEMA_VERSION_V3,
+        };
     }
 };
 
@@ -227,6 +243,10 @@ pub fn writeManifest(ctx: *Context, dir_path: []const u8, manifest: *const Packa
 
 pub fn writeManifestV2(ctx: *Context, dir_path: []const u8, manifest: *const PackageManifestV1, secret_key: []const u8) ManifestError!void {
     return writeManifestForFormat(ctx, dir_path, manifest, secret_key, .v2);
+}
+
+pub fn writeManifestV3(ctx: *Context, dir_path: []const u8, manifest: *const PackageManifestV1, secret_key: []const u8) ManifestError!void {
+    return writeManifestForFormat(ctx, dir_path, manifest, secret_key, .v3);
 }
 
 fn writeManifestForFormat(ctx: *Context, dir_path: []const u8, input: *const PackageManifestV1, secret_key: []const u8, format: Format) ManifestError!void {
@@ -478,4 +498,11 @@ test "readManifestFile reports InvalidInput when manifest is missing" {
     try path.ensureDirExists(package_dir);
 
     try std.testing.expectError(ManifestError.InvalidInput, readManifestFile(&test_env.ctx, package_dir));
+}
+
+test "manifest v3 has distinct filenames and schema" {
+    try std.testing.expectEqual(@as(u32, 3), Format.v3.schemaVersion());
+    try std.testing.expectEqualStrings(MANIFEST_V3_FILENAME, Format.v3.manifestFilename());
+    try std.testing.expectEqualStrings(MANIFEST_V3_SIG_FILENAME, Format.v3.signatureFilename());
+    try std.testing.expect(!std.mem.eql(u8, Format.v2.manifestFilename(), Format.v3.manifestFilename()));
 }

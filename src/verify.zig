@@ -229,12 +229,18 @@ fn verifyStore(
         };
 
         const format: manifest.Format = blk: {
+            const v3_path = std.fs.path.join(ctx.allocator, &.{ entry_path, manifest.MANIFEST_V3_FILENAME }) catch {
+                return ctx.fail(VerifyError.OutOfMemory, entry_path, "failed to construct v3 manifest path");
+            };
+            defer ctx.allocator.free(v3_path);
+            if (std.Io.Dir.accessAbsolute(path_mod.currentIo(), v3_path, .{})) |_| break :blk .v3 else |_| {}
+
             const v2_path = std.fs.path.join(ctx.allocator, &.{ entry_path, manifest.MANIFEST_V2_FILENAME }) catch {
                 return ctx.fail(VerifyError.OutOfMemory, entry_path, "failed to construct v2 manifest path");
             };
             defer ctx.allocator.free(v2_path);
-            std.Io.Dir.accessAbsolute(path_mod.currentIo(), v2_path, .{}) catch break :blk .v1;
-            break :blk .v2;
+            if (std.Io.Dir.accessAbsolute(path_mod.currentIo(), v2_path, .{})) |_| break :blk .v2 else |_| {}
+            break :blk .v1;
         };
         const manifest_path = std.fs.path.join(ctx.allocator, &.{ entry_path, format.manifestFilename() }) catch {
             return ctx.fail(VerifyError.OutOfMemory, entry_path, "failed to construct manifest path");
@@ -317,10 +323,11 @@ fn verifyStore(
         };
 
         if (full_hash) {
-            const computed = if (format == .v2)
-                hash.calculateStoreContentHashV2(ctx.allocator, entry_path, null)
-            else
-                hash.calculateStoreContentHash(ctx.allocator, entry_path, null);
+            const computed = switch (format) {
+                .v1 => hash.calculateStoreContentHash(ctx.allocator, entry_path, null),
+                .v2 => hash.calculateStoreContentHashV2(ctx.allocator, entry_path, null),
+                .v3 => hash.calculateStoreContentHashV3(ctx.allocator, entry_path, null),
+            };
             const computed_hash = computed catch {
                 result.store_issues += 1;
                 try addIssue(ctx, result, .store, entry_path, "failed to compute store content hash");
@@ -510,20 +517,29 @@ fn verifyProfileManifestPackages(
         }
 
         if (full_hash) {
-            const v2_manifest_path = std.fs.path.join(ctx.allocator, &.{ pkg.store_path, manifest.MANIFEST_V2_FILENAME }) catch {
-                result.profile_issues += 1;
-                try addProfileIssue(ctx, result, pkg.store_path, profile_name, realization_name, "failed to construct manifest path");
-                continue;
+            const format: manifest.Format = blk: {
+                const v3_manifest_path = std.fs.path.join(ctx.allocator, &.{ pkg.store_path, manifest.MANIFEST_V3_FILENAME }) catch {
+                    result.profile_issues += 1;
+                    try addProfileIssue(ctx, result, pkg.store_path, profile_name, realization_name, "failed to construct manifest path");
+                    continue;
+                };
+                defer ctx.allocator.free(v3_manifest_path);
+                if (std.Io.Dir.accessAbsolute(path_mod.currentIo(), v3_manifest_path, .{})) |_| break :blk .v3 else |_| {}
+
+                const v2_manifest_path = std.fs.path.join(ctx.allocator, &.{ pkg.store_path, manifest.MANIFEST_V2_FILENAME }) catch {
+                    result.profile_issues += 1;
+                    try addProfileIssue(ctx, result, pkg.store_path, profile_name, realization_name, "failed to construct manifest path");
+                    continue;
+                };
+                defer ctx.allocator.free(v2_manifest_path);
+                if (std.Io.Dir.accessAbsolute(path_mod.currentIo(), v2_manifest_path, .{})) |_| break :blk .v2 else |_| {}
+                break :blk .v1;
             };
-            defer ctx.allocator.free(v2_manifest_path);
-            const is_v2 = blk: {
-                std.Io.Dir.accessAbsolute(path_mod.currentIo(), v2_manifest_path, .{}) catch break :blk false;
-                break :blk true;
+            const computed = switch (format) {
+                .v1 => hash.calculateStoreContentHash(ctx.allocator, pkg.store_path, null),
+                .v2 => hash.calculateStoreContentHashV2(ctx.allocator, pkg.store_path, null),
+                .v3 => hash.calculateStoreContentHashV3(ctx.allocator, pkg.store_path, null),
             };
-            const computed = if (is_v2)
-                hash.calculateStoreContentHashV2(ctx.allocator, pkg.store_path, null)
-            else
-                hash.calculateStoreContentHash(ctx.allocator, pkg.store_path, null);
             const computed_hash = computed catch {
                 result.profile_issues += 1;
                 try addProfileIssue(ctx, result, pkg.store_path, profile_name, realization_name, "failed to compute store content hash");
@@ -533,7 +549,7 @@ fn verifyProfileManifestPackages(
 
             if (!std.mem.eql(u8, computed_hash, pkg.content_hash)) {
                 var accepted_transitional = false;
-                if (!is_v2) {
+                if (format == .v1) {
                     const transitional = hash.calculateTransitionalMetadataContentHash(ctx.allocator, pkg.store_path, null) catch null;
                     if (transitional) |transitional_hash| {
                         accepted_transitional = std.mem.eql(u8, transitional_hash, pkg.content_hash);

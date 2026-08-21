@@ -553,18 +553,32 @@ fn validateGenerationStorePaths(
                 return ctx.fail(ActivationError.InvalidInput, pkg.store_path, "invalid content hash length in manifest");
             }
 
-            const is_v2 = blk: {
+            const format: package_manifest.Format = blk: {
+                const v3_manifest_path = std.fs.path.join(ctx.allocator, &.{ pkg.store_path, package_manifest.MANIFEST_V3_FILENAME }) catch {
+                    return ctx.fail(ActivationError.OutOfMemory, pkg.store_path, "failed to construct v3 manifest path");
+                };
+                defer ctx.allocator.free(v3_manifest_path);
+                const has_v3 = blk_v3: {
+                    std.Io.Dir.accessAbsolute(path_mod.currentIo(), v3_manifest_path, .{}) catch break :blk_v3 false;
+                    break :blk_v3 true;
+                };
+                if (has_v3) break :blk .v3;
+
                 const v2_manifest_path = std.fs.path.join(ctx.allocator, &.{ pkg.store_path, package_manifest.MANIFEST_V2_FILENAME }) catch {
                     return ctx.fail(ActivationError.OutOfMemory, pkg.store_path, "failed to construct v2 manifest path");
                 };
                 defer ctx.allocator.free(v2_manifest_path);
-                std.Io.Dir.accessAbsolute(path_mod.currentIo(), v2_manifest_path, .{}) catch break :blk false;
-                break :blk true;
+                const has_v2 = blk_v2: {
+                    std.Io.Dir.accessAbsolute(path_mod.currentIo(), v2_manifest_path, .{}) catch break :blk_v2 false;
+                    break :blk_v2 true;
+                };
+                break :blk if (has_v2) .v2 else .v1;
             };
-            const computed = if (is_v2)
-                hash.calculateStoreContentHashV2(ctx.allocator, pkg.store_path, null)
-            else
-                hash.calculateStoreContentHash(ctx.allocator, pkg.store_path, null);
+            const computed = switch (format) {
+                .v1 => hash.calculateStoreContentHash(ctx.allocator, pkg.store_path, null),
+                .v2 => hash.calculateStoreContentHashV2(ctx.allocator, pkg.store_path, null),
+                .v3 => hash.calculateStoreContentHashV3(ctx.allocator, pkg.store_path, null),
+            };
             const computed_hash = computed catch |err| {
                 return ctx.fail(switch (err) {
                     hash.HashError.OutOfMemory => ActivationError.OutOfMemory,
@@ -577,7 +591,7 @@ fn validateGenerationStorePaths(
 
             if (!std.mem.eql(u8, computed_hash, pkg.content_hash)) {
                 var accepted_transitional = false;
-                if (!is_v2) {
+                if (format == .v1) {
                     const transitional = hash.calculateTransitionalMetadataContentHash(ctx.allocator, pkg.store_path, null) catch null;
                     if (transitional) |transitional_hash| {
                         accepted_transitional = std.mem.eql(u8, transitional_hash, pkg.content_hash);
