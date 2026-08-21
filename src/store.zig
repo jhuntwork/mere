@@ -353,8 +353,13 @@ fn stripWriteBits(io: std.Io, handle: anytype) void {
 }
 
 fn hardenDir(io: std.Io, d: std.Io.Dir, result: *HardenResult) void {
+    // Capture mode before fchown — chown clears setgid bits on directories.
+    const mode = if (d.stat(io)) |st| st.permissions.toMode() else |_| {
+        result.files_processed += 1;
+        return;
+    };
     _ = std.os.linux.fchown(d.handle, 0, 0);
-    stripWriteBits(io, d);
+    d.setPermissions(io, .fromMode(mode & ~@as(std.posix.mode_t, 0o222))) catch {};
     if (!setImmutable(d.handle)) result.immutable_supported = false;
     result.files_processed += 1;
 }
@@ -854,6 +859,33 @@ test "harden requires privilege" {
     if (!isPrivileged()) {
         try std.testing.expectError(StoreError.PermissionDenied, harden(ctx, store_path));
     }
+}
+
+test "harden preserves directory setgid and sticky bits" {
+    const th = @import("test_helpers.zig");
+    var test_env = try th.createTestEnv();
+    defer {
+        test_env.cleanup();
+        std.testing.allocator.destroy(test_env);
+    }
+
+    if (!isPrivileged()) return error.SkipZigTest;
+
+    const io = path_mod.currentIo();
+    const allocator = test_env.ctx.allocator;
+    const dir_path = try std.fs.path.join(allocator, &.{ test_env.path, "harden-special" });
+    defer allocator.free(dir_path);
+
+    var dir = try path_mod.makePathAndOpenDir(dir_path);
+    defer dir.close(io);
+    try dir.setPermissions(io, .fromMode(0o3777));
+
+    var result = HardenResult{};
+    hardenDir(io, dir, &result);
+    defer _ = clearImmutableFlag(dir.handle);
+
+    const mode = (try dir.stat(io)).permissions.toMode() & 0o7777;
+    try std.testing.expectEqual(@as(std.posix.mode_t, 0o3555), mode);
 }
 
 test "harden detects escaping symlinks" {
