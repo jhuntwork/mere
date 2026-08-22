@@ -115,7 +115,7 @@ pub fn calculateStoreContentHash(
     dir_path: []const u8,
     diag: ?*HashDiag,
 ) HashError![]const u8 {
-    return calculateTreeHashInternal(allocator, dir_path, diag, false, false, null);
+    return calculateTreeHashInternal(allocator, dir_path, diag, false, false, false, null);
 }
 
 /// The transitional v0.18.0 identity: payload plus meta.kdl, without a
@@ -126,7 +126,7 @@ pub fn calculateTransitionalMetadataContentHash(
     dir_path: []const u8,
     diag: ?*HashDiag,
 ) HashError![]const u8 {
-    return calculateTreeHashInternal(allocator, dir_path, diag, false, true, null);
+    return calculateTreeHashInternal(allocator, dir_path, diag, false, true, false, null);
 }
 
 /// The versioned metadata-aware store identity used by new packages.
@@ -135,7 +135,18 @@ pub fn calculateStoreContentHashV2(
     dir_path: []const u8,
     diag: ?*HashDiag,
 ) HashError![]const u8 {
-    return calculateTreeHashInternal(allocator, dir_path, diag, false, true, "mere-store-content-v2\x00");
+    return calculateTreeHashInternal(allocator, dir_path, diag, false, true, false, "mere-store-content-v2\x00");
+}
+
+/// The v3 metadata-aware store identity includes setuid, setgid, and sticky
+/// bits for regular files and directories. Read/write bits, ownership, and
+/// symlink modes remain outside identity.
+pub fn calculateStoreContentHashV3(
+    allocator: std.mem.Allocator,
+    dir_path: []const u8,
+    diag: ?*HashDiag,
+) HashError![]const u8 {
+    return calculateTreeHashInternal(allocator, dir_path, diag, false, true, true, "mere-store-content-v3\x00");
 }
 
 pub fn calculateBuildSnapshotHash(
@@ -143,7 +154,7 @@ pub fn calculateBuildSnapshotHash(
     dir_path: []const u8,
     diag: ?*HashDiag,
 ) HashError![]const u8 {
-    return calculateTreeHashInternal(allocator, dir_path, diag, true, false, null);
+    return calculateTreeHashInternal(allocator, dir_path, diag, true, false, false, null);
 }
 
 fn calculateTreeHashInternal(
@@ -152,6 +163,7 @@ fn calculateTreeHashInternal(
     diag: ?*HashDiag,
     include_mtime: bool,
     include_metadata: bool,
+    include_special_bits: bool,
     domain: ?[]const u8,
 ) HashError![]const u8 {
     if (!path.isValidInputPath(dir_path)) {
@@ -251,6 +263,11 @@ fn calculateTreeHashInternal(
             else => continue, // Skip other types (devices, sockets, etc.)
         };
         hasher.update(&[_]u8{type_tag});
+
+        if (include_special_bits and entry.kind != .sym_link) {
+            const special: u8 = @intCast((entry.mode & 0o7000) >> 9);
+            hasher.update(&[_]u8{special});
+        }
 
         if (include_mtime) {
             const mode_le = std.mem.nativeToLittle(u32, entry.mode);
@@ -946,4 +963,38 @@ test "hash mapHashFsError preserves actionable classes" {
     try std.testing.expectEqual(HashError.OutOfMemory, mapHashFsError(error.OutOfMemory));
     try std.testing.expectEqual(HashError.InvalidInput, mapHashFsError(error.BadPathName));
     try std.testing.expectEqual(HashError.FileSystem, mapHashFsError(error.InputOutput));
+}
+
+test "calculateStoreContentHashV3 distinguishes special bits while v2 does not" {
+    const th = @import("test_helpers.zig");
+    var test_env = try th.createTestEnv();
+    defer {
+        test_env.cleanup();
+        std.testing.allocator.destroy(test_env);
+    }
+
+    const file_path = try std.fs.path.join(std.testing.allocator, &.{ test_env.path, "tool" });
+    defer std.testing.allocator.free(file_path);
+    {
+        var file = try std.Io.Dir.createFileAbsolute(path.currentIo(), file_path, .{});
+        try file.writeStreamingAll(path.currentIo(), "payload");
+        file.close(path.currentIo());
+    }
+    var file = try path.openExistingFile(file_path);
+    defer file.close(path.currentIo());
+    try file.setPermissions(path.currentIo(), .fromMode(0o755));
+
+    const v2_plain = try calculateStoreContentHashV2(test_env.ctx.allocator, test_env.path, null);
+    defer test_env.ctx.allocator.free(v2_plain);
+    const v3_plain = try calculateStoreContentHashV3(test_env.ctx.allocator, test_env.path, null);
+    defer test_env.ctx.allocator.free(v3_plain);
+
+    try file.setPermissions(path.currentIo(), .fromMode(0o4755));
+    const v2_setuid = try calculateStoreContentHashV2(test_env.ctx.allocator, test_env.path, null);
+    defer test_env.ctx.allocator.free(v2_setuid);
+    const v3_setuid = try calculateStoreContentHashV3(test_env.ctx.allocator, test_env.path, null);
+    defer test_env.ctx.allocator.free(v3_setuid);
+
+    try std.testing.expectEqualStrings(v2_plain, v2_setuid);
+    try std.testing.expect(!std.mem.eql(u8, v3_plain, v3_setuid));
 }

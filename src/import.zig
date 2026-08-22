@@ -209,10 +209,23 @@ pub const ManifestResult = struct {
 };
 
 fn detectManifestFormat(ctx: *Context, temp_dir: []const u8) !manifest.Format {
+    const v3_path = try std.fs.path.join(ctx.allocator, &.{ temp_dir, manifest.MANIFEST_V3_FILENAME });
+    defer ctx.allocator.free(v3_path);
+    const has_v3 = blk: {
+        std.Io.Dir.accessAbsolute(p.currentIo(), v3_path, .{}) catch break :blk false;
+        break :blk true;
+    };
+    if (has_v3) return .v3;
+
     const v2_path = try std.fs.path.join(ctx.allocator, &.{ temp_dir, manifest.MANIFEST_V2_FILENAME });
     defer ctx.allocator.free(v2_path);
-    std.Io.Dir.accessAbsolute(p.currentIo(), v2_path, .{}) catch return .v1;
-    return .v2;
+    const has_v2 = blk: {
+        std.Io.Dir.accessAbsolute(p.currentIo(), v2_path, .{}) catch break :blk false;
+        break :blk true;
+    };
+    if (has_v2) return .v2;
+
+    return .v1;
 }
 const PreparedImport = struct {
     extract: ExtractResult,
@@ -383,10 +396,11 @@ fn appendJsonEscaped(buf: *std.ArrayList(u8), allocator: std.mem.Allocator, valu
 }
 
 fn computeAndVerifyContentHash(ctx: *Context, temp_dir: []const u8, pkg_manifest: *const manifest.PackageManifestV1, format: manifest.Format) !void {
-    const computed_hash = if (format == .v2)
-        try hash.calculateStoreContentHashV2(ctx.allocator, temp_dir, null)
-    else
-        try hash.calculateStoreContentHash(ctx.allocator, temp_dir, null);
+    const computed_hash = switch (format) {
+        .v1 => try hash.calculateStoreContentHash(ctx.allocator, temp_dir, null),
+        .v2 => try hash.calculateStoreContentHashV2(ctx.allocator, temp_dir, null),
+        .v3 => try hash.calculateStoreContentHashV3(ctx.allocator, temp_dir, null),
+    };
     defer ctx.allocator.free(computed_hash);
 
     const declared_hash = try pkg_manifest.contentHashHex(ctx.allocator);
