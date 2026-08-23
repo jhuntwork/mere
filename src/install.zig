@@ -2281,22 +2281,13 @@ fn preVerifyManifest(
 
     ctx.debug("partial-extracting manifest for pre-verification", .{});
     var format: manifest.Format = .v1;
-    extract.fileInto(ctx, cache_path, verify_dir, manifest.MANIFEST_V4_FILENAME) catch {};
-    const v4_probe_path = try std.fs.path.join(ctx.allocator, &.{ verify_dir, manifest.MANIFEST_V4_FILENAME });
-    defer ctx.allocator.free(v4_probe_path);
-    if (path.fileExists(v4_probe_path)) {
-        format = .v4;
-    } else {
-        extract.fileInto(ctx, cache_path, verify_dir, manifest.MANIFEST_V3_FILENAME) catch {};
-        const v3_probe_path = try std.fs.path.join(ctx.allocator, &.{ verify_dir, manifest.MANIFEST_V3_FILENAME });
-        defer ctx.allocator.free(v3_probe_path);
-        if (path.fileExists(v3_probe_path)) {
-            format = .v3;
-        } else {
-            extract.fileInto(ctx, cache_path, verify_dir, manifest.MANIFEST_V2_FILENAME) catch {};
-            const v2_probe_path = try std.fs.path.join(ctx.allocator, &.{ verify_dir, manifest.MANIFEST_V2_FILENAME });
-            defer ctx.allocator.free(v2_probe_path);
-            if (path.fileExists(v2_probe_path)) format = .v2;
+    for (manifest.formats_newest_first) |candidate| {
+        extract.fileInto(ctx, cache_path, verify_dir, candidate.manifestFilename()) catch {};
+        const probe_path = try std.fs.path.join(ctx.allocator, &.{ verify_dir, candidate.manifestFilename() });
+        defer ctx.allocator.free(probe_path);
+        if (path.fileExists(probe_path)) {
+            format = candidate;
+            break;
         }
     }
 
@@ -2440,10 +2431,11 @@ fn stageAndValidatePayload(
     // Compute content hash from realized payload and canonical package metadata (spec #1/#4)
     var hash_diag: hash.HashDiag = .{};
     defer hash_diag.deinit(ctx.allocator);
-    var content_hash: []const u8 = switch (format) {
+    var content_hash: []const u8 = switch (format.storeHashFormat()) {
         .v1 => hash.calculateStoreContentHash(ctx.allocator, staging_dir, &hash_diag),
         .v2 => hash.calculateStoreContentHashV2(ctx.allocator, staging_dir, &hash_diag),
-        .v3, .v4 => hash.calculateStoreContentHashV3(ctx.allocator, staging_dir, &hash_diag),
+        .v3 => hash.calculateStoreContentHashV3(ctx.allocator, staging_dir, &hash_diag),
+        .v4 => hash.calculateStoreContentHashV4(ctx.allocator, staging_dir, &hash_diag),
     } catch |err| {
         const action = hash_diag.action orelse "compute content hash";
         const path_label = hash_diag.path orelse staging_dir;

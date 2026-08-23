@@ -553,41 +553,19 @@ fn validateGenerationStorePaths(
                 return ctx.fail(ActivationError.InvalidInput, pkg.store_path, "invalid content hash length in manifest");
             }
 
-            const format: package_manifest.Format = blk: {
-                const v4_manifest_path = std.fs.path.join(ctx.allocator, &.{ pkg.store_path, package_manifest.MANIFEST_V4_FILENAME }) catch {
-                    return ctx.fail(ActivationError.OutOfMemory, pkg.store_path, "failed to construct v4 manifest path");
-                };
-                defer ctx.allocator.free(v4_manifest_path);
-                const has_v4 = blk_v4: {
-                    std.Io.Dir.accessAbsolute(path_mod.currentIo(), v4_manifest_path, .{}) catch break :blk_v4 false;
-                    break :blk_v4 true;
-                };
-                if (has_v4) break :blk .v4;
-
-                const v3_manifest_path = std.fs.path.join(ctx.allocator, &.{ pkg.store_path, package_manifest.MANIFEST_V3_FILENAME }) catch {
-                    return ctx.fail(ActivationError.OutOfMemory, pkg.store_path, "failed to construct v3 manifest path");
-                };
-                defer ctx.allocator.free(v3_manifest_path);
-                const has_v3 = blk_v3: {
-                    std.Io.Dir.accessAbsolute(path_mod.currentIo(), v3_manifest_path, .{}) catch break :blk_v3 false;
-                    break :blk_v3 true;
-                };
-                if (has_v3) break :blk .v3;
-
-                const v2_manifest_path = std.fs.path.join(ctx.allocator, &.{ pkg.store_path, package_manifest.MANIFEST_V2_FILENAME }) catch {
-                    return ctx.fail(ActivationError.OutOfMemory, pkg.store_path, "failed to construct v2 manifest path");
-                };
-                defer ctx.allocator.free(v2_manifest_path);
-                const has_v2 = blk_v2: {
-                    std.Io.Dir.accessAbsolute(path_mod.currentIo(), v2_manifest_path, .{}) catch break :blk_v2 false;
-                    break :blk_v2 true;
-                };
-                break :blk if (has_v2) .v2 else .v1;
+            const format = package_manifest.detectFormat(ctx.allocator, pkg.store_path) catch |err| {
+                return ctx.fail(switch (err) {
+                    package_manifest.ManifestError.OutOfMemory => ActivationError.OutOfMemory,
+                    package_manifest.ManifestError.PermissionDenied => ActivationError.PermissionDenied,
+                    package_manifest.ManifestError.InvalidInput => ActivationError.InvalidInput,
+                    else => ActivationError.FileSystem,
+                }, pkg.store_path, "failed to detect package manifest format");
             };
-            const computed = switch (format) {
+            const computed = switch (format.storeHashFormat()) {
                 .v1 => hash.calculateStoreContentHash(ctx.allocator, pkg.store_path, null),
                 .v2 => hash.calculateStoreContentHashV2(ctx.allocator, pkg.store_path, null),
-                .v3, .v4 => hash.calculateStoreContentHashV3(ctx.allocator, pkg.store_path, null),
+                .v3 => hash.calculateStoreContentHashV3(ctx.allocator, pkg.store_path, null),
+                .v4 => hash.calculateStoreContentHashV4(ctx.allocator, pkg.store_path, null),
             };
             const computed_hash = computed catch |err| {
                 return ctx.fail(switch (err) {

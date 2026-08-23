@@ -638,22 +638,39 @@ fn mergeStagedTree(ctx: *Context, staged_dir: []const u8, target_abs: []const u8
         defer ctx.allocator.free(src_path);
         var slot = try openDestSlot(ctx, target_root, rel_path, false);
         defer slot.close();
-        try copyDirectoryTimes(ctx, src_path, slot, rel_path);
+        try copyDirectoryMetadata(ctx, src_path, slot, rel_path);
     }
 }
 
-fn copyDirectoryTimes(
+fn copyDirectoryMetadata(
     ctx: *Context,
     src_path: []const u8,
     dst: DestSlot,
     diag_path: []const u8,
 ) ExtractError!void {
-    var src_dir = std.Io.Dir.openDirAbsolute(p.currentIo(), src_path, .{}) catch |err| {
-        return ctx.fail(mapFsError(err), src_path, "failed to open staged directory for timestamp copy");
+    const io = p.currentIo();
+    var src_dir = std.Io.Dir.openDirAbsolute(io, src_path, .{}) catch |err| {
+        return ctx.fail(mapFsError(err), src_path, "failed to open staged directory for metadata copy");
     };
-    defer src_dir.close(p.currentIo());
-    const stat = src_dir.stat(p.currentIo()) catch |err| {
-        return ctx.fail(mapFsError(err), src_path, "failed to stat staged directory for timestamp copy");
+    defer src_dir.close(io);
+    const stat = src_dir.stat(io) catch |err| {
+        return ctx.fail(mapFsError(err), src_path, "failed to stat staged directory for metadata copy");
+    };
+
+    var dst_dir = dst.dir.openDir(io, dst.name, .{
+        .iterate = true,
+        .follow_symlinks = false,
+    }) catch |err| switch (err) {
+        error.SymLinkLoop => return ctx.fail(ExtractError.InvalidInput, diag_path, "directory metadata target is a symlink"),
+        else => return ctx.fail(mapFsError(err), diag_path, "failed to open directory for metadata copy"),
+    };
+    defer dst_dir.close(io);
+    // The staged merge creates destination directories with process defaults.
+    // Restore ordinary archive permissions here; special bits remain governed
+    // by SpecialBitRestorePolicy and are applied separately when requested.
+    const ordinary_mode = stat.permissions.toMode() & @as(std.posix.mode_t, 0o777);
+    dst_dir.setPermissions(io, std.Io.File.Permissions.fromMode(ordinary_mode)) catch |err| {
+        return ctx.fail(mapFsError(err), diag_path, "failed to restore directory permissions");
     };
 
     const name_z = ctx.allocator.dupeZ(u8, dst.name) catch {

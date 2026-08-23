@@ -101,8 +101,8 @@ Mere persists a number of formats, several of which are signed or content-addres
 
 | Format | Location | Discriminator | Written | Accepted |
 | --- | --- | --- | --- | --- |
-| Store content hash (§1) | store path name | manifest format and `schema_version` | v3 | v1, transitional, v2, v3 |
-| Package manifest (§17) | `.mere/manifest.v1` through `.mere/manifest.v4` | `schema_version` field and filename | v4 | v1, v2, v3, v4 |
+| Store content hash (§1) | store path name | manifest format and `schema_version` | v4 | v1, transitional, v2, v3, v4 |
+| Package manifest (§17) | `.mere/manifest.v1` through `.mere/manifest.v5` | `schema_version` field and filename | v5 | v1, v2, v3, v4, v5 |
 | Manifest signature (§5) | `.mere/manifest.vN.sig` | manifest format; v4 envelope magic/version/algorithm | domain-separated v2 envelope | legacy raw Ed25519, domain-separated v2 |
 | Key file | `*.pub`, `*.key` | `MEREKEY` magic, version and algorithm bytes | v1 / Ed25519 | v1 / Ed25519 |
 | Generation manifest (§6) | `<generation>/` | `schema_version` field | 2 | 2 only |
@@ -138,6 +138,12 @@ path_len        = u32 LE
 path            = UTF-8 bytes, '/' separators, no leading slash
 type_tag        = 1 byte: 0x10=file, 0x11=dir, 0x12=symlink
 
+For v3, after type_tag when type is file or directory:
+  special_bits  = 1 byte: (mode & 07000) >> 9
+
+For v4, after type_tag when type is file or directory:
+  canonical_mode = u16 LE: mode & 07555
+
 If file (0x10):
   exec_bit      = 1 byte: 0x00 (not executable) or 0x01 (executable)
   content_len   = u64 LE
@@ -164,8 +170,7 @@ If dir (0x11):
 - Example: `/mere/store/9f2c3a...64chars...-nginx-1.24.0/`
 
 **Metadata location**:
-- `.mere/manifest.v1` (binary) and `.mere/manifest.v1.sig` (signature) in the `.mere/` subdirectory
-- Both manifest files are **excluded from the content hash** (see spec #4) because the manifest contains the hash it describes and the signature authenticates that manifest
+- `.mere/manifest.v1` through `.mere/manifest.v5` and their signatures are excluded from the content hash (see spec #4) because the selected manifest contains the hash it describes and its signature authenticates that manifest
 - `.mere/meta.kdl` is canonical package intent metadata and **is included in the content hash**
 - `.mere/projection.v1` is a derived index and **is excluded from the content hash**; it is regenerated and validated from the package contents and metadata
 - The `content_hash` field in the manifest and the hash in the store path are **identical** (same 32 bytes, displayed as 64 hex chars in path)
@@ -176,17 +181,18 @@ The store content hash **MUST** incorporate:
 - File bytes
 - Path names
 - File type (file / directory / symlink)
-- setuid, setgid, and sticky bits on files and directories (v3)
+- setuid, setgid, and sticky bits on files and directories (v3 and v4)
+- User/group/other read and execute permission classes on files and directories (v4)
 
 The store content hash **MUST NOT** incorporate:
-- Read/write permission bits (other than executable)
+- Write permission bits (v4 normalizes them away because admission removes them)
 - Ownership (uid/gid)
 - Timestamps
 - ACLs or extended attributes
 
-**Normative invariant**: Two payloads that differ only in non-executable read/write permission bits or ownership are considered *identical content*. Under v3, two payloads that differ in a setuid, setgid, or sticky bit are different content.
+**Normative invariant**: Two v4 payloads that differ only in write permission bits or ownership are considered *identical content*. Two v4 payloads that differ in a read, execute, setuid, setgid, or sticky bit are different content. Earlier variants retain their frozen identity rules.
 
-Implementations MUST preserve extracted permission bits when unpacking archives. Special bits on files and directories participate in v3 identity; symlink modes do not. Read/write bits outside executable and ownership remain outside identity because they are environment-dependent.
+Implementations MUST preserve extracted permission bits when unpacking archives. V4 authenticates the canonical post-hardening mode `mode & 07555` for files and directories; symlink modes do not participate. Ownership remains outside identity because privileged and unprivileged admission intentionally establish different owners.
 
 ---
 
@@ -2046,6 +2052,8 @@ The package manifest is the authoritative source of package metadata, using a de
 **Total size**: 8 + 4 + 8 + 4 + 4 + arch_len + 4 + name_len + 4 + version_len + 32 bytes
 
 **Field ordering is part of the canonical definition** - do not reorder fields.
+
+The byte layout is shared by manifest formats v1-v5; the filename and `schema_version` select the immutable verification contract. New packages write `.mere/manifest.v5`, use the existing domain-separated signature envelope, and bind `content_hash` to store identity v4. Manifest v4 retains store identity v3 and MUST NOT be reinterpreted.
 
 **Required fields (v1)**:
 - `schema_version`: Must be `1`
