@@ -11,6 +11,7 @@ const testing = std.testing;
 const th = @import("test_helpers.zig");
 const config_mod = @import("config.zig");
 const path = @import("path.zig");
+const ui = @import("ui/mod.zig");
 const Repository = @import("repository.zig").Repository;
 
 const Std = errors.StandardErrors;
@@ -41,6 +42,15 @@ fn matchesArch(arch: []const u8) bool {
 }
 
 pub fn searchPackages(ctx: *mere.Context, term: []const u8, client: download.TransferClient) SearchError!std.ArrayList(SearchResult) {
+    return searchPackagesWithPolicy(ctx, term, client, .automatic);
+}
+
+pub fn searchPackagesWithPolicy(
+    ctx: *mere.Context,
+    term: []const u8,
+    client: download.TransferClient,
+    sync_policy: repocache.SyncPolicy,
+) SearchError!std.ArrayList(SearchResult) {
     var results: std.ArrayList(SearchResult) = .empty;
     errdefer {
         for (results.items) |*r| r.deinit(ctx.allocator);
@@ -70,36 +80,29 @@ pub fn searchPackages(ctx: *mere.Context, term: []const u8, client: download.Tra
         loaded_keys.deinit(ctx.allocator);
     }
 
-    // Check if any remote repo needs an initial sync
-    var needs_sync = false;
+    var searchable_repositories: usize = 0;
     for (repocaches.items) |rc| {
-        if (!rc.is_local) {
-            rc.ensureRepository(loaded_keys.items) catch {
-                needs_sync = true;
-                break;
+        if (rc.is_local) {
+            rc.sync(client, .{}, loaded_keys.items) catch {
+                ui.emit.logFmtSeverity(ctx, .search, .warn, "repository {s} is unavailable; skipping it", .{rc.name});
+                continue;
             };
-        }
-    }
-
-    if (needs_sync) {
-        for (repocaches.items) |rc| {
-            if (rc.is_local) continue;
+        } else if (sync_policy != .no_sync) {
             rc.sync(client, .{
-                .force = false,
-                .ttl_seconds = rc.sync_ttl_seconds,
+                .force = sync_policy == .force,
+                .interval_seconds = rc.sync_interval_seconds,
                 .timeout_seconds = rc.sync_timeout_seconds,
             }, loaded_keys.items) catch {
-                ctx.debug("skipping repo {s}: sync failed", .{rc.name});
+                ui.emit.logFmtSeverity(ctx, .search, .warn, "repository {s} is unavailable; skipping it", .{rc.name});
                 continue;
             };
         }
-    }
 
-    for (repocaches.items) |rc| {
         rc.ensureRepository(loaded_keys.items) catch {
-            ctx.debug("skipping repo {s}: failed to open", .{rc.name});
+            ui.emit.logFmtSeverity(ctx, .search, .warn, "repository {s} has no usable verified metadata; skipping it", .{rc.name});
             continue;
         };
+        searchable_repositories += 1;
 
         const repo = &(rc.repository.?);
         var matches = repo.db.searchByName(ctx.allocator, term) catch {
@@ -125,6 +128,10 @@ pub fn searchPackages(ctx: *mere.Context, term: []const u8, client: download.Tra
             };
             results.append(ctx.allocator, result) catch return SearchError.OutOfMemory;
         }
+    }
+
+    if (searchable_repositories == 0) {
+        return ctx.fail(SearchError.FileSystem, term, "no repository has usable verified metadata");
     }
 
     return results;

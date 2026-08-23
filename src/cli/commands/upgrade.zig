@@ -3,6 +3,7 @@ const mere = @import("mere");
 const download = mere.download;
 const types = @import("../types.zig");
 const command = @import("../command.zig");
+const sync_command = @import("sync.zig");
 const MereError = types.MereError;
 
 const upgrade_meta = command.CommandMeta{
@@ -31,7 +32,12 @@ const upgrade_meta = command.CommandMeta{
         },
         .{
             .name = "sync",
-            .description = "Force repository sync even if cache is fresh",
+            .description = "Refresh repository metadata now, retaining verified-cache fallback",
+            .flag_type = .bool,
+        },
+        .{
+            .name = "no-sync",
+            .description = "Use verified cached repository metadata without refreshing it",
             .flag_type = .bool,
         },
         .{
@@ -46,7 +52,7 @@ fn handleUpgrade(ctx: *mere.Context, args: *const types.ParsedArgs) MereError!ty
     const package_names = args.positional;
     const profile_name = args.getString("profile") orelse "system";
     const verify_store = args.getBool("verify-store");
-    const force_sync = args.getBool("sync");
+    const sync_policy = sync_command.repositorySyncPolicy(args) catch return MereError.InvalidInput;
     const dry_run = args.getBool("dry-run");
 
     ctx.withDiagnosticContext(mere.errors.DiagnosticContext.init().withSubject(
@@ -67,7 +73,7 @@ fn handleUpgrade(ctx: *mere.Context, args: *const types.ParsedArgs) MereError!ty
         package_names,
         curl_client.client(),
         verify_store,
-        force_sync,
+        sync_policy,
         profile_name,
         dry_run,
     ) catch |err| return try command.errorResult(ctx, err, null);

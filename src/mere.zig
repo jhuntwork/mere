@@ -21,6 +21,7 @@ pub const scratch = @import("scratch.zig");
 pub const package = @import("package.zig");
 pub const packaging = @import("packaging.zig");
 pub const pin = @import("pin.zig");
+pub const repocache = @import("repocache.zig");
 pub const repodb = @import("repodb.zig");
 pub const profile = @import("profile.zig");
 pub const recipe = @import("recipe.zig");

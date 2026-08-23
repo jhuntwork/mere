@@ -2,6 +2,7 @@ const std = @import("std");
 const mere = @import("mere");
 const types = @import("../types.zig");
 const command = @import("../command.zig");
+const sync_command = @import("sync.zig");
 const MereError = mere.errors.MereError;
 const ui = mere.ui;
 const emit = ui.emit;
@@ -18,6 +19,18 @@ const search_meta = command.CommandMeta{
             .required = true,
         },
     },
+    .flags = &[_]types.Flag{
+        .{
+            .name = "sync",
+            .description = "Refresh repository metadata now, retaining verified-cache fallback",
+            .flag_type = .bool,
+        },
+        .{
+            .name = "no-sync",
+            .description = "Use verified cached repository metadata without refreshing it",
+            .flag_type = .bool,
+        },
+    },
 };
 
 fn handleSearch(ctx: *mere.Context, args: *const types.ParsedArgs) MereError!types.CommandResult {
@@ -26,12 +39,13 @@ fn handleSearch(ctx: *mere.Context, args: *const types.ParsedArgs) MereError!typ
     }
 
     const term = args.positional[0];
+    const sync_policy = sync_command.repositorySyncPolicy(args) catch return MereError.InvalidInput;
 
     var curl_client = try mere.download.CurlTransferClient.init(ctx, command.user_agent);
     defer mere.download.CurlTransferClient.cleanupFn(ctx, curl_client);
     const client = curl_client.client();
 
-    var results = mere.search.searchPackages(ctx, term, client) catch |err| {
+    var results = mere.search.searchPackagesWithPolicy(ctx, term, client, sync_policy) catch |err| {
         const user_message = mere.errors.getUserFriendlyMessage(err);
         return types.CommandResult{
             .success = false,

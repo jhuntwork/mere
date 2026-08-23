@@ -3,6 +3,7 @@ const mere = @import("mere");
 const download = mere.download;
 const types = @import("../types.zig");
 const command = @import("../command.zig");
+const sync_command = @import("sync.zig");
 const MereError = types.MereError;
 
 /// Install command metadata
@@ -32,7 +33,12 @@ const install_meta = command.CommandMeta{
         },
         .{
             .name = "sync",
-            .description = "Force repository sync even if cache is fresh",
+            .description = "Refresh repository metadata now, retaining verified-cache fallback",
+            .flag_type = .bool,
+        },
+        .{
+            .name = "no-sync",
+            .description = "Use verified cached repository metadata without refreshing it",
             .flag_type = .bool,
         },
         .{
@@ -52,7 +58,7 @@ fn handleInstall(ctx: *mere.Context, args: *const types.ParsedArgs) MereError!ty
     const package_names = args.positional;
     const profile_name = args.getString("profile") orelse "system";
     const verify_store = args.getBool("verify-store");
-    const force_sync = args.getBool("sync");
+    const sync_policy = sync_command.repositorySyncPolicy(args) catch return MereError.InvalidInput;
     const dry_run = args.getBool("dry-run");
 
     // Set initial diagnostic context - the subject is the package being installed
@@ -64,7 +70,7 @@ fn handleInstall(ctx: *mere.Context, args: *const types.ParsedArgs) MereError!ty
     defer ctx.releaseStoreLock();
 
     // Error boundary: catch all errors and map them to user-friendly messages at CLI boundary
-    const success_message = performInstallation(ctx, package_names, profile_name, verify_store, force_sync, dry_run) catch |err| {
+    const success_message = performInstallation(ctx, package_names, profile_name, verify_store, sync_policy, dry_run) catch |err| {
         return try command.errorResult(ctx, err, null);
     };
 
@@ -82,7 +88,7 @@ fn performInstallation(
     package_names: []const []const u8,
     profile_name: []const u8,
     verify_store: bool,
-    force_sync: bool,
+    sync_policy: mere.repocache.SyncPolicy,
     dry_run: bool,
 ) !?[]const u8 {
     // Ensure configuration is loaded (no logging - errors propagate)
@@ -94,7 +100,7 @@ fn performInstallation(
     const client = curl_client.client();
 
     // Perform installation (no logging - errors propagate)
-    const outcome = try mere.install.installPackagesFromConfigWithPreview(ctx, package_names, client, false, verify_store, force_sync, profile_name, dry_run);
+    const outcome = try mere.install.installPackagesFromConfigWithPreview(ctx, package_names, client, false, verify_store, sync_policy, profile_name, dry_run);
     return switch (outcome) {
         .completed => null,
         .store_only_system_activation_deferred => null,

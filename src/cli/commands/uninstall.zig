@@ -3,6 +3,7 @@ const mere = @import("mere");
 const download = mere.download;
 const types = @import("../types.zig");
 const command = @import("../command.zig");
+const sync_command = @import("sync.zig");
 const MereError = types.MereError;
 
 const uninstall_meta = command.CommandMeta{
@@ -41,7 +42,12 @@ const uninstall_meta = command.CommandMeta{
         },
         .{
             .name = "sync",
-            .description = "Force repository sync even if cache is fresh",
+            .description = "Refresh repository metadata now, retaining verified-cache fallback",
+            .flag_type = .bool,
+        },
+        .{
+            .name = "no-sync",
+            .description = "Use verified cached repository metadata without refreshing it",
             .flag_type = .bool,
         },
     },
@@ -55,7 +61,7 @@ fn handleUninstall(ctx: *mere.Context, args: *const types.ParsedArgs) MereError!
     const package_names = args.positional;
     const profile_name = args.getString("profile") orelse "system";
     const verify_store = args.getBool("verify-store");
-    const force_sync = args.getBool("sync");
+    const sync_policy = sync_command.repositorySyncPolicy(args) catch return MereError.InvalidInput;
     const cascade = args.getBool("cascade");
     const dry_run = args.getBool("dry-run");
 
@@ -66,7 +72,7 @@ fn handleUninstall(ctx: *mere.Context, args: *const types.ParsedArgs) MereError!
     if (try command.acquireStoreLockOrResult(ctx)) |result| return result;
     defer ctx.releaseStoreLock();
 
-    const result = performUninstall(ctx, package_names, profile_name, verify_store, force_sync, cascade, dry_run) catch |err| {
+    const result = performUninstall(ctx, package_names, profile_name, verify_store, sync_policy, cascade, dry_run) catch |err| {
         return try command.errorResult(ctx, err, null);
     };
 
@@ -89,7 +95,7 @@ fn performUninstall(
     package_names: []const []const u8,
     profile_name: []const u8,
     verify_store: bool,
-    force_sync: bool,
+    sync_policy: mere.repocache.SyncPolicy,
     cascade: bool,
     dry_run: bool,
 ) !?[]const u8 {
@@ -104,7 +110,7 @@ fn performUninstall(
         package_names,
         client,
         verify_store,
-        force_sync,
+        sync_policy,
         profile_name,
         cascade,
         dry_run,

@@ -11,6 +11,7 @@ const repodb = @import("repodb.zig");
 const c = repodb.c;
 const sign = @import("sign.zig");
 const repocache_mod = @import("repocache.zig");
+const SyncPolicy = repocache_mod.SyncPolicy;
 const RepoCache = repocache_mod.RepoCache;
 const config_mod = @import("config.zig");
 const repo_sources = @import("repo_sources.zig");
@@ -368,7 +369,7 @@ pub fn installPackagesFromConfig(
         client,
         reinstall,
         verify_store,
-        force_sync,
+        if (force_sync) SyncPolicy.force else .automatic,
         profile_name,
         false,
     );
@@ -380,7 +381,7 @@ pub fn installPackagesFromConfigWithPreview(
     client: download.TransferClient,
     reinstall: bool,
     verify_store: bool,
-    force_sync: bool,
+    sync_policy: SyncPolicy,
     profile_name: ?[]const u8,
     dry_run: bool,
 ) !InstallCommandOutcome {
@@ -441,7 +442,7 @@ pub fn installPackagesFromConfigWithPreview(
     }
 
     // Resolve
-    var resolution = try resolveProfile(ctx, repocaches.items, resolver_requirements, preferred_selections, client, force_sync, true);
+    var resolution = try resolveProfile(ctx, repocaches.items, resolver_requirements, preferred_selections, client, sync_policy == .force, sync_policy != .no_sync);
     defer resolution.deinit();
     if (requested_state) |*state| resolution.setRequestedIntent(state.packages.items);
 
@@ -548,7 +549,7 @@ pub fn upgradePackagesFromConfig(
     pkg_names: []const []const u8,
     client: download.TransferClient,
     verify_store: bool,
-    force_sync: bool,
+    sync_policy: SyncPolicy,
     profile_name: []const u8,
     dry_run: bool,
 ) !InstallCommandOutcome {
@@ -608,8 +609,8 @@ pub fn upgradePackagesFromConfig(
         resolver_requirements,
         preferred_selections_state.selections,
         client,
-        force_sync,
-        true,
+        sync_policy == .force,
+        sync_policy != .no_sync,
     );
     defer resolution.deinit();
     resolution.setRequestedIntent(requested_state.packages.items);
@@ -634,7 +635,7 @@ pub fn uninstallPackagesFromConfig(
     pkg_names: []const []const u8,
     client: download.TransferClient,
     verify_store: bool,
-    force_sync: bool,
+    sync_policy: SyncPolicy,
     profile_name: []const u8,
     cascade: bool,
     dry_run: bool,
@@ -680,7 +681,7 @@ pub fn uninstallPackagesFromConfig(
         preferred_selections_state.holdAll();
 
         // Resolve
-        var resolution = try resolveProfile(ctx, repocaches.items, resolver_requirements, preferred_selections_state.selections, client, force_sync, false);
+        var resolution = try resolveProfile(ctx, repocaches.items, resolver_requirements, preferred_selections_state.selections, client, sync_policy == .force, sync_policy != .no_sync);
         defer resolution.deinit();
 
         if (requested_state.removed_count == 0) {
@@ -766,7 +767,7 @@ pub fn uninstallPackagesFromConfig(
                 for (requested_state.packages.items, 0..) |pkg, ri| {
                     new_reqs[ri] = .{ .name = pkg.name, .constraint_expr = pkg.constraint_expr };
                 }
-                resolution = try resolveProfile(ctx, repocaches.items, new_reqs, preferred_selections_state.selections, client, force_sync, false);
+                resolution = try resolveProfile(ctx, repocaches.items, new_reqs, preferred_selections_state.selections, client, sync_policy == .force, sync_policy != .no_sync);
                 resolution.setRequestedIntent(requested_state.packages.items);
             } else {
                 // All roots removed. Do NOT deinit `resolution` here - the
@@ -1563,7 +1564,7 @@ fn syncRepoCaches(
     for (repocaches) |repo_cache| {
         try repo_cache.sync(client, .{
             .force = force_sync,
-            .ttl_seconds = repo_cache.sync_ttl_seconds,
+            .interval_seconds = repo_cache.sync_interval_seconds,
             .timeout_seconds = repo_cache.sync_timeout_seconds,
         }, loaded_keys);
         try repo_cache.ensureRepository(loaded_keys);
@@ -5199,7 +5200,7 @@ test "uninstallPackagesFromConfig cascade handles multiple independently-require
 
     // Uninstall A and C with cascade. Both E (depends on A) and F (depends
     // on C) must be cascaded away too - not just whichever is checked first.
-    const result = try uninstallPackagesFromConfig(ctx, &.{ "A", "C" }, client, false, false, "testprofile", true, false);
+    const result = try uninstallPackagesFromConfig(ctx, &.{ "A", "C" }, client, false, .automatic, "testprofile", true, false);
     defer if (result) |msg| allocator.free(msg);
     try std.testing.expect(result == null);
 

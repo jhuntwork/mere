@@ -6,7 +6,7 @@ const download = @import("download.zig");
 const kdl = @import("kdl.zig");
 const kdl_schema = @import("kdl_schema.zig");
 
-const default_sync_ttl_seconds: u64 = 15 * 60;
+const default_sync_interval_seconds: u64 = 15 * 60;
 const default_sync_timeout_seconds: u32 = 30;
 
 pub const InitProvider = enum {
@@ -37,8 +37,8 @@ pub const RepoConfig = struct {
     priority: u8 = 100,
     /// Whether this repository is enabled (disabled repos are skipped during install/sync)
     enabled: bool = true,
-    /// Sync TTL in seconds (remote repos only; local repos ignore)
-    sync_ttl_seconds: u64 = default_sync_ttl_seconds,
+    /// Automatic refresh interval in seconds (remote repos only; local repos ignore)
+    sync_interval_seconds: u64 = default_sync_interval_seconds,
     /// Sync timeout in seconds (remote repos only; local repos ignore)
     sync_timeout_seconds: u32 = default_sync_timeout_seconds,
 
@@ -77,7 +77,7 @@ pub const RepoConfig = struct {
             .url = url_copy,
             .priority = self.priority,
             .enabled = self.enabled,
-            .sync_ttl_seconds = self.sync_ttl_seconds,
+            .sync_interval_seconds = self.sync_interval_seconds,
             .sync_timeout_seconds = self.sync_timeout_seconds,
             .trusted_fingerprints = fingerprints_copy,
         };
@@ -89,7 +89,7 @@ pub const RepoConfig = struct {
         ctx: *Context,
         node: *const kdl.Node,
         allocator: std.mem.Allocator,
-        default_ttl_seconds: u64,
+        default_interval_seconds: u64,
         default_timeout_seconds: u32,
     ) !RepoConfig {
         ctx.debug("parsing repository from kdl", .{});
@@ -121,15 +121,21 @@ pub const RepoConfig = struct {
         // Get optional enabled flag (default true)
         const enabled = node.getChildBool("enabled") orelse true;
 
-        // Get optional sync ttl (seconds)
-        const sync_ttl_seconds: u64 = blk: {
-            if (node.getChildInt("sync-ttl")) |ttl| {
-                if (ttl < 0) {
-                    return ctx.fail(error.InvalidConfig, name, "sync-ttl must be non-negative");
+        // `sync-ttl` remains a read-only compatibility alias. Both names at
+        // once are ambiguous and therefore rejected.
+        const interval_value = node.getChildInt("sync-interval");
+        const ttl_alias_value = node.getChildInt("sync-ttl");
+        if (interval_value != null and ttl_alias_value != null) {
+            return ctx.fail(error.InvalidConfig, name, "sync-interval and sync-ttl cannot both be set");
+        }
+        const sync_interval_seconds: u64 = blk: {
+            if (interval_value orelse ttl_alias_value) |interval| {
+                if (interval < 0) {
+                    return ctx.fail(error.InvalidConfig, name, "sync-interval must be non-negative");
                 }
-                break :blk @intCast(ttl);
+                break :blk @intCast(interval);
             }
-            break :blk default_ttl_seconds;
+            break :blk default_interval_seconds;
         };
 
         // Get optional sync timeout (seconds)
@@ -195,7 +201,7 @@ pub const RepoConfig = struct {
             .url = url_copy,
             .priority = priority,
             .enabled = enabled,
-            .sync_ttl_seconds = sync_ttl_seconds,
+            .sync_interval_seconds = sync_interval_seconds,
             .sync_timeout_seconds = sync_timeout_seconds,
             .trusted_fingerprints = fingerprints,
         };
@@ -222,8 +228,8 @@ pub const Config = struct {
     ctx: *Context,
     alloc: std.mem.Allocator,
     color: ?bool = null,
-    /// Default sync TTL for remote repos (seconds)
-    sync_ttl_seconds: u64 = default_sync_ttl_seconds,
+    /// Default automatic refresh interval for remote repos (seconds)
+    sync_interval_seconds: u64 = default_sync_interval_seconds,
     /// Default sync timeout for remote repos (seconds)
     sync_timeout_seconds: u32 = default_sync_timeout_seconds,
     /// Init/service provider. Null means use the default provider.
@@ -238,7 +244,7 @@ pub const Config = struct {
             .ctx = ctx,
             .alloc = alloc,
             .color = null,
-            .sync_ttl_seconds = default_sync_ttl_seconds,
+            .sync_interval_seconds = default_sync_interval_seconds,
             .sync_timeout_seconds = default_sync_timeout_seconds,
             .init_provider = null,
         };
@@ -308,11 +314,16 @@ pub const Config = struct {
                 if (node.getChildBool("color")) |color| {
                     config.color = color;
                 }
-                if (node.getChildInt("sync-ttl")) |ttl| {
-                    if (ttl < 0) {
-                        return ctx.fail(error.InvalidConfig, "settings", "sync-ttl must be non-negative");
+                const interval_value = node.getChildInt("sync-interval");
+                const ttl_alias_value = node.getChildInt("sync-ttl");
+                if (interval_value != null and ttl_alias_value != null) {
+                    return ctx.fail(error.InvalidConfig, "settings", "sync-interval and sync-ttl cannot both be set");
+                }
+                if (interval_value orelse ttl_alias_value) |interval| {
+                    if (interval < 0) {
+                        return ctx.fail(error.InvalidConfig, "settings", "sync-interval must be non-negative");
                     }
-                    config.sync_ttl_seconds = @intCast(ttl);
+                    config.sync_interval_seconds = @intCast(interval);
                 }
                 if (node.getChildInt("sync-timeout")) |timeout| {
                     if (timeout < 0 or timeout > std.math.maxInt(u32)) {
@@ -335,7 +346,7 @@ pub const Config = struct {
                     ctx,
                     node,
                     allocator,
-                    config.sync_ttl_seconds,
+                    config.sync_interval_seconds,
                     config.sync_timeout_seconds,
                 );
                 try config.repos.append(allocator, repo);
@@ -355,7 +366,7 @@ pub const Config = struct {
 
         out.writeAll("// Mere Linux configuration\n\n") catch return error.OutOfMemory;
 
-        if (self.color != null or self.sync_ttl_seconds != default_sync_ttl_seconds or self.sync_timeout_seconds != default_sync_timeout_seconds or self.init_provider != null) {
+        if (self.color != null or self.sync_interval_seconds != default_sync_interval_seconds or self.sync_timeout_seconds != default_sync_timeout_seconds or self.init_provider != null) {
             out.writeAll("settings {\n") catch return error.OutOfMemory;
             if (self.color) |color| {
                 out.print("    color {}\n", .{color}) catch return error.OutOfMemory;
@@ -363,8 +374,8 @@ pub const Config = struct {
             if (self.init_provider) |provider| {
                 out.print("    init-provider \"{s}\"\n", .{provider.label()}) catch return error.OutOfMemory;
             }
-            if (self.sync_ttl_seconds != default_sync_ttl_seconds) {
-                out.print("    sync-ttl {d}\n", .{self.sync_ttl_seconds}) catch return error.OutOfMemory;
+            if (self.sync_interval_seconds != default_sync_interval_seconds) {
+                out.print("    sync-interval {d}\n", .{self.sync_interval_seconds}) catch return error.OutOfMemory;
             }
             if (self.sync_timeout_seconds != default_sync_timeout_seconds) {
                 out.print("    sync-timeout {d}\n", .{self.sync_timeout_seconds}) catch return error.OutOfMemory;
@@ -384,8 +395,8 @@ pub const Config = struct {
                 out.writeAll("\n") catch return error.OutOfMemory;
             }
             out.print("    priority {d}\n", .{repo.priority}) catch return error.OutOfMemory;
-            if (repo.sync_ttl_seconds != self.sync_ttl_seconds) {
-                out.print("    sync-ttl {d}\n", .{repo.sync_ttl_seconds}) catch return error.OutOfMemory;
+            if (repo.sync_interval_seconds != self.sync_interval_seconds) {
+                out.print("    sync-interval {d}\n", .{repo.sync_interval_seconds}) catch return error.OutOfMemory;
             }
             if (repo.sync_timeout_seconds != self.sync_timeout_seconds) {
                 out.print("    sync-timeout {d}\n", .{repo.sync_timeout_seconds}) catch return error.OutOfMemory;
@@ -453,7 +464,7 @@ pub const Config = struct {
             .url = url_copy,
             .priority = src.priority,
             .enabled = src.enabled,
-            .sync_ttl_seconds = src.sync_ttl_seconds,
+            .sync_interval_seconds = src.sync_interval_seconds,
             .sync_timeout_seconds = src.sync_timeout_seconds,
             .trusted_fingerprints = fingerprints_copy,
         };
@@ -485,7 +496,7 @@ pub const Config = struct {
     pub fn deepCopy(self: *const Config, allocator: std.mem.Allocator) !Config {
         var new_config = Config.init(self.ctx, allocator);
         new_config.color = self.color;
-        new_config.sync_ttl_seconds = self.sync_ttl_seconds;
+        new_config.sync_interval_seconds = self.sync_interval_seconds;
         new_config.sync_timeout_seconds = self.sync_timeout_seconds;
         new_config.init_provider = self.init_provider;
         errdefer new_config.deinit();
@@ -1381,4 +1392,46 @@ test "KDL config normalizes trusted-fingerprints to lowercase" {
         "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
         config.repos.items[0].trusted_fingerprints.items[0],
     );
+}
+
+test "sync-ttl remains a read alias while config writes sync-interval" {
+    var test_env = try @import("test_helpers.zig").createTestEnv();
+    defer {
+        test_env.cleanup();
+        std.testing.allocator.destroy(test_env);
+    }
+
+    var config = try Config.fromKdl(&test_env.ctx,
+        \\settings {
+        \\    sync-ttl 42
+        \\}
+        \\repo "core" {
+        \\    url "https://example.com/core"
+        \\    sync-ttl 7
+        \\}
+    , test_env.ctx.allocator);
+    defer config.deinit();
+
+    try std.testing.expectEqual(@as(u64, 42), config.sync_interval_seconds);
+    try std.testing.expectEqual(@as(u64, 7), config.repos.items[0].sync_interval_seconds);
+    const encoded = try config.toKdl();
+    defer config.alloc.free(encoded);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "sync-interval 42") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "sync-interval 7") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "sync-ttl") == null);
+}
+
+test "config rejects sync interval and ttl alias together" {
+    var test_env = try @import("test_helpers.zig").createTestEnv();
+    defer {
+        test_env.cleanup();
+        std.testing.allocator.destroy(test_env);
+    }
+
+    try std.testing.expectError(error.InvalidConfig, Config.fromKdl(&test_env.ctx,
+        \\settings {
+        \\    sync-interval 60
+        \\    sync-ttl 60
+        \\}
+    , test_env.ctx.allocator));
 }
