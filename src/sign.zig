@@ -15,6 +15,17 @@ pub const SignError = Std.OutOfMemory || Std.FileSystem || Std.PermissionDenied 
     SodiumInitFailed,
 };
 
+pub const ManifestSignatureFormat = enum {
+    legacy_raw,
+    domain_v2,
+};
+
+pub const MANIFEST_SIGNATURE_DOMAIN_V2 = "MERE\x00package-manifest\x00signature-v2\x00";
+pub const MANIFEST_SIGNATURE_MAGIC: *const [8]u8 = "MERESIG\x00";
+pub const MANIFEST_SIGNATURE_VERSION_V2: u16 = 2;
+pub const MANIFEST_SIGNATURE_ALGORITHM_ED25519: u16 = 1;
+pub const MANIFEST_SIGNATURE_ENVELOPE_V2_SIZE = 8 + 2 + 2 + c.crypto_sign_BYTES;
+
 fn mapCryptoError(err: sign_crypto.CryptoError) SignError {
     switch (err) {
         sign_crypto.CryptoError.SodiumInitFailed => return SignError.SodiumInitFailed,
@@ -262,6 +273,61 @@ pub fn verifyBytes(public_key_bytes: []const u8, msg: []const u8, sig: []const u
     return;
 }
 
+fn manifestSignatureMessageV2(allocator: std.mem.Allocator, manifest_bytes: []const u8) SignError![]u8 {
+    const message = allocator.alloc(u8, MANIFEST_SIGNATURE_DOMAIN_V2.len + manifest_bytes.len) catch {
+        return SignError.OutOfMemory;
+    };
+    @memcpy(message[0..MANIFEST_SIGNATURE_DOMAIN_V2.len], MANIFEST_SIGNATURE_DOMAIN_V2);
+    @memcpy(message[MANIFEST_SIGNATURE_DOMAIN_V2.len..], manifest_bytes);
+    return message;
+}
+
+pub fn signManifestBytes(
+    allocator: std.mem.Allocator,
+    secret_key_bytes: []const u8,
+    manifest_bytes: []const u8,
+    format: ManifestSignatureFormat,
+) SignError![]u8 {
+    return switch (format) {
+        .legacy_raw => blk: {
+            const signature = try signBytes(secret_key_bytes, manifest_bytes);
+            const encoded = allocator.alloc(u8, c.crypto_sign_BYTES) catch return SignError.OutOfMemory;
+            @memcpy(encoded, &signature);
+            break :blk encoded;
+        },
+        .domain_v2 => blk: {
+            const message = try manifestSignatureMessageV2(allocator, manifest_bytes);
+            defer allocator.free(message);
+            const signature = try signBytes(secret_key_bytes, message);
+            const envelope = allocator.alloc(u8, MANIFEST_SIGNATURE_ENVELOPE_V2_SIZE) catch return SignError.OutOfMemory;
+            @memcpy(envelope[0..8], MANIFEST_SIGNATURE_MAGIC);
+            std.mem.writeInt(u16, envelope[8..10], MANIFEST_SIGNATURE_VERSION_V2, .little);
+            std.mem.writeInt(u16, envelope[10..12], MANIFEST_SIGNATURE_ALGORITHM_ED25519, .little);
+            @memcpy(envelope[12..], &signature);
+            break :blk envelope;
+        },
+    };
+}
+
+fn decodeManifestSignature(
+    signature_bytes: []const u8,
+    format: ManifestSignatureFormat,
+) SignError![]const u8 {
+    return switch (format) {
+        .legacy_raw => if (signature_bytes.len == c.crypto_sign_BYTES)
+            signature_bytes
+        else
+            SignError.VerifyFailed,
+        .domain_v2 => blk: {
+            if (signature_bytes.len != MANIFEST_SIGNATURE_ENVELOPE_V2_SIZE) return SignError.VerifyFailed;
+            if (!std.mem.eql(u8, signature_bytes[0..8], MANIFEST_SIGNATURE_MAGIC)) return SignError.VerifyFailed;
+            if (std.mem.readInt(u16, signature_bytes[8..10], .little) != MANIFEST_SIGNATURE_VERSION_V2) return SignError.VerifyFailed;
+            if (std.mem.readInt(u16, signature_bytes[10..12], .little) != MANIFEST_SIGNATURE_ALGORITHM_ED25519) return SignError.VerifyFailed;
+            break :blk signature_bytes[12..];
+        },
+    };
+}
+
 /// Write a signature file for `file_path` using an injected or default signer/resolver.
 /// This centralizes the file-writing semantics so callers (like convert/packaging) do not need to
 /// handle signer resolution and IO themselves.
@@ -495,7 +561,7 @@ fn verifyMsgAgainstTrustedKeys(
     all_keys: []const LoadedKey,
     trusted_fingerprints: []const []const u8,
     msg: []const u8,
-    signature: [c.crypto_sign_BYTES]u8,
+    signature: []const u8,
 ) SignError!VerifyWithFingerprintResult {
     var trusted_key_count: usize = 0;
 
@@ -504,7 +570,7 @@ fn verifyMsgAgainstTrustedKeys(
         trusted_key_count += 1;
 
         // Try to verify with this key
-        verifyBytes(loaded_key.public_key.key[0..], msg, signature[0..]) catch {
+        verifyBytes(loaded_key.public_key.key[0..], msg, signature) catch {
             continue; // Try next key
         };
 
@@ -665,27 +731,33 @@ pub const VerifyManifestResult = struct {
 pub fn verifyManifestWithTrustedFingerprints(
     ctx: *Context,
     manifest_path: []const u8,
-    signature_path: ?[]const u8,
+    signature_path: []const u8,
+    format: ManifestSignatureFormat,
     trusted_fingerprints: []const []const u8,
     all_keys: []const LoadedKey,
 ) SignError!VerifyManifestResult {
-    // Read raw manifest bytes (manifests are signed directly, not hashed)
     const manifest_bytes = sign_io.readRawFile(manifest_path) catch |e| {
         return mapIOReadError(e);
     };
     defer std.heap.page_allocator.free(manifest_bytes);
 
+    const signature_bytes = sign_io.readRawFile(signature_path) catch |e| {
+        return mapIOReadError(e);
+    };
+    defer std.heap.page_allocator.free(signature_bytes);
+    const signature = try decodeManifestSignature(signature_bytes, format);
+
+    const message = switch (format) {
+        .legacy_raw => manifest_bytes,
+        .domain_v2 => try manifestSignatureMessageV2(ctx.allocator, manifest_bytes),
+    };
+    defer if (format == .domain_v2) ctx.allocator.free(message);
+
     const owned_bytes = ctx.allocator.dupe(u8, manifest_bytes) catch return SignError.OutOfMemory;
     errdefer ctx.allocator.free(owned_bytes);
 
-    const result = try verifyMsgWithTrustedFingerprints(
-        ctx,
-        manifest_path,
-        manifest_bytes,
-        signature_path,
-        trusted_fingerprints,
-        all_keys,
-    );
+    try requireTrustedFingerprints(ctx, trusted_fingerprints);
+    const result = try verifyMsgAgainstTrustedKeys(ctx, all_keys, trusted_fingerprints, message, signature);
     return VerifyManifestResult{
         .verifying_fingerprint = result.verifying_fingerprint,
         .manifest_bytes = owned_bytes,
@@ -736,7 +808,7 @@ test "verifyManifestWithTrustedFingerprints returns manifest bytes usable after 
     }};
     const trusted = [_][]const u8{fingerprint};
 
-    var result = try verifyManifestWithTrustedFingerprints(ctx, manifest_path, sig_path, &trusted, &loaded_keys);
+    var result = try verifyManifestWithTrustedFingerprints(ctx, manifest_path, sig_path, .legacy_raw, &trusted, &loaded_keys);
     defer result.deinit(ctx.allocator);
 
     // Simulate the swap window this fix closes: remove the on-disk manifest
@@ -764,7 +836,7 @@ fn verifyMsgWithTrustedFingerprints(
     // Load signature
     const signature = try resolveAndLoadSignature(file_path, signature_path);
 
-    const result = verifyMsgAgainstTrustedKeys(ctx, all_keys, trusted_fingerprints, msg, signature) catch |err| {
+    const result = verifyMsgAgainstTrustedKeys(ctx, all_keys, trusted_fingerprints, msg, &signature) catch |err| {
         if (err == SignError.VerifyFailed) {
             ctx.debug("verifyMsgWithTrustedFingerprints: no trusted key verified the signature", .{});
         }
@@ -2131,4 +2203,160 @@ test "SecretKey.derivePublicKey extracts correct public key" {
 
     // The derived public key should match the original
     try testing.expectEqualSlices(u8, &expected_public_key.key, &derived.key);
+}
+
+fn readHexFixture(allocator: std.mem.Allocator, fixture_path: []const u8) ![]u8 {
+    const hex_file = try sign_io.readRawFile(fixture_path);
+    defer std.heap.page_allocator.free(hex_file);
+    const hex = std.mem.trim(u8, hex_file, "\r\n");
+    const bytes = try allocator.alloc(u8, hex.len / 2);
+    errdefer allocator.free(bytes);
+    _ = try std.fmt.hexToBytes(bytes, hex);
+    return bytes;
+}
+
+const SignatureFixtureKeyPair = struct {
+    public: [c.crypto_sign_PUBLICKEYBYTES]u8,
+    secret: [c.crypto_sign_SECRETKEYBYTES]u8,
+};
+
+fn signatureFixtureKeyPair() !SignatureFixtureKeyPair {
+    const seed_hex = "9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60";
+    var seed: [c.crypto_sign_SEEDBYTES]u8 = undefined;
+    _ = try std.fmt.hexToBytes(&seed, seed_hex);
+    const key_pair = try sign_crypto.deriveKeypairFromSeed(&seed);
+    return .{ .public = key_pair.public, .secret = key_pair.secret };
+}
+
+test "legacy v3 signature fixture remains byte-compatible" {
+    const allocator = std.testing.allocator;
+    const manifest_bytes = try readHexFixture(allocator, "test/testdata/signatures/legacy-v3-manifest.hex");
+    defer allocator.free(manifest_bytes);
+    const expected_signature = try readHexFixture(allocator, "test/testdata/signatures/legacy-v3-signature.hex");
+    defer allocator.free(expected_signature);
+    const expected_public_key = try readHexFixture(allocator, "test/testdata/signatures/test-public-key.hex");
+    defer allocator.free(expected_public_key);
+
+    const key_pair = try signatureFixtureKeyPair();
+    try std.testing.expectEqualSlices(u8, expected_public_key, &key_pair.public);
+
+    const signature = try signManifestBytes(allocator, &key_pair.secret, manifest_bytes, .legacy_raw);
+    defer allocator.free(signature);
+    try std.testing.expectEqualSlices(u8, expected_signature, signature);
+    try verifyBytes(expected_public_key, manifest_bytes, expected_signature);
+}
+
+test "v4 signature fixture fixes the domain and envelope bytes" {
+    const allocator = std.testing.allocator;
+    const manifest_bytes = try readHexFixture(allocator, "test/testdata/signatures/domain-v2-manifest-v4.hex");
+    defer allocator.free(manifest_bytes);
+    const expected_envelope = try readHexFixture(allocator, "test/testdata/signatures/domain-v2-envelope.hex");
+    defer allocator.free(expected_envelope);
+    const expected_public_key = try readHexFixture(allocator, "test/testdata/signatures/test-public-key.hex");
+    defer allocator.free(expected_public_key);
+
+    const key_pair = try signatureFixtureKeyPair();
+    const envelope = try signManifestBytes(allocator, &key_pair.secret, manifest_bytes, .domain_v2);
+    defer allocator.free(envelope);
+    try std.testing.expectEqualSlices(u8, expected_envelope, envelope);
+
+    const signature = try decodeManifestSignature(envelope, .domain_v2);
+    const message = try manifestSignatureMessageV2(allocator, manifest_bytes);
+    defer allocator.free(message);
+    try verifyBytes(expected_public_key, message, signature);
+    try std.testing.expectError(SignError.VerifyFailed, verifyBytes(expected_public_key, manifest_bytes, signature));
+
+    const wrong_domain_message = try allocator.dupe(u8, message);
+    defer allocator.free(wrong_domain_message);
+    wrong_domain_message[5] ^= 0x01;
+    try std.testing.expectError(SignError.VerifyFailed, verifyBytes(expected_public_key, wrong_domain_message, signature));
+
+    const changed_manifest_message = try allocator.dupe(u8, message);
+    defer allocator.free(changed_manifest_message);
+    changed_manifest_message[MANIFEST_SIGNATURE_DOMAIN_V2.len + 8] = 3;
+    try std.testing.expectError(SignError.VerifyFailed, verifyBytes(expected_public_key, changed_manifest_message, signature));
+}
+
+test "trusted manifest verification dispatches frozen legacy and v4 fixtures without fallback" {
+    const allocator = std.testing.allocator;
+    const th = @import("test_helpers.zig");
+    var test_env = try th.createTestEnv();
+    defer {
+        test_env.cleanup();
+        allocator.destroy(test_env);
+    }
+
+    const legacy_manifest = try readHexFixture(allocator, "test/testdata/signatures/legacy-v3-manifest.hex");
+    defer allocator.free(legacy_manifest);
+    const legacy_signature = try readHexFixture(allocator, "test/testdata/signatures/legacy-v3-signature.hex");
+    defer allocator.free(legacy_signature);
+    const v4_manifest = try readHexFixture(allocator, "test/testdata/signatures/domain-v2-manifest-v4.hex");
+    defer allocator.free(v4_manifest);
+    const v4_envelope = try readHexFixture(allocator, "test/testdata/signatures/domain-v2-envelope.hex");
+    defer allocator.free(v4_envelope);
+    const public_key_bytes = try readHexFixture(allocator, "test/testdata/signatures/test-public-key.hex");
+    defer allocator.free(public_key_bytes);
+
+    const legacy_manifest_path = try std.fs.path.join(allocator, &.{ test_env.path, "manifest.v3" });
+    defer allocator.free(legacy_manifest_path);
+    const legacy_signature_path = try std.fs.path.join(allocator, &.{ test_env.path, "manifest.v3.sig" });
+    defer allocator.free(legacy_signature_path);
+    const v4_manifest_path = try std.fs.path.join(allocator, &.{ test_env.path, "manifest.v4" });
+    defer allocator.free(v4_manifest_path);
+    const v4_signature_path = try std.fs.path.join(allocator, &.{ test_env.path, "manifest.v4.sig" });
+    defer allocator.free(v4_signature_path);
+
+    const fixture_files = [_]struct { path: []const u8, bytes: []const u8 }{
+        .{ .path = legacy_manifest_path, .bytes = legacy_manifest },
+        .{ .path = legacy_signature_path, .bytes = legacy_signature },
+        .{ .path = v4_manifest_path, .bytes = v4_manifest },
+        .{ .path = v4_signature_path, .bytes = v4_envelope },
+    };
+    for (fixture_files) |fixture| {
+        var file = try std.Io.Dir.createFileAbsolute(path_mod.currentIo(), fixture.path, .{});
+        try file.writeStreamingAll(path_mod.currentIo(), fixture.bytes);
+        file.close(path_mod.currentIo());
+    }
+
+    var public_key: PublicKey = undefined;
+    @memcpy(&public_key.key, public_key_bytes);
+    const fingerprint = try public_key.fingerprint(allocator);
+    defer allocator.free(fingerprint);
+    const loaded_keys = [_]LoadedKey{.{ .public_key = public_key, .fingerprint = fingerprint, .path = "fixture" }};
+    const trusted = [_][]const u8{fingerprint};
+
+    var legacy_result = try verifyManifestWithTrustedFingerprints(&test_env.ctx, legacy_manifest_path, legacy_signature_path, .legacy_raw, &trusted, &loaded_keys);
+    defer legacy_result.deinit(test_env.ctx.allocator);
+    try std.testing.expectEqualSlices(u8, legacy_manifest, legacy_result.manifest_bytes);
+
+    var v4_result = try verifyManifestWithTrustedFingerprints(&test_env.ctx, v4_manifest_path, v4_signature_path, .domain_v2, &trusted, &loaded_keys);
+    defer v4_result.deinit(test_env.ctx.allocator);
+    try std.testing.expectEqualSlices(u8, v4_manifest, v4_result.manifest_bytes);
+
+    try std.testing.expectError(SignError.VerifyFailed, verifyManifestWithTrustedFingerprints(&test_env.ctx, legacy_manifest_path, legacy_signature_path, .domain_v2, &trusted, &loaded_keys));
+    try std.testing.expectError(SignError.VerifyFailed, verifyManifestWithTrustedFingerprints(&test_env.ctx, v4_manifest_path, v4_signature_path, .legacy_raw, &trusted, &loaded_keys));
+}
+
+test "manifest signature formats reject substitution and malformed envelopes" {
+    const allocator = std.testing.allocator;
+    const legacy_signature = try readHexFixture(allocator, "test/testdata/signatures/legacy-v3-signature.hex");
+    defer allocator.free(legacy_signature);
+    const envelope = try readHexFixture(allocator, "test/testdata/signatures/domain-v2-envelope.hex");
+    defer allocator.free(envelope);
+
+    try std.testing.expectError(SignError.VerifyFailed, decodeManifestSignature(legacy_signature, .domain_v2));
+    try std.testing.expectError(SignError.VerifyFailed, decodeManifestSignature(envelope, .legacy_raw));
+
+    var malformed: [MANIFEST_SIGNATURE_ENVELOPE_V2_SIZE]u8 = undefined;
+    @memcpy(&malformed, envelope);
+    malformed[0] ^= 0xff;
+    try std.testing.expectError(SignError.VerifyFailed, decodeManifestSignature(&malformed, .domain_v2));
+
+    @memcpy(&malformed, envelope);
+    std.mem.writeInt(u16, malformed[8..10], 99, .little);
+    try std.testing.expectError(SignError.VerifyFailed, decodeManifestSignature(&malformed, .domain_v2));
+
+    @memcpy(&malformed, envelope);
+    std.mem.writeInt(u16, malformed[10..12], 99, .little);
+    try std.testing.expectError(SignError.VerifyFailed, decodeManifestSignature(&malformed, .domain_v2));
 }

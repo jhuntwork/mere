@@ -229,6 +229,12 @@ fn verifyStore(
         };
 
         const format: manifest.Format = blk: {
+            const v4_path = std.fs.path.join(ctx.allocator, &.{ entry_path, manifest.MANIFEST_V4_FILENAME }) catch {
+                return ctx.fail(VerifyError.OutOfMemory, entry_path, "failed to construct v4 manifest path");
+            };
+            defer ctx.allocator.free(v4_path);
+            if (std.Io.Dir.accessAbsolute(path_mod.currentIo(), v4_path, .{})) |_| break :blk .v4 else |_| {}
+
             const v3_path = std.fs.path.join(ctx.allocator, &.{ entry_path, manifest.MANIFEST_V3_FILENAME }) catch {
                 return ctx.fail(VerifyError.OutOfMemory, entry_path, "failed to construct v3 manifest path");
             };
@@ -254,26 +260,26 @@ fn verifyStore(
 
         std.Io.Dir.accessAbsolute(path_mod.currentIo(), manifest_path, .{}) catch {
             result.store_issues += 1;
-            try addIssue(ctx, result, .store, entry_path, if (format == .v2) "manifest.v2 missing" else "manifest.v1 missing");
+            try addIssue(ctx, result, .store, entry_path, "package manifest missing");
             continue;
         };
 
         std.Io.Dir.accessAbsolute(path_mod.currentIo(), sig_path, .{}) catch {
             result.store_issues += 1;
-            try addIssue(ctx, result, .store, entry_path, if (format == .v2) "manifest.v2.sig missing" else "manifest.v1.sig missing");
+            try addIssue(ctx, result, .store, entry_path, "package manifest signature missing");
             continue;
         };
 
         const manifest_bytes = manifest.readManifestFileForFormat(ctx, entry_path, format) catch {
             result.store_issues += 1;
-            try addIssue(ctx, result, .store, entry_path, if (format == .v2) "failed to read manifest.v2" else "failed to read manifest.v1");
+            try addIssue(ctx, result, .store, entry_path, "failed to read package manifest");
             continue;
         };
         defer ctx.allocator.free(manifest_bytes);
 
         const pkg_manifest = manifest.PackageManifestV1.decodeForSchema(manifest_bytes, format.schemaVersion()) catch {
             result.store_issues += 1;
-            try addIssue(ctx, result, .store, entry_path, if (format == .v2) "failed to decode manifest.v2" else "failed to decode manifest.v1");
+            try addIssue(ctx, result, .store, entry_path, "failed to decode package manifest");
             continue;
         };
 
@@ -300,7 +306,7 @@ fn verifyStore(
         }
 
         if (trusted_fingerprints.len > 0) {
-            var verify_result = sign.verifyManifestWithTrustedFingerprints(ctx, manifest_path, sig_path, trusted_fingerprints, loaded_keys.items) catch {
+            var verify_result = sign.verifyManifestWithTrustedFingerprints(ctx, manifest_path, sig_path, format.signatureFormat(), trusted_fingerprints, loaded_keys.items) catch {
                 result.store_issues += 1;
                 try addIssue(ctx, result, .store, entry_path, "manifest signature verification failed");
                 continue;
@@ -326,7 +332,7 @@ fn verifyStore(
             const computed = switch (format) {
                 .v1 => hash.calculateStoreContentHash(ctx.allocator, entry_path, null),
                 .v2 => hash.calculateStoreContentHashV2(ctx.allocator, entry_path, null),
-                .v3 => hash.calculateStoreContentHashV3(ctx.allocator, entry_path, null),
+                .v3, .v4 => hash.calculateStoreContentHashV3(ctx.allocator, entry_path, null),
             };
             const computed_hash = computed catch {
                 result.store_issues += 1;
@@ -518,6 +524,14 @@ fn verifyProfileManifestPackages(
 
         if (full_hash) {
             const format: manifest.Format = blk: {
+                const v4_manifest_path = std.fs.path.join(ctx.allocator, &.{ pkg.store_path, manifest.MANIFEST_V4_FILENAME }) catch {
+                    result.profile_issues += 1;
+                    try addProfileIssue(ctx, result, pkg.store_path, profile_name, realization_name, "failed to construct manifest path");
+                    continue;
+                };
+                defer ctx.allocator.free(v4_manifest_path);
+                if (std.Io.Dir.accessAbsolute(path_mod.currentIo(), v4_manifest_path, .{})) |_| break :blk .v4 else |_| {}
+
                 const v3_manifest_path = std.fs.path.join(ctx.allocator, &.{ pkg.store_path, manifest.MANIFEST_V3_FILENAME }) catch {
                     result.profile_issues += 1;
                     try addProfileIssue(ctx, result, pkg.store_path, profile_name, realization_name, "failed to construct manifest path");
@@ -538,7 +552,7 @@ fn verifyProfileManifestPackages(
             const computed = switch (format) {
                 .v1 => hash.calculateStoreContentHash(ctx.allocator, pkg.store_path, null),
                 .v2 => hash.calculateStoreContentHashV2(ctx.allocator, pkg.store_path, null),
-                .v3 => hash.calculateStoreContentHashV3(ctx.allocator, pkg.store_path, null),
+                .v3, .v4 => hash.calculateStoreContentHashV3(ctx.allocator, pkg.store_path, null),
             };
             const computed_hash = computed catch {
                 result.profile_issues += 1;

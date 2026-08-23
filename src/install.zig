@@ -2024,8 +2024,8 @@ fn preVerifyManifest(
     pkg_id: []const u8,
     loaded_keys: []const sign.LoadedKey,
 ) !PreVerifyResult {
-    // Partial-extract manifest.v1 and manifest.v1.sig to a temp location
-    // and verify signature before doing any store operations.
+    // Partial-extract the newest supported manifest/signature pair and verify
+    // it before doing any store operations.
     var verify_temp_dir = try path.createTempDir("mere-verify");
     defer verify_temp_dir.cleanup();
 
@@ -2035,16 +2035,23 @@ fn preVerifyManifest(
 
     ctx.debug("partial-extracting manifest for pre-verification", .{});
     var format: manifest.Format = .v1;
-    extract.fileInto(ctx, cache_path, verify_dir, manifest.MANIFEST_V3_FILENAME) catch {};
-    const v3_probe_path = try std.fs.path.join(ctx.allocator, &.{ verify_dir, manifest.MANIFEST_V3_FILENAME });
-    defer ctx.allocator.free(v3_probe_path);
-    if (path.fileExists(v3_probe_path)) {
-        format = .v3;
+    extract.fileInto(ctx, cache_path, verify_dir, manifest.MANIFEST_V4_FILENAME) catch {};
+    const v4_probe_path = try std.fs.path.join(ctx.allocator, &.{ verify_dir, manifest.MANIFEST_V4_FILENAME });
+    defer ctx.allocator.free(v4_probe_path);
+    if (path.fileExists(v4_probe_path)) {
+        format = .v4;
     } else {
-        extract.fileInto(ctx, cache_path, verify_dir, manifest.MANIFEST_V2_FILENAME) catch {};
-        const v2_probe_path = try std.fs.path.join(ctx.allocator, &.{ verify_dir, manifest.MANIFEST_V2_FILENAME });
-        defer ctx.allocator.free(v2_probe_path);
-        if (path.fileExists(v2_probe_path)) format = .v2;
+        extract.fileInto(ctx, cache_path, verify_dir, manifest.MANIFEST_V3_FILENAME) catch {};
+        const v3_probe_path = try std.fs.path.join(ctx.allocator, &.{ verify_dir, manifest.MANIFEST_V3_FILENAME });
+        defer ctx.allocator.free(v3_probe_path);
+        if (path.fileExists(v3_probe_path)) {
+            format = .v3;
+        } else {
+            extract.fileInto(ctx, cache_path, verify_dir, manifest.MANIFEST_V2_FILENAME) catch {};
+            const v2_probe_path = try std.fs.path.join(ctx.allocator, &.{ verify_dir, manifest.MANIFEST_V2_FILENAME });
+            defer ctx.allocator.free(v2_probe_path);
+            if (path.fileExists(v2_probe_path)) format = .v2;
+        }
     }
 
     try extract.fileInto(ctx, cache_path, verify_dir, format.manifestFilename());
@@ -2060,7 +2067,7 @@ fn preVerifyManifest(
     }
 
     ctx.debug("verifying manifest signature against {d} trusted fingerprints", .{repo_cache.trusted_fingerprints.len});
-    const result = sign.verifyManifestWithTrustedFingerprints(ctx, manifest_path, sig_path, repo_cache.trusted_fingerprints, loaded_keys) catch {
+    const result = sign.verifyManifestWithTrustedFingerprints(ctx, manifest_path, sig_path, format.signatureFormat(), repo_cache.trusted_fingerprints, loaded_keys) catch {
         return ctx.fail(error.SignatureInvalid, pkg_id, "manifest signature verification");
     };
     errdefer ctx.allocator.free(result.verifying_fingerprint);
@@ -2071,7 +2078,7 @@ fn preVerifyManifest(
     // verify-then-reread TOCTOU window).
     const pkg_manifest = manifest.PackageManifestV1.decodeForSchema(result.manifest_bytes, format.schemaVersion()) catch {
         ctx.allocator.free(result.manifest_bytes);
-        ctx.setDiagnosticContext(verify_dir, "manifest.v1 invalid or failed to decode");
+        ctx.setDiagnosticContext(verify_dir, "package manifest invalid or failed to decode");
         return error.InvalidInput;
     };
     var parsed_manifest = ParsedManifest{
@@ -2190,7 +2197,7 @@ fn stageAndValidatePayload(
     var content_hash: []const u8 = switch (format) {
         .v1 => hash.calculateStoreContentHash(ctx.allocator, staging_dir, &hash_diag),
         .v2 => hash.calculateStoreContentHashV2(ctx.allocator, staging_dir, &hash_diag),
-        .v3 => hash.calculateStoreContentHashV3(ctx.allocator, staging_dir, &hash_diag),
+        .v3, .v4 => hash.calculateStoreContentHashV3(ctx.allocator, staging_dir, &hash_diag),
     } catch |err| {
         const action = hash_diag.action orelse "compute content hash";
         const path_label = hash_diag.path orelse staging_dir;
@@ -2220,7 +2227,7 @@ fn stageAndValidatePayload(
                 return ctx.fail(error.CorruptData, staging_dir, "manifest content hash does not match payload");
             }
         } else {
-            return ctx.fail(error.CorruptData, staging_dir, "manifest v2 content hash does not match payload and metadata");
+            return ctx.fail(error.CorruptData, staging_dir, "manifest content hash does not match payload and metadata");
         }
     }
 

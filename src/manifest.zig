@@ -11,6 +11,7 @@ pub const MAGIC: *const [8]u8 = "MEREMFST";
 pub const SCHEMA_VERSION: u32 = 1;
 pub const SCHEMA_VERSION_V2: u32 = 2;
 pub const SCHEMA_VERSION_V3: u32 = 3;
+pub const SCHEMA_VERSION_V4: u32 = 4;
 pub const META_DIR = ".mere";
 pub const MANIFEST_FILENAME = ".mere/manifest.v1";
 pub const MANIFEST_SIG_FILENAME = ".mere/manifest.v1.sig";
@@ -18,6 +19,8 @@ pub const MANIFEST_V2_FILENAME = ".mere/manifest.v2";
 pub const MANIFEST_V2_SIG_FILENAME = ".mere/manifest.v2.sig";
 pub const MANIFEST_V3_FILENAME = ".mere/manifest.v3";
 pub const MANIFEST_V3_SIG_FILENAME = ".mere/manifest.v3.sig";
+pub const MANIFEST_V4_FILENAME = ".mere/manifest.v4";
+pub const MANIFEST_V4_SIG_FILENAME = ".mere/manifest.v4.sig";
 pub const META_KDL_FILENAME = ".mere/meta.kdl";
 pub const PROJECTION_FILENAME = ".mere/projection.v1";
 
@@ -25,12 +28,14 @@ pub const Format = enum {
     v1,
     v2,
     v3,
+    v4,
 
     pub fn manifestFilename(self: Format) []const u8 {
         return switch (self) {
             .v1 => MANIFEST_FILENAME,
             .v2 => MANIFEST_V2_FILENAME,
             .v3 => MANIFEST_V3_FILENAME,
+            .v4 => MANIFEST_V4_FILENAME,
         };
     }
 
@@ -39,6 +44,7 @@ pub const Format = enum {
             .v1 => MANIFEST_SIG_FILENAME,
             .v2 => MANIFEST_V2_SIG_FILENAME,
             .v3 => MANIFEST_V3_SIG_FILENAME,
+            .v4 => MANIFEST_V4_SIG_FILENAME,
         };
     }
 
@@ -47,7 +53,19 @@ pub const Format = enum {
             .v1 => SCHEMA_VERSION,
             .v2 => SCHEMA_VERSION_V2,
             .v3 => SCHEMA_VERSION_V3,
+            .v4 => SCHEMA_VERSION_V4,
         };
+    }
+
+    pub fn signatureFormat(self: Format) sign.ManifestSignatureFormat {
+        return switch (self) {
+            .v1, .v2, .v3 => .legacy_raw,
+            .v4 => .domain_v2,
+        };
+    }
+
+    pub fn usesStoreHashV3(self: Format) bool {
+        return self == .v3 or self == .v4;
     }
 };
 
@@ -249,6 +267,10 @@ pub fn writeManifestV3(ctx: *Context, dir_path: []const u8, manifest: *const Pac
     return writeManifestForFormat(ctx, dir_path, manifest, secret_key, .v3);
 }
 
+pub fn writeManifestV4(ctx: *Context, dir_path: []const u8, manifest: *const PackageManifestV1, secret_key: []const u8) ManifestError!void {
+    return writeManifestForFormat(ctx, dir_path, manifest, secret_key, .v4);
+}
+
 fn writeManifestForFormat(ctx: *Context, dir_path: []const u8, input: *const PackageManifestV1, secret_key: []const u8, format: Format) ManifestError!void {
     var manifest_copy = input.*;
     manifest_copy.schema_version = format.schemaVersion();
@@ -257,9 +279,10 @@ fn writeManifestForFormat(ctx: *Context, dir_path: []const u8, input: *const Pac
     const manifest_bytes = try manifest.encode(ctx.allocator);
     defer ctx.allocator.free(manifest_bytes);
 
-    const signature = sign.signBytes(secret_key, manifest_bytes) catch {
+    const signature = sign.signManifestBytes(ctx.allocator, secret_key, manifest_bytes, format.signatureFormat()) catch {
         return ManifestError.SigningFailed;
     };
+    defer ctx.allocator.free(signature);
 
     const meta_dir_path = std.fs.path.join(ctx.allocator, &.{ dir_path, META_DIR }) catch {
         return ManifestError.OutOfMemory;
@@ -306,7 +329,7 @@ fn writeManifestForFormat(ctx: *Context, dir_path: []const u8, input: *const Pac
             };
         };
         defer file.close(io);
-        file.writeStreamingAll(io, &signature) catch |err| {
+        file.writeStreamingAll(io, signature) catch |err| {
             return switch (err) {
                 error.AccessDenied => ManifestError.PermissionDenied,
                 else => ManifestError.FileSystem,
@@ -500,9 +523,11 @@ test "readManifestFile reports InvalidInput when manifest is missing" {
     try std.testing.expectError(ManifestError.InvalidInput, readManifestFile(&test_env.ctx, package_dir));
 }
 
-test "manifest v3 has distinct filenames and schema" {
-    try std.testing.expectEqual(@as(u32, 3), Format.v3.schemaVersion());
-    try std.testing.expectEqualStrings(MANIFEST_V3_FILENAME, Format.v3.manifestFilename());
-    try std.testing.expectEqualStrings(MANIFEST_V3_SIG_FILENAME, Format.v3.signatureFilename());
-    try std.testing.expect(!std.mem.eql(u8, Format.v2.manifestFilename(), Format.v3.manifestFilename()));
+test "manifest v4 separates signature format from store hash identity" {
+    try std.testing.expectEqual(@as(u32, 4), Format.v4.schemaVersion());
+    try std.testing.expectEqualStrings(MANIFEST_V4_FILENAME, Format.v4.manifestFilename());
+    try std.testing.expectEqualStrings(MANIFEST_V4_SIG_FILENAME, Format.v4.signatureFilename());
+    try std.testing.expectEqual(sign.ManifestSignatureFormat.domain_v2, Format.v4.signatureFormat());
+    try std.testing.expectEqual(sign.ManifestSignatureFormat.legacy_raw, Format.v3.signatureFormat());
+    try std.testing.expect(Format.v4.usesStoreHashV3());
 }
