@@ -267,7 +267,7 @@ The store supports **two-tier admission**: unprivileged users can add objects fo
 - Mode `1777` (world-writable with sticky bit)
 - Allows unprivileged addition, prevents unauthorized deletion
 
-**Normative invariant**: If `/mere/store/<hash>-<name>-<version>/` exists, it is **immutable forever** (enforced by permissions, ownership, and filesystem immutable flags on system-hardened objects). For system profile store objects, immutability is enforced by `FS_IMMUTABLE_FL` which prevents modification even by root. For user-owned store objects, immutability is enforced by read-only permissions only.
+**Reference eligibility invariant**: Atomic admission makes `/mere/store/<hash>-<name>-<version>/` visible, but path existence alone does not establish that post-admission finalization completed. Mere MUST NOT return an object for profile or generation publication until its required finalization succeeds. Once eligible for reference, Mere does not mutate the object in place: user-owned objects have recursively non-writable files and directories, while system-published objects additionally use root ownership and filesystem immutable flags where supported.
 
 #### Unprivileged Admission Steps
 
@@ -308,10 +308,12 @@ For unprivileged `mere install` or `mere dev build`:
    - Not required for normal install once pre-verification + payload hash check succeeded
    - May be performed by explicit verification tools (`mere store verify`) or privileged hardening
 
-7. **Set permissions**:
-   - Make the admitted directory and contents read-only for the owner
+7. **Finalize permissions**:
+   - Make every regular file and directory, including the object root, read-only without following symlinks
+   - Verify that no write bits remain
+   - If traversal, permission change, or verification fails: fail the operation and do not return the object for profile publication
 
-**Result**: User-owned (unpublished) store object suitable for experimentation but NOT for system profiles.
+**Result**: A successfully finalized user-owned store object is suitable for personal profiles but NOT for system profiles. A final path left by interruption or failed finalization is admitted storage, not a profile-eligible object; a later operation must finalize it successfully before reuse.
 
 #### Existing Store Object Fast-Path
 
@@ -320,7 +322,7 @@ If `/mere/store/<hash>-<name>-<version>/` already exists and `reinstall` is fals
 - The object is reusable only for the same complete content identity, including canonical `.mere/meta.kdl`
 - A package with changed metadata produces a different `content_hash` and therefore a different immutable store path
 - The existing object is never overwritten or augmented with metadata from a later package revision
-- **Unprivileged**: No further verification required (user is only affecting their own profile)
+- **Unprivileged**: MUST establish and verify the object's recursive read-only state before returning it for profile use. If the caller owns the object, Mere may repair interrupted finalization; an already read-only object requires no permission change. If finalization cannot succeed, reject the object. No additional content verification is required because the user is only affecting their own profile.
 - **Privileged**: MUST harden the existing store object before referencing it in a system profile. An unprivileged user may have admitted this object previously; the privileged fast-path ensures it is root-owned, read-only, has valid symlink boundaries, has verified content hash, and has filesystem immutable flags set before any system generation uses it. If the object is already hardened (root-owned with immutable flags set), verification and hardening are skipped — the object was verified when first admitted.
 
 This keeps installs fast for already-admitted complete identities while enforcing the trust boundary for system profiles.
@@ -364,7 +366,7 @@ For privileged `sudo mere install` (system installation):
 If the final store path already exists when attempting rename:
 
 1. Verify the existing directory's `manifest.v1.sig` is valid
-2. If valid: success (content already present, skip)
+2. If valid: retain the existing content and complete the required unprivileged or privileged finalization before returning it for profile use
 3. If invalid: error (store corruption detected)
 
 For privileged operations, additionally verify ownership:

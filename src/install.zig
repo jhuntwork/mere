@@ -2056,12 +2056,10 @@ fn installSinglePackageToStore(
     };
 
     if (preverify_exists and !reinstall) {
-        // Privileged fast-path: harden existing store object before referencing it.
-        // An unprivileged user may have admitted this object previously; we must
-        // ensure it is root-owned and read-only before any system profile uses it.
-        if (store.isPrivileged()) {
-            try finalizeAdmittedStoreObject(ctx, preverify_install_dir, true);
-        }
+        // Every existing object must be finalized before a profile can
+        // reference it. Privileged installs verify and harden it for system
+        // use; unprivileged installs repair or verify its read-only state.
+        try finalizeAdmittedStoreObject(ctx, preverify_install_dir, true);
 
         keep_preverify_install_dir = true;
 
@@ -2165,43 +2163,100 @@ fn installSinglePackageToStore(
     };
 }
 
-/// Set a directory and its contents to read-only (best-effort)
-/// Removes write permissions while preserving read and execute bits
-fn setDirectoryReadOnly(dir_path: []const u8) !void {
+const ReadOnlyEntryKind = enum { file, directory };
+const ReadOnlyEntryFn = *const fn (?*anyopaque, std.Io.Dir, []const u8, ReadOnlyEntryKind) anyerror!void;
+
+const ReadOnlyOptions = struct {
+    context: ?*anyopaque = null,
+    apply_fn: ReadOnlyEntryFn = applyReadOnlyEntry,
+};
+
+fn removeWriteBitsAndVerify(io: std.Io, handle: anytype) !void {
+    const before = try handle.stat(io);
+    const mode = before.permissions.toMode();
+    if (mode & 0o222 != 0) {
+        try handle.setPermissions(io, .fromMode(mode & ~@as(std.posix.mode_t, 0o222)));
+    }
+    const after = try handle.stat(io);
+    if (after.permissions.toMode() & 0o222 != 0) return error.PermissionDenied;
+}
+
+fn applyReadOnlyEntry(
+    _: ?*anyopaque,
+    root: std.Io.Dir,
+    rel_path: []const u8,
+    kind: ReadOnlyEntryKind,
+) !void {
     const io = path.currentIo();
-    var dir = try std.Io.Dir.openDirAbsolute(io, dir_path, .{ .iterate = true });
-    defer dir.close(io);
-
-    var walker = try dir.walk(std.heap.page_allocator);
-    defer walker.deinit();
-
-    while (true) {
-        const entry = try walker.next(io);
-        if (entry == null) break;
-        const e = entry.?;
-        // Get metadata and change permissions
-        if (e.kind == .directory) {
-            var subdir = dir.openDir(io, e.path, .{ .iterate = true }) catch continue;
-            defer subdir.close(io);
-            const stat = subdir.stat(io) catch continue;
-            // Remove write bits (0o222) but preserve read (0o444) and execute (0o111)
-            const new_mode = stat.permissions.toMode() & ~@as(std.posix.mode_t, 0o222);
-            subdir.setPermissions(io, .fromMode(new_mode)) catch {};
-        } else {
-            // Open file in read-only mode just to get handle for chmod
-            var file = dir.openFile(io, e.path, .{ .mode = .read_only }) catch continue;
+    switch (kind) {
+        .file => {
+            var file = try root.openFile(io, rel_path, .{ .mode = .read_only });
             defer file.close(io);
-            const stat = file.stat(io) catch continue;
-            // Remove write bits (0o222) but preserve read (0o444) and execute (0o111)
-            const new_mode = stat.permissions.toMode() & ~@as(std.posix.mode_t, 0o222);
-            file.setPermissions(io, .fromMode(new_mode)) catch {};
-        }
+            try removeWriteBitsAndVerify(io, file);
+        },
+        .directory => {
+            if (rel_path.len == 0) return removeWriteBitsAndVerify(io, root);
+            var dir = try root.openDir(io, rel_path, .{ .iterate = true });
+            defer dir.close(io);
+            try removeWriteBitsAndVerify(io, dir);
+        },
+    }
+}
+
+fn setDirectoryReadOnlyWithOptions(
+    allocator: std.mem.Allocator,
+    dir_path: []const u8,
+    options: ReadOnlyOptions,
+) !void {
+    const io = path.currentIo();
+    var root = try std.Io.Dir.openDirAbsolute(io, dir_path, .{ .iterate = true });
+    defer root.close(io);
+
+    var directory_paths: std.ArrayList([]const u8) = .empty;
+    defer {
+        for (directory_paths.items) |rel_path| allocator.free(rel_path);
+        directory_paths.deinit(allocator);
     }
 
-    // Also chmod the directory itself
-    const stat = try dir.stat(io);
-    const new_mode = stat.permissions.toMode() & ~@as(std.posix.mode_t, 0o222);
-    dir.setPermissions(io, .fromMode(new_mode)) catch {};
+    var walker = try root.walk(allocator);
+    defer walker.deinit();
+    while (try walker.next(io)) |entry| switch (entry.kind) {
+        .file => try options.apply_fn(options.context, root, entry.path, .file),
+        .directory => {
+            const rel_path = try allocator.dupe(u8, entry.path);
+            directory_paths.append(allocator, rel_path) catch |err| {
+                allocator.free(rel_path);
+                return err;
+            };
+        },
+        // Symlink modes do not contribute to store identity. Never follow a
+        // package symlink while finalizing permissions.
+        else => {},
+    };
+
+    std.mem.sort([]const u8, directory_paths.items, {}, struct {
+        fn depth(rel_path: []const u8) usize {
+            return std.mem.count(u8, rel_path, "/");
+        }
+
+        fn lessThan(_: void, a: []const u8, b: []const u8) bool {
+            const a_depth = depth(a);
+            const b_depth = depth(b);
+            if (a_depth != b_depth) return a_depth > b_depth;
+            return std.mem.lessThan(u8, b, a);
+        }
+    }.lessThan);
+    for (directory_paths.items) |rel_path| {
+        try options.apply_fn(options.context, root, rel_path, .directory);
+    }
+    try options.apply_fn(options.context, root, "", .directory);
+}
+
+/// Make every regular file and directory recursively non-writable without
+/// following symlinks. Success is required before an unprivileged profile may
+/// reference the store object.
+fn setDirectoryReadOnly(allocator: std.mem.Allocator, dir_path: []const u8) !void {
+    try setDirectoryReadOnlyWithOptions(allocator, dir_path, .{});
 }
 
 const ParsedManifest = struct {
@@ -2748,7 +2803,6 @@ fn finalizeAdmittedStoreObject(
     install_dir: []const u8,
     existing_only: bool,
 ) !void {
-    _ = existing_only;
     if (store.isPrivileged()) {
         _ = store.harden(ctx, install_dir) catch |err| {
             return switch (err) {
@@ -2761,10 +2815,14 @@ fn finalizeAdmittedStoreObject(
         };
         ctx.debug("store object hardened (root ownership)", .{});
     } else {
-        // Unprivileged install - set read-only (best-effort)
-        setDirectoryReadOnly(install_dir) catch |err| {
-            ctx.debug("failed to set read-only permissions: {}", .{err});
+        setDirectoryReadOnly(ctx.allocator, install_dir) catch |err| {
+            const detail = if (existing_only)
+                "existing store object could not be finalized read-only"
+            else
+                "admitted store object could not be finalized read-only";
+            return ctx.fail(mapInstallFsError(err), install_dir, detail);
         };
+        ctx.debug("store object finalized read-only", .{});
     }
 }
 test "multi-repository install uses priority and resolves dependencies across repos" {
@@ -5569,11 +5627,100 @@ test "setDirectoryReadOnly reports traversal permission failures" {
     const root_path_len = try tmp.dir.realPath(path.currentIo(), &buf);
     const root_path = buf[0..root_path_len];
 
-    const result = setDirectoryReadOnly(root_path);
+    const result = setDirectoryReadOnly(std.testing.allocator, root_path);
     try std.testing.expectError(error.AccessDenied, result);
 }
 
-test "finalizeAdmittedStoreObject skips hardening when unprivileged" {
+test "setDirectoryReadOnly finalizes files and directories without following symlinks" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const io = path.currentIo();
+
+    try tmp.dir.createDirPath(io, "object/sub");
+    var root = try tmp.dir.openDir(io, "object", .{ .iterate = true });
+    defer root.close(io);
+    var sub = try root.openDir(io, "sub", .{ .iterate = true });
+    defer sub.close(io);
+    var payload = try sub.createFile(io, "payload", .{});
+    try payload.setPermissions(io, .fromMode(0o764));
+    payload.close(io);
+    var outside = try tmp.dir.createFile(io, "outside", .{});
+    try outside.setPermissions(io, .fromMode(0o666));
+    outside.close(io);
+
+    var tmp_path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const tmp_path_len = try tmp.dir.realPath(io, &tmp_path_buf);
+    const tmp_path = tmp_path_buf[0..tmp_path_len];
+    var object_path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const object_path_len = try root.realPath(io, &object_path_buf);
+    const object_path = object_path_buf[0..object_path_len];
+    const outside_path = try std.fs.path.join(std.testing.allocator, &.{ tmp_path, "outside" });
+    defer std.testing.allocator.free(outside_path);
+    const link_path = try std.fs.path.join(std.testing.allocator, &.{ object_path, "outside-link" });
+    defer std.testing.allocator.free(link_path);
+    try std.Io.Dir.symLinkAbsolute(io, outside_path, link_path, .{});
+
+    try setDirectoryReadOnly(std.testing.allocator, object_path);
+
+    const root_stat = try root.stat(io);
+    const sub_stat = try sub.stat(io);
+    var finalized_payload = try sub.openFile(io, "payload", .{});
+    defer finalized_payload.close(io);
+    const payload_stat = try finalized_payload.stat(io);
+    var untouched_outside = try tmp.dir.openFile(io, "outside", .{});
+    defer untouched_outside.close(io);
+    const outside_stat = try untouched_outside.stat(io);
+    try std.testing.expectEqual(@as(std.posix.mode_t, 0), root_stat.permissions.toMode() & 0o222);
+    try std.testing.expectEqual(@as(std.posix.mode_t, 0), sub_stat.permissions.toMode() & 0o222);
+    try std.testing.expectEqual(@as(std.posix.mode_t, 0), payload_stat.permissions.toMode() & 0o222);
+    try std.testing.expect(outside_stat.permissions.toMode() & 0o222 != 0);
+
+    // Restore directory write bits so tmpDir cleanup can remove the tree.
+    try root.setPermissions(io, .fromMode(root_stat.permissions.toMode() | 0o200));
+    try sub.setPermissions(io, .fromMode(sub_stat.permissions.toMode() | 0o200));
+}
+
+test "setDirectoryReadOnly propagates an entry finalization failure before directories" {
+    const TestState = struct {
+        file_calls: usize = 0,
+        directory_calls: usize = 0,
+
+        fn apply(raw: ?*anyopaque, _: std.Io.Dir, _: []const u8, kind: ReadOnlyEntryKind) anyerror!void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            switch (kind) {
+                .file => {
+                    self.file_calls += 1;
+                    return error.InjectedFinalizationFailure;
+                },
+                .directory => self.directory_calls += 1,
+            }
+        }
+    };
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const io = path.currentIo();
+    try tmp.dir.createDirPath(io, "object/sub");
+    var file = try tmp.dir.createFile(io, "object/sub/payload", .{});
+    file.close(io);
+    var object = try tmp.dir.openDir(io, "object", .{ .iterate = true });
+    defer object.close(io);
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const object_path_len = try object.realPath(io, &path_buf);
+
+    var state = TestState{};
+    try std.testing.expectError(
+        error.InjectedFinalizationFailure,
+        setDirectoryReadOnlyWithOptions(std.testing.allocator, path_buf[0..object_path_len], .{
+            .context = &state,
+            .apply_fn = TestState.apply,
+        }),
+    );
+    try std.testing.expectEqual(@as(usize, 1), state.file_calls);
+    try std.testing.expectEqual(@as(usize, 0), state.directory_calls);
+}
+
+test "finalizeAdmittedStoreObject makes unprivileged objects read-only" {
     if (store.isPrivileged()) return error.SkipZigTest;
 
     const th = @import("test_helpers.zig");
@@ -5588,11 +5735,11 @@ test "finalizeAdmittedStoreObject skips hardening when unprivileged" {
     defer ctx.allocator.free(install_dir);
     try path.ensureDirExists(install_dir);
 
-    // Unprivileged: function succeeds, skipping the root-ownership hardening.
-    // Hardening is only meaningful for privileged system installs; see the
-    // matching guard in finalizeAdmittedStoreObject.
-    try finalizeAdmittedStoreObject(ctx, install_dir, false);
+    try finalizeAdmittedStoreObject(ctx, install_dir, true);
 
-    // Store object remains admitted.
-    try std.Io.Dir.accessAbsolute(path.currentIo(), install_dir, .{});
+    var dir = try std.Io.Dir.openDirAbsolute(path.currentIo(), install_dir, .{ .iterate = true });
+    defer dir.close(path.currentIo());
+    const stat = try dir.stat(path.currentIo());
+    try std.testing.expectEqual(@as(std.posix.mode_t, 0), stat.permissions.toMode() & 0o222);
+    try dir.setPermissions(path.currentIo(), .fromMode(stat.permissions.toMode() | 0o200));
 }
