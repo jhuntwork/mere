@@ -103,7 +103,7 @@ Mere persists a number of formats, several of which are signed or content-addres
 | --- | --- | --- | --- | --- |
 | Store content hash (§1) | store path name | manifest format and `schema_version` | v4 | v1, transitional, v2, v3, v4 |
 | Package manifest (§17) | `.mere/manifest.v1` through `.mere/manifest.v5` | `schema_version` field and filename | v5 | v1, v2, v3, v4, v5 |
-| Manifest signature (§5) | `.mere/manifest.vN.sig` | manifest format; v4 envelope magic/version/algorithm | domain-separated v2 envelope | legacy raw Ed25519, domain-separated v2 |
+| Manifest signature (§5) | `.mere/manifest.vN.sig` | manifest format; v4/v5 envelope magic/version/algorithm | domain-separated v2 envelope | legacy raw Ed25519, domain-separated v2 |
 | Key file | `*.pub`, `*.key` | `MEREKEY` magic, version and algorithm bytes | v1 / Ed25519 | v1 / Ed25519 |
 | Generation manifest (§6) | `<generation>/` | `schema_version` field | 2 | 2 only |
 | Realization manifest | named profile `root/` | `schema_version` field | 1 | 1 only |
@@ -129,7 +129,7 @@ Requirements:
 
 The store path is `<hash>-<name>-<version>` where hash is BLAKE3 of the realized payload.
 
-**Algorithm**: Use a single incremental BLAKE3 hasher. Walk entries in deterministic (lexicographic) order. For each entry, feed a canonical record with explicit length-prefixed boundaries.
+**Algorithm**: Use a single incremental BLAKE3 hasher. V1 and the transitional identity have no domain prefix; v2 begins with `mere-store-content-v2\0`, v3 with `mere-store-content-v3\0`, and v4 with `mere-store-content-v4\0`. Walk entries in deterministic (lexicographic) order. For each entry, feed a canonical record with explicit length-prefixed boundaries.
 
 **Record format per entry**:
 ```
@@ -154,7 +154,7 @@ If symlink (0x12):
   target        = symlink target bytes
 
 If dir (0x11):
-  (nothing else - just the entry_tag + path + type_tag)
+  (no content fields; v3/v4 retain the mode field described above)
 ```
 
 **Rules**:
