@@ -177,9 +177,9 @@ fn statusDinit(ctx: *mere.Context, name: []const u8) ServiceError!StatusDetail {
     const raw = dinit.status(allocator, name) catch return error.ProcessFailed;
     defer allocator.free(raw);
 
-    const kind = dinit.serviceKind(allocator, name) catch .daemon;
+    const kind = dinit.serviceKind(allocator, name) catch return error.ProcessFailed;
     const state = try dinitState(allocator, raw);
-    const boot_state: BootState = if (dinit.isBootEnabled(allocator, name) catch false) .enabled else .disabled;
+    const boot_state: BootState = if (dinit.isBootEnabled(allocator, name) catch return error.ProcessFailed) .enabled else .disabled;
     const is_daemon = kind == .daemon;
 
     return .{
@@ -261,11 +261,12 @@ fn listDinit(ctx: *mere.Context) ServiceError![]ListEntry {
 
     for (all_names) |name| {
         const owned_name = name;
-        const failed = dinit.isFailed(allocator, name) catch false;
-        const started = dinit.isStarted(allocator, name) catch false;
+        const failed = dinit.isFailed(allocator, name) catch return error.ProcessFailed;
+        const started = dinit.isStarted(allocator, name) catch return error.ProcessFailed;
+        const boot_enabled = dinit.isBootEnabled(allocator, name) catch return error.ProcessFailed;
         try entries.append(allocator, .{
             .name = owned_name,
-            .boot_state = if (dinit.isBootEnabled(allocator, name) catch false) .enabled else .disabled,
+            .boot_state = if (boot_enabled) .enabled else .disabled,
             .state = if (failed) "failed" else if (started) "started" else "stopped",
         });
     }

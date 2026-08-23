@@ -216,8 +216,11 @@ pub fn handleList(ctx: *mere.Context, args: *const types.ParsedArgs) MereError!t
     };
     defer ctx.allocator.free(profile_gc_dir);
 
-    const rooted_gens = gcroots.listGenerationRoots(ctx.allocator, profile_gc_dir) catch &[_]u32{};
-    defer if (rooted_gens.len > 0) ctx.allocator.free(rooted_gens);
+    const rooted_gens = gcroots.listGenerationRoots(ctx.allocator, profile_gc_dir) catch |err| {
+        ctx.withDiagnosticContext(mere.errors.DiagnosticContext.init().withSubject(profile_gc_dir));
+        return try command.errorResult(ctx, err, "failed to list generation roots");
+    };
+    defer ctx.allocator.free(rooted_gens);
 
     // Build output
     var output: std.ArrayList(u8) = .empty;
@@ -234,7 +237,10 @@ pub fn handleList(ctx: *mere.Context, args: *const types.ParsedArgs) MereError!t
             }
             break :blk false;
         };
-        const is_kept = gcroots.isExplicitlyKept(ctx.allocator, profile_dir, gen) catch false;
+        const is_kept = gcroots.isExplicitlyKept(ctx.allocator, profile_dir, gen) catch |err| {
+            ctx.withDiagnosticContext(mere.errors.DiagnosticContext.init().withSubject(profile_dir));
+            return try command.errorResult(ctx, err, "failed to inspect generation keep state");
+        };
 
         var flags_buf: [32]u8 = undefined;
         var flags_len: usize = 0;
@@ -446,12 +452,12 @@ pub fn handleActivate(ctx: *mere.Context, args: *const types.ParsedArgs) MereErr
     };
     defer ctx.allocator.free(gen_path);
 
-    std.Io.Dir.accessAbsolute(path.currentIo(), gen_path, .{}) catch {
-        return types.CommandResult{
-            .success = false,
-            .exit_code = 1,
-            .message = try std.fmt.allocPrint(ctx.allocator, "generation {d} not found", .{gen_num}),
-        };
+    std.Io.Dir.accessAbsolute(path.currentIo(), gen_path, .{}) catch |err| {
+        ctx.withDiagnosticContext(mere.errors.DiagnosticContext.init().withSubject(gen_path));
+        if (err == error.FileNotFound) {
+            return try command.errorResult(ctx, activation.ActivationError.GenerationNotFound, "generation not found");
+        }
+        return try command.errorResult(ctx, err, "failed to inspect generation");
     };
 
     const result = activation.activateSystemGeneration(

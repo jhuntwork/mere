@@ -13,7 +13,6 @@ const Repository = mere.repository.Repository;
 const RepoError = mere.repository.Error;
 const MereError = mere.errors.MereError;
 const DiagnosticContext = mere.errors.DiagnosticContext;
-const ErrorMapping = mere.errors.ErrorMapping;
 const getUserFriendlyMessage = mere.errors.getUserFriendlyMessage;
 
 /// Dev command metadata
@@ -166,17 +165,7 @@ fn handleHash(ctx: *mere.Context, args: *const types.ParsedArgs) MereError!types
 
     // Perform hash calculation with error handling at CLI boundary
     const hash_str = hash.calculateFileHash(ctx, file_path) catch |err| {
-        // Get user-friendly error message and format with context
-        const user_message = getUserFriendlyMessage(err);
-        const error_ctx = ctx.getDiagnosticContext().toErrorContext();
-        const formatted_message = error_ctx.formatWithMessage(ctx.allocator, user_message) catch user_message;
-        defer if (formatted_message.ptr != user_message.ptr) ctx.allocator.free(formatted_message);
-
-        return types.CommandResult{
-            .success = false,
-            .exit_code = 1,
-            .message = try ctx.allocator.dupe(u8, formatted_message),
-        };
+        return try command.errorResult(ctx, err, null);
     };
 
     // Return the computed hash in "hash  filename" format (compatible with sha256sum)
@@ -211,15 +200,7 @@ fn handleValidate(ctx: *mere.Context, args: *const types.ParsedArgs) MereError!t
             error.InvalidInput => "recipe validation failed",
             else => getUserFriendlyMessage(err),
         };
-        const error_ctx = ctx.getDiagnosticContext().toErrorContext();
-        const formatted_message = error_ctx.formatWithMessage(ctx.allocator, base_message) catch base_message;
-        defer if (formatted_message.ptr != base_message.ptr) ctx.allocator.free(formatted_message);
-
-        return types.CommandResult{
-            .success = false,
-            .exit_code = 1,
-            .message = try ctx.allocator.dupe(u8, formatted_message),
-        };
+        return try command.errorResult(ctx, err, base_message);
     };
 
     return types.CommandResult{
@@ -295,12 +276,7 @@ fn handleClean(ctx: *mere.Context, args: *const types.ParsedArgs) MereError!type
     defer summary_parts.deinit(ctx.allocator);
 
     const clean_result = dev_cleanup.clean(ctx, selection) catch |err| {
-        const user_message = getUserFriendlyMessage(err);
-        return types.CommandResult{
-            .success = false,
-            .exit_code = 1,
-            .message = try ctx.allocator.dupe(u8, user_message),
-        };
+        return try command.errorResult(ctx, err, null);
     };
 
     if (selection.workspaces) {
@@ -365,20 +341,7 @@ fn handleRepoSign(ctx: *mere.Context, args: *const types.ParsedArgs) MereError!t
     ctx.withDiagnosticContext(diagnostic_ctx);
 
     performRepoSign(ctx, repo_name) catch |err| {
-        const mapped_error = ErrorMapping.mapModuleError(@TypeOf(err), err);
-
-        const user_message = getUserFriendlyMessage(err);
-        const error_ctx = ctx.getDiagnosticContext().toErrorContext();
-        const formatted_message = error_ctx.formatWithMessage(ctx.allocator, user_message) catch user_message;
-        defer if (formatted_message.ptr != user_message.ptr) ctx.allocator.free(formatted_message);
-
-        const exit_code = command.exitCodeForError(mapped_error);
-
-        return types.CommandResult{
-            .success = false,
-            .exit_code = exit_code,
-            .message = try ctx.allocator.dupe(u8, formatted_message),
-        };
+        return try command.errorResult(ctx, err, null);
     };
 
     const sign_segments = [_]mere.ui.Segment{
@@ -446,20 +409,7 @@ fn handleRepoRemove(ctx: *mere.Context, args: *const types.ParsedArgs) MereError
     ctx.signing_key_path = key_path;
 
     performRepoRemove(ctx, repo_name, pkg_name, version, release, arch) catch |err| {
-        const mapped_error = ErrorMapping.mapModuleError(@TypeOf(err), err);
-
-        const user_message = getUserFriendlyMessage(err);
-        const error_ctx = ctx.getDiagnosticContext().toErrorContext();
-        const formatted_message = error_ctx.formatWithMessage(ctx.allocator, user_message) catch user_message;
-        defer if (formatted_message.ptr != user_message.ptr) ctx.allocator.free(formatted_message);
-
-        const exit_code = command.exitCodeForError(mapped_error);
-
-        return types.CommandResult{
-            .success = false,
-            .exit_code = exit_code,
-            .message = try ctx.allocator.dupe(u8, formatted_message),
-        };
+        return try command.errorResult(ctx, err, null);
     };
 
     var release_buf: [32]u8 = undefined;

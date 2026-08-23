@@ -258,11 +258,8 @@ pub fn exitCodeForError(err: MereError) u8 {
 /// a CommandResult the handler should return immediately.
 pub fn acquireStoreLockOrResult(ctx: *mere.Context) !?types.CommandResult {
     ctx.acquireStoreLock() catch |err| {
-        return types.CommandResult{
-            .success = false,
-            .exit_code = exitCodeForError(mere.errors.ErrorMapping.mapZigError(err)),
-            .message = try ctx.allocator.dupe(u8, mere.errors.getUserFriendlyMessage(err)),
-        };
+        ctx.setDiagnosticContext(ctx.root_path, "failed to acquire store lock");
+        return try errorResult(ctx, err, null);
     };
     return null;
 }
@@ -291,18 +288,24 @@ pub fn errorResult(ctx: *mere.Context, err: anyerror, message_override: ?[]const
     };
 }
 
-test "errorResult maps the exit code correctly instead of hardcoding it" {
+test "errorResult preserves the standard vocabulary's exit-code classes" {
     const testing = std.testing;
     var ctx = mere.Context.init(testing.allocator, "/test");
     defer ctx.deinit();
 
-    // Regression: every CLI handler's error boundary used to hardcode
-    // exit_code = 1 regardless of the underlying error, so a
-    // PermissionDenied surfaced identically to an out-of-memory failure.
-    const result = try errorResult(&ctx, error.PermissionDenied, null);
-    defer ctx.allocator.free(result.message.?);
-    try testing.expectEqual(@as(u8, 13), result.exit_code);
-    try testing.expect(!result.success);
+    const cases = [_]struct { err: anyerror, exit_code: u8 }{
+        .{ .err = error.InvalidInput, .exit_code = 2 },
+        .{ .err = error.PermissionDenied, .exit_code = 13 },
+        .{ .err = error.OutOfMemory, .exit_code = 12 },
+        .{ .err = error.OutOfDisk, .exit_code = 12 },
+        .{ .err = error.TooManyFiles, .exit_code = 12 },
+    };
+    for (cases) |case| {
+        const result = try errorResult(&ctx, case.err, null);
+        defer ctx.allocator.free(result.message.?);
+        try testing.expectEqual(case.exit_code, result.exit_code);
+        try testing.expect(!result.success);
+    }
 }
 
 test "errorResult folds existing diagnostic context into the message" {

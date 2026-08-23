@@ -28,7 +28,7 @@ const store = @import("store.zig");
 
 /// Activation error set
 const Std = errors.StandardErrors;
-pub const ActivationError = Std.OutOfMemory || Std.FileSystem || Std.PermissionDenied || Std.InvalidInput || error{
+pub const ActivationError = Std.OutOfMemory || Std.FileSystem || Std.PermissionDenied || Std.InvalidInput || Std.CorruptData || error{
     GenerationNotFound, // Target generation doesn't exist
     ManifestNotFound, // Generation exists but manifest is missing/unreadable
     DuplicateEtcTemplate, // Two packages provide same /etc path
@@ -71,7 +71,7 @@ pub fn switchProfileGeneration(
     };
     defer ctx.allocator.free(store_root_a);
     gcroots.updateRoots(ctx.allocator, store_root_a, gc_roots_dir, profile_dir, gcroots.DEFAULT_RETENTION_COUNT) catch |err| {
-        return mapGCRootError(err);
+        return ctx.fail(mapGCRootError(err), gc_roots_dir, "failed to update GC roots after activation");
     };
 }
 
@@ -110,7 +110,7 @@ pub fn activateSystemGeneration(
     };
     defer ctx.allocator.free(store_root_b);
     gcroots.updateRoots(ctx.allocator, store_root_b, gc_roots_dir, profile_dir, gcroots.DEFAULT_RETENTION_COUNT) catch |err| {
-        return mapGCRootError(err);
+        return ctx.fail(mapGCRootError(err), gc_roots_dir, "failed to update GC roots after activation");
     };
 
     const result = SystemActivationResult{
@@ -249,10 +249,10 @@ fn loadValidatedTargetManifest(
         };
         return ctx.fail(switch (err) {
             generation.GenerationError.OutOfMemory => ActivationError.OutOfMemory,
-            generation.GenerationError.GenerationNotFound,
             generation.GenerationError.InvalidManifest,
             generation.GenerationError.ParseError,
-            => ActivationError.ManifestNotFound,
+            => ActivationError.CorruptData,
+            generation.GenerationError.GenerationNotFound => ActivationError.ManifestNotFound,
             else => ActivationError.FileSystem,
         }, manifest_path, detail);
     };
@@ -522,7 +522,7 @@ fn validateGenerationStorePaths(
         defer ctx.allocator.free(normalized_store_path);
 
         if (!path_safety.isWithinBoundary(normalized_store_path, normalized_store_root)) {
-            return ctx.fail(ActivationError.InvalidInput, pkg.store_path, "store path outside store root");
+            return ctx.fail(ActivationError.CorruptData, pkg.store_path, "store path outside store root");
         }
 
         var store_dir = path_mod.openExistingDir(pkg.store_path) catch |err| {
@@ -550,14 +550,14 @@ fn validateGenerationStorePaths(
 
         if (do_hash_verify) {
             if (pkg.content_hash.len != 64) {
-                return ctx.fail(ActivationError.InvalidInput, pkg.store_path, "invalid content hash length in manifest");
+                return ctx.fail(ActivationError.CorruptData, pkg.store_path, "invalid content hash length in manifest");
             }
 
             const format = package_manifest.detectFormat(ctx.allocator, pkg.store_path) catch |err| {
                 return ctx.fail(switch (err) {
                     package_manifest.ManifestError.OutOfMemory => ActivationError.OutOfMemory,
                     package_manifest.ManifestError.PermissionDenied => ActivationError.PermissionDenied,
-                    package_manifest.ManifestError.InvalidInput => ActivationError.InvalidInput,
+                    package_manifest.ManifestError.InvalidInput => ActivationError.CorruptData,
                     else => ActivationError.FileSystem,
                 }, pkg.store_path, "failed to detect package manifest format");
             };
@@ -571,7 +571,7 @@ fn validateGenerationStorePaths(
                 return ctx.fail(switch (err) {
                     hash.HashError.OutOfMemory => ActivationError.OutOfMemory,
                     hash.HashError.PermissionDenied => ActivationError.PermissionDenied,
-                    hash.HashError.InvalidInput => ActivationError.InvalidInput,
+                    hash.HashError.InvalidInput => ActivationError.CorruptData,
                     else => ActivationError.FileSystem,
                 }, pkg.store_path, "failed to compute store content hash");
             };
@@ -587,7 +587,7 @@ fn validateGenerationStorePaths(
                     }
                 }
                 if (!accepted_transitional) {
-                    return ctx.fail(ActivationError.InvalidInput, pkg.store_path, "store content hash mismatch");
+                    return ctx.fail(ActivationError.CorruptData, pkg.store_path, "store content hash mismatch");
                 }
             }
         }
@@ -1154,7 +1154,7 @@ test "system profile activation rejects mismatched content hash without verify-s
     // Activate with .fast (no explicit verify-store) — should STILL fail
     // because system profile hash verification is now mandatory
     try std.testing.expectError(
-        ActivationError.InvalidInput,
+        ActivationError.CorruptData,
         activateSystemGeneration(&test_env.ctx, 2, .fast),
     );
 

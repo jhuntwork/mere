@@ -50,13 +50,70 @@ pub const ErrorMapping = struct {
     /// Map common Zig errors to standard vocabulary
     pub fn mapZigError(err: anyerror) MereError {
         return switch (err) {
-            error.OutOfMemory => MereError.OutOfMemory,
-            error.Network, error.ConnectionTimeout => MereError.Network,
-            error.AccessDenied, error.PermissionDenied => MereError.PermissionDenied,
+            // Preserve Mere's standard vocabulary when it crosses a boundary.
+            error.InvalidInput => MereError.InvalidInput,
+            error.MissingArgument => MereError.MissingArgument,
+            error.Network => MereError.Network,
+            error.FileSystem => MereError.FileSystem,
+            error.PermissionDenied => MereError.PermissionDenied,
+            error.CorruptData => MereError.CorruptData,
             error.SignatureInvalid => MereError.SignatureInvalid,
-            error.FileNotFound, error.IsDir, error.NotDir => MereError.FileSystem,
-            error.ConnectionRefused, error.NetworkUnreachable => MereError.Network,
-            error.InvalidConfig, error.ParseError => MereError.InvalidInput,
+            error.OutOfMemory => MereError.OutOfMemory,
+            error.OutOfDisk => MereError.OutOfDisk,
+            error.TooManyFiles => MereError.TooManyFiles,
+            error.Internal => MereError.Internal,
+
+            // Translate common Zig and module errors into that vocabulary.
+            error.ConnectionTimeout,
+            error.ConnectionTimedOut,
+            error.ConnectionRefused,
+            error.ConnectionResetByPeer,
+            error.NetworkUnreachable,
+            error.NetworkSubsystemFailed,
+            error.HostLookupFailed,
+            error.RepositoryUnavailable,
+            => MereError.Network,
+            error.AccessDenied,
+            error.OperationNotPermitted,
+            error.ReadOnlyFileSystem,
+            => MereError.PermissionDenied,
+            error.FileNotFound,
+            error.IsDir,
+            error.NotDir,
+            error.PathAlreadyExists,
+            error.ProcessFailed,
+            error.NoLogDirectory,
+            error.NoLogFile,
+            error.NoActiveGeneration,
+            error.LockFailed,
+            error.Locked,
+            => MereError.FileSystem,
+            error.InvalidConfig,
+            error.ParseError,
+            error.ParseFailed,
+            error.InvalidFormat,
+            error.InvalidCharacter,
+            error.BadPathName,
+            error.UnsupportedProvider,
+            error.NoRoots,
+            error.GenerationNotFound,
+            error.RepositoryNotFound,
+            error.PackageNotFound,
+            error.ConflictingProvision,
+            error.ConflictingProvisions,
+            error.UnsatisfiableDependencies,
+            error.DuplicateTemplate,
+            error.TemplateNotFound,
+            => MereError.InvalidInput,
+            error.ChecksumMismatch,
+            error.InvalidData,
+            error.BadData,
+            error.CorruptInput,
+            error.ManifestNotFound,
+            error.InvalidManifest,
+            error.ArchiveHashMismatch,
+            error.SignatureVerificationFailed,
+            => MereError.CorruptData,
             error.NoSpaceLeft => MereError.OutOfDisk,
             error.ProcessFdQuotaExceeded, error.SystemFdQuotaExceeded => MereError.TooManyFiles,
             else => MereError.Internal,
@@ -80,6 +137,7 @@ pub const ErrorMapping = struct {
             .{ MereError.SignatureInvalid, @as(anyerror, error.SignatureInvalid) },
             .{ MereError.OutOfDisk, @as(anyerror, error.OutOfDisk) },
             .{ MereError.TooManyFiles, @as(anyerror, error.TooManyFiles) },
+            .{ MereError.Internal, @as(anyerror, error.Internal) },
         };
         inline for (mere_errors) |pair| {
             if (any == pair[1]) return pair[0];
@@ -158,8 +216,11 @@ pub fn getUserFriendlyMessage(err: anyerror) []const u8 {
         // Standard module vocabulary
         error.FileSystem => "file system error",
         error.InvalidInput => "invalid input",
+        error.MissingArgument => "missing required argument",
         error.CorruptData => "corrupt or incompatible data",
         error.SignatureInvalid => "signature verification failed",
+        error.OutOfDisk => "insufficient disk space",
+        error.TooManyFiles => "too many open files",
         error.Internal => "internal error",
         error.SessionSetupError => "failed to set up namespace session",
         error.SyntheticRootSetupError => "failed to build synthetic root",
@@ -279,8 +340,22 @@ test "mapZigError maps common errors correctly" {
     const testing = std.testing;
 
     // Test mapping of common Zig errors
+    try testing.expectEqual(MereError.InvalidInput, ErrorMapping.mapZigError(error.InvalidInput));
+    try testing.expectEqual(MereError.MissingArgument, ErrorMapping.mapZigError(error.MissingArgument));
+    try testing.expectEqual(MereError.FileSystem, ErrorMapping.mapZigError(error.FileSystem));
+    try testing.expectEqual(MereError.Network, ErrorMapping.mapZigError(error.Network));
+    try testing.expectEqual(MereError.PermissionDenied, ErrorMapping.mapZigError(error.PermissionDenied));
+    try testing.expectEqual(MereError.CorruptData, ErrorMapping.mapZigError(error.CorruptData));
+    try testing.expectEqual(MereError.SignatureInvalid, ErrorMapping.mapZigError(error.SignatureInvalid));
     try testing.expectEqual(MereError.OutOfMemory, ErrorMapping.mapZigError(error.OutOfMemory));
+    try testing.expectEqual(MereError.OutOfDisk, ErrorMapping.mapZigError(error.OutOfDisk));
+    try testing.expectEqual(MereError.TooManyFiles, ErrorMapping.mapZigError(error.TooManyFiles));
+    try testing.expectEqual(MereError.Internal, ErrorMapping.mapZigError(error.Internal));
+
     try testing.expectEqual(MereError.PermissionDenied, ErrorMapping.mapZigError(error.AccessDenied));
+    try testing.expectEqual(MereError.FileSystem, ErrorMapping.mapZigError(error.Locked));
+    try testing.expectEqual(MereError.InvalidInput, ErrorMapping.mapZigError(error.UnsatisfiableDependencies));
+    try testing.expectEqual(MereError.CorruptData, ErrorMapping.mapZigError(error.SignatureVerificationFailed));
     try testing.expectEqual(MereError.FileSystem, ErrorMapping.mapZigError(error.FileNotFound));
     try testing.expectEqual(MereError.FileSystem, ErrorMapping.mapZigError(error.IsDir));
     try testing.expectEqual(MereError.FileSystem, ErrorMapping.mapZigError(error.NotDir));

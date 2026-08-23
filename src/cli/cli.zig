@@ -79,16 +79,19 @@ pub const CLI = struct {
         var parse_args_with_program = std.ArrayList([]const u8).empty;
         defer parse_args_with_program.deinit(self.allocator);
         parse_args_with_program.append(self.allocator, args[0]) catch {
-            return 1;
+            emitFormattedCliError(ctx, null, MereError.OutOfMemory, null);
+            return command.exitCodeForError(MereError.OutOfMemory);
         };
         for (prescan_result.filtered_args) |arg| {
             parse_args_with_program.append(self.allocator, arg) catch {
-                return 1;
+                emitFormattedCliError(ctx, null, MereError.OutOfMemory, null);
+                return command.exitCodeForError(MereError.OutOfMemory);
             };
         }
 
-        var inferred_command_path = self.inferCommandPath(parse_args_with_program.items) catch {
-            return 1;
+        var inferred_command_path = self.inferCommandPath(parse_args_with_program.items) catch |err| {
+            emitFormattedCliError(ctx, null, err, null);
+            return command.exitCodeForError(err);
         };
         defer inferred_command_path.deinit(self.allocator);
 
@@ -100,10 +103,16 @@ pub const CLI = struct {
 
         // Store verbose flag in parsed_args for consistency
         if (prescan_result.verbose) {
-            parsed_args.global_flags.put("verbose", types.FlagValue{ .bool = true }) catch {};
+            parsed_args.global_flags.put("verbose", types.FlagValue{ .bool = true }) catch {
+                emitFormattedCliError(ctx, commandPhase(parsed_args.command_path), MereError.OutOfMemory, null);
+                return command.exitCodeForError(MereError.OutOfMemory);
+            };
         }
         if (prescan_result.no_color) {
-            parsed_args.global_flags.put("no-color", types.FlagValue{ .bool = true }) catch {};
+            parsed_args.global_flags.put("no-color", types.FlagValue{ .bool = true }) catch {
+                emitFormattedCliError(ctx, commandPhase(parsed_args.command_path), MereError.OutOfMemory, null);
+                return command.exitCodeForError(MereError.OutOfMemory);
+            };
         }
 
         // Handle case where no command was specified - this is a usage error
@@ -323,10 +332,14 @@ pub const CLI = struct {
             return 2; // Usage error for invalid flags
         };
 
-        // Execute the command
-        const result = cmd.handler(ctx, args) catch |err| {
-            emitFormattedCliError(ctx, commandPhase(args.command_path), err, null);
-            return 1; // Execution error
+        // Execute the command. This is the final error boundary: handlers may
+        // return a CommandResult themselves, but any propagated MereError still
+        // receives the same diagnostic formatting and exit-code mapping.
+        const result = cmd.handler(ctx, args) catch |err| blk: {
+            break :blk command.errorResult(ctx, err, null) catch {
+                emitFormattedCliError(ctx, commandPhase(args.command_path), err, null);
+                return command.exitCodeForError(err);
+            };
         };
 
         if (result.segments) |segments| {

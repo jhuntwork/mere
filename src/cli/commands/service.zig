@@ -4,7 +4,6 @@ const mere = @import("mere");
 const types = @import("../types.zig");
 const command = @import("../command.zig");
 const MereError = mere.errors.MereError;
-const getUserFriendlyMessage = mere.errors.getUserFriendlyMessage;
 const ui = mere.ui;
 const emit = ui.emit;
 const services = mere.services;
@@ -167,9 +166,8 @@ fn handleLogs(ctx: *mere.Context, args: *const types.ParsedArgs) MereError!types
     const sio = mere.path.currentIo();
 
     const output = services.readLogs(ctx, name) catch |err| switch (err) {
-        error.NoLogDirectory => return .{ .success = false, .exit_code = 1, .message = "no log directory for service" },
-        error.NoLogFile => return .{ .success = false, .exit_code = 1, .message = "no log file for service" },
-        error.OutOfMemory => return .{ .success = false, .exit_code = 1, .message = "out of memory" },
+        error.NoLogDirectory => return try command.errorResult(ctx, err, "no log directory for service"),
+        error.NoLogFile => return try command.errorResult(ctx, err, "no log file for service"),
         else => return serviceFailure(ctx, err, "failed to read logs"),
     };
     defer ctx.allocator.free(output);
@@ -209,18 +207,11 @@ fn handleList(ctx: *mere.Context, _: *const types.ParsedArgs) MereError!types.Co
 
 fn serviceFailure(ctx: *mere.Context, err: services.ServiceError, fallback: []const u8) !types.CommandResult {
     const message = switch (err) {
-        error.UnsupportedProvider => try ctx.allocator.dupe(u8, "configured init provider is not implemented for service management"),
-        error.InvalidConfig, error.PermissionDenied => blk: {
-            const user_message = getUserFriendlyMessage(err);
-            const error_ctx = ctx.getDiagnosticContext().toErrorContext();
-            const formatted = error_ctx.formatWithMessage(ctx.allocator, user_message) catch
-                try ctx.allocator.dupe(u8, user_message);
-            break :blk formatted;
-        },
-        error.OutOfMemory => try ctx.allocator.dupe(u8, "out of memory"),
-        else => try std.fmt.allocPrint(ctx.allocator, "{s}: {s}", .{ fallback, getUserFriendlyMessage(err) }),
+        error.UnsupportedProvider => "configured init provider is not implemented for service management",
+        error.InvalidConfig, error.PermissionDenied, error.OutOfMemory => null,
+        else => fallback,
     };
-    return .{ .success = false, .exit_code = 1, .message = message };
+    return command.errorResult(ctx, err, message);
 }
 
 // ── Registration ──────────────────────────────────────────────────

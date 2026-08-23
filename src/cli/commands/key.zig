@@ -73,70 +73,22 @@ fn handleGenerate(ctx: *mere.Context, args: *const types.ParsedArgs) MereError!t
         try ctx.allocator.dupe(u8, dir)
     else
         sign.getDefaultKeyDirectory(ctx) catch |err| {
-            return types.CommandResult{
-                .success = false,
-                .exit_code = 1,
-                .message = try std.fmt.allocPrint(ctx.allocator, "Could not determine home directory: {s}", .{@errorName(err)}),
-            };
+            return try command.errorResult(ctx, err, "could not determine home directory");
         };
     defer ctx.allocator.free(key_dir);
 
-    // Generate and save key pair with specific error handling
     const result = sign.generateAndSaveKeyPair(ctx, key_dir) catch |err| {
-        // Provide specific error messages based on error type
-        switch (err) {
-            sign.SignError.FileSystem => {
-                // Check if keys already exist
-                const pub_path = std.fs.path.join(ctx.allocator, &.{ key_dir, "mere.pub" }) catch {
-                    return types.CommandResult{
-                        .success = false,
-                        .exit_code = 1,
-                        .message = try std.fmt.allocPrint(ctx.allocator, "Failed to generate key pair in {s}: file system error", .{key_dir}),
-                    };
-                };
-                defer ctx.allocator.free(pub_path);
-
-                const key_path = std.fs.path.join(ctx.allocator, &.{ key_dir, "mere.key" }) catch {
-                    return types.CommandResult{
-                        .success = false,
-                        .exit_code = 1,
-                        .message = try std.fmt.allocPrint(ctx.allocator, "Failed to generate key pair in {s}: file system error", .{key_dir}),
-                    };
-                };
-                defer ctx.allocator.free(key_path);
-
-                if (path.fileExists(pub_path) or path.fileExists(key_path)) {
-                    return types.CommandResult{
-                        .success = false,
-                        .exit_code = 1,
-                        .message = try std.fmt.allocPrint(ctx.allocator, "Key pair already exists in {s}", .{key_dir}),
-                    };
-                }
-
-                return types.CommandResult{
-                    .success = false,
-                    .exit_code = 1,
-                    .message = try std.fmt.allocPrint(ctx.allocator, "Failed to generate key pair in {s}: file system error", .{key_dir}),
-                };
-            },
-            sign.SignError.PermissionDenied => {
-                return types.CommandResult{
-                    .success = false,
-                    .exit_code = 1,
-                    .message = try std.fmt.allocPrint(ctx.allocator, "Failed to generate key pair in {s}: permission denied", .{key_dir}),
-                };
-            },
-            sign.SignError.OutOfMemory => {
-                return MereError.OutOfMemory;
-            },
-            else => {
-                return types.CommandResult{
-                    .success = false,
-                    .exit_code = 1,
-                    .message = try std.fmt.allocPrint(ctx.allocator, "Failed to generate key pair in {s}: {s}", .{ key_dir, @errorName(err) }),
-                };
-            },
+        ctx.withDiagnosticContext(mere.errors.DiagnosticContext.init().withSubject(key_dir));
+        if (err == sign.SignError.FileSystem) {
+            const pub_path = std.fs.path.join(ctx.allocator, &.{ key_dir, "mere.pub" }) catch return MereError.OutOfMemory;
+            defer ctx.allocator.free(pub_path);
+            const key_path = std.fs.path.join(ctx.allocator, &.{ key_dir, "mere.key" }) catch return MereError.OutOfMemory;
+            defer ctx.allocator.free(key_path);
+            if (path.fileExists(pub_path) or path.fileExists(key_path)) {
+                return try command.errorResult(ctx, err, "key pair already exists");
+            }
         }
+        return try command.errorResult(ctx, err, "failed to generate key pair");
     };
     defer ctx.allocator.free(result.public_key_path);
     defer ctx.allocator.free(result.secret_key_path);
@@ -161,13 +113,12 @@ fn handleGenerate(ctx: *mere.Context, args: *const types.ParsedArgs) MereError!t
     };
     emit.logSegmentsSeverity(ctx, .key, .info, &public_segments);
 
-    // Load the generated public key to compute its fingerprint
-    const pub_key = sign.PublicKey.loadFromFile(result.public_key_path) catch {
-        return types.CommandResult{ .success = true };
+    const pub_key = sign.PublicKey.loadFromFile(result.public_key_path) catch |err| {
+        return try command.errorResult(ctx, err, "key pair generated, but failed to load public key");
     };
 
-    const fingerprint = pub_key.fingerprint(ctx.allocator) catch {
-        return types.CommandResult{ .success = true };
+    const fingerprint = pub_key.fingerprint(ctx.allocator) catch |err| {
+        return try command.errorResult(ctx, err, "key pair generated, but failed to compute fingerprint");
     };
     defer ctx.allocator.free(fingerprint);
 
@@ -211,31 +162,21 @@ fn handleFingerprint(ctx: *mere.Context, args: *const types.ParsedArgs) MereErro
     }
 
     const pub_key: sign.PublicKey = if (is_secret_key) blk: {
-        var secret_key = sign.SecretKey.loadFromFile(key_path) catch {
-            return types.CommandResult{
-                .success = false,
-                .exit_code = 1,
-                .message = try std.fmt.allocPrint(ctx.allocator, "Failed to load secret key: '{s}'", .{key_path}),
-            };
+        var secret_key = sign.SecretKey.loadFromFile(key_path) catch |err| {
+            ctx.withDiagnosticContext(mere.errors.DiagnosticContext.init().withSubject(key_path));
+            return try command.errorResult(ctx, err, "failed to load secret key");
         };
         defer secret_key.deinit();
         break :blk secret_key.derivePublicKey();
     } else blk: {
-        break :blk sign.PublicKey.loadFromFile(key_path) catch {
-            return types.CommandResult{
-                .success = false,
-                .exit_code = 1,
-                .message = try std.fmt.allocPrint(ctx.allocator, "Failed to load public key: '{s}'", .{key_path}),
-            };
+        break :blk sign.PublicKey.loadFromFile(key_path) catch |err| {
+            ctx.withDiagnosticContext(mere.errors.DiagnosticContext.init().withSubject(key_path));
+            return try command.errorResult(ctx, err, "failed to load public key");
         };
     };
 
-    const fingerprint = pub_key.fingerprint(ctx.allocator) catch {
-        return types.CommandResult{
-            .success = false,
-            .exit_code = 1,
-            .message = try ctx.allocator.dupe(u8, "Failed to compute fingerprint"),
-        };
+    const fingerprint = pub_key.fingerprint(ctx.allocator) catch |err| {
+        return try command.errorResult(ctx, err, "failed to compute fingerprint");
     };
 
     const segments = [_]mere.ui.Segment{
@@ -250,12 +191,8 @@ fn handleFingerprint(ctx: *mere.Context, args: *const types.ParsedArgs) MereErro
 fn handleList(ctx: *mere.Context, args: *const types.ParsedArgs) MereError!types.CommandResult {
     _ = args;
 
-    var all_keys = sign.loadAllKeys(ctx) catch {
-        return types.CommandResult{
-            .success = false,
-            .exit_code = 1,
-            .message = try ctx.allocator.dupe(u8, "Failed to scan key directories"),
-        };
+    var all_keys = sign.loadAllKeys(ctx) catch |err| {
+        return try command.errorResult(ctx, err, "failed to scan key directories");
     };
     defer {
         for (all_keys.items) |*k| k.deinit(ctx.allocator);
@@ -277,11 +214,7 @@ fn handleList(ctx: *mere.Context, args: *const types.ParsedArgs) MereError!types
 
     for (all_keys.items) |key| {
         out.print("{s}: {s}\n", .{ std.fs.path.basename(key.path), key.fingerprint }) catch {
-            return types.CommandResult{
-                .success = false,
-                .exit_code = 1,
-                .message = try ctx.allocator.dupe(u8, "Failed to format output"),
-            };
+            return MereError.OutOfMemory;
         };
     }
     output = out_buf.toArrayList();

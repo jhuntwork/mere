@@ -105,17 +105,14 @@ pub fn handleVerify(ctx: *mere.Context, args: *const types.ParsedArgs) MereError
     }
 
     var result = verify_mod.verifyAll(ctx, opts) catch |err| {
-        emit.diagnostic(ctx, .verify, switch (err) {
+        emit.phaseEnd(ctx, .verify, false);
+        const message = switch (err) {
             verify_mod.VerifyError.PermissionDenied => "permission denied",
             verify_mod.VerifyError.FileSystem => "filesystem error",
             verify_mod.VerifyError.InvalidInput => "invalid input",
             verify_mod.VerifyError.OutOfMemory => "out of memory",
-        }, null, null, null);
-        emit.phaseEnd(ctx, .verify, false);
-        return types.CommandResult{
-            .success = false,
-            .exit_code = 1,
         };
+        return try command.errorResult(ctx, err, message);
     };
     defer result.deinit(ctx.allocator);
 

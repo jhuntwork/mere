@@ -39,6 +39,7 @@ fn handleSearch(ctx: *mere.Context, args: *const types.ParsedArgs) MereError!typ
     }
 
     const term = args.positional[0];
+    ctx.withDiagnosticContext(mere.errors.DiagnosticContext.init().withSubject(term));
     const sync_policy = sync_options.repositorySyncPolicy(args) catch return MereError.InvalidInput;
 
     var curl_client = try mere.download.CurlTransferClient.init(ctx, command.user_agent);
@@ -46,12 +47,7 @@ fn handleSearch(ctx: *mere.Context, args: *const types.ParsedArgs) MereError!typ
     const client = curl_client.client();
 
     var results = mere.search.searchPackagesWithPolicy(ctx, term, client, sync_policy) catch |err| {
-        const user_message = mere.errors.getUserFriendlyMessage(err);
-        return types.CommandResult{
-            .success = false,
-            .exit_code = 1,
-            .message = try std.fmt.allocPrint(ctx.allocator, "search failed: {s}", .{user_message}),
-        };
+        return try command.errorResult(ctx, err, null);
     };
     defer {
         for (results.items) |*r| r.deinit(ctx.allocator);
