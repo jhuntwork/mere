@@ -85,6 +85,49 @@ fn matchesRecursiveDirPattern(rel_path: []const u8, pattern: []const u8) bool {
     return std.mem.eql(u8, rel_path, root) or std.mem.startsWith(u8, rel_path, pattern);
 }
 
+pub fn validatePathPatterns(patterns: []const []const u8) PackageStagingError!void {
+    var has_include = false;
+    for (patterns) |pattern| {
+        const raw_pattern = basePattern(pattern);
+        if (raw_pattern.len == 0 or raw_pattern[0] == '/') return PackageStagingError.InvalidInput;
+        if (!isExclusionPattern(pattern)) has_include = true;
+    }
+    if (!has_include) return PackageStagingError.InvalidInput;
+}
+
+/// Match one relative path using the same pathname-aware pattern language as
+/// recipe `files`. Positive patterns are ORed and exclusions override them.
+/// Unlike package staging, this helper does not require any pattern to match.
+pub fn matchesPathPatterns(
+    allocator: std.mem.Allocator,
+    rel_path: []const u8,
+    patterns: []const []const u8,
+) PackageStagingError!bool {
+    try validatePathPatterns(patterns);
+    if (rel_path.len == 0 or rel_path[0] == '/') return PackageStagingError.InvalidInput;
+    const rel_path_z = allocator.dupeZ(u8, rel_path) catch return PackageStagingError.OutOfMemory;
+    defer allocator.free(rel_path_z);
+
+    var included = false;
+    var excluded = false;
+    for (patterns) |pattern| {
+        const raw_pattern = basePattern(pattern);
+        if (raw_pattern.len == 0 or raw_pattern[0] == '/') return PackageStagingError.InvalidInput;
+        const matched = if (isRecursiveDirPattern(raw_pattern))
+            matchesRecursiveDirPattern(rel_path, raw_pattern)
+        else blk: {
+            const pattern_z = allocator.dupeZ(u8, raw_pattern) catch return PackageStagingError.OutOfMemory;
+            defer allocator.free(pattern_z);
+            const code = c.fnmatch(pattern_z.ptr, rel_path_z.ptr, c.FNM_PATHNAME);
+            if (code != 0 and code != c.FNM_NOMATCH) return PackageStagingError.InvalidInput;
+            break :blk code == 0;
+        };
+        if (!matched) continue;
+        if (isExclusionPattern(pattern)) excluded = true else included = true;
+    }
+    return included and !excluded;
+}
+
 /// Convert an absolute symlink target to a relative path if it points within source_dir.
 /// If the target points outside source_dir, return an error.
 ///
@@ -1200,4 +1243,20 @@ test "PackageStaging rejects absolute symlink target outside source boundary" {
         .destination = dest_dir,
     });
     try std.testing.expectError(error.InvalidInput, result);
+}
+
+test "matchesPathPatterns reuses files globs without requiring a match" {
+    const allocator = std.testing.allocator;
+    const patterns = [_][]const u8{
+        "usr/share/glib-2.0/schemas/*.xml",
+        "!usr/share/glib-2.0/schemas/ignored.xml",
+    };
+    try std.testing.expect(try matchesPathPatterns(allocator, "usr/share/glib-2.0/schemas/app.xml", &patterns));
+    try std.testing.expect(!try matchesPathPatterns(allocator, "usr/share/glib-2.0/schemas/ignored.xml", &patterns));
+    try std.testing.expect(!try matchesPathPatterns(allocator, "usr/share/glib-2.0/schemas/nested/app.xml", &patterns));
+    try std.testing.expect(!try matchesPathPatterns(allocator, "usr/share/icons/app.png", &patterns));
+    try std.testing.expect(try matchesPathPatterns(allocator, "usr/share/fonts/truetype/app.ttf", &.{"usr/share/fonts/"}));
+    try std.testing.expect(try matchesPathPatterns(allocator, "usr/bin/tool7", &.{"usr/bin/tool[0-9]"}));
+    try std.testing.expectError(error.InvalidInput, validatePathPatterns(&.{"!usr/share/ignored"}));
+    try std.testing.expectError(error.InvalidInput, validatePathPatterns(&.{"/usr/share/data"}));
 }

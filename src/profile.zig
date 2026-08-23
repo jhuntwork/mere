@@ -16,6 +16,9 @@ const package_manifest = @import("manifest.zig");
 const path_safety = @import("path_safety.zig");
 const generation = @import("generation.zig");
 const projection_index = @import("projection_index.zig");
+const meta = @import("meta.zig");
+const namespace = @import("namespace.zig");
+const package_staging = @import("package_staging.zig");
 const path = @import("path.zig");
 const Context = @import("mere.zig").Context;
 const store = @import("store.zig");
@@ -848,6 +851,198 @@ fn exchangePaths(left_path: []const u8, right_path: []const u8) ProfileError!voi
     }
 }
 
+const RealizerRunner = struct {
+    context: ?*anyopaque = null,
+    runFn: *const fn (?*anyopaque, *Context, []const u8, []const u8, *const meta.Realizer) anyerror!void = runRealizerCommand,
+
+    fn run(self: RealizerRunner, ctx: *Context, stage_path: []const u8, provider_store_path: []const u8, realizer: *const meta.Realizer) !void {
+        try self.runFn(self.context, ctx, stage_path, provider_store_path, realizer);
+    }
+};
+
+fn realizerApplies(
+    allocator: std.mem.Allocator,
+    stage_path: []const u8,
+    inputs: []const []const u8,
+) ProfileError!bool {
+    package_staging.validatePathPatterns(inputs) catch |err| return switch (err) {
+        error.OutOfMemory => ProfileError.OutOfMemory,
+        else => ProfileError.InvalidInput,
+    };
+    var root = std.Io.Dir.openDirAbsolute(path.currentIo(), stage_path, .{ .iterate = true }) catch |err| {
+        return switch (err) {
+            error.AccessDenied => ProfileError.PermissionDenied,
+            else => ProfileError.FileSystem,
+        };
+    };
+    defer root.close(path.currentIo());
+    var walker = root.walk(allocator) catch return ProfileError.OutOfMemory;
+    defer walker.deinit();
+    while (walker.next(path.currentIo()) catch return ProfileError.FileSystem) |entry| {
+        if (entry.kind != .file and entry.kind != .sym_link) continue;
+        if (package_staging.matchesPathPatterns(allocator, entry.path, inputs) catch |err| return switch (err) {
+            error.OutOfMemory => ProfileError.OutOfMemory,
+            else => ProfileError.InvalidInput,
+        }) return true;
+    }
+    return false;
+}
+
+fn runRealizerCommand(
+    _: ?*anyopaque,
+    ctx: *Context,
+    stage_path: []const u8,
+    provider_store_path: []const u8,
+    realizer: *const meta.Realizer,
+) !void {
+    const executable = realizer.command.items[0];
+    if (executable.len < 2 or executable[0] != '/') {
+        return ctx.fail(ProfileError.InvalidInput, realizer.name, "realizer executable must be an absolute generation path");
+    }
+    const provider_executable = std.fs.path.resolve(ctx.allocator, &.{ provider_store_path, executable[1..] }) catch
+        return ctx.fail(ProfileError.OutOfMemory, realizer.name, "failed to resolve provider executable");
+    defer ctx.allocator.free(provider_executable);
+    if (!path_safety.isWithinBoundary(provider_executable, provider_store_path)) {
+        return ctx.fail(ProfileError.InvalidInput, realizer.name, "realizer executable escapes its provider package");
+    }
+    std.Io.Dir.accessAbsolute(path.currentIo(), provider_executable, .{}) catch |err| {
+        return ctx.fail(switch (err) {
+            error.AccessDenied => ProfileError.PermissionDenied,
+            else => ProfileError.InvalidInput,
+        }, realizer.name, "realizer executable is not provided by its declaring package");
+    };
+
+    const mere_root = std.fs.path.join(ctx.allocator, &.{ ctx.root(), "mere" }) catch
+        return ProfileError.OutOfMemory;
+    defer ctx.allocator.free(mere_root);
+    const env_values = [_][]const u8{
+        "PATH=/usr/bin:/bin",
+        "HOME=/tmp",
+        "TMPDIR=/tmp",
+        "MERE_REALIZATION_ROOT=/work",
+    };
+    var envp: [env_values.len][*:0]const u8 = undefined;
+    var env_count: usize = 0;
+    defer {
+        for (envp[0..env_count]) |entry| {
+            const value = std.mem.span(entry);
+            ctx.allocator.free(entry[0 .. value.len + 1]);
+        }
+    }
+    for (env_values, 0..) |value, i| {
+        const owned = ctx.allocator.dupeZ(u8, value) catch return ProfileError.OutOfMemory;
+        envp[i] = owned.ptr;
+        env_count += 1;
+    }
+
+    const exit_code = namespace.forkAndEnterEnv(ctx.allocator, .build, .{
+        .profile_root = stage_path,
+        .workspace = stage_path,
+        .cwd = "/work",
+        .command = realizer.command.items,
+        .env = &envp,
+        .mere_root = mere_root,
+    }) catch |err| {
+        ctx.setDiagnosticContextFmt(realizer.name, "failed to enter generation realizer environment: {s}", .{@errorName(err)});
+        return switch (err) {
+            error.OutOfMemory => ProfileError.OutOfMemory,
+            error.PermissionDenied, error.UserNamespacesDisabled, error.MountRestricted => ProfileError.PermissionDenied,
+            else => ProfileError.FileSystem,
+        };
+    };
+    if (exit_code != 0) {
+        return ctx.fail(ProfileError.FileSystem, realizer.name, "generation realizer command failed");
+    }
+}
+
+fn runGenerationRealizers(
+    ctx: *Context,
+    stage_path: []const u8,
+    packages: []const generation.PackageEntry,
+    runner: RealizerRunner,
+) ProfileError!void {
+    var names = std.StringHashMap(void).init(ctx.allocator);
+    defer {
+        var it = names.keyIterator();
+        while (it.next()) |name| ctx.allocator.free(name.*);
+        names.deinit();
+    }
+
+    // Load every definition and snapshot applicability before executing any
+    // command. Realizer outputs therefore cannot trigger later realizers.
+    var package_metadata: std.ArrayList(meta.Data) = .empty;
+    defer {
+        for (package_metadata.items) |*pkg_meta| pkg_meta.deinit();
+        package_metadata.deinit(ctx.allocator);
+    }
+    for (packages) |pkg| {
+        const pkg_meta = meta.readFile(ctx.allocator, pkg.store_path) catch |err| {
+            return ctx.fail(switch (err) {
+                error.OutOfMemory => ProfileError.OutOfMemory,
+                error.PermissionDenied => ProfileError.PermissionDenied,
+                error.InvalidInput, error.ParseError => ProfileError.InvalidInput,
+                else => ProfileError.FileSystem,
+            }, pkg.store_path, "failed to read generation realizer metadata");
+        };
+        package_metadata.append(ctx.allocator, pkg_meta) catch {
+            var owned = pkg_meta;
+            owned.deinit();
+            return ProfileError.OutOfMemory;
+        };
+    }
+
+    const ActiveRealizer = struct {
+        package_index: usize,
+        realizer_index: usize,
+    };
+    var active: std.ArrayList(ActiveRealizer) = .empty;
+    defer active.deinit(ctx.allocator);
+
+    for (package_metadata.items, 0..) |*pkg_meta, package_index| {
+        for (pkg_meta.realizers.items, 0..) |*realizer, realizer_index| {
+            if (realizer.name.len == 0 or realizer.command.items.len == 0 or
+                realizer.command.items[0].len < 2 or realizer.command.items[0][0] != '/')
+            {
+                return ctx.fail(ProfileError.InvalidInput, packages[package_index].store_path, "invalid generation realizer metadata");
+            }
+            package_staging.validatePathPatterns(realizer.inputs.items) catch |err| {
+                return ctx.fail(switch (err) {
+                    error.OutOfMemory => ProfileError.OutOfMemory,
+                    else => ProfileError.InvalidInput,
+                }, realizer.name, "invalid generation realizer input patterns");
+            };
+
+            const name = ctx.allocator.dupe(u8, realizer.name) catch return ProfileError.OutOfMemory;
+            const entry = names.getOrPut(name) catch {
+                ctx.allocator.free(name);
+                return ProfileError.OutOfMemory;
+            };
+            if (entry.found_existing) {
+                ctx.allocator.free(name);
+                return ctx.fail(ProfileError.InvalidInput, realizer.name, "duplicate active generation realizer name");
+            }
+            if (try realizerApplies(ctx.allocator, stage_path, realizer.inputs.items)) {
+                active.append(ctx.allocator, .{
+                    .package_index = package_index,
+                    .realizer_index = realizer_index,
+                }) catch return ProfileError.OutOfMemory;
+            }
+        }
+    }
+
+    for (active.items) |selected| {
+        const realizer = &package_metadata.items[selected.package_index].realizers.items[selected.realizer_index];
+        runner.run(ctx, stage_path, packages[selected.package_index].store_path, realizer) catch |err| {
+            return switch (err) {
+                error.OutOfMemory => ProfileError.OutOfMemory,
+                error.PermissionDenied => ProfileError.PermissionDenied,
+                error.InvalidInput => ProfileError.InvalidInput,
+                else => ctx.fail(ProfileError.FileSystem, realizer.name, "generation realizer failed"),
+            };
+        };
+    }
+}
+
 fn buildProfileManifest(
     allocator: std.mem.Allocator,
     packages: []const generation.PackageEntry,
@@ -959,6 +1154,8 @@ pub fn publishProfileRoot(
     result.stats.reused_entries = apply_stats.reused_entries;
     result.stats.duration_ns = @intCast(std.Io.Clock.Timestamp.now(path.currentIo(), .awake).raw.toNanoseconds() - started_at);
 
+    try runGenerationRealizers(ctx, stage_dir, sorted_packages, .{});
+
     var manifest = try buildProfileManifest(
         ctx.allocator,
         sorted_packages,
@@ -1011,6 +1208,17 @@ pub fn createGeneration(
     store_root: []const u8,
     packages: []const generation.PackageEntry,
     parent_generation: ?u32,
+) ProfileError!u32 {
+    return createGenerationWithRealizerRunner(ctx, profile_dir, store_root, packages, parent_generation, .{});
+}
+
+fn createGenerationWithRealizerRunner(
+    ctx: *Context,
+    profile_dir: []const u8,
+    store_root: []const u8,
+    packages: []const generation.PackageEntry,
+    parent_generation: ?u32,
+    realizer_runner: RealizerRunner,
 ) ProfileError!u32 {
     const sorted_packages = try canonicalizePackages(ctx.allocator, packages);
     defer ctx.allocator.free(sorted_packages);
@@ -1091,6 +1299,8 @@ pub fn createGeneration(
     result.stats.materialized_entries = apply_stats.materialized_entries;
     result.stats.reused_entries = apply_stats.reused_entries;
     result.stats.duration_ns = @intCast(std.Io.Clock.Timestamp.now(path.currentIo(), .awake).raw.toNanoseconds() - started_at);
+
+    try runGenerationRealizers(ctx, stage_path, sorted_packages, realizer_runner);
 
     var manifest = try buildProfileManifest(
         ctx.allocator,
@@ -2270,4 +2480,127 @@ test "createGeneration no false conflict when parent realization misattributes p
     }
     // pkg-a sorts before pkg-b, so pkg-b is at index 1
     try std.testing.expectEqual(@as(?u32, 1), btool_owner);
+}
+
+test "generation realizers use contributor inputs and block publication on failure" {
+    const th = @import("test_helpers.zig");
+    var test_env = try th.createTestEnv();
+    defer {
+        test_env.cleanup();
+        std.testing.allocator.destroy(test_env);
+    }
+    const allocator = test_env.ctx.allocator;
+    const store_root = try std.fs.path.join(allocator, &.{ test_env.path, "mere", "store" });
+    defer allocator.free(store_root);
+    const profile_dir = try std.fs.path.join(allocator, &.{ test_env.path, "profiles", "test" });
+    defer allocator.free(profile_dir);
+    try path.ensureDirExists(store_root);
+    try path.ensureDirExists(profile_dir);
+
+    const provider_path = try std.fs.path.join(allocator, &.{ store_root, "provider-glib" });
+    defer allocator.free(provider_path);
+    const provider_bin = try std.fs.path.join(allocator, &.{ provider_path, "usr", "bin" });
+    defer allocator.free(provider_bin);
+    try path.ensureDirExists(provider_bin);
+    const executable_path = try std.fs.path.join(allocator, &.{ provider_bin, "glib-compile-schemas" });
+    defer allocator.free(executable_path);
+    var executable = try std.Io.Dir.createFileAbsolute(path.currentIo(), executable_path, .{});
+    executable.close(path.currentIo());
+
+    var provider_meta = meta.Data.init(allocator);
+    defer provider_meta.deinit();
+    var realizer = meta.Realizer.init();
+    realizer.name = try allocator.dupe(u8, "glib-schemas");
+    try realizer.inputs.append(allocator, try allocator.dupe(u8, "usr/share/glib-2.0/schemas/*.xml"));
+    try realizer.command.append(allocator, try allocator.dupe(u8, "/usr/bin/glib-compile-schemas"));
+    try realizer.command.append(allocator, try allocator.dupe(u8, "usr/share/glib-2.0/schemas"));
+    try provider_meta.realizers.append(allocator, realizer);
+    var output_trigger = meta.Realizer.init();
+    output_trigger.name = try allocator.dupe(u8, "generated-output-must-not-trigger");
+    try output_trigger.inputs.append(allocator, try allocator.dupe(u8, "usr/share/glib-2.0/schemas/gschemas.compiled"));
+    try output_trigger.command.append(allocator, try allocator.dupe(u8, "/usr/bin/glib-compile-schemas"));
+    try provider_meta.realizers.append(allocator, output_trigger);
+    try meta.writeFile(allocator, provider_path, &provider_meta);
+    try writeProjectionForTestPackage(allocator, provider_path);
+
+    const contributor_path = try std.fs.path.join(allocator, &.{ store_root, "contributor-app" });
+    defer allocator.free(contributor_path);
+    const schemas_path = try std.fs.path.join(allocator, &.{ contributor_path, "usr", "share", "glib-2.0", "schemas" });
+    defer allocator.free(schemas_path);
+    try path.ensureDirExists(schemas_path);
+    const schema_path = try std.fs.path.join(allocator, &.{ schemas_path, "app.xml" });
+    defer allocator.free(schema_path);
+    var schema = try std.Io.Dir.createFileAbsolute(path.currentIo(), schema_path, .{});
+    schema.close(path.currentIo());
+    try writeProjectionForTestPackage(allocator, contributor_path);
+
+    const State = struct {
+        calls: usize = 0,
+        fail: bool = false,
+
+        fn run(raw: ?*anyopaque, _: *Context, stage_path: []const u8, provider: []const u8, value: *const meta.Realizer) anyerror!void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            self.calls += 1;
+            try std.testing.expect(std.mem.endsWith(u8, provider, "provider-glib"));
+            try std.testing.expectEqualStrings("glib-schemas", value.name);
+            if (self.fail) return error.InjectedRealizerFailure;
+            const output = try std.fs.path.join(std.testing.allocator, &.{ stage_path, "usr", "share", "glib-2.0", "schemas", "gschemas.compiled" });
+            defer std.testing.allocator.free(output);
+            var file = try std.Io.Dir.createFileAbsolute(path.currentIo(), output, .{});
+            defer file.close(path.currentIo());
+            try file.writeStreamingAll(path.currentIo(), "compiled");
+        }
+    };
+
+    const packages = [_]generation.PackageEntry{
+        testPackageEntry("glib", provider_path),
+        testPackageEntry("app", contributor_path),
+    };
+    var state = State{};
+    const gen1 = try createGenerationWithRealizerRunner(
+        &test_env.ctx,
+        profile_dir,
+        store_root,
+        &packages,
+        null,
+        .{ .context = &state, .runFn = State.run },
+    );
+    try std.testing.expectEqual(@as(u32, 1), gen1);
+    try std.testing.expectEqual(@as(usize, 1), state.calls);
+    // The first command created gschemas.compiled, but trigger applicability was
+    // snapshotted before execution, so it did not activate the second realizer.
+    const output_path = try std.fs.path.join(allocator, &.{ profile_dir, "gen-1", "usr", "share", "glib-2.0", "schemas", "gschemas.compiled" });
+    defer allocator.free(output_path);
+    try std.Io.Dir.accessAbsolute(path.currentIo(), output_path, .{});
+
+    // A provider without matching contributor inputs is valid and is skipped.
+    _ = try createGenerationWithRealizerRunner(
+        &test_env.ctx,
+        profile_dir,
+        store_root,
+        &.{testPackageEntry("glib", provider_path)},
+        gen1,
+        .{ .context = &state, .runFn = State.run },
+    );
+    try std.testing.expectEqual(@as(usize, 1), state.calls);
+
+    // A failed realizer leaves neither a selectable generation nor staging.
+    state.fail = true;
+    try std.testing.expectError(
+        ProfileError.FileSystem,
+        createGenerationWithRealizerRunner(
+            &test_env.ctx,
+            profile_dir,
+            store_root,
+            &packages,
+            2,
+            .{ .context = &state, .runFn = State.run },
+        ),
+    );
+    const failed_generation = try std.fs.path.join(allocator, &.{ profile_dir, "gen-3" });
+    defer allocator.free(failed_generation);
+    const failed_staging = try std.fs.path.join(allocator, &.{ profile_dir, "gen-3.staging" });
+    defer allocator.free(failed_staging);
+    try std.testing.expect(!path.fileExists(failed_generation));
+    try std.testing.expect(!path.fileExists(failed_staging));
 }

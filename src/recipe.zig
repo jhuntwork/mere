@@ -229,7 +229,6 @@ fn parseKdlRecipeNode(allocator: std.mem.Allocator, node: *const kdl.Node, recip
         }
     }
 
-
     // env CC="clang" CXX="clang++" (properties on an env child node)
     if (node.findChild("env")) |env_node| {
         try parseKdlEnvProperties(allocator, env_node, &recipe.env);
@@ -384,9 +383,40 @@ fn parseKdlPackageNode(
         artifact.arch = try allocator.dupe(u8, val);
     }
 
-    // Parse service definitions
+    // Parse service and generation-realizer definitions.
     for (node.children.items) |*child| {
-        if (std.mem.eql(u8, child.name, "service")) {
+        if (std.mem.eql(u8, child.name, "realizer")) {
+            var realizer = RealizerDef.init();
+            errdefer realizer.deinit(allocator);
+
+            const realizer_name = child.getFirstArgString() orelse return RecipeError.MissingKey;
+            if (realizer_name.len == 0) return RecipeError.InvalidInput;
+            realizer.name = try allocator.dupe(u8, realizer_name);
+            if (child.findChild("inputs")) |inputs| {
+                var has_include = false;
+                for (inputs.arguments.items) |arg| {
+                    const value = arg.getString() orelse return RecipeError.NonStringValue;
+                    const expanded = try interpolate(allocator, ctx, value, recipe_ref, vars);
+                    errdefer allocator.free(expanded);
+                    const raw_pattern = if (expanded[0] == '!') expanded[1..] else expanded;
+                    if (raw_pattern.len == 0 or raw_pattern[0] == '/') return RecipeError.InvalidInput;
+                    if (expanded[0] != '!') has_include = true;
+                    try realizer.inputs.append(allocator, expanded);
+                }
+                if (!has_include) return RecipeError.InvalidInput;
+            }
+            if (child.findChild("command")) |command| {
+                for (command.arguments.items) |arg| {
+                    const value = arg.getString() orelse return RecipeError.NonStringValue;
+                    const expanded = try interpolate(allocator, ctx, value, recipe_ref, vars);
+                    errdefer allocator.free(expanded);
+                    if (expanded.len == 0) return RecipeError.InvalidInput;
+                    try realizer.command.append(allocator, expanded);
+                }
+            }
+            if (realizer.command.items.len == 0 or realizer.command.items[0][0] != '/') return RecipeError.InvalidInput;
+            try artifact.realizers.append(allocator, realizer);
+        } else if (std.mem.eql(u8, child.name, "service")) {
             var svc = try ServiceDef.init(allocator);
             errdefer svc.deinit(allocator);
 
@@ -535,6 +565,24 @@ pub const BuildState = enum { Planned, Built, Scanned, Archived, Published };
 
 pub const ServiceType = enum { daemon, oneshot };
 
+pub const RealizerDef = struct {
+    name: []const u8 = "",
+    inputs: std.ArrayList([]const u8) = .empty,
+    command: std.ArrayList([]const u8) = .empty,
+
+    pub fn init() RealizerDef {
+        return .{};
+    }
+
+    pub fn deinit(self: *RealizerDef, allocator: std.mem.Allocator) void {
+        if (self.name.len > 0) allocator.free(self.name);
+        for (self.inputs.items) |value| allocator.free(value);
+        self.inputs.deinit(allocator);
+        for (self.command.items) |value| allocator.free(value);
+        self.command.deinit(allocator);
+    }
+};
+
 pub const ServiceDef = struct {
     name: []const u8,
     service_type: ServiceType,
@@ -586,6 +634,7 @@ pub const BuildArtifact = struct {
     compress_manpages: bool,
     arch: ?[]const u8,
     services: std.ArrayList(ServiceDef),
+    realizers: std.ArrayList(RealizerDef),
 
     pub fn init(allocator: std.mem.Allocator) !BuildArtifact {
         return BuildArtifact{
@@ -601,6 +650,7 @@ pub const BuildArtifact = struct {
             .compress_manpages = true,
             .arch = null,
             .services = try std.ArrayList(ServiceDef).initCapacity(allocator, 0),
+            .realizers = try std.ArrayList(RealizerDef).initCapacity(allocator, 0),
         };
     }
 
@@ -626,6 +676,10 @@ pub const BuildArtifact = struct {
             svc.deinit(gpa);
         }
         self.services.deinit(gpa);
+        for (self.realizers.items) |*realizer| {
+            realizer.deinit(gpa);
+        }
+        self.realizers.deinit(gpa);
     }
 
     pub fn markBuilt(self: *BuildArtifact, allocator: std.mem.Allocator, archive_path: []const u8, content_hash: []const u8, archive_hash: []const u8, signature: []const u8) !void {
@@ -880,6 +934,14 @@ pub const Recipe = struct {
                     try writer.print(" \"{s}\"", .{pf});
                 }
                 try writer.writeAll("\n");
+            }
+            for (pkg.realizers.items) |realizer| {
+                try writer.print("    realizer \"{s}\" {{\n", .{realizer.name});
+                try writer.writeAll("        inputs");
+                for (realizer.inputs.items) |input| try writer.print(" \"{s}\"", .{input});
+                try writer.writeAll("\n        command");
+                for (realizer.command.items) |arg| try writer.print(" \"{s}\"", .{arg});
+                try writer.writeAll("\n    }\n");
             }
             try writer.writeAll("}\n\n");
         }
@@ -1647,4 +1709,68 @@ test "validateFile rewrites parse diagnostics to the recipe path" {
     const diag = test_env.ctx.getDiagnosticContext();
     try std.testing.expect(diag.subject != null);
     try std.testing.expectEqualStrings(recipe_path, diag.subject.?);
+}
+
+test "parse preserves interpolated generation realizer definition" {
+    const th = @import("test_helpers.zig");
+    var test_env = try th.createTestEnv();
+    defer {
+        test_env.cleanup();
+        std.testing.allocator.destroy(test_env);
+    }
+    const input =
+        \\recipe {
+        \\    name "glib"
+        \\    version "2.0"
+        \\    release 1
+        \\}
+        \\vars {
+        \\    schema-dir "usr/share/glib-2.0/schemas"
+        \\}
+        \\build {
+        \\    script "true"
+        \\}
+        \\package "glib" {
+        \\    files "usr/"
+        \\    realizer "glib-schemas" {
+        \\        inputs "${vars.schema-dir}/*.xml" "!${vars.schema-dir}/ignored.xml"
+        \\        command "/usr/bin/glib-compile-schemas" "${vars.schema-dir}"
+        \\    }
+        \\}
+    ;
+    var parsed = try parse(&test_env.ctx, input);
+    defer parsed.deinit();
+    try std.testing.expectEqual(@as(usize, 1), parsed.packages.items[0].realizers.items.len);
+    const realizer = parsed.packages.items[0].realizers.items[0];
+    try std.testing.expectEqualStrings("glib-schemas", realizer.name);
+    try std.testing.expectEqualStrings("usr/share/glib-2.0/schemas/*.xml", realizer.inputs.items[0]);
+    try std.testing.expectEqualStrings("/usr/bin/glib-compile-schemas", realizer.command.items[0]);
+    try std.testing.expectEqualStrings("usr/share/glib-2.0/schemas", realizer.command.items[1]);
+}
+
+test "parse rejects a relative generation realizer executable" {
+    const th = @import("test_helpers.zig");
+    var test_env = try th.createTestEnv();
+    defer {
+        test_env.cleanup();
+        std.testing.allocator.destroy(test_env);
+    }
+    const input =
+        \\recipe {
+        \\    name "demo"
+        \\    version "1"
+        \\    release 1
+        \\}
+        \\build {
+        \\    script "true"
+        \\}
+        \\package "demo" {
+        \\    files "usr/"
+        \\    realizer "cache" {
+        \\        inputs "usr/share/data/"
+        \\        command "usr/bin/cache-tool"
+        \\    }
+        \\}
+    ;
+    try std.testing.expectError(RecipeError.InvalidInput, parse(&test_env.ctx, input));
 }
