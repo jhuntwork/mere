@@ -11,7 +11,8 @@ const repodb = @import("repodb.zig");
 const c = repodb.c;
 const sign = @import("sign.zig");
 const repocache_mod = @import("repocache.zig");
-const SyncPolicy = repocache_mod.SyncPolicy;
+const repo_sync = @import("repo_sync.zig");
+const SyncPolicy = repo_sync.SyncPolicy;
 const RepoCache = repocache_mod.RepoCache;
 const config_mod = @import("config.zig");
 const repo_sources = @import("repo_sources.zig");
@@ -442,7 +443,7 @@ pub fn installPackagesFromConfigWithPreview(
     }
 
     // Resolve
-    var resolution = try resolveProfile(ctx, repocaches.items, resolver_requirements, preferred_selections, client, sync_policy == .force, sync_policy != .no_sync);
+    var resolution = try resolveProfile(ctx, repocaches.items, resolver_requirements, preferred_selections, client, sync_policy);
     defer resolution.deinit();
     if (requested_state) |*state| resolution.setRequestedIntent(state.packages.items);
 
@@ -530,7 +531,7 @@ pub fn installPackageSpecsFromConfig(
     }
 
     // Resolve
-    var resolution = try resolveProfile(ctx, repocaches.items, resolver_requirements, preferred_selections, client, force_sync, true);
+    var resolution = try resolveProfile(ctx, repocaches.items, resolver_requirements, preferred_selections, client, if (force_sync) .force else .automatic);
     defer resolution.deinit();
     resolution.setRequirementIntent(input_requirements.items);
 
@@ -609,8 +610,7 @@ pub fn upgradePackagesFromConfig(
         resolver_requirements,
         preferred_selections_state.selections,
         client,
-        sync_policy == .force,
-        sync_policy != .no_sync,
+        sync_policy,
     );
     defer resolution.deinit();
     resolution.setRequestedIntent(requested_state.packages.items);
@@ -681,7 +681,7 @@ pub fn uninstallPackagesFromConfig(
         preferred_selections_state.holdAll();
 
         // Resolve
-        var resolution = try resolveProfile(ctx, repocaches.items, resolver_requirements, preferred_selections_state.selections, client, sync_policy == .force, sync_policy != .no_sync);
+        var resolution = try resolveProfile(ctx, repocaches.items, resolver_requirements, preferred_selections_state.selections, client, sync_policy);
         defer resolution.deinit();
 
         if (requested_state.removed_count == 0) {
@@ -767,7 +767,7 @@ pub fn uninstallPackagesFromConfig(
                 for (requested_state.packages.items, 0..) |pkg, ri| {
                     new_reqs[ri] = .{ .name = pkg.name, .constraint_expr = pkg.constraint_expr };
                 }
-                resolution = try resolveProfile(ctx, repocaches.items, new_reqs, preferred_selections_state.selections, client, sync_policy == .force, sync_policy != .no_sync);
+                resolution = try resolveProfile(ctx, repocaches.items, new_reqs, preferred_selections_state.selections, client, sync_policy);
                 resolution.setRequestedIntent(requested_state.packages.items);
             } else {
                 // All roots removed. Do NOT deinit `resolution` here - the
@@ -859,7 +859,7 @@ pub fn installPackagesToProfile(
     }
 
     // Resolve
-    var resolution = try resolveProfile(ctx, repocaches, resolver_requirements, preferred_selections, client, force_sync, true);
+    var resolution = try resolveProfile(ctx, repocaches, resolver_requirements, preferred_selections, client, if (force_sync) .force else .automatic);
     defer resolution.deinit();
     if (requested_state) |*state| resolution.setRequestedIntent(state.packages.items);
 
@@ -1441,7 +1441,7 @@ pub fn resolveDependencyTokens(
     const resolver_requirements = try installRequirementsToResolverRequirements(ctx.allocator, input_requirements.items);
     defer ctx.allocator.free(resolver_requirements);
 
-    return resolveProfile(ctx, repocaches, resolver_requirements, &.{}, client, force_sync, true);
+    return resolveProfile(ctx, repocaches, resolver_requirements, &.{}, client, if (force_sync) .force else .automatic);
 }
 
 /// Resolve a profile: sync repos, resolve dependencies, return the resolved package set.
@@ -1452,8 +1452,7 @@ pub fn resolveProfile(
     requirements: []const resolver.Requirement,
     preferred_selections: []const resolver.PreferredSelection,
     client: download.TransferClient,
-    force_sync: bool,
-    sync: bool,
+    sync_policy: SyncPolicy,
 ) !ProfileResolution {
     var loaded_keys = try sign.loadAllKeys(ctx);
     errdefer {
@@ -1461,13 +1460,11 @@ pub fn resolveProfile(
         loaded_keys.deinit(ctx.allocator);
     }
 
-    if (sync) {
-        try syncRepoCaches(ctx, repocaches, client, force_sync, loaded_keys.items);
-    } else {
-        for (repocaches) |repo_cache| {
-            try repo_cache.ensureRepository(loaded_keys.items);
-        }
-    }
+    var sync_result = try repo_sync.synchronize(ctx, repocaches, client, .{
+        .policy = sync_policy,
+    }, loaded_keys.items);
+    defer sync_result.deinit(ctx.allocator);
+    if (sync_result.firstFailure()) |err| return err;
 
     var arena = std.heap.ArenaAllocator.init(ctx.allocator);
     errdefer arena.deinit();
@@ -1551,25 +1548,6 @@ pub fn realizeProfile(
     }
 
     return target_behavior;
-}
-
-fn syncRepoCaches(
-    ctx: *Context,
-    repocaches: []*RepoCache,
-    client: download.TransferClient,
-    force_sync: bool,
-    loaded_keys: []const sign.LoadedKey,
-) !void {
-    // 0. Sync all RepoCaches before install
-    for (repocaches) |repo_cache| {
-        try repo_cache.sync(client, .{
-            .force = force_sync,
-            .interval_seconds = repo_cache.sync_interval_seconds,
-            .timeout_seconds = repo_cache.sync_timeout_seconds,
-        }, loaded_keys);
-        try repo_cache.ensureRepository(loaded_keys);
-    }
-    ctx.debug("repo sync complete for {d} repositories", .{repocaches.len});
 }
 
 fn resolveInstallPlan(

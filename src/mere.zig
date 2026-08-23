@@ -11,6 +11,7 @@ pub const gc = @import("gc.zig");
 pub const gcroots = @import("gcroots.zig");
 pub const generation = @import("generation.zig");
 pub const repo_history = @import("repo_history.zig");
+pub const repo_sync = @import("repo_sync.zig");
 pub const hash = @import("hash.zig");
 pub const import = @import("import.zig");
 pub const init = @import("init.zig");

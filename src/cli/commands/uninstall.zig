@@ -3,7 +3,7 @@ const mere = @import("mere");
 const download = mere.download;
 const types = @import("../types.zig");
 const command = @import("../command.zig");
-const sync_command = @import("sync.zig");
+const sync_options = @import("../sync_options.zig");
 const MereError = types.MereError;
 
 const uninstall_meta = command.CommandMeta{
@@ -61,7 +61,7 @@ fn handleUninstall(ctx: *mere.Context, args: *const types.ParsedArgs) MereError!
     const package_names = args.positional;
     const profile_name = args.getString("profile") orelse "system";
     const verify_store = args.getBool("verify-store");
-    const sync_policy = sync_command.repositorySyncPolicy(args) catch return MereError.InvalidInput;
+    const sync_policy = sync_options.repositorySyncPolicy(args) catch return MereError.InvalidInput;
     const cascade = args.getBool("cascade");
     const dry_run = args.getBool("dry-run");
 
@@ -95,7 +95,7 @@ fn performUninstall(
     package_names: []const []const u8,
     profile_name: []const u8,
     verify_store: bool,
-    sync_policy: mere.repocache.SyncPolicy,
+    sync_policy: mere.repo_sync.SyncPolicy,
     cascade: bool,
     dry_run: bool,
 ) !?[]const u8 {

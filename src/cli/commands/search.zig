@@ -2,7 +2,7 @@ const std = @import("std");
 const mere = @import("mere");
 const types = @import("../types.zig");
 const command = @import("../command.zig");
-const sync_command = @import("sync.zig");
+const sync_options = @import("../sync_options.zig");
 const MereError = mere.errors.MereError;
 const ui = mere.ui;
 const emit = ui.emit;
@@ -39,7 +39,7 @@ fn handleSearch(ctx: *mere.Context, args: *const types.ParsedArgs) MereError!typ
     }
 
     const term = args.positional[0];
-    const sync_policy = sync_command.repositorySyncPolicy(args) catch return MereError.InvalidInput;
+    const sync_policy = sync_options.repositorySyncPolicy(args) catch return MereError.InvalidInput;
 
     var curl_client = try mere.download.CurlTransferClient.init(ctx, command.user_agent);
     defer mere.download.CurlTransferClient.cleanupFn(ctx, curl_client);

@@ -3,7 +3,7 @@ const mere = @import("mere");
 const download = mere.download;
 const types = @import("../types.zig");
 const command = @import("../command.zig");
-const sync_command = @import("sync.zig");
+const sync_options = @import("../sync_options.zig");
 const MereError = types.MereError;
 
 const upgrade_meta = command.CommandMeta{
@@ -52,7 +52,7 @@ fn handleUpgrade(ctx: *mere.Context, args: *const types.ParsedArgs) MereError!ty
     const package_names = args.positional;
     const profile_name = args.getString("profile") orelse "system";
     const verify_store = args.getBool("verify-store");
-    const sync_policy = sync_command.repositorySyncPolicy(args) catch return MereError.InvalidInput;
+    const sync_policy = sync_options.repositorySyncPolicy(args) catch return MereError.InvalidInput;
     const dry_run = args.getBool("dry-run");
 
     ctx.withDiagnosticContext(mere.errors.DiagnosticContext.init().withSubject(

@@ -3,7 +3,7 @@ const mere = @import("mere");
 const download = mere.download;
 const types = @import("../types.zig");
 const command = @import("../command.zig");
-const sync_command = @import("sync.zig");
+const sync_options = @import("../sync_options.zig");
 const MereError = types.MereError;
 
 /// Install command metadata
@@ -58,7 +58,7 @@ fn handleInstall(ctx: *mere.Context, args: *const types.ParsedArgs) MereError!ty
     const package_names = args.positional;
     const profile_name = args.getString("profile") orelse "system";
     const verify_store = args.getBool("verify-store");
-    const sync_policy = sync_command.repositorySyncPolicy(args) catch return MereError.InvalidInput;
+    const sync_policy = sync_options.repositorySyncPolicy(args) catch return MereError.InvalidInput;
     const dry_run = args.getBool("dry-run");
 
     // Set initial diagnostic context - the subject is the package being installed
@@ -88,7 +88,7 @@ fn performInstallation(
     package_names: []const []const u8,
     profile_name: []const u8,
     verify_store: bool,
-    sync_policy: mere.repocache.SyncPolicy,
+    sync_policy: mere.repo_sync.SyncPolicy,
     dry_run: bool,
 ) !?[]const u8 {
     // Ensure configuration is loaded (no logging - errors propagate)

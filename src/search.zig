@@ -2,7 +2,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const mere = @import("mere.zig");
 const repo_sources = @import("repo_sources.zig");
-const repocache = @import("repocache.zig");
+const repo_sync = @import("repo_sync.zig");
 const package = @import("package.zig");
 const errors = @import("errors.zig");
 const download = @import("download.zig");
@@ -49,7 +49,7 @@ pub fn searchPackagesWithPolicy(
     ctx: *mere.Context,
     term: []const u8,
     client: download.TransferClient,
-    sync_policy: repocache.SyncPolicy,
+    sync_policy: repo_sync.SyncPolicy,
 ) SearchError!std.ArrayList(SearchResult) {
     var results: std.ArrayList(SearchResult) = .empty;
     errdefer {
@@ -81,27 +81,18 @@ pub fn searchPackagesWithPolicy(
     }
 
     var searchable_repositories: usize = 0;
-    for (repocaches.items) |rc| {
-        if (rc.is_local) {
-            rc.sync(client, .{}, loaded_keys.items) catch {
-                ui.emit.logFmtSeverity(ctx, .search, .warn, "repository {s} is unavailable; skipping it", .{rc.name});
-                continue;
-            };
-        } else if (sync_policy != .no_sync) {
-            rc.sync(client, .{
-                .force = sync_policy == .force,
-                .interval_seconds = rc.sync_interval_seconds,
-                .timeout_seconds = rc.sync_timeout_seconds,
-            }, loaded_keys.items) catch {
-                ui.emit.logFmtSeverity(ctx, .search, .warn, "repository {s} is unavailable; skipping it", .{rc.name});
-                continue;
-            };
-        }
+    var sync_result = repo_sync.synchronize(ctx, repocaches.items, client, .{
+        .policy = sync_policy,
+    }, loaded_keys.items) catch return SearchError.OutOfMemory;
+    defer sync_result.deinit(ctx.allocator);
 
-        rc.ensureRepository(loaded_keys.items) catch {
-            ui.emit.logFmtSeverity(ctx, .search, .warn, "repository {s} has no usable verified metadata; skipping it", .{rc.name});
+    for (sync_result.outcomes.items) |outcome| {
+        if (outcome.status != .ready) {
+            const detail = if (outcome.failure) |err| @errorName(err) else "unavailable";
+            ui.emit.logFmtSeverity(ctx, .search, .warn, "repository {s} is unavailable ({s}); skipping it", .{ outcome.name, detail });
             continue;
-        };
+        }
+        const rc = outcome.cache.?;
         searchable_repositories += 1;
 
         const repo = &(rc.repository.?);

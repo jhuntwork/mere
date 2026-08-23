@@ -22,12 +22,6 @@ const hash = @import("hash.zig");
 const Std = errors.StandardErrors;
 pub const RepoCacheError = Std.OutOfMemory || Std.FileSystem || Std.Network || Std.PermissionDenied || Std.SignatureInvalid || Std.CorruptData;
 
-pub const SyncPolicy = enum {
-    automatic,
-    force,
-    no_sync,
-};
-
 pub const SyncOptions = struct {
     force: bool = false,
     interval_seconds: u64 = default_sync_interval_seconds,

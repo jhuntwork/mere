@@ -41,6 +41,7 @@ test {
     _ = @import("recipe.zig");
     _ = @import("repodb.zig");
     _ = @import("repo_history.zig");
+    _ = @import("repo_sync.zig");
     _ = @import("repo_sources.zig");
     _ = @import("repocache.zig");
     _ = @import("repository.zig");

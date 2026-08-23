@@ -18,32 +18,6 @@ const sync_meta = command.CommandMeta{
     },
 };
 
-fn selected(names: []const []const u8, candidate: []const u8) bool {
-    if (names.len == 0) return true;
-    for (names) |name| {
-        if (std.mem.eql(u8, name, candidate)) return true;
-    }
-    return false;
-}
-
-pub fn repositorySyncPolicy(args: *const types.ParsedArgs) MereError!mere.repocache.SyncPolicy {
-    return repositorySyncPolicyFromFlags(args.getBool("sync"), args.getBool("no-sync"));
-}
-
-fn repositorySyncPolicyFromFlags(force: bool, disabled: bool) MereError!mere.repocache.SyncPolicy {
-    if (force and disabled) return MereError.InvalidInput;
-    if (force) return .force;
-    if (disabled) return .no_sync;
-    return .automatic;
-}
-
-test "repository sync flags are explicit and mutually exclusive" {
-    try std.testing.expectEqual(mere.repocache.SyncPolicy.automatic, try repositorySyncPolicyFromFlags(false, false));
-    try std.testing.expectEqual(mere.repocache.SyncPolicy.force, try repositorySyncPolicyFromFlags(true, false));
-    try std.testing.expectEqual(mere.repocache.SyncPolicy.no_sync, try repositorySyncPolicyFromFlags(false, true));
-    try std.testing.expectError(MereError.InvalidInput, repositorySyncPolicyFromFlags(true, true));
-}
-
 fn handleSync(ctx: *mere.Context, args: *const types.ParsedArgs) MereError!types.CommandResult {
     const config = ctx.getConfig() catch |err| return try command.errorResult(ctx, err, null);
     var caches = mere.repo_sources.createCaches(ctx, config) catch |err| return try command.errorResult(ctx, err, null);
@@ -66,40 +40,25 @@ fn handleSync(ctx: *mere.Context, args: *const types.ParsedArgs) MereError!types
     };
     defer mere.download.CurlTransferClient.cleanupFn(ctx, curl_client);
 
-    var matched = try ctx.allocator.alloc(bool, args.positional.len);
-    defer ctx.allocator.free(matched);
-    @memset(matched, false);
+    var sync_result = mere.repo_sync.synchronize(ctx, caches.items, curl_client.client(), .{
+        .policy = .force,
+        .repositories = args.positional,
+        .strict = true,
+    }, loaded_keys.items) catch |err| return try command.errorResult(ctx, err, null);
+    defer sync_result.deinit(ctx.allocator);
 
-    var failures: usize = 0;
-    var attempted: usize = 0;
-    for (caches.items) |cache| {
-        if (!selected(args.positional, cache.name)) continue;
-        attempted += 1;
-        for (args.positional, 0..) |name, index| {
-            if (std.mem.eql(u8, name, cache.name)) matched[index] = true;
-        }
-
-        cache.sync(curl_client.client(), .{
-            .force = true,
-            .interval_seconds = cache.sync_interval_seconds,
-            .timeout_seconds = cache.sync_timeout_seconds,
-            .allow_stale_fallback = false,
-        }, loaded_keys.items) catch |err| {
-            failures += 1;
-            mere.ui.emit.logFmtSeverity(ctx, null, .err, "failed to refresh repository {s}: {s}", .{ cache.name, @errorName(err) });
-        };
-    }
-
-    for (args.positional, 0..) |name, index| {
-        if (!matched[index]) {
-            failures += 1;
-            mere.ui.emit.logFmtSeverity(ctx, null, .err, "enabled repository not found: {s}", .{name});
+    for (sync_result.outcomes.items) |outcome| {
+        switch (outcome.status) {
+            .ready => {},
+            .failed => mere.ui.emit.logFmtSeverity(ctx, null, .err, "failed to refresh repository {s}: {s}", .{ outcome.name, @errorName(outcome.failure.?) }),
+            .not_found => mere.ui.emit.logFmtSeverity(ctx, null, .err, "enabled repository not found: {s}", .{outcome.name}),
         }
     }
 
-    if (attempted == 0 and args.positional.len == 0) {
+    if (sync_result.selected_count == 0 and args.positional.len == 0) {
         return .{ .success = true, .message = "no enabled repositories configured" };
     }
+    const failures = sync_result.failureCount();
     if (failures > 0) {
         return .{
             .success = false,
