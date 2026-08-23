@@ -88,8 +88,8 @@ Mere persists a number of formats, several of which are signed or content-addres
 
 | Format | Location | Discriminator | Written | Accepted |
 | --- | --- | --- | --- | --- |
-| Store content hash (§1) | store path name | variant is implied, not recorded | v2 | v1, transitional, v2 |
-| Package manifest (§17) | `.mere/manifest.v1`, `.mere/manifest.v2` | `schema_version` field and filename | v2 | v1, v2 |
+| Store content hash (§1) | store path name | manifest format and `schema_version` | v3 | v1, transitional, v2, v3 |
+| Package manifest (§17) | `.mere/manifest.v1`, `.mere/manifest.v2`, `.mere/manifest.v3` | `schema_version` field and filename | v3 | v1, v2, v3 |
 | Manifest signature (§5) | `.mere/manifest.vN.sig` | **none** | raw Ed25519 | raw Ed25519 |
 | Key file | `*.pub`, `*.key` | `MEREKEY` magic, version and algorithm bytes | v1 / Ed25519 | v1 / Ed25519 |
 | Generation manifest (§6) | `<generation>/` | `schema_version` field | 2 | 2 only |
@@ -163,7 +163,7 @@ The store content hash **MUST** incorporate:
 - File bytes
 - Path names
 - File type (file / directory / symlink)
-- Executable bit (`+x`)
+- setuid, setgid, and sticky bits on files and directories (v3)
 
 The store content hash **MUST NOT** incorporate:
 - Read/write permission bits (other than executable)
@@ -171,9 +171,9 @@ The store content hash **MUST NOT** incorporate:
 - Timestamps
 - ACLs or extended attributes
 
-**Normative invariant**: Two payloads that differ only in non-executable permission bits or ownership are considered *identical content*.
+**Normative invariant**: Two payloads that differ only in non-executable read/write permission bits or ownership are considered *identical content*. Under v3, two payloads that differ in a setuid, setgid, or sticky bit are different content.
 
-Implementations MUST preserve extracted permission bits when unpacking archives, but MUST NOT treat them as part of store identity.
+Implementations MUST preserve extracted permission bits when unpacking archives. Special bits on files and directories participate in v3 identity; symlink modes do not. Read/write bits outside executable and ownership remain outside identity because they are environment-dependent.
 
 ---
 

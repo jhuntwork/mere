@@ -2035,11 +2035,17 @@ fn preVerifyManifest(
 
     ctx.debug("partial-extracting manifest for pre-verification", .{});
     var format: manifest.Format = .v1;
-    const v2_probe_dir = verify_dir;
-    extract.fileInto(ctx, cache_path, v2_probe_dir, manifest.MANIFEST_V2_FILENAME) catch {};
-    const v2_probe_path = try std.fs.path.join(ctx.allocator, &.{ verify_dir, manifest.MANIFEST_V2_FILENAME });
-    defer ctx.allocator.free(v2_probe_path);
-    if (path.fileExists(v2_probe_path)) format = .v2;
+    extract.fileInto(ctx, cache_path, verify_dir, manifest.MANIFEST_V3_FILENAME) catch {};
+    const v3_probe_path = try std.fs.path.join(ctx.allocator, &.{ verify_dir, manifest.MANIFEST_V3_FILENAME });
+    defer ctx.allocator.free(v3_probe_path);
+    if (path.fileExists(v3_probe_path)) {
+        format = .v3;
+    } else {
+        extract.fileInto(ctx, cache_path, verify_dir, manifest.MANIFEST_V2_FILENAME) catch {};
+        const v2_probe_path = try std.fs.path.join(ctx.allocator, &.{ verify_dir, manifest.MANIFEST_V2_FILENAME });
+        defer ctx.allocator.free(v2_probe_path);
+        if (path.fileExists(v2_probe_path)) format = .v2;
+    }
 
     try extract.fileInto(ctx, cache_path, verify_dir, format.manifestFilename());
     try extract.fileInto(ctx, cache_path, verify_dir, format.signatureFilename());
@@ -2181,34 +2187,22 @@ fn stageAndValidatePayload(
     // Compute content hash from realized payload and canonical package metadata (spec #1/#4)
     var hash_diag: hash.HashDiag = .{};
     defer hash_diag.deinit(ctx.allocator);
-    var content_hash: []const u8 = undefined;
-    if (format == .v2) {
-        content_hash = hash.calculateStoreContentHashV2(ctx.allocator, staging_dir, &hash_diag) catch |err| {
-            const action = hash_diag.action orelse "compute content hash";
-            const path_label = hash_diag.path orelse staging_dir;
-            const os_err = if (hash_diag.os_error) |oe| @errorName(oe) else "unknown";
-            ctx.setDiagnosticContextFmt(staging_dir, "failed to compute content hash from payload and metadata: {s}: {s} ({s})", .{ action, path_label, os_err });
-            return switch (err) {
-                hash.HashError.OutOfMemory => error.OutOfMemory,
-                hash.HashError.PermissionDenied => error.PermissionDenied,
-                hash.HashError.InvalidInput => error.InvalidInput,
-                else => error.FileSystem,
-            };
+    var content_hash: []const u8 = switch (format) {
+        .v1 => hash.calculateStoreContentHash(ctx.allocator, staging_dir, &hash_diag),
+        .v2 => hash.calculateStoreContentHashV2(ctx.allocator, staging_dir, &hash_diag),
+        .v3 => hash.calculateStoreContentHashV3(ctx.allocator, staging_dir, &hash_diag),
+    } catch |err| {
+        const action = hash_diag.action orelse "compute content hash";
+        const path_label = hash_diag.path orelse staging_dir;
+        const os_err = if (hash_diag.os_error) |oe| @errorName(oe) else "unknown";
+        ctx.setDiagnosticContextFmt(staging_dir, "failed to compute content hash from payload and metadata: {s}: {s} ({s})", .{ action, path_label, os_err });
+        return switch (err) {
+            hash.HashError.OutOfMemory => error.OutOfMemory,
+            hash.HashError.PermissionDenied => error.PermissionDenied,
+            hash.HashError.InvalidInput => error.InvalidInput,
+            else => error.FileSystem,
         };
-    } else {
-        content_hash = hash.calculateStoreContentHash(ctx.allocator, staging_dir, &hash_diag) catch |err| {
-            const action = hash_diag.action orelse "compute content hash";
-            const path_label = hash_diag.path orelse staging_dir;
-            const os_err = if (hash_diag.os_error) |oe| @errorName(oe) else "unknown";
-            ctx.setDiagnosticContextFmt(staging_dir, "failed to compute content hash from payload and metadata: {s}: {s} ({s})", .{ action, path_label, os_err });
-            return switch (err) {
-                hash.HashError.OutOfMemory => error.OutOfMemory,
-                hash.HashError.PermissionDenied => error.PermissionDenied,
-                hash.HashError.InvalidInput => error.InvalidInput,
-                else => error.FileSystem,
-            };
-        };
-    }
+    };
     errdefer ctx.allocator.free(content_hash);
     ctx.debug("content hash from payload and metadata: {s}", .{content_hash});
 
