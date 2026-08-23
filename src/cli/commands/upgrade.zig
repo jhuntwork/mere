@@ -53,11 +53,8 @@ fn handleUpgrade(ctx: *mere.Context, args: *const types.ParsedArgs) MereError!ty
         if (package_names.len > 0) package_names[0] else profile_name,
     ));
 
-    // Preview is observational and must not contend for the mutation lock.
-    if (!dry_run) {
-        if (try command.acquireStoreLockOrResult(ctx)) |result| return result;
-    }
-    defer if (!dry_run) ctx.releaseStoreLock();
+    if (try command.acquireStoreLockOrResult(ctx)) |result| return result;
+    defer ctx.releaseStoreLock();
 
     _ = ctx.getConfig() catch |err| return try command.errorResult(ctx, err, null);
     var curl_client = download.CurlTransferClient.init(ctx, command.user_agent) catch |err| {

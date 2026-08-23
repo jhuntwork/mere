@@ -362,6 +362,28 @@ pub fn installPackagesFromConfig(
     force_sync: bool,
     profile_name: ?[]const u8,
 ) !InstallCommandOutcome {
+    return installPackagesFromConfigWithPreview(
+        ctx,
+        pkg_names,
+        client,
+        reinstall,
+        verify_store,
+        force_sync,
+        profile_name,
+        false,
+    );
+}
+
+pub fn installPackagesFromConfigWithPreview(
+    ctx: *Context,
+    pkg_names: []const []const u8,
+    client: download.TransferClient,
+    reinstall: bool,
+    verify_store: bool,
+    force_sync: bool,
+    profile_name: ?[]const u8,
+    dry_run: bool,
+) !InstallCommandOutcome {
     if (pkg_names.len == 0) {
         return ctx.fail(error.InvalidInput, "package", "no package names provided");
     }
@@ -411,6 +433,7 @@ pub fn installPackagesFromConfig(
         );
         resolver_requirements = owned_resolver_requirements.?;
         preferred_selections_state = try loadCurrentGenerationPreferences(ctx, profile_name.?);
+        preferred_selections_state.?.setInstallTargets(input_requirements.items);
         preferred_selections = preferred_selections_state.?.selections;
     } else {
         owned_resolver_requirements = try installRequirementsToResolverRequirements(ctx.allocator, input_requirements.items);
@@ -421,6 +444,13 @@ pub fn installPackagesFromConfig(
     var resolution = try resolveProfile(ctx, repocaches.items, resolver_requirements, preferred_selections, client, force_sync, true);
     defer resolution.deinit();
     if (requested_state) |*state| resolution.setRequestedIntent(state.packages.items);
+
+    if (dry_run) {
+        emitResolutionDiff(ctx, profile_name.?, resolution.plan.sorted, .install);
+        emit.logLineSeverity(ctx, .install, .info, "dry run: no changes made");
+        emit.phaseEnd(ctx, .install, true);
+        return .completed;
+    }
 
     // Realize
     const result_behavior = try realizeProfile(ctx, &resolution, client, reinstall, verify_store, profile_name, null, .install);
@@ -630,7 +660,7 @@ pub fn uninstallPackagesFromConfig(
     var requested_state = try buildRequestedRootsAfterRemove(ctx, profile_name, pkg_names);
     defer requested_state.deinit(ctx.allocator);
 
-    if (requested_state.removed_count == 0) {
+    if (requested_state.removed_count == 0 and requested_state.packages.items.len == 0) {
         return "No requested packages matched";
     }
 
@@ -647,10 +677,22 @@ pub fn uninstallPackagesFromConfig(
 
         var preferred_selections_state = try loadCurrentGenerationPreferences(ctx, profile_name);
         defer preferred_selections_state.deinit();
+        preferred_selections_state.holdAll();
 
         // Resolve
         var resolution = try resolveProfile(ctx, repocaches.items, resolver_requirements, preferred_selections_state.selections, client, force_sync, false);
         defer resolution.deinit();
+
+        if (requested_state.removed_count == 0) {
+            var matched_dependency = false;
+            for (pkg_names) |name| {
+                if (resolution.containsPackage(name)) {
+                    matched_dependency = true;
+                    break;
+                }
+            }
+            if (!matched_dependency) return "No requested packages matched";
+        }
 
         // Check if removed packages are still in the resolved set as transitive
         // deps. Loop to a fixed point: each cascade round only accounts for the
@@ -725,6 +767,7 @@ pub fn uninstallPackagesFromConfig(
                     new_reqs[ri] = .{ .name = pkg.name, .constraint_expr = pkg.constraint_expr };
                 }
                 resolution = try resolveProfile(ctx, repocaches.items, new_reqs, preferred_selections_state.selections, client, force_sync, false);
+                resolution.setRequestedIntent(requested_state.packages.items);
             } else {
                 // All roots removed. Do NOT deinit `resolution` here - the
                 // caller's `defer resolution.deinit()` (set up right after
@@ -746,6 +789,7 @@ pub fn uninstallPackagesFromConfig(
         }
 
         // Realize
+        resolution.setRequestedIntent(requested_state.packages.items);
         if (dry_run) {
             emitResolutionDiff(ctx, profile_name, resolution.plan.sorted, .uninstall);
             emit.logLineSeverity(ctx, .uninstall, .info, "dry run: no changes made");
@@ -806,6 +850,7 @@ pub fn installPackagesToProfile(
         );
         resolver_requirements = owned_resolver_requirements.?;
         preferred_selections_state = try loadCurrentGenerationPreferences(ctx, profile_name.?);
+        preferred_selections_state.?.setInstallTargets(input_requirements.items);
         preferred_selections = preferred_selections_state.?.selections;
     } else {
         owned_resolver_requirements = try installRequirementsToResolverRequirements(ctx.allocator, input_requirements.items);
@@ -844,7 +889,7 @@ const RequestedPackage = struct {
 
 const PreferredSelectionsState = struct {
     selections: []resolver.PreferredSelection,
-    manifest: ?generation.GenerationManifest,
+    manifest: ?generation.GenerationManifest = null,
     allocator: std.mem.Allocator,
 
     fn initEmpty(allocator: std.mem.Allocator) PreferredSelectionsState {
@@ -875,6 +920,22 @@ const PreferredSelectionsState = struct {
                         selection.allow_upgrade = true;
                         break;
                     }
+                }
+            }
+        }
+    }
+
+    fn holdAll(self: *PreferredSelectionsState) void {
+        for (self.selections) |*selection| selection.allow_upgrade = false;
+    }
+
+    fn setInstallTargets(self: *PreferredSelectionsState, requirements: []const InstallRootRequirement) void {
+        self.holdAll();
+        for (self.selections) |*selection| {
+            for (requirements) |requirement| {
+                if (std.mem.eql(u8, selection.name, requirement.name)) {
+                    selection.allow_upgrade = true;
+                    break;
                 }
             }
         }
@@ -976,6 +1037,7 @@ fn buildRequestedRootsAfterAdd(
     }
 
     for (requirements) |req| {
+        if (!req.requested) continue;
         if (package_index.get(req.name)) |idx| {
             const existing = &state.packages.items[idx];
             // Repeating an unconstrained install preserves an existing
@@ -1235,15 +1297,34 @@ fn buildProfileResolverRequirements(
     explicit_requirements: []const InstallRootRequirement,
     packages: []const RequestedPackage,
 ) ![]resolver.Requirement {
-    const out = try allocator.alloc(resolver.Requirement, packages.len);
     var seen = std.StringHashMap(void).init(allocator);
     defer seen.deinit();
+    for (explicit_requirements) |requirement| try seen.put(requirement.name, {});
 
+    var count = explicit_requirements.len;
+    for (packages) |pkg| {
+        if (!seen.contains(pkg.name)) count += 1;
+    }
+
+    seen.clearRetainingCapacity();
+    const out = try allocator.alloc(resolver.Requirement, count);
     var idx: usize = 0;
     for (explicit_requirements) |req| {
+        var constraint = req.constraint_expr;
+        // An unconstrained repeated install keeps the persisted root
+        // constraint. Exact profile specs continue to select their recorded
+        // content hash regardless of future intent.
+        if (req.requested and req.content_hash == null and req.intent_constraint == null) {
+            for (packages) |pkg| {
+                if (std.mem.eql(u8, pkg.name, req.name)) {
+                    constraint = pkg.constraint_expr;
+                    break;
+                }
+            }
+        }
         out[idx] = .{
             .name = req.name,
-            .constraint_expr = req.constraint_expr,
+            .constraint_expr = constraint,
             .content_hash = req.content_hash,
         };
         idx += 1;
@@ -1259,7 +1340,7 @@ fn buildProfileResolverRequirements(
         idx += 1;
     }
 
-    std.debug.assert(idx == packages.len);
+    std.debug.assert(idx == count);
     return out;
 }
 
@@ -2968,6 +3049,59 @@ test "upgrade targeting holds unrelated requested roots" {
     const targets = [_][]const u8{"app"};
 
     state.setUpgradeTargets(&roots, &targets);
+
+    try std.testing.expect(selections[0].allow_upgrade);
+    try std.testing.expect(!selections[1].allow_upgrade);
+    try std.testing.expect(!selections[2].allow_upgrade);
+}
+
+test "unconstrained repeat install preserves the persisted root constraint" {
+    const allocator = std.testing.allocator;
+    const install_requirements = [_]InstallRootRequirement{
+        .{ .name = "tool", .constraint_expr = null, .intent_constraint = null },
+    };
+    const requested_packages = [_]RequestedPackage{
+        .{ .name = "tool", .constraint_expr = ">=2,<3" },
+    };
+
+    const requirements = try buildProfileResolverRequirements(allocator, &install_requirements, &requested_packages);
+    defer allocator.free(requirements);
+
+    try std.testing.expectEqual(@as(usize, 1), requirements.len);
+    try std.testing.expectEqualStrings(">=2,<3", requirements[0].constraint_expr.?);
+}
+
+test "profile requirements keep exact dependency specs without promoting them" {
+    const allocator = std.testing.allocator;
+    const install_requirements = [_]InstallRootRequirement{
+        .{ .name = "app", .content_hash = "app-hash", .requested = true, .intent_constraint = ">=1" },
+        .{ .name = "lib", .content_hash = "lib-hash", .requested = false },
+    };
+    const requested_packages = [_]RequestedPackage{
+        .{ .name = "app", .constraint_expr = ">=1" },
+    };
+
+    const requirements = try buildProfileResolverRequirements(allocator, &install_requirements, &requested_packages);
+    defer allocator.free(requirements);
+
+    try std.testing.expectEqual(@as(usize, 2), requirements.len);
+    try std.testing.expectEqualStrings("app-hash", requirements[0].content_hash.?);
+    try std.testing.expectEqualStrings("lib-hash", requirements[1].content_hash.?);
+}
+
+test "install targeting holds unrelated current selections" {
+    var selections = [_]resolver.PreferredSelection{
+        .{ .name = "app", .version = "1", .release = 1, .arch = "x86_64", .content_hash = "a" },
+        .{ .name = "tool", .version = "1", .release = 1, .arch = "x86_64", .content_hash = "b" },
+        .{ .name = "lib", .version = "1", .release = 1, .arch = "x86_64", .content_hash = "c" },
+    };
+    var state = PreferredSelectionsState{
+        .allocator = std.testing.allocator,
+        .selections = selections[0..],
+    };
+    const requirements = [_]InstallRootRequirement{.{ .name = "app" }};
+
+    state.setInstallTargets(&requirements);
 
     try std.testing.expect(selections[0].allow_upgrade);
     try std.testing.expect(!selections[1].allow_upgrade);
