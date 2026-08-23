@@ -502,11 +502,22 @@ const recipe_service_children = [_]NodeSpec{
     .{ .name = "env", .any_child_args = .{ .kind = .string, .min = 1, .max = 1, .label = "value" } },
 };
 
+const recipe_realizer_children = [_]NodeSpec{
+    .{ .name = "inputs", .required = true, .args = .{ .kind = .string, .min = 1, .label = "pattern" } },
+    .{ .name = "command", .required = true, .args = .{ .kind = .string, .min = 1, .label = "argv" } },
+};
+
 const recipe_package_children = [_]NodeSpec{
     .{ .name = "files", .required = true, .args = .{ .kind = .string, .min = 1, .label = "value" } },
     .{ .name = "strip", .args = .{ .kind = .boolean, .min = 1, .max = 1, .label = "value" } },
     .{ .name = "compress-manpages", .args = .{ .kind = .boolean, .min = 1, .max = 1, .label = "value" } },
     .{ .name = "arch", .args = .{ .kind = .string, .min = 1, .max = 1, .label = "value" } },
+    .{
+        .name = "realizer",
+        .repeatable = true,
+        .args = .{ .kind = .string, .min = 1, .max = 1, .label = "name" },
+        .children = &recipe_realizer_children,
+    },
     .{
         .name = "service",
         .repeatable = true,

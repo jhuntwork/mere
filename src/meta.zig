@@ -123,6 +123,24 @@ pub const Service = struct {
     }
 };
 
+pub const Realizer = struct {
+    name: []const u8,
+    inputs: std.ArrayList([]const u8) = .empty,
+    command: std.ArrayList([]const u8) = .empty,
+
+    pub fn init() Realizer {
+        return .{ .name = "" };
+    }
+
+    pub fn deinit(self: *Realizer, allocator: std.mem.Allocator) void {
+        if (self.name.len > 0) allocator.free(self.name);
+        for (self.inputs.items) |value| allocator.free(value);
+        self.inputs.deinit(allocator);
+        for (self.command.items) |value| allocator.free(value);
+        self.command.deinit(allocator);
+    }
+};
+
 pub const Data = struct {
     dependencies: std.ArrayList(Dependency),
     provisions: std.ArrayList(Provision),
@@ -134,6 +152,7 @@ pub const Data = struct {
     licenses: std.ArrayList([]const u8) = .empty,
     source_urls: std.ArrayList([]const u8) = .empty,
     services: std.ArrayList(Service) = .empty,
+    realizers: std.ArrayList(Realizer) = .empty,
 
     pub fn init(allocator: std.mem.Allocator) Data {
         return Data{
@@ -162,6 +181,8 @@ pub const Data = struct {
         self.source_urls.deinit(self.allocator);
         for (self.services.items) |*service| service.deinit(self.allocator);
         self.services.deinit(self.allocator);
+        for (self.realizers.items) |*realizer| realizer.deinit(self.allocator);
+        self.realizers.deinit(self.allocator);
     }
 
     pub fn addDependency(self: *Data, dep_type: DependencyType, value: []const u8) MetaError!void {
@@ -246,6 +267,19 @@ pub const Data = struct {
         }
 
         try self.services.append(self.allocator, service);
+    }
+
+    pub fn addRealizer(self: *Data, source: anytype) MetaError!void {
+        var realizer = Realizer.init();
+        errdefer realizer.deinit(self.allocator);
+        realizer.name = self.allocator.dupe(u8, source.name) catch return MetaError.OutOfMemory;
+        for (source.inputs.items) |value| {
+            try realizer.inputs.append(self.allocator, try self.allocator.dupe(u8, value));
+        }
+        for (source.command.items) |value| {
+            try realizer.command.append(self.allocator, try self.allocator.dupe(u8, value));
+        }
+        try self.realizers.append(self.allocator, realizer);
     }
 
     /// Populate recipe-level metadata (description, homepage, licenses, source URLs).
@@ -407,6 +441,20 @@ pub const Data = struct {
             buffer.appendSlice(allocator, "}\n") catch return MetaError.OutOfMemory;
         }
 
+        if (self.realizers.items.len > 0) {
+            if (buffer.items.len > 0) buffer.append(allocator, '\n') catch return MetaError.OutOfMemory;
+            buffer.appendSlice(allocator, "realizers {\n") catch return MetaError.OutOfMemory;
+            for (self.realizers.items) |realizer| {
+                buffer.appendSlice(allocator, "    realizer \"") catch return MetaError.OutOfMemory;
+                try appendEscaped(&buffer, allocator, realizer.name);
+                buffer.appendSlice(allocator, "\" {\n") catch return MetaError.OutOfMemory;
+                try appendMetaArgs(&buffer, allocator, "inputs", realizer.inputs.items, 8);
+                try appendMetaArgs(&buffer, allocator, "command", realizer.command.items, 8);
+                buffer.appendSlice(allocator, "    }\n") catch return MetaError.OutOfMemory;
+            }
+            buffer.appendSlice(allocator, "}\n") catch return MetaError.OutOfMemory;
+        }
+
         return buffer.toOwnedSlice(allocator) catch return MetaError.OutOfMemory;
     }
 
@@ -464,6 +512,17 @@ pub const Data = struct {
                     try parseServiceArgs(allocator, child, "down", &service.down);
                     try parseServiceArgs(allocator, child, "depends-on", &service.depends_on);
                     try meta.services.append(allocator, service);
+                }
+            } else if (std.mem.eql(u8, node.name, "realizers")) {
+                for (node.children.items) |*child| {
+                    if (!std.mem.eql(u8, child.name, "realizer")) continue;
+                    var realizer = Realizer.init();
+                    errdefer realizer.deinit(allocator);
+                    realizer.name = allocator.dupe(u8, child.getFirstArgString() orelse return MetaError.InvalidInput) catch return MetaError.OutOfMemory;
+                    try parseServiceArgs(allocator, child, "inputs", &realizer.inputs);
+                    try parseServiceArgs(allocator, child, "command", &realizer.command);
+                    if (realizer.inputs.items.len == 0 or realizer.command.items.len == 0) return MetaError.InvalidInput;
+                    try meta.realizers.append(allocator, realizer);
                 }
             } else if (std.mem.eql(u8, node.name, "metadata")) {
                 for (node.children.items) |*child| {
@@ -858,4 +917,31 @@ test "Data encode and parse split-runtime dependency" {
     try std.testing.expectEqualStrings("libssl-3", parsed.dependencies.items[0].value);
     try std.testing.expect(parsed.dependencies.items[0].version_constraint != null);
     try std.testing.expectEqualStrings("=3.6.1-4", parsed.dependencies.items[0].version_constraint.?);
+}
+
+test "Data generation realizer metadata roundtrip" {
+    const allocator = std.testing.allocator;
+    var value = Data.init(allocator);
+    defer value.deinit();
+
+    var realizer = Realizer.init();
+    realizer.name = try allocator.dupe(u8, "glib-schemas");
+    try realizer.inputs.append(allocator, try allocator.dupe(u8, "usr/share/glib-2.0/schemas/*.xml"));
+    try realizer.inputs.append(allocator, try allocator.dupe(u8, "!usr/share/glib-2.0/schemas/ignored.xml"));
+    try realizer.command.append(allocator, try allocator.dupe(u8, "/usr/bin/glib-compile-schemas"));
+    try realizer.command.append(allocator, try allocator.dupe(u8, "usr/share/glib-2.0/schemas"));
+    try value.realizers.append(allocator, realizer);
+
+    const encoded = try value.encode(allocator);
+    defer allocator.free(encoded);
+    var parsed = try Data.parse(allocator, encoded);
+    defer parsed.deinit();
+
+    try std.testing.expectEqual(@as(usize, 1), parsed.realizers.items.len);
+    const parsed_realizer = parsed.realizers.items[0];
+    try std.testing.expectEqualStrings("glib-schemas", parsed_realizer.name);
+    try std.testing.expectEqualStrings("usr/share/glib-2.0/schemas/*.xml", parsed_realizer.inputs.items[0]);
+    try std.testing.expectEqualStrings("!usr/share/glib-2.0/schemas/ignored.xml", parsed_realizer.inputs.items[1]);
+    try std.testing.expectEqualStrings("/usr/bin/glib-compile-schemas", parsed_realizer.command.items[0]);
+    try std.testing.expectEqualStrings("usr/share/glib-2.0/schemas", parsed_realizer.command.items[1]);
 }

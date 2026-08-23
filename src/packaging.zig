@@ -323,6 +323,12 @@ pub const Packager = struct {
                 };
             }
         }
+        for (config.artifact.realizers.items) |realizer| {
+            pkg_meta.addRealizer(realizer) catch {
+                self.ctx.allocator.free(content_hash);
+                return self.fail(config.staging_dir, "failed to populate realizer metadata", PackagingError.CreationFailed);
+            };
+        }
 
         meta.writeFile(self.ctx.allocator, config.staging_dir, &pkg_meta) catch {
             self.ctx.allocator.free(content_hash);
@@ -722,6 +728,11 @@ test "Packager handles signing and metadata generation" {
     defer test_artifact.deinit(test_env.ctx.allocator);
     // Properly allocate the name since BuildArtifact.deinit() will free it
     test_artifact.name = try test_env.ctx.allocator.dupe(u8, "custom-name");
+    var test_realizer = recipe.RealizerDef.init();
+    test_realizer.name = try test_env.ctx.allocator.dupe(u8, "glib-schemas");
+    try test_realizer.inputs.append(test_env.ctx.allocator, try test_env.ctx.allocator.dupe(u8, "usr/share/glib-2.0/schemas/*.xml"));
+    try test_realizer.command.append(test_env.ctx.allocator, try test_env.ctx.allocator.dupe(u8, "/usr/bin/glib-compile-schemas"));
+    try test_artifact.realizers.append(test_env.ctx.allocator, test_realizer);
 
     // Create staging directory with content
     const staging_dir = try std.fs.path.join(test_env.ctx.allocator, &.{ test_env.path, "staging2" });
@@ -757,6 +768,10 @@ test "Packager handles signing and metadata generation" {
     defer generated_meta.deinit();
     try testing.expectEqual(@as(usize, 1), generated_meta.source_urls.items.len);
     try testing.expectEqualStrings("https://example.org/source-2.1.0.tar.xz", generated_meta.source_urls.items[0]);
+    try testing.expectEqual(@as(usize, 1), generated_meta.realizers.items.len);
+    try testing.expectEqualStrings("glib-schemas", generated_meta.realizers.items[0].name);
+    try testing.expectEqualStrings("usr/share/glib-2.0/schemas/*.xml", generated_meta.realizers.items[0].inputs.items[0]);
+    try testing.expectEqualStrings("/usr/bin/glib-compile-schemas", generated_meta.realizers.items[0].command.items[0]);
 
     // Verify manifest.v1.sig exists in staging (was written before archiving)
     const manifest_sig_path = try std.fs.path.join(test_env.ctx.allocator, &.{ staging_dir, manifest.MANIFEST_SIG_FILENAME });

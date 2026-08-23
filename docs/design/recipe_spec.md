@@ -421,6 +421,48 @@ package "hostname" {
 }
 ```
 
+### `realizer` Node (Optional, child of `package`)
+
+A package can provide a generation-time tool for derived artifacts without using
+an arbitrary shell hook. The provider package owns the definition and must ship
+the executable named by the first `command` argument. Other packages trigger it
+simply by contributing paths that match its `inputs`.
+
+```kdl
+package "glib" {
+    files "usr/"
+
+    realizer "glib-schemas" {
+        inputs "usr/share/glib-2.0/schemas/*.xml"
+        command "/usr/bin/glib-compile-schemas" "usr/share/glib-2.0/schemas"
+    }
+}
+```
+
+`inputs` uses the same pattern language as package `files`: paths are relative
+to the generation root, POSIX `fnmatch(3)` is pathname-aware, `*` does not cross
+`/`, `?` and bracket expressions are supported, a trailing `/` recursively
+matches a directory, `!` excludes matches, and recipe variables are expanded.
+Unlike `files`, a realizer input is a trigger rather than a package-content
+assertion: matching no paths is valid and skips the realizer. Any included file
+or symlink that survives exclusions makes it applicable. Mere snapshots all
+applicable realizers before running any command, so generated outputs cannot
+activate another realizer in the same generation build.
+
+`command` is an argv array, not a shell script. Its first argument must be an
+absolute path supplied by the declaring package. Mere runs it in an isolated
+build namespace after assembling the complete staged generation and before
+publication. `/usr` and the store are read-only, the staged generation is the
+working directory and is writable at `/work`, and the environment includes
+`MERE_REALIZATION_ROOT=/work`. Relative command arguments therefore refer to
+the staged generation, as in the GLib schema directory above. A non-zero exit or
+setup failure aborts publication and leaves the currently active generation
+unchanged.
+
+The MVP always evaluates and, when applicable, runs realizers for each newly
+constructed generation. It has no host-scoped writes, incremental realization
+cache, or lifecycle `scope` option.
+
 ## Variable Interpolation
 
 Variables can be used in strings with `${...}` syntax.
