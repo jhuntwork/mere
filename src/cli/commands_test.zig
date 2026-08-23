@@ -166,3 +166,116 @@ test "pin add fails without ever touching gc-roots when the store lock can't be 
     defer testing.allocator.free(gc_roots_dir);
     try testing.expectError(error.FileNotFound, std.Io.Dir.accessAbsolute(mere.path.currentIo(), gc_roots_dir, .{}));
 }
+
+fn writeProfileManifest(
+    ctx: *mere.Context,
+    profile_path: []const u8,
+    generation: ?u32,
+    packages: []const struct { name: []const u8, version: []const u8, release: u32 },
+) !void {
+    var profile_dir = try mere.path.makePathAndOpenDir(profile_path);
+    profile_dir.close(mere.path.currentIo());
+
+    var manifest = if (generation) |number|
+        mere.generation.GenerationManifest.init(ctx.allocator, number)
+    else
+        mere.generation.GenerationManifest.initRoot(ctx.allocator);
+    defer manifest.deinit();
+
+    for (packages) |pkg| {
+        const store_path = try std.fmt.allocPrint(ctx.allocator, "/mere/store/{s}-{s}-{s}", .{ "a" ** 64, pkg.name, pkg.version });
+        defer ctx.allocator.free(store_path);
+        try manifest.addPackage(pkg.name, pkg.version, pkg.release, "x86_64", store_path, "a" ** 64);
+    }
+    try mere.generation.writeManifest(ctx.allocator, profile_path, &manifest);
+}
+
+test "profile packages lists the active system generation deterministically" {
+    const testing = std.testing;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(mere.path.currentIo(), &path_buf);
+    var ctx = mere.Context.init(testing.allocator, path_buf[0..root_len]);
+    defer ctx.deinit();
+
+    const profile_dir = try std.fs.path.join(testing.allocator, &.{ ctx.root_path, "mere", "profiles", "system" });
+    defer testing.allocator.free(profile_dir);
+    const gen_path = try std.fs.path.join(testing.allocator, &.{ profile_dir, "gen-2" });
+    defer testing.allocator.free(gen_path);
+    try writeProfileManifest(&ctx, gen_path, 2, &.{
+        .{ .name = "zlib", .version = "1.3.1", .release = 2 },
+        .{ .name = "busybox", .version = "1.36.1", .release = 4 },
+    });
+    var profile_handle = try std.Io.Dir.openDirAbsolute(mere.path.currentIo(), profile_dir, .{});
+    defer profile_handle.close(mere.path.currentIo());
+    try profile_handle.symLink(mere.path.currentIo(), "gen-2", mere.generation.CURRENT_SYMLINK, .{});
+
+    var args = types.ParsedArgs.init(testing.allocator);
+    defer args.deinit();
+    const result = try profile_cmd.handlePackages(&ctx, &args);
+    defer if (result.message) |message| testing.allocator.free(message);
+
+    try testing.expect(result.success);
+    try testing.expectEqualStrings(
+        "Packages in profile 'system' (gen-2):\n  busybox 1.36.1-4\n  zlib 1.3.1-2\n",
+        result.message.?,
+    );
+}
+
+test "profile packages reads a named profile's active root" {
+    const testing = std.testing;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(mere.path.currentIo(), &path_buf);
+    var ctx = mere.Context.init(testing.allocator, path_buf[0..root_len]);
+    defer ctx.deinit();
+
+    const root_path = try std.fs.path.join(testing.allocator, &.{ ctx.root_path, "mere", "profiles", "tools", "root" });
+    defer testing.allocator.free(root_path);
+    try writeProfileManifest(&ctx, root_path, null, &.{
+        .{ .name = "git", .version = "2.51.0", .release = 1 },
+    });
+
+    var args = types.ParsedArgs.init(testing.allocator);
+    defer args.deinit();
+    try args.flags.put("profile", .{ .string = "tools" });
+    const result = try profile_cmd.handlePackages(&ctx, &args);
+    defer if (result.message) |message| testing.allocator.free(message);
+
+    try testing.expect(result.success);
+    try testing.expectEqualStrings("Packages in profile 'tools':\n  git 2.51.0-1\n", result.message.?);
+}
+
+test "profile packages distinguishes missing and empty active state" {
+    const testing = std.testing;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(mere.path.currentIo(), &path_buf);
+    var ctx = mere.Context.init(testing.allocator, path_buf[0..root_len]);
+    defer ctx.deinit();
+    var args = types.ParsedArgs.init(testing.allocator);
+    defer args.deinit();
+
+    const missing = try profile_cmd.handlePackages(&ctx, &args);
+    defer if (missing.message) |message| testing.allocator.free(message);
+    try testing.expectEqualStrings("Profile 'system' has no active generation", missing.message.?);
+
+    const profile_dir = try std.fs.path.join(testing.allocator, &.{ ctx.root_path, "mere", "profiles", "system" });
+    defer testing.allocator.free(profile_dir);
+    const gen_path = try std.fs.path.join(testing.allocator, &.{ profile_dir, "gen-1" });
+    defer testing.allocator.free(gen_path);
+    try writeProfileManifest(&ctx, gen_path, 1, &.{});
+    var profile_handle = try std.Io.Dir.openDirAbsolute(mere.path.currentIo(), profile_dir, .{});
+    defer profile_handle.close(mere.path.currentIo());
+    try profile_handle.symLink(mere.path.currentIo(), "gen-1", mere.generation.CURRENT_SYMLINK, .{});
+
+    const empty = try profile_cmd.handlePackages(&ctx, &args);
+    defer if (empty.message) |message| testing.allocator.free(message);
+    try testing.expectEqualStrings("Packages in profile 'system' (gen-1):\n  (none)\n", empty.message.?);
+}
