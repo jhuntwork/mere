@@ -209,31 +209,7 @@ pub const ManifestResult = struct {
 };
 
 fn detectManifestFormat(ctx: *Context, temp_dir: []const u8) !manifest.Format {
-    const v4_path = try std.fs.path.join(ctx.allocator, &.{ temp_dir, manifest.MANIFEST_V4_FILENAME });
-    defer ctx.allocator.free(v4_path);
-    const has_v4 = blk: {
-        std.Io.Dir.accessAbsolute(p.currentIo(), v4_path, .{}) catch break :blk false;
-        break :blk true;
-    };
-    if (has_v4) return .v4;
-
-    const v3_path = try std.fs.path.join(ctx.allocator, &.{ temp_dir, manifest.MANIFEST_V3_FILENAME });
-    defer ctx.allocator.free(v3_path);
-    const has_v3 = blk: {
-        std.Io.Dir.accessAbsolute(p.currentIo(), v3_path, .{}) catch break :blk false;
-        break :blk true;
-    };
-    if (has_v3) return .v3;
-
-    const v2_path = try std.fs.path.join(ctx.allocator, &.{ temp_dir, manifest.MANIFEST_V2_FILENAME });
-    defer ctx.allocator.free(v2_path);
-    const has_v2 = blk: {
-        std.Io.Dir.accessAbsolute(p.currentIo(), v2_path, .{}) catch break :blk false;
-        break :blk true;
-    };
-    if (has_v2) return .v2;
-
-    return .v1;
+    return manifest.detectFormat(ctx.allocator, temp_dir);
 }
 const PreparedImport = struct {
     extract: ExtractResult,
@@ -404,10 +380,11 @@ fn appendJsonEscaped(buf: *std.ArrayList(u8), allocator: std.mem.Allocator, valu
 }
 
 fn computeAndVerifyContentHash(ctx: *Context, temp_dir: []const u8, pkg_manifest: *const manifest.PackageManifestV1, format: manifest.Format) !void {
-    const computed_hash = switch (format) {
+    const computed_hash = switch (format.storeHashFormat()) {
         .v1 => try hash.calculateStoreContentHash(ctx.allocator, temp_dir, null),
         .v2 => try hash.calculateStoreContentHashV2(ctx.allocator, temp_dir, null),
-        .v3, .v4 => try hash.calculateStoreContentHashV3(ctx.allocator, temp_dir, null),
+        .v3 => try hash.calculateStoreContentHashV3(ctx.allocator, temp_dir, null),
+        .v4 => try hash.calculateStoreContentHashV4(ctx.allocator, temp_dir, null),
     };
     defer ctx.allocator.free(computed_hash);
 

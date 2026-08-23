@@ -329,11 +329,11 @@ pub const Packager = struct {
             return self.fail(config.staging_dir, "failed to write meta.kdl", PackagingError.FileSystem);
         };
 
-        // meta.kdl is part of the versioned v3 store identity. Manifest v4
-        // keeps that identity while introducing domain-separated signatures.
+        // meta.kdl is part of the v4 store identity. Manifest v5 selects that
+        // identity while retaining the domain-separated signature envelope.
         self.ctx.allocator.free(content_hash);
-        content_hash = hash.calculateStoreContentHashV3(self.ctx.allocator, config.staging_dir, null) catch {
-            return self.fail(config.staging_dir, "failed to compute v3 content hash", PackagingError.CreationFailed);
+        content_hash = hash.calculateStoreContentHashV4(self.ctx.allocator, config.staging_dir, null) catch {
+            return self.fail(config.staging_dir, "failed to compute v4 content hash", PackagingError.CreationFailed);
         };
         if (pkg.content_hash.len > 0) self.ctx.allocator.free(pkg.content_hash);
         pkg.content_hash = self.ctx.allocator.dupe(u8, content_hash) catch |err| {
@@ -347,7 +347,7 @@ pub const Packager = struct {
             return self.fail(content_hash, "invalid content hash hex", PackagingError.InvalidInput);
         };
         pkg_manifest.content_hash = final_content_hash_bytes;
-        manifest.writeManifestV4(self.ctx, config.staging_dir, &pkg_manifest, &secret_key.key) catch {
+        manifest.writeManifestV5(self.ctx, config.staging_dir, &pkg_manifest, &secret_key.key) catch {
             self.ctx.allocator.free(content_hash);
             return self.fail(config.staging_dir, "failed to write final manifest", PackagingError.FileSystem);
         };
@@ -467,6 +467,52 @@ pub const Packager = struct {
 const testing = std.testing;
 const test_helpers = @import("test_helpers.zig");
 
+test "package archive round trip preserves ordinary permission classes" {
+    var test_env = try test_helpers.createTestEnv();
+    defer {
+        test_env.cleanup();
+        std.testing.allocator.destroy(test_env);
+    }
+
+    const staging = try std.fs.path.join(test_env.ctx.allocator, &.{ test_env.path, "mode-staging" });
+    defer test_env.ctx.allocator.free(staging);
+    const private_dir = try std.fs.path.join(test_env.ctx.allocator, &.{ staging, "private" });
+    defer test_env.ctx.allocator.free(private_dir);
+    try path_mod.ensureDirExists(private_dir);
+    var private_handle = try std.Io.Dir.openDirAbsolute(path_mod.currentIo(), private_dir, .{ .iterate = true });
+    try private_handle.setPermissions(path_mod.currentIo(), .fromMode(0o750));
+    private_handle.close(path_mod.currentIo());
+
+    const secret_path = try std.fs.path.join(test_env.ctx.allocator, &.{ private_dir, "secret" });
+    defer test_env.ctx.allocator.free(secret_path);
+    var secret = try std.Io.Dir.createFileAbsolute(path_mod.currentIo(), secret_path, .{});
+    try secret.writeStreamingAll(path_mod.currentIo(), "secret\n");
+    try secret.setPermissions(path_mod.currentIo(), .fromMode(0o640));
+    secret.close(path_mod.currentIo());
+
+    var source_root = try std.Io.Dir.openDirAbsolute(path_mod.currentIo(), staging, .{ .iterate = true });
+    defer source_root.close(path_mod.currentIo());
+    const source_dir_stat = try source_root.statFile(path_mod.currentIo(), "private", .{ .follow_symlinks = false });
+    const source_file_stat = try source_root.statFile(path_mod.currentIo(), "private/secret", .{ .follow_symlinks = false });
+    try testing.expectEqual(@as(u32, 0o750), source_dir_stat.permissions.toMode() & 0o777);
+    try testing.expectEqual(@as(u32, 0o640), source_file_stat.permissions.toMode() & 0o777);
+
+    const archive_path = try std.fs.path.join(test_env.ctx.allocator, &.{ test_env.path, "modes.pkg.tar.zst" });
+    defer test_env.ctx.allocator.free(archive_path);
+    try archive.createPackageArchive(&test_env.ctx, staging, archive_path);
+
+    const extracted = try std.fs.path.join(test_env.ctx.allocator, &.{ test_env.path, "mode-extracted" });
+    defer test_env.ctx.allocator.free(extracted);
+    try extract.intoPreservingSpecialBits(&test_env.ctx, archive_path, extracted);
+
+    var extracted_dir = try std.Io.Dir.openDirAbsolute(path_mod.currentIo(), extracted, .{ .iterate = true });
+    defer extracted_dir.close(path_mod.currentIo());
+    const dir_stat = try extracted_dir.statFile(path_mod.currentIo(), "private", .{ .follow_symlinks = false });
+    const file_stat = try extracted_dir.statFile(path_mod.currentIo(), "private/secret", .{ .follow_symlinks = false });
+    try testing.expectEqual(@as(u32, 0o750), dir_stat.permissions.toMode() & 0o777);
+    try testing.expectEqual(@as(u32, 0o640), file_stat.permissions.toMode() & 0o777);
+}
+
 test "Packager creates package artifacts with metadata independently" {
     var test_env = try test_helpers.createTestEnv();
     defer {
@@ -533,6 +579,20 @@ test "Packager creates package artifacts with metadata independently" {
     defer test_env.ctx.allocator.free(manifest_sig_path);
     var _sigf = try std.Io.Dir.openFileAbsolute(path_mod.currentIo(), manifest_sig_path, .{});
     defer _sigf.close(path_mod.currentIo());
+
+    // The final v5 manifest selects store identity v4.
+    const manifest_v5_path = try std.fs.path.join(test_env.ctx.allocator, &.{ staging_dir, manifest.MANIFEST_V5_FILENAME });
+    defer test_env.ctx.allocator.free(manifest_v5_path);
+    var manifest_v5_file = try std.Io.Dir.openFileAbsolute(path_mod.currentIo(), manifest_v5_path, .{});
+    defer manifest_v5_file.close(path_mod.currentIo());
+    const manifest_v5_stat = try manifest_v5_file.stat(path_mod.currentIo());
+    const manifest_v5_bytes = try test_env.ctx.allocator.alloc(u8, @intCast(manifest_v5_stat.size));
+    defer test_env.ctx.allocator.free(manifest_v5_bytes);
+    _ = try manifest_v5_file.readPositionalAll(path_mod.currentIo(), manifest_v5_bytes, 0);
+    const decoded_v5 = try manifest.PackageManifestV1.decodeForSchema(manifest_v5_bytes, manifest.SCHEMA_VERSION_V5);
+    const decoded_hash = try decoded_v5.contentHashHex(test_env.ctx.allocator);
+    defer test_env.ctx.allocator.free(decoded_hash);
+    try std.testing.expectEqualStrings(result.content_hash, decoded_hash);
 
     const projection_path = try std.fs.path.join(test_env.ctx.allocator, &.{ staging_dir, manifest.PROJECTION_FILENAME });
     defer test_env.ctx.allocator.free(projection_path);

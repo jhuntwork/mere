@@ -12,6 +12,7 @@ pub const SCHEMA_VERSION: u32 = 1;
 pub const SCHEMA_VERSION_V2: u32 = 2;
 pub const SCHEMA_VERSION_V3: u32 = 3;
 pub const SCHEMA_VERSION_V4: u32 = 4;
+pub const SCHEMA_VERSION_V5: u32 = 5;
 pub const META_DIR = ".mere";
 pub const MANIFEST_FILENAME = ".mere/manifest.v1";
 pub const MANIFEST_SIG_FILENAME = ".mere/manifest.v1.sig";
@@ -21,14 +22,24 @@ pub const MANIFEST_V3_FILENAME = ".mere/manifest.v3";
 pub const MANIFEST_V3_SIG_FILENAME = ".mere/manifest.v3.sig";
 pub const MANIFEST_V4_FILENAME = ".mere/manifest.v4";
 pub const MANIFEST_V4_SIG_FILENAME = ".mere/manifest.v4.sig";
+pub const MANIFEST_V5_FILENAME = ".mere/manifest.v5";
+pub const MANIFEST_V5_SIG_FILENAME = ".mere/manifest.v5.sig";
 pub const META_KDL_FILENAME = ".mere/meta.kdl";
 pub const PROJECTION_FILENAME = ".mere/projection.v1";
+
+pub const StoreHashFormat = enum {
+    v1,
+    v2,
+    v3,
+    v4,
+};
 
 pub const Format = enum {
     v1,
     v2,
     v3,
     v4,
+    v5,
 
     pub fn manifestFilename(self: Format) []const u8 {
         return switch (self) {
@@ -36,6 +47,7 @@ pub const Format = enum {
             .v2 => MANIFEST_V2_FILENAME,
             .v3 => MANIFEST_V3_FILENAME,
             .v4 => MANIFEST_V4_FILENAME,
+            .v5 => MANIFEST_V5_FILENAME,
         };
     }
 
@@ -45,6 +57,7 @@ pub const Format = enum {
             .v2 => MANIFEST_V2_SIG_FILENAME,
             .v3 => MANIFEST_V3_SIG_FILENAME,
             .v4 => MANIFEST_V4_SIG_FILENAME,
+            .v5 => MANIFEST_V5_SIG_FILENAME,
         };
     }
 
@@ -54,20 +67,28 @@ pub const Format = enum {
             .v2 => SCHEMA_VERSION_V2,
             .v3 => SCHEMA_VERSION_V3,
             .v4 => SCHEMA_VERSION_V4,
+            .v5 => SCHEMA_VERSION_V5,
         };
     }
 
     pub fn signatureFormat(self: Format) sign.ManifestSignatureFormat {
         return switch (self) {
             .v1, .v2, .v3 => .legacy_raw,
-            .v4 => .domain_v2,
+            .v4, .v5 => .domain_v2,
         };
     }
 
-    pub fn usesStoreHashV3(self: Format) bool {
-        return self == .v3 or self == .v4;
+    pub fn storeHashFormat(self: Format) StoreHashFormat {
+        return switch (self) {
+            .v1 => .v1,
+            .v2 => .v2,
+            .v3, .v4 => .v3,
+            .v5 => .v4,
+        };
     }
 };
+
+pub const formats_newest_first = [_]Format{ .v5, .v4, .v3, .v2, .v1 };
 
 pub const PackageManifestV1 = struct {
     schema_version: u32,
@@ -205,6 +226,19 @@ pub const PackageManifestV1 = struct {
     }
 };
 
+pub fn detectFormat(allocator: std.mem.Allocator, dir_path: []const u8) ManifestError!Format {
+    for (formats_newest_first) |format| {
+        const manifest_path = std.fs.path.join(allocator, &.{ dir_path, format.manifestFilename() }) catch {
+            return ManifestError.OutOfMemory;
+        };
+        defer allocator.free(manifest_path);
+        if (std.Io.Dir.accessAbsolute(path.currentIo(), manifest_path, .{})) |_| {
+            return format;
+        } else |_| {}
+    }
+    return .v1;
+}
+
 pub fn readManifestFile(ctx: *Context, dir_path: []const u8) ManifestError![]u8 {
     return readManifestFileForFormat(ctx, dir_path, .v1);
 }
@@ -269,6 +303,10 @@ pub fn writeManifestV3(ctx: *Context, dir_path: []const u8, manifest: *const Pac
 
 pub fn writeManifestV4(ctx: *Context, dir_path: []const u8, manifest: *const PackageManifestV1, secret_key: []const u8) ManifestError!void {
     return writeManifestForFormat(ctx, dir_path, manifest, secret_key, .v4);
+}
+
+pub fn writeManifestV5(ctx: *Context, dir_path: []const u8, manifest: *const PackageManifestV1, secret_key: []const u8) ManifestError!void {
+    return writeManifestForFormat(ctx, dir_path, manifest, secret_key, .v5);
 }
 
 fn writeManifestForFormat(ctx: *Context, dir_path: []const u8, input: *const PackageManifestV1, secret_key: []const u8, format: Format) ManifestError!void {
@@ -523,11 +561,44 @@ test "readManifestFile reports InvalidInput when manifest is missing" {
     try std.testing.expectError(ManifestError.InvalidInput, readManifestFile(&test_env.ctx, package_dir));
 }
 
-test "manifest v4 separates signature format from store hash identity" {
+test "manifest formats separate signature and store hash identities" {
     try std.testing.expectEqual(@as(u32, 4), Format.v4.schemaVersion());
     try std.testing.expectEqualStrings(MANIFEST_V4_FILENAME, Format.v4.manifestFilename());
     try std.testing.expectEqualStrings(MANIFEST_V4_SIG_FILENAME, Format.v4.signatureFilename());
     try std.testing.expectEqual(sign.ManifestSignatureFormat.domain_v2, Format.v4.signatureFormat());
     try std.testing.expectEqual(sign.ManifestSignatureFormat.legacy_raw, Format.v3.signatureFormat());
-    try std.testing.expect(Format.v4.usesStoreHashV3());
+    try std.testing.expectEqual(StoreHashFormat.v3, Format.v4.storeHashFormat());
+
+    try std.testing.expectEqual(@as(u32, 5), Format.v5.schemaVersion());
+    try std.testing.expectEqualStrings(MANIFEST_V5_FILENAME, Format.v5.manifestFilename());
+    try std.testing.expectEqualStrings(MANIFEST_V5_SIG_FILENAME, Format.v5.signatureFilename());
+    try std.testing.expectEqual(sign.ManifestSignatureFormat.domain_v2, Format.v5.signatureFormat());
+    try std.testing.expectEqual(StoreHashFormat.v4, Format.v5.storeHashFormat());
+}
+
+test "detectFormat selects the newest manifest without fallback" {
+    const th = @import("test_helpers.zig");
+    var test_env = try th.createTestEnv();
+    defer {
+        test_env.cleanup();
+        std.testing.allocator.destroy(test_env);
+    }
+
+    const package_dir = try std.fs.path.join(test_env.ctx.allocator, &.{ test_env.path, "pkg" });
+    defer test_env.ctx.allocator.free(package_dir);
+    const meta_dir = try std.fs.path.join(test_env.ctx.allocator, &.{ package_dir, META_DIR });
+    defer test_env.ctx.allocator.free(meta_dir);
+    try path.ensureDirExists(meta_dir);
+
+    const v4_path = try std.fs.path.join(test_env.ctx.allocator, &.{ package_dir, MANIFEST_V4_FILENAME });
+    defer test_env.ctx.allocator.free(v4_path);
+    var v4_file = try std.Io.Dir.createFileAbsolute(path.currentIo(), v4_path, .{});
+    v4_file.close(path.currentIo());
+    try std.testing.expectEqual(Format.v4, try detectFormat(test_env.ctx.allocator, package_dir));
+
+    const v5_path = try std.fs.path.join(test_env.ctx.allocator, &.{ package_dir, MANIFEST_V5_FILENAME });
+    defer test_env.ctx.allocator.free(v5_path);
+    var v5_file = try std.Io.Dir.createFileAbsolute(path.currentIo(), v5_path, .{});
+    v5_file.close(path.currentIo());
+    try std.testing.expectEqual(Format.v5, try detectFormat(test_env.ctx.allocator, package_dir));
 }

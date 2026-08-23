@@ -228,25 +228,13 @@ fn verifyStore(
             continue;
         };
 
-        const format: manifest.Format = blk: {
-            const v4_path = std.fs.path.join(ctx.allocator, &.{ entry_path, manifest.MANIFEST_V4_FILENAME }) catch {
-                return ctx.fail(VerifyError.OutOfMemory, entry_path, "failed to construct v4 manifest path");
-            };
-            defer ctx.allocator.free(v4_path);
-            if (std.Io.Dir.accessAbsolute(path_mod.currentIo(), v4_path, .{})) |_| break :blk .v4 else |_| {}
-
-            const v3_path = std.fs.path.join(ctx.allocator, &.{ entry_path, manifest.MANIFEST_V3_FILENAME }) catch {
-                return ctx.fail(VerifyError.OutOfMemory, entry_path, "failed to construct v3 manifest path");
-            };
-            defer ctx.allocator.free(v3_path);
-            if (std.Io.Dir.accessAbsolute(path_mod.currentIo(), v3_path, .{})) |_| break :blk .v3 else |_| {}
-
-            const v2_path = std.fs.path.join(ctx.allocator, &.{ entry_path, manifest.MANIFEST_V2_FILENAME }) catch {
-                return ctx.fail(VerifyError.OutOfMemory, entry_path, "failed to construct v2 manifest path");
-            };
-            defer ctx.allocator.free(v2_path);
-            if (std.Io.Dir.accessAbsolute(path_mod.currentIo(), v2_path, .{})) |_| break :blk .v2 else |_| {}
-            break :blk .v1;
+        const format = manifest.detectFormat(ctx.allocator, entry_path) catch |err| {
+            return ctx.fail(switch (err) {
+                manifest.ManifestError.OutOfMemory => VerifyError.OutOfMemory,
+                manifest.ManifestError.PermissionDenied => VerifyError.PermissionDenied,
+                manifest.ManifestError.InvalidInput => VerifyError.InvalidInput,
+                else => VerifyError.FileSystem,
+            }, entry_path, "failed to detect package manifest format");
         };
         const manifest_path = std.fs.path.join(ctx.allocator, &.{ entry_path, format.manifestFilename() }) catch {
             return ctx.fail(VerifyError.OutOfMemory, entry_path, "failed to construct manifest path");
@@ -329,10 +317,11 @@ fn verifyStore(
         };
 
         if (full_hash) {
-            const computed = switch (format) {
+            const computed = switch (format.storeHashFormat()) {
                 .v1 => hash.calculateStoreContentHash(ctx.allocator, entry_path, null),
                 .v2 => hash.calculateStoreContentHashV2(ctx.allocator, entry_path, null),
-                .v3, .v4 => hash.calculateStoreContentHashV3(ctx.allocator, entry_path, null),
+                .v3 => hash.calculateStoreContentHashV3(ctx.allocator, entry_path, null),
+                .v4 => hash.calculateStoreContentHashV4(ctx.allocator, entry_path, null),
             };
             const computed_hash = computed catch {
                 result.store_issues += 1;
@@ -523,36 +512,16 @@ fn verifyProfileManifestPackages(
         }
 
         if (full_hash) {
-            const format: manifest.Format = blk: {
-                const v4_manifest_path = std.fs.path.join(ctx.allocator, &.{ pkg.store_path, manifest.MANIFEST_V4_FILENAME }) catch {
-                    result.profile_issues += 1;
-                    try addProfileIssue(ctx, result, pkg.store_path, profile_name, realization_name, "failed to construct manifest path");
-                    continue;
-                };
-                defer ctx.allocator.free(v4_manifest_path);
-                if (std.Io.Dir.accessAbsolute(path_mod.currentIo(), v4_manifest_path, .{})) |_| break :blk .v4 else |_| {}
-
-                const v3_manifest_path = std.fs.path.join(ctx.allocator, &.{ pkg.store_path, manifest.MANIFEST_V3_FILENAME }) catch {
-                    result.profile_issues += 1;
-                    try addProfileIssue(ctx, result, pkg.store_path, profile_name, realization_name, "failed to construct manifest path");
-                    continue;
-                };
-                defer ctx.allocator.free(v3_manifest_path);
-                if (std.Io.Dir.accessAbsolute(path_mod.currentIo(), v3_manifest_path, .{})) |_| break :blk .v3 else |_| {}
-
-                const v2_manifest_path = std.fs.path.join(ctx.allocator, &.{ pkg.store_path, manifest.MANIFEST_V2_FILENAME }) catch {
-                    result.profile_issues += 1;
-                    try addProfileIssue(ctx, result, pkg.store_path, profile_name, realization_name, "failed to construct manifest path");
-                    continue;
-                };
-                defer ctx.allocator.free(v2_manifest_path);
-                if (std.Io.Dir.accessAbsolute(path_mod.currentIo(), v2_manifest_path, .{})) |_| break :blk .v2 else |_| {}
-                break :blk .v1;
+            const format = manifest.detectFormat(ctx.allocator, pkg.store_path) catch {
+                result.profile_issues += 1;
+                try addProfileIssue(ctx, result, pkg.store_path, profile_name, realization_name, "failed to detect manifest format");
+                continue;
             };
-            const computed = switch (format) {
+            const computed = switch (format.storeHashFormat()) {
                 .v1 => hash.calculateStoreContentHash(ctx.allocator, pkg.store_path, null),
                 .v2 => hash.calculateStoreContentHashV2(ctx.allocator, pkg.store_path, null),
-                .v3, .v4 => hash.calculateStoreContentHashV3(ctx.allocator, pkg.store_path, null),
+                .v3 => hash.calculateStoreContentHashV3(ctx.allocator, pkg.store_path, null),
+                .v4 => hash.calculateStoreContentHashV4(ctx.allocator, pkg.store_path, null),
             };
             const computed_hash = computed catch {
                 result.profile_issues += 1;
