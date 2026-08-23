@@ -50,7 +50,6 @@ Format changes (detailed below):
 Capability removals:
 
 - **Remove ambient state.** Working-directory profile discovery and TTL-based metadata staleness.
-- **Hermetic builds by default.** Opt-in can ship earlier; flipping the default is the removal.
 - **Stop treating every installed package as a resolution root.** `mere install` moves every installed package, because nothing records which ones were asked for. Narrowing install is the removal; the additive half — recording intent, and a `mere upgrade` that moves the world deliberately — lands first. Detailed below.
 
 Closing the remaining conformance gaps:
@@ -107,7 +106,7 @@ Existing generations have no `requested`, so everything in them reads as request
 - **Attestation.** A signed, append-only record of what was done — who, which plan, which generation before and after.
 - **Plans as artifacts.** Separate deciding from doing: resolve an operation into a content-addressed plan, then apply the plan by its hash. Gives idempotent retry, a reviewable diff before anything mutates, and a natural identity for crash recovery.
 - **Concurrency.** Dropping the per-root lock for store admission waits for concurrent-mutator tests. Conditional activation is not scheduled: without a concrete split between observing state and applying a previously derived decision, an expected-generation argument merely asks callers to repeat state Mere can already read. Reconsider it if a real split-phase consumer or observed lost update establishes the need.
-- **Hermetic builds.** Builds currently have network access and inherit the host resolver and CA bundle, so a build is not a function of its declared inputs.
+- **Build isolation.** Mere builds enter a real namespace in routine package CI, providing end-to-end evidence that the supported build environment works. Network access and the host resolver and CA bundle remain practical inputs rather than bugs by definition. Tighter isolation is not a 1.0 requirement: consider it only for an observed problem or a simple proposal that improves the boundary without sacrificing recipe clarity, debugging, or ease of use.
 
 ## Release approach
 
@@ -122,4 +121,3 @@ Existing generations have no `requested`, so everything in them reads as request
 Recorded so they are not mistaken for oversights:
 
 - **Repository metadata freshness is not inferred.** A repository signature authenticates provenance and integrity, not universal recency. Mere does not retain a highest-seen timestamp or sequence: timestamps require clock authority, while counters still require every mirror, restored machine, and recovery path to agree on one canonical lineage. Without that authority, anti-rollback state can reject legitimate metadata and make recovery or intentional rollback unsafe. A hostile mirror can therefore replay an older validly signed database; deployments that require freshness need a separately trusted distribution mechanism. Revisit this only with a concrete repository, replica, and recovery model.
-- Namespace setup is not covered by the test suite: the suite substitutes a host runner, so `enterEnv` never executes under test. Verification is manual. An integration test that actually enters a namespace would close this, and is a prerequisite worth having before the hermetic-build work changes that setup again.
