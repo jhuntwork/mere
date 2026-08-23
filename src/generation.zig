@@ -31,6 +31,8 @@ pub const PackageEntry = struct {
     arch: []const u8,
     store_path: []const u8,
     content_hash: []const u8, // 64 hex chars
+    requested: bool = true,
+    constraint_expr: ?[]const u8 = null,
 
     pub fn deinit(self: *PackageEntry, allocator: std.mem.Allocator) void {
         allocator.free(self.name);
@@ -38,6 +40,7 @@ pub const PackageEntry = struct {
         allocator.free(self.arch);
         allocator.free(self.store_path);
         allocator.free(self.content_hash);
+        if (self.constraint_expr) |constraint| allocator.free(constraint);
     }
 };
 
@@ -48,11 +51,14 @@ pub const PackageSpec = struct {
     version: ?[]const u8 = null,
     release: ?u32 = null,
     content_hash: ?[]const u8 = null,
+    requested: bool = true,
+    constraint_expr: ?[]const u8 = null,
 
     pub fn deinit(self: *PackageSpec, allocator: std.mem.Allocator) void {
         allocator.free(self.name);
         if (self.version) |v| allocator.free(v);
         if (self.content_hash) |h| allocator.free(h);
+        if (self.constraint_expr) |constraint| allocator.free(constraint);
     }
 };
 
@@ -259,6 +265,20 @@ pub const GenerationManifest = struct {
         store_path: []const u8,
         content_hash: []const u8,
     ) GenerationError!void {
+        return self.addPackageWithIntent(name, version, release, arch, store_path, content_hash, true, null);
+    }
+
+    pub fn addPackageWithIntent(
+        self: *GenerationManifest,
+        name: []const u8,
+        version: []const u8,
+        release: u32,
+        arch: []const u8,
+        store_path: []const u8,
+        content_hash: []const u8,
+        requested: bool,
+        constraint_expr: ?[]const u8,
+    ) GenerationError!void {
         const entry = PackageEntry{
             .name = self.allocator.dupe(u8, name) catch return GenerationError.OutOfMemory,
             .version = self.allocator.dupe(u8, version) catch return GenerationError.OutOfMemory,
@@ -266,6 +286,11 @@ pub const GenerationManifest = struct {
             .arch = self.allocator.dupe(u8, arch) catch return GenerationError.OutOfMemory,
             .store_path = self.allocator.dupe(u8, store_path) catch return GenerationError.OutOfMemory,
             .content_hash = self.allocator.dupe(u8, content_hash) catch return GenerationError.OutOfMemory,
+            .requested = requested,
+            .constraint_expr = if (constraint_expr) |constraint|
+                self.allocator.dupe(u8, constraint) catch return GenerationError.OutOfMemory
+            else
+                null,
         };
 
         self.packages.append(self.allocator, entry) catch return GenerationError.OutOfMemory;
@@ -337,11 +362,19 @@ pub const GenerationManifest = struct {
             try append(&buffer, a, pkg.name);
             try append(&buffer, a, "\"");
 
-            const props = std.fmt.allocPrint(a, " version=\"{s}\" release={d} content-hash=\"{s}\"", .{
-                pkg.version, pkg.release, pkg.content_hash,
+            const props = std.fmt.allocPrint(a, " version=\"{s}\" release={d} content-hash=\"{s}\" requested=#{s}", .{
+                pkg.version,
+                pkg.release,
+                pkg.content_hash,
+                if (pkg.requested) "true" else "false",
             }) catch return GenerationError.OutOfMemory;
             defer a.free(props);
             try append(&buffer, a, props);
+            if (pkg.constraint_expr) |constraint| {
+                try append(&buffer, a, " constraint=\"");
+                try append(&buffer, a, constraint);
+                try append(&buffer, a, "\"");
+            }
             try append(&buffer, a, "\n");
         }
 
@@ -434,6 +467,12 @@ pub const GenerationManifest = struct {
                 break :blk @intCast(v);
             };
             const content_hash = child.getStringProperty("content-hash") orelse return GenerationError.InvalidManifest;
+            const requested = if (child.getProperty("requested")) |value|
+                value.getBoolean() orelse return GenerationError.InvalidManifest
+            else
+                true;
+            const constraint_expr = child.getStringProperty("constraint");
+            if (!requested and constraint_expr != null) return GenerationError.InvalidManifest;
 
             const store_dir_name = std.fmt.allocPrint(allocator, "{s}-{s}-{s}", .{ content_hash, name, version }) catch return GenerationError.OutOfMemory;
             defer allocator.free(store_dir_name);
@@ -442,7 +481,7 @@ pub const GenerationManifest = struct {
 
             const host_arch = @tagName(builtin.cpu.arch);
 
-            try manifest.addPackage(name, version, release, host_arch, store_path, content_hash);
+            try manifest.addPackageWithIntent(name, version, release, host_arch, store_path, content_hash, requested, constraint_expr);
         }
 
         return manifest;
@@ -513,6 +552,13 @@ pub fn parseProfilePackageSpecs(allocator: std.mem.Allocator, input: []const u8)
         }
         if (child.getStringProperty("content-hash")) |h| {
             spec.content_hash = allocator.dupe(u8, h) catch return GenerationError.OutOfMemory;
+        }
+        if (child.getProperty("requested")) |value| {
+            spec.requested = value.getBoolean() orelse return GenerationError.InvalidManifest;
+        }
+        if (child.getStringProperty("constraint")) |constraint| {
+            if (!spec.requested) return GenerationError.InvalidManifest;
+            spec.constraint_expr = allocator.dupe(u8, constraint) catch return GenerationError.OutOfMemory;
         }
 
         specs.append(allocator, spec) catch return GenerationError.OutOfMemory;
@@ -1067,22 +1113,26 @@ test "GenerationManifest encode and parse roundtrip" {
     manifest.notes = try allocator.dupe(u8, "test generation");
     manifest.tool_version = try allocator.dupe(u8, "test-version");
 
-    try manifest.addPackage(
+    try manifest.addPackageWithIntent(
         "nginx",
         "1.24.0",
         1,
         "x86_64",
         "/mere/store/abc123-nginx-1.24.0/",
         "abc123def456789012345678901234567890123456789012345678901234",
+        true,
+        ">=1.24 <2",
     );
 
-    try manifest.addPackage(
+    try manifest.addPackageWithIntent(
         "musl",
         "1.2.4",
         1,
         "x86_64",
         "/mere/store/def456-musl-1.2.4/",
         "def456abc123789012345678901234567890123456789012345678901234",
+        false,
+        null,
     );
 
     const encoded = try manifest.encode(allocator);
@@ -1102,6 +1152,8 @@ test "GenerationManifest encode and parse roundtrip" {
     try std.testing.expectEqualStrings("musl", parsed.packages.items[0].name);
     try std.testing.expectEqualStrings("1.2.4", parsed.packages.items[0].version);
     try std.testing.expectEqual(@as(u32, 1), parsed.packages.items[0].release);
+    try std.testing.expect(!parsed.packages.items[0].requested);
+    try std.testing.expect(parsed.packages.items[0].constraint_expr == null);
     // Verify store path is derived from content-hash + name + version
     try std.testing.expectEqualStrings(
         "/mere/store/def456abc123789012345678901234567890123456789012345678901234-musl-1.2.4",
@@ -1109,6 +1161,48 @@ test "GenerationManifest encode and parse roundtrip" {
     );
     try std.testing.expectEqualStrings("nginx", parsed.packages.items[1].name);
     try std.testing.expectEqualStrings("1.24.0", parsed.packages.items[1].version);
+    try std.testing.expect(parsed.packages.items[1].requested);
+    try std.testing.expectEqualStrings(">=1.24 <2", parsed.packages.items[1].constraint_expr.?);
+}
+
+test "legacy profile packages default to requested roots" {
+    const allocator = std.testing.allocator;
+    const input =
+        \\profile {
+        \\    schema-version 2
+        \\    created-at 1234567890
+        \\    package "demo" version="1.0.0" release=1 content-hash="aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        \\}
+    ;
+
+    var parsed = try GenerationManifest.parse(allocator, "/mere/store", input);
+    defer parsed.deinit();
+
+    try std.testing.expectEqual(@as(usize, 1), parsed.packages.items.len);
+    try std.testing.expect(parsed.packages.items[0].requested);
+    try std.testing.expect(parsed.packages.items[0].constraint_expr == null);
+}
+
+test "profile package specs preserve intent" {
+    const allocator = std.testing.allocator;
+    const input =
+        \\profile {
+        \\    package "app" version="2.0.0" release=3 content-hash="bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb" requested=#true constraint=">=2 <3"
+        \\    package "lib" version="1.0.0" release=1 content-hash="cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc" requested=#false
+        \\}
+    ;
+
+    const specs = try parseProfilePackageSpecs(allocator, input);
+    defer {
+        for (specs) |*spec| spec.deinit(allocator);
+        allocator.free(specs);
+    }
+
+    try std.testing.expectEqual(@as(usize, 2), specs.len);
+    try std.testing.expect(specs[0].requested);
+    try std.testing.expectEqualStrings(">=2 <3", specs[0].constraint_expr.?);
+    try std.testing.expect(!specs[1].requested);
+    try std.testing.expect(specs[1].constraint_expr == null);
 }
 
 test "RealizationData encode and decode roundtrip" {

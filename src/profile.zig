@@ -865,13 +865,15 @@ fn buildProfileManifest(
     manifest.selected_profile = allocator.dupe(u8, selected_profile) catch return ProfileError.OutOfMemory;
 
     for (packages) |pkg| {
-        manifest.addPackage(
+        manifest.addPackageWithIntent(
             pkg.name,
             pkg.version,
             pkg.release,
             pkg.arch,
             pkg.store_path,
             pkg.content_hash,
+            pkg.requested,
+            pkg.constraint_expr,
         ) catch return ProfileError.OutOfMemory;
     }
 

@@ -7,6 +7,7 @@ const MereError = mere.errors.MereError;
 
 // Import command implementations
 const install = @import("commands/install.zig");
+const upgrade = @import("commands/upgrade.zig");
 const uninstall = @import("commands/uninstall.zig");
 const dev = @import("commands/dev.zig");
 const release_cmd = @import("commands/release.zig");
@@ -138,6 +139,11 @@ fn registerCommands(allocator: std.mem.Allocator, cli_system: *cli.CLI, root_com
     const install_command = try install.createCommand(allocator);
     try cli_system.registerCommand(install_command);
     try root_command.addSubcommand(install_command);
+
+    // Create upgrade command
+    const upgrade_command = try upgrade.createCommand(allocator);
+    try cli_system.registerCommand(upgrade_command);
+    try root_command.addSubcommand(upgrade_command);
 
     // Create uninstall command
     const uninstall_command = try uninstall.createCommand(allocator);

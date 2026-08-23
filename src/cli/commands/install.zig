@@ -35,6 +35,11 @@ const install_meta = command.CommandMeta{
             .description = "Force repository sync even if cache is fresh",
             .flag_type = .bool,
         },
+        .{
+            .name = "dry-run",
+            .description = "Show changes without creating or activating a generation",
+            .flag_type = .bool,
+        },
     },
 };
 
@@ -48,6 +53,7 @@ fn handleInstall(ctx: *mere.Context, args: *const types.ParsedArgs) MereError!ty
     const profile_name = args.getString("profile") orelse "system";
     const verify_store = args.getBool("verify-store");
     const force_sync = args.getBool("sync");
+    const dry_run = args.getBool("dry-run");
 
     // Set initial diagnostic context - the subject is the package being installed
     const diagnostic_ctx = mere.errors.DiagnosticContext.init()
@@ -58,7 +64,7 @@ fn handleInstall(ctx: *mere.Context, args: *const types.ParsedArgs) MereError!ty
     defer ctx.releaseStoreLock();
 
     // Error boundary: catch all errors and map them to user-friendly messages at CLI boundary
-    const success_message = performInstallation(ctx, package_names, profile_name, verify_store, force_sync) catch |err| {
+    const success_message = performInstallation(ctx, package_names, profile_name, verify_store, force_sync, dry_run) catch |err| {
         return try command.errorResult(ctx, err, null);
     };
 
@@ -77,6 +83,7 @@ fn performInstallation(
     profile_name: []const u8,
     verify_store: bool,
     force_sync: bool,
+    dry_run: bool,
 ) !?[]const u8 {
     // Ensure configuration is loaded (no logging - errors propagate)
     _ = try ctx.getConfig();
@@ -87,7 +94,7 @@ fn performInstallation(
     const client = curl_client.client();
 
     // Perform installation (no logging - errors propagate)
-    const outcome = try mere.install.installPackagesFromConfig(ctx, package_names, client, false, verify_store, force_sync, profile_name);
+    const outcome = try mere.install.installPackagesFromConfigWithPreview(ctx, package_names, client, false, verify_store, force_sync, profile_name, dry_run);
     return switch (outcome) {
         .completed => null,
         .store_only_system_activation_deferred => null,

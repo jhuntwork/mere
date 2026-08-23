@@ -24,6 +24,8 @@ pub const ResolvedPackage = struct {
     scc_id: usize,
     from_pin: bool = false,
     pinned_store_path: ?[]const u8 = null,
+    requested: bool = false,
+    constraint_expr: ?[]const u8 = null,
     /// Package names this package directly depends on (extracted from the dependency graph).
     dependency_names: []const []const u8 = &.{},
 };
@@ -60,7 +62,15 @@ pub const PreferredSelection = struct {
     release: u32,
     arch: []const u8,
     content_hash: []const u8,
+    allow_upgrade: bool = true,
 };
+
+fn preferredAllowsUpgrade(name: []const u8, selections: []const PreferredSelection) bool {
+    for (selections) |selection| {
+        if (std.mem.eql(u8, selection.name, name)) return selection.allow_upgrade;
+    }
+    return true;
+}
 
 const GraphNode = struct {
     pkg_key: []const u8,
@@ -1300,10 +1310,10 @@ fn resolveRequirement(
             const candidate_label = try formatCandidateLabel(allocator, candidate.*);
             defer allocator.free(candidate_label);
 
-            // Skip preferred candidate if a newer version exists in the repo.
-            // Preferred selections stabilize dependency resolution but should
-            // not hold back upgrades when a newer version is available.
-            skip_preferred: {
+            // A caller can hold an existing selection while adding or
+            // removing unrelated roots. Explicit upgrade operations opt the
+            // selected roots back into normal newest-candidate ranking.
+            if (preferredAllowsUpgrade(candidate.pkg_name, preferred_selections)) skip_preferred: {
                 var all_candidates = collectAndRankCandidates(
                     ctx,
                     candidate.pkg_name,
