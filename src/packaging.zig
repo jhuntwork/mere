@@ -329,8 +329,8 @@ pub const Packager = struct {
             return self.fail(config.staging_dir, "failed to write meta.kdl", PackagingError.FileSystem);
         };
 
-        // meta.kdl is part of the versioned v3 store identity. Compute the
-        // v3 hash only after writing canonical metadata.
+        // meta.kdl is part of the versioned v3 store identity. Manifest v4
+        // keeps that identity while introducing domain-separated signatures.
         self.ctx.allocator.free(content_hash);
         content_hash = hash.calculateStoreContentHashV3(self.ctx.allocator, config.staging_dir, null) catch {
             return self.fail(config.staging_dir, "failed to compute v3 content hash", PackagingError.CreationFailed);
@@ -347,7 +347,7 @@ pub const Packager = struct {
             return self.fail(content_hash, "invalid content hash hex", PackagingError.InvalidInput);
         };
         pkg_manifest.content_hash = final_content_hash_bytes;
-        manifest.writeManifestV3(self.ctx, config.staging_dir, &pkg_manifest, &secret_key.key) catch {
+        manifest.writeManifestV4(self.ctx, config.staging_dir, &pkg_manifest, &secret_key.key) catch {
             self.ctx.allocator.free(content_hash);
             return self.fail(config.staging_dir, "failed to write final manifest", PackagingError.FileSystem);
         };

@@ -188,7 +188,7 @@ fn verifyManifestSignatureAndGetBytes(
         return ImportError.PackageNotFound;
     };
 
-    const result = sign.verifyManifestWithTrustedFingerprints(ctx, manifest_path, sig_path, trusted_fingerprints, loaded_keys) catch |err| {
+    const result = sign.verifyManifestWithTrustedFingerprints(ctx, manifest_path, sig_path, format.signatureFormat(), trusted_fingerprints, loaded_keys) catch |err| {
         ctx.debug("manifest signature verification failed: {}", .{err});
         ctx.setDiagnosticContextFmt(manifest_path, "manifest signature verification failed ({d} trusted key{s} tried)", .{
             trusted_fingerprints.len,
@@ -209,6 +209,14 @@ pub const ManifestResult = struct {
 };
 
 fn detectManifestFormat(ctx: *Context, temp_dir: []const u8) !manifest.Format {
+    const v4_path = try std.fs.path.join(ctx.allocator, &.{ temp_dir, manifest.MANIFEST_V4_FILENAME });
+    defer ctx.allocator.free(v4_path);
+    const has_v4 = blk: {
+        std.Io.Dir.accessAbsolute(p.currentIo(), v4_path, .{}) catch break :blk false;
+        break :blk true;
+    };
+    if (has_v4) return .v4;
+
     const v3_path = try std.fs.path.join(ctx.allocator, &.{ temp_dir, manifest.MANIFEST_V3_FILENAME });
     defer ctx.allocator.free(v3_path);
     const has_v3 = blk: {
@@ -399,7 +407,7 @@ fn computeAndVerifyContentHash(ctx: *Context, temp_dir: []const u8, pkg_manifest
     const computed_hash = switch (format) {
         .v1 => try hash.calculateStoreContentHash(ctx.allocator, temp_dir, null),
         .v2 => try hash.calculateStoreContentHashV2(ctx.allocator, temp_dir, null),
-        .v3 => try hash.calculateStoreContentHashV3(ctx.allocator, temp_dir, null),
+        .v3, .v4 => try hash.calculateStoreContentHashV3(ctx.allocator, temp_dir, null),
     };
     defer ctx.allocator.free(computed_hash);
 

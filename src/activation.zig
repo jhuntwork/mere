@@ -554,6 +554,16 @@ fn validateGenerationStorePaths(
             }
 
             const format: package_manifest.Format = blk: {
+                const v4_manifest_path = std.fs.path.join(ctx.allocator, &.{ pkg.store_path, package_manifest.MANIFEST_V4_FILENAME }) catch {
+                    return ctx.fail(ActivationError.OutOfMemory, pkg.store_path, "failed to construct v4 manifest path");
+                };
+                defer ctx.allocator.free(v4_manifest_path);
+                const has_v4 = blk_v4: {
+                    std.Io.Dir.accessAbsolute(path_mod.currentIo(), v4_manifest_path, .{}) catch break :blk_v4 false;
+                    break :blk_v4 true;
+                };
+                if (has_v4) break :blk .v4;
+
                 const v3_manifest_path = std.fs.path.join(ctx.allocator, &.{ pkg.store_path, package_manifest.MANIFEST_V3_FILENAME }) catch {
                     return ctx.fail(ActivationError.OutOfMemory, pkg.store_path, "failed to construct v3 manifest path");
                 };
@@ -577,7 +587,7 @@ fn validateGenerationStorePaths(
             const computed = switch (format) {
                 .v1 => hash.calculateStoreContentHash(ctx.allocator, pkg.store_path, null),
                 .v2 => hash.calculateStoreContentHashV2(ctx.allocator, pkg.store_path, null),
-                .v3 => hash.calculateStoreContentHashV3(ctx.allocator, pkg.store_path, null),
+                .v3, .v4 => hash.calculateStoreContentHashV3(ctx.allocator, pkg.store_path, null),
             };
             const computed_hash = computed catch |err| {
                 return ctx.fail(switch (err) {

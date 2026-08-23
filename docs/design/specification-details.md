@@ -89,8 +89,8 @@ Mere persists a number of formats, several of which are signed or content-addres
 | Format | Location | Discriminator | Written | Accepted |
 | --- | --- | --- | --- | --- |
 | Store content hash (§1) | store path name | manifest format and `schema_version` | v3 | v1, transitional, v2, v3 |
-| Package manifest (§17) | `.mere/manifest.v1`, `.mere/manifest.v2`, `.mere/manifest.v3` | `schema_version` field and filename | v3 | v1, v2, v3 |
-| Manifest signature (§5) | `.mere/manifest.vN.sig` | **none** | raw Ed25519 | raw Ed25519 |
+| Package manifest (§17) | `.mere/manifest.v1` through `.mere/manifest.v4` | `schema_version` field and filename | v4 | v1, v2, v3, v4 |
+| Manifest signature (§5) | `.mere/manifest.vN.sig` | manifest format; v4 envelope magic/version/algorithm | domain-separated v2 envelope | legacy raw Ed25519, domain-separated v2 |
 | Key file | `*.pub`, `*.key` | `MEREKEY` magic, version and algorithm bytes | v1 / Ed25519 | v1 / Ed25519 |
 | Generation manifest (§6) | `<generation>/` | `schema_version` field | 2 | 2 only |
 | Realization manifest | named profile `root/` | `schema_version` field | 1 | 1 only |
@@ -101,7 +101,7 @@ Mere persists a number of formats, several of which are signed or content-addres
 
 Requirements:
 
-- A persisted format SHOULD carry an explicit version discriminator. Two do not: manifest signatures are a bare Ed25519 signature with no header, and the directory layouts are structural. A signature file therefore cannot express a different algorithm, even though the key file it verifies against records one.
+- A persisted format SHOULD carry an explicit version discriminator. Directory layouts remain structural, while newly written manifest signatures carry an envelope discriminator. Legacy v1-v3 manifest signatures remain accepted as raw Ed25519 only because their manifest filename and schema freeze that historical verification contract.
 - A reader MUST reject a version it does not recognize rather than attempt to interpret it. Generation and realization manifests do this strictly, accepting only the current schema; a store object or package manifest is instead tried against each accepted variant.
 - A variant that is no longer written MUST be recorded here as read-only, together with what produced it. The store hash has two such variants: v1 predates metadata-aware identity, and the transitional variant exists only for packages built by the released but unversioned metadata-aware implementation.
 - Accepting a variant is a standing cost. Every accepted store-hash variant is a fallback that each verification path must carry, and dropping one invalidates store objects on existing systems. Adding or removing acceptance is therefore a deliberate release decision, not an implementation detail.
@@ -375,13 +375,11 @@ For privileged operations, additionally verify ownership:
 
 ### 4.2 Manifest Location in Archives and Store
 
-**In package archives** (`.pkg.tar.zst`):
-- `.mere/manifest.v1` (manifest)
-- `.mere/manifest.v1.sig` (signature)
+**In package archives** (`.pkg.tar.zst`), newly written packages contain:
+- `.mere/manifest.v4` (manifest; store content-hash schema v3)
+- `.mere/manifest.v4.sig` (domain-separated signature envelope)
 
-**In store objects** (`/mere/store/<hash>-<name>-<version>/`):
-- `.mere/manifest.v1`
-- `.mere/manifest.v1.sig`
+**In store objects** (`/mere/store/<hash>-<name>-<version>/`), newly written packages contain the same two files. Readers continue to accept the corresponding v1, v2, and v3 manifest/signature pairs under their frozen legacy rules.
 
 ---
 
@@ -419,27 +417,40 @@ Reclamation is opportunistic and MUST NOT fail the operation that triggers it: a
 
 ### 5. Signature File Binary Format
 
-**Blob Signing (.sig files)**:
+#### Legacy manifest signatures (v1-v3, read-only)
 
-| Field     | Size     | Description                                 |
-| --------- | -------- | ------------------------------------------- |
-| signature | 64 bytes | Raw Ed25519 signature (`crypto_sign_BYTES`) |
+Manifest v1, v2, and v3 signatures are exactly 64 raw Ed25519 bytes over the exact encoded manifest bytes:
 
-**That's it.** No header, no version, no timestamp, no signer identifier.
-
-**What is signed**: The exact bytes of the file being signed (for `manifest.v1.sig`, this is the raw bytes of `manifest.v1`).
-```
+```text
 signature = ed25519_sign(secret_key, manifest_bytes)
 ```
 
-**Key file formats**:
-- `.pub`: 32 raw bytes (Ed25519 public key)
-- `.key`: 64 raw bytes (libsodium secret key format: seed || public), permissions 0600
+Their meaning is frozen. Readers MUST continue to verify them as raw signatures and MUST NOT reinterpret them as an envelope. New packages MUST NOT write this format.
 
-**Package manifest signing**:
-- The manifest (`manifest.v1`) carries semantic meaning (name, version, content_hash, created_at)
-- The signature (`manifest.v1.sig`) proves the manifest bytes are intact
-- Together they provide authenticated package metadata
+#### Domain-separated manifest signature v2 (manifest v4)
+
+Manifest v4 uses the following fixed-size envelope:
+
+| Field | Size | Encoding |
+| --- | ---: | --- |
+| magic | 8 bytes | `MERESIG\0` |
+| version | 2 bytes | little-endian `2` |
+| algorithm | 2 bytes | little-endian `1` (Ed25519) |
+| signature | 64 bytes | detached Ed25519 signature |
+
+The signed message is:
+
+```text
+"MERE\0package-manifest\0signature-v2\0" || manifest_bytes
+```
+
+The fixed domain identifies both the object type and signing protocol. A v4 reader MUST require the exact envelope size, magic, version, and algorithm; unknown or malformed values MUST fail closed. It MUST NOT retry legacy verification. Conversely, v1-v3 readers MUST require exactly 64 raw bytes and MUST NOT accept the v2 envelope.
+
+Manifest v4 changes only the manifest/signature protocol. Its `content_hash` continues to use store content-hash v3, so adding signature discrimination does not create a new store identity.
+
+**Key file formats** remain unchanged and continue to use the versioned `MEREKEY` envelope described in the format table. Signature-protocol versioning does not alter key identity or encoding.
+
+The manifest carries package identity and content identity. Its signature authenticates those exact bytes under a protocol-specific domain without placing signer identity inside the package; trust remains anchored in locally configured fingerprints.
 
 ---
 
