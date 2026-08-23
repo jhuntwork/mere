@@ -99,8 +99,9 @@ mere search python
 # install more packages
 mere install -p test busybox curl git
 
-# see what's in your profile
-mere profile list
+# see which package versions are active
+mere profile packages
+mere profile packages -p test
 
 # inspect the store
 ls /mere/store/

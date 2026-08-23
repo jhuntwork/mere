@@ -51,6 +51,21 @@ const list_meta = command.CommandMeta{
     .description = "List all profiles",
 };
 
+/// Packages subcommand metadata
+const packages_meta = command.CommandMeta{
+    .name = "packages",
+    .description = "List packages in a profile's active state",
+    .flags = &[_]types.Flag{
+        .{
+            .name = "profile",
+            .short = 'p',
+            .description = "Profile to inspect (default: system)",
+            .flag_type = .string,
+            .value_name = "name",
+        },
+    },
+};
+
 /// Create subcommand metadata
 const create_meta = command.CommandMeta{
     .name = "create",
@@ -212,6 +227,99 @@ pub fn handleList(ctx: *mere.Context, args: *const types.ParsedArgs) MereError!t
 
     if (profile_count == 0) {
         out.writeAll("  (no profiles found)\n") catch return MereError.OutOfMemory;
+    }
+    output = out_buf.toArrayList();
+
+    return types.CommandResult{
+        .success = true,
+        .message = try ctx.allocator.dupe(u8, output.items),
+    };
+}
+
+/// List package names and versions from a profile's active realized state.
+pub fn handlePackages(ctx: *mere.Context, args: *const types.ParsedArgs) MereError!types.CommandResult {
+    const profile_name = args.getString("profile") orelse "system";
+    const profile_dir = std.fs.path.join(ctx.allocator, &.{ ctx.root_path, "mere", "profiles", profile_name }) catch {
+        return MereError.OutOfMemory;
+    };
+    defer ctx.allocator.free(profile_dir);
+
+    const store_root = std.fs.path.join(ctx.allocator, &.{ ctx.root_path, "mere", "store" }) catch {
+        return MereError.OutOfMemory;
+    };
+    defer ctx.allocator.free(store_root);
+
+    var active_generation: ?u32 = null;
+    const active_path = if (std.mem.eql(u8, profile_name, "system")) blk: {
+        active_generation = generation_mod.getCurrentGeneration(profile_dir) catch |err| {
+            ctx.setDiagnosticContextFmt(profile_dir, "failed to read current generation: {s}", .{@errorName(err)});
+            return try command.errorResult(ctx, err, "failed to read current generation");
+        };
+        const generation = active_generation orelse {
+            return types.CommandResult{
+                .success = true,
+                .message = try std.fmt.allocPrint(ctx.allocator, "Profile '{s}' has no active generation", .{profile_name}),
+            };
+        };
+        break :blk generation_mod.getGenerationPath(ctx.allocator, profile_dir, generation) catch return MereError.OutOfMemory;
+    } else blk: {
+        const root_path = profile_mod.getRootPath(ctx.allocator, profile_dir) catch return MereError.OutOfMemory;
+        std.Io.Dir.accessAbsolute(path.currentIo(), root_path, .{}) catch |err| switch (err) {
+            error.FileNotFound => {
+                ctx.allocator.free(root_path);
+                return types.CommandResult{
+                    .success = true,
+                    .message = try std.fmt.allocPrint(ctx.allocator, "Profile '{s}' has no active realized state", .{profile_name}),
+                };
+            },
+            else => {
+                ctx.withDiagnosticContext(mere.errors.DiagnosticContext.init().withSubject(root_path));
+                const failure = try command.errorResult(ctx, err, "failed to inspect profile state");
+                ctx.allocator.free(root_path);
+                return failure;
+            },
+        };
+        break :blk root_path;
+    };
+    defer ctx.allocator.free(active_path);
+
+    var manifest = generation_mod.readManifest(ctx.allocator, store_root, active_path) catch |err| {
+        ctx.withDiagnosticContext(mere.errors.DiagnosticContext.init().withSubject(active_path));
+        return try command.errorResult(ctx, err, "failed to read active profile manifest");
+    };
+    defer manifest.deinit();
+
+    const packages = ctx.allocator.dupe(generation_mod.PackageEntry, manifest.packages.items) catch {
+        return MereError.OutOfMemory;
+    };
+    defer ctx.allocator.free(packages);
+    std.mem.sort(generation_mod.PackageEntry, packages, {}, struct {
+        fn lessThan(_: void, left: generation_mod.PackageEntry, right: generation_mod.PackageEntry) bool {
+            const name_order = std.mem.order(u8, left.name, right.name);
+            if (name_order != .eq) return name_order == .lt;
+            const version_order = std.mem.order(u8, left.version, right.version);
+            if (version_order != .eq) return version_order == .lt;
+            return left.release < right.release;
+        }
+    }.lessThan);
+
+    var output: std.ArrayList(u8) = .empty;
+    defer output.deinit(ctx.allocator);
+    var out_buf: std.Io.Writer.Allocating = .fromArrayList(ctx.allocator, &output);
+    const out = &out_buf.writer;
+
+    if (active_generation) |generation| {
+        out.print("Packages in profile '{s}' (gen-{d}):\n", .{ profile_name, generation }) catch return MereError.OutOfMemory;
+    } else {
+        out.print("Packages in profile '{s}':\n", .{profile_name}) catch return MereError.OutOfMemory;
+    }
+
+    if (packages.len == 0) {
+        out.writeAll("  (none)\n") catch return MereError.OutOfMemory;
+    } else {
+        for (packages) |pkg| {
+            out.print("  {s} {s}-{d}\n", .{ pkg.name, pkg.version, pkg.release }) catch return MereError.OutOfMemory;
+        }
     }
     output = out_buf.toArrayList();
 
@@ -513,6 +621,9 @@ pub fn createCommand(allocator: std.mem.Allocator) !*command.Command {
     const list_cmd = try allocator.create(command.Command);
     list_cmd.* = command.Command.init(allocator, list_meta, handleList);
 
+    const packages_cmd = try allocator.create(command.Command);
+    packages_cmd.* = command.Command.init(allocator, packages_meta, handlePackages);
+
     const create_cmd = try allocator.create(command.Command);
     create_cmd.* = command.Command.init(allocator, create_meta, handleCreate);
 
@@ -523,6 +634,7 @@ pub fn createCommand(allocator: std.mem.Allocator) !*command.Command {
     apply_cmd.* = command.Command.init(allocator, apply_meta, handleApply);
 
     try profile_cmd.addSubcommand(list_cmd);
+    try profile_cmd.addSubcommand(packages_cmd);
     try profile_cmd.addSubcommand(create_cmd);
     try profile_cmd.addSubcommand(delete_cmd);
     try profile_cmd.addSubcommand(apply_cmd);
