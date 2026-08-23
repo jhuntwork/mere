@@ -275,6 +275,11 @@ pub fn build(b: *std.Build) void {
         .{ .name = "meta", .path = "src/meta.zig" },
         .{ .name = "namespace", .path = "src/namespace.zig" },
         .{ .name = "package", .path = "src/package.zig" },
+        .{
+            .name = "performance_baseline",
+            .path = "src/performance_baseline.zig",
+            .filters = &.{"install and activation performance baseline"},
+        },
         .{ .name = "package_staging", .path = "src/package_staging.zig" },
         .{ .name = "packaging", .path = "src/packaging.zig" },
         .{ .name = "describe", .path = "src/cli/describe.zig" },
@@ -320,6 +325,7 @@ pub fn build(b: *std.Build) void {
 const TestModule = struct {
     name: []const u8,
     path: []const u8,
+    filters: []const []const u8 = &.{},
 };
 
 fn linkSystemLibraries(artifact: *std.Build.Step.Compile) void {
@@ -357,6 +363,7 @@ fn createTestStep(
             mod.addImport("build_zon", zon_module);
             break :blk mod;
         },
+        .filters = test_module.filters,
     });
     addVendoredIncludePaths(test_exe.root_module, b, deps);
     linkSystemLibraries(test_exe);
