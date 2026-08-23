@@ -43,7 +43,6 @@ Three kinds of work, distinguished by whether they have a deadline.
 Format changes (detailed below):
 
 - Decide what store identity covers
-- Rollback protection for repository metadata
 - Signature discriminator and domain separation
 - Retire read-only variants
 - Settle the store's permission model
@@ -74,7 +73,6 @@ Closing the remaining conformance gaps:
 None of these is impossible after 1.0. Each done later means another accepted variant, carried by every verification path until a major version retires it.
 
 - **Decide what store identity covers.** The content hash currently records a file's exec bit and nothing else about mode: setuid, setgid, sticky, the remaining permission bits, and ownership are all outside it, so two payloads differing only in setuid share a store path and `mere store verify` cannot tell them apart. Changing this changes every content hash. Doing it before 1.0 costs a v3 variant; doing it after costs a v3 variant *and* a fourth fallback.
-- **Decide on rollback protection for repository metadata.** A validly signed but older `repo.db` is currently indistinguishable from the current one, so a mirror can pin a client to a stale snapshot and keep offering known-vulnerable versions. A monotonic sequence number in the signed database would close this without timestamps or clock trust, which matters because "no network trust or timestamps" is an explicit non-goal. This is a `repo.db` schema change.
 - **Give signatures a discriminator.** A manifest signature is 64 raw bytes with no header, so there is no way to express a different algorithm — even though the key file it verifies against records one. Separately, signatures are computed over a digest in one path and over raw bytes in another, with no domain separation between them.
 - **Retire read-only variants.** The transitional store hash exists for one unversioned release and is carried by five fallback sites. Decide whether v1 store objects are still readable at 1.0, and drop what is not.
 - **Settle the store's permission model.** The store is world-writable by design (§4.1, two-tier admission), and the existing-object fast path accepts a directory on the strength of its content-addressed name. Those two decisions interact, and the interaction should be deliberate.
@@ -124,4 +122,5 @@ Existing generations have no `requested`, so everything in them reads as request
 
 Recorded so they are not mistaken for oversights:
 
+- **Repository metadata freshness is not inferred.** A repository signature authenticates provenance and integrity, not universal recency. Mere does not retain a highest-seen timestamp or sequence: timestamps require clock authority, while counters still require every mirror, restored machine, and recovery path to agree on one canonical lineage. Without that authority, anti-rollback state can reject legitimate metadata and make recovery or intentional rollback unsafe. A hostile mirror can therefore replay an older validly signed database; deployments that require freshness need a separately trusted distribution mechanism. Revisit this only with a concrete repository, replica, and recovery model.
 - Namespace setup is not covered by the test suite: the suite substitutes a host runner, so `enterEnv` never executes under test. Verification is manual. An integration test that actually enters a namespace would close this, and is a prerequisite worth having before the hermetic-build work changes that setup again.
