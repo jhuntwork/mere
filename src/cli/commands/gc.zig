@@ -57,7 +57,6 @@ pub fn handleGC(ctx: *mere.Context, args: *const types.ParsedArgs) MereError!typ
     var result = gc.collectGarbage(ctx, .{
         .dry_run = dry_run,
     }) catch |err| {
-        const diag = ctx.getDiagnosticContext();
         const msg = switch (err) {
             gc.GCError.NoRoots => "no GC roots found - nothing is protected, refusing to run",
             gc.GCError.PermissionDenied => "permission denied",
@@ -65,12 +64,8 @@ pub fn handleGC(ctx: *mere.Context, args: *const types.ParsedArgs) MereError!typ
             else => "garbage collection failed",
         };
         emit.stepEnd(ctx, .gc, "collect", false);
-        emit.diagnostic(ctx, .gc, msg, diag.subject, diag.details, null);
         emit.phaseEnd(ctx, .gc, false);
-        return types.CommandResult{
-            .success = false,
-            .exit_code = 1,
-        };
+        return try command.errorResult(ctx, err, msg);
     };
     defer result.deinit();
 

@@ -87,38 +87,13 @@ fn handleImport(ctx: *mere.Context, args: *const types.ParsedArgs) MereError!typ
     var package_paths: []const []const u8 = positional_package_paths;
     if (package_paths.len == 0) {
         mere.build.collectBuildOutputPackageArchives(ctx, &owned_package_paths) catch |err| {
-            const mapped_error = mere.errors.ErrorMapping.mapModuleError(@TypeOf(err), err);
-            const exit_code = command.exitCodeForError(mapped_error);
-            const user_message = mere.errors.getUserFriendlyMessage(err);
-            return types.CommandResult{
-                .success = false,
-                .exit_code = exit_code,
-                .message = try std.fmt.allocPrint(ctx.allocator, "Failed to collect package archives from /mere/dev/outputs: {s}", .{user_message}),
-            };
+            return try command.errorResult(ctx, err, "failed to collect package archives from /mere/dev/outputs");
         };
         package_paths = owned_package_paths.items;
     }
 
-    // Error boundary: catch all errors and map them to user-friendly messages at CLI boundary
     performImport(ctx, repo_dir, package_paths, force) catch |err| {
-        // Map error to MereError vocabulary
-        const mapped_error = mere.errors.ErrorMapping.mapModuleError(@TypeOf(err), err);
-
-        // Get user-friendly error message and format with context
-        const user_message = mere.errors.getUserFriendlyMessage(err);
-        const error_ctx = ctx.getDiagnosticContext().toErrorContext();
-        const formatted_message = error_ctx.formatWithMessage(ctx.allocator, user_message) catch user_message;
-        defer if (formatted_message.ptr != user_message.ptr) ctx.allocator.free(formatted_message);
-
-        // Return error result with appropriate exit code
-        // Note: Don't log here - the CLI layer handles error output via CommandResult.message
-        const exit_code = command.exitCodeForError(mapped_error);
-
-        return types.CommandResult{
-            .success = false,
-            .exit_code = exit_code,
-            .message = try ctx.allocator.dupe(u8, formatted_message),
-        };
+        return try command.errorResult(ctx, err, null);
     };
 
     // Success case - no error logging needed

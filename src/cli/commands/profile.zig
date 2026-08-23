@@ -129,10 +129,9 @@ pub fn handleList(ctx: *mere.Context, args: *const types.ParsedArgs) MereError!t
                 .success = true,
                 .message = try ctx.allocator.dupe(u8, "No profiles found (profiles directory does not exist)"),
             },
-            else => types.CommandResult{
-                .success = false,
-                .exit_code = 1,
-                .message = try ctx.allocator.dupe(u8, "Failed to open profiles directory"),
+            else => {
+                ctx.withDiagnosticContext(mere.errors.DiagnosticContext.init().withSubject(profiles_dir));
+                return try command.errorResult(ctx, err, "failed to open profiles directory");
             },
         };
     };
@@ -149,7 +148,10 @@ pub fn handleList(ctx: *mere.Context, args: *const types.ParsedArgs) MereError!t
 
     // Iterate over profiles directory entries
     var iter = dir.iterate();
-    while (iter.next(path.currentIo()) catch null) |entry| {
+    while (iter.next(path.currentIo()) catch |err| {
+        ctx.withDiagnosticContext(mere.errors.DiagnosticContext.init().withSubject(profiles_dir));
+        return try command.errorResult(ctx, err, "failed to enumerate profiles");
+    }) |entry| {
         if (entry.kind != .directory) continue;
 
         const profile_name = entry.name;
@@ -174,11 +176,12 @@ pub fn handleList(ctx: *mere.Context, args: *const types.ParsedArgs) MereError!t
                 return MereError.OutOfMemory;
             };
             defer ctx.allocator.free(store_root);
-            const generations = generation_mod.listGenerations(ctx.allocator, store_root, profile_path) catch null;
-            const gen_count = if (generations) |gens| blk: {
-                defer ctx.allocator.free(gens);
-                break :blk gens.len;
-            } else 0;
+            const generations = generation_mod.listGenerations(ctx.allocator, store_root, profile_path) catch |err| {
+                ctx.setDiagnosticContextFmt(profile_path, "failed to list generations: {s}", .{@errorName(err)});
+                return try command.errorResult(ctx, err, "failed to list generations");
+            };
+            defer ctx.allocator.free(generations);
+            const gen_count = generations.len;
 
             if (current_gen) |gen| {
                 out.print("  {s}{s}: gen-{d} ({d} generations)\n", .{ profile_name, kind_str, gen, gen_count }) catch return MereError.OutOfMemory;
@@ -192,10 +195,9 @@ pub fn handleList(ctx: *mere.Context, args: *const types.ParsedArgs) MereError!t
             const has_root = blk: {
                 std.Io.Dir.accessAbsolute(path.currentIo(), root_path, .{}) catch |err| switch (err) {
                     error.FileNotFound => break :blk false,
-                    else => return types.CommandResult{
-                        .success = false,
-                        .exit_code = 1,
-                        .message = try ctx.allocator.dupe(u8, "Failed to inspect profile root"),
+                    else => {
+                        ctx.withDiagnosticContext(mere.errors.DiagnosticContext.init().withSubject(root_path));
+                        return try command.errorResult(ctx, err, "failed to inspect profile root");
                     },
                 };
                 break :blk true;
@@ -273,7 +275,7 @@ pub fn handleCreate(ctx: *mere.Context, args: *const types.ParsedArgs) MereError
         @constCast(&d).close(path.currentIo());
         return types.CommandResult{
             .success = false,
-            .exit_code = 1,
+            .exit_code = 2,
             .message = try std.fmt.allocPrint(ctx.allocator, "Profile '{s}' already exists", .{profile_name}),
         };
     } else |_| {
@@ -294,29 +296,25 @@ pub fn handleCreate(ctx: *mere.Context, args: *const types.ParsedArgs) MereError
             return switch (err) {
                 error.FileNotFound => types.CommandResult{
                     .success = false,
-                    .exit_code = 1,
+                    .exit_code = 2,
                     .message = try std.fmt.allocPrint(ctx.allocator, "Base profile '{s}' does not exist", .{base_name}),
                 },
-                else => types.CommandResult{
-                    .success = false,
-                    .exit_code = 1,
-                    .message = try ctx.allocator.dupe(u8, "Failed to open base profile"),
+                else => {
+                    ctx.withDiagnosticContext(mere.errors.DiagnosticContext.init().withSubject(base_path));
+                    return try command.errorResult(ctx, err, "failed to open base profile");
                 },
             };
         };
         base_dir.close(path.currentIo());
 
         const base_realization_path = if (std.mem.eql(u8, base_name, "system")) blk: {
-            const current_gen = generation_mod.getCurrentGeneration(base_path) catch {
-                return types.CommandResult{
-                    .success = false,
-                    .exit_code = 1,
-                    .message = try std.fmt.allocPrint(ctx.allocator, "Base profile '{s}' has no current generation", .{base_name}),
-                };
+            const current_gen = generation_mod.getCurrentGeneration(base_path) catch |err| {
+                ctx.withDiagnosticContext(mere.errors.DiagnosticContext.init().withSubject(base_path));
+                return try command.errorResult(ctx, err, "failed to read base profile generation");
             } orelse {
                 return types.CommandResult{
                     .success = false,
-                    .exit_code = 1,
+                    .exit_code = 2,
                     .message = try std.fmt.allocPrint(ctx.allocator, "Base profile '{s}' has no current generation", .{base_name}),
                 };
             };
@@ -324,43 +322,39 @@ pub fn handleCreate(ctx: *mere.Context, args: *const types.ParsedArgs) MereError
             break :blk generation_mod.getGenerationPath(ctx.allocator, base_path, current_gen) catch return MereError.OutOfMemory;
         } else blk: {
             const root_path = profile_mod.getRootPath(ctx.allocator, base_path) catch return MereError.OutOfMemory;
-            std.Io.Dir.accessAbsolute(path.currentIo(), root_path, .{}) catch {
+            std.Io.Dir.accessAbsolute(path.currentIo(), root_path, .{}) catch |err| {
+                if (err == error.FileNotFound) {
+                    ctx.allocator.free(root_path);
+                    return types.CommandResult{
+                        .success = false,
+                        .exit_code = 2,
+                        .message = try std.fmt.allocPrint(ctx.allocator, "Base profile '{s}' has no realized state", .{base_name}),
+                    };
+                }
+                ctx.withDiagnosticContext(mere.errors.DiagnosticContext.init().withSubject(root_path));
+                const failure = try command.errorResult(ctx, err, "failed to inspect base profile state");
                 ctx.allocator.free(root_path);
-                return types.CommandResult{
-                    .success = false,
-                    .exit_code = 1,
-                    .message = try std.fmt.allocPrint(ctx.allocator, "Base profile '{s}' has no realized state", .{base_name}),
-                };
+                return failure;
             };
             break :blk root_path;
         };
         defer ctx.allocator.free(base_realization_path);
 
         const store_root = std.fs.path.join(ctx.allocator, &.{ ctx.root_path, "mere", "store" }) catch {
-            return types.CommandResult{
-                .success = false,
-                .exit_code = 1,
-                .message = try ctx.allocator.dupe(u8, "Out of memory"),
-            };
+            return MereError.OutOfMemory;
         };
         defer ctx.allocator.free(store_root);
 
-        var manifest = generation_mod.readManifest(ctx.allocator, store_root, base_realization_path) catch {
-            return types.CommandResult{
-                .success = false,
-                .exit_code = 1,
-                .message = try ctx.allocator.dupe(u8, "Failed to read base profile manifest"),
-            };
+        var manifest = generation_mod.readManifest(ctx.allocator, store_root, base_realization_path) catch |err| {
+            ctx.withDiagnosticContext(mere.errors.DiagnosticContext.init().withSubject(base_realization_path));
+            return try command.errorResult(ctx, err, "failed to read base profile manifest");
         };
         defer manifest.deinit();
 
         // Create new profile directory
-        path.ensureDirExists(profile_path) catch {
-            return types.CommandResult{
-                .success = false,
-                .exit_code = 1,
-                .message = try ctx.allocator.dupe(u8, "Failed to create profile directory"),
-            };
+        path.ensureDirExists(profile_path) catch |err| {
+            ctx.withDiagnosticContext(mere.errors.DiagnosticContext.init().withSubject(profile_path));
+            return try command.errorResult(ctx, err, "failed to create profile directory");
         };
 
         // Build package entries for the new generation
@@ -385,23 +379,16 @@ pub fn handleCreate(ctx: *mere.Context, args: *const types.ParsedArgs) MereError
             profile_path,
             store_root,
             packages.items,
-        ) catch {
-            return types.CommandResult{
-                .success = false,
-                .exit_code = 1,
-                .message = try ctx.allocator.dupe(u8, "Failed to publish profile root"),
-            };
+        ) catch |err| {
+            return try command.errorResult(ctx, err, "failed to publish profile root");
         };
 
         return try profileCreationSegments(ctx, profile_name, base_name);
     } else {
         // Create empty profile
-        path.ensureDirExists(profile_path) catch {
-            return types.CommandResult{
-                .success = false,
-                .exit_code = 1,
-                .message = try ctx.allocator.dupe(u8, "Failed to create profile directory"),
-            };
+        path.ensureDirExists(profile_path) catch |err| {
+            ctx.withDiagnosticContext(mere.errors.DiagnosticContext.init().withSubject(profile_path));
+            return try command.errorResult(ctx, err, "failed to create profile directory");
         };
 
         return try profileCreationSegments(ctx, profile_name, null);
@@ -443,25 +430,21 @@ pub fn handleDelete(ctx: *mere.Context, args: *const types.ParsedArgs) MereError
         return switch (err) {
             error.FileNotFound => types.CommandResult{
                 .success = false,
-                .exit_code = 1,
+                .exit_code = 2,
                 .message = try std.fmt.allocPrint(ctx.allocator, "Profile '{s}' does not exist", .{profile_name}),
             },
-            else => types.CommandResult{
-                .success = false,
-                .exit_code = 1,
-                .message = try ctx.allocator.dupe(u8, "Failed to open profile"),
+            else => {
+                ctx.withDiagnosticContext(mere.errors.DiagnosticContext.init().withSubject(profile_path));
+                return try command.errorResult(ctx, err, "failed to open profile");
             },
         };
     };
     dir.close(path.currentIo());
 
     // Delete profile directory recursively
-    path.deleteTreeAbsolute(profile_path) catch {
-        return types.CommandResult{
-            .success = false,
-            .exit_code = 1,
-            .message = try ctx.allocator.dupe(u8, "Failed to delete profile directory"),
-        };
+    path.deleteTreeAbsolute(profile_path) catch |err| {
+        ctx.withDiagnosticContext(mere.errors.DiagnosticContext.init().withSubject(profile_path));
+        return try command.errorResult(ctx, err, "failed to delete profile directory");
     };
 
     const delete_segments = [_]mere.ui.Segment{

@@ -1464,7 +1464,13 @@ pub fn resolveProfile(
         .policy = sync_policy,
     }, loaded_keys.items);
     defer sync_result.deinit(ctx.allocator);
-    if (sync_result.firstFailure()) |err| return err;
+    for (sync_result.outcomes.items) |outcome| {
+        switch (outcome.status) {
+            .ready => {},
+            .failed => return ctx.fail(outcome.failure orelse error.RepositoryUnavailable, outcome.name, "repository synchronization failed"),
+            .not_found => return ctx.fail(error.RepositoryNotFound, outcome.name, "repository not found"),
+        }
+    }
 
     var arena = std.heap.ArenaAllocator.init(ctx.allocator);
     errdefer arena.deinit();
@@ -1503,7 +1509,7 @@ pub fn realizeProfile(
                         ctx,
                         if (verify_store) .full_store else .fast,
                     ) catch |err| {
-                        return ctx.fail(mapActivationError(err), "boot", "failed to stage boot artifacts");
+                        return mapActivationFailure(ctx, err, "boot", "failed to stage boot artifacts");
                     };
                     if (staged > 0) {
                         emit.logLineSeverity(ctx, phase, .info, "staged boot artifacts for active system generation");
@@ -1916,7 +1922,7 @@ fn applyProfileRealization(ctx: *Context, prof_name: []const u8, installed_packa
             if (verify_store) .full_store else .fast,
         ) catch |err| {
             ctx.debug("failed to activate generation: {}", .{err});
-            return ctx.fail(mapActivationError(err), profile_dir, "failed to activate generation");
+            return mapActivationFailure(ctx, err, profile_dir, "failed to activate generation");
         };
 
         if (staged_dinit) |*staged| {
@@ -2241,14 +2247,58 @@ fn mapInstallFsError(err: anyerror) anyerror {
     };
 }
 
+fn mapActivationFailure(
+    ctx: *Context,
+    err: activation.ActivationError,
+    fallback_subject: []const u8,
+    fallback_details: []const u8,
+) anyerror {
+    const mapped = mapActivationError(err);
+    const diagnostic = ctx.getDiagnosticContext();
+    if (diagnostic.subject != null or diagnostic.details != null) return mapped;
+    return ctx.fail(mapped, fallback_subject, fallback_details);
+}
+
 fn mapActivationError(err: activation.ActivationError) anyerror {
     return switch (err) {
         activation.ActivationError.OutOfMemory => error.OutOfMemory,
         activation.ActivationError.PermissionDenied => error.PermissionDenied,
         activation.ActivationError.InvalidInput => error.InvalidInput,
+        activation.ActivationError.CorruptData,
+        activation.ActivationError.ManifestNotFound,
+        => error.CorruptData,
         activation.ActivationError.DuplicateEtcTemplate => error.ConflictingProvision,
+        activation.ActivationError.GenerationNotFound => error.InvalidInput,
         else => error.FileSystem,
     };
+}
+
+test "mapActivationFailure preserves specific lower-level diagnostics and supplies a fallback" {
+    var ctx = Context.init(std.testing.allocator, "/test");
+    defer ctx.deinit();
+
+    ctx.setDiagnosticContext("/test/etc/service.conf", "permission denied writing /etc template");
+    const mapped = mapActivationFailure(&ctx, activation.ActivationError.PermissionDenied, "/test/profile", "failed to activate generation");
+
+    try std.testing.expectEqual(error.PermissionDenied, mapped);
+    var diagnostic = ctx.getDiagnosticContext();
+    try std.testing.expectEqualStrings("/test/etc/service.conf", diagnostic.subject.?);
+    try std.testing.expectEqualStrings("permission denied writing /etc template", diagnostic.details.?);
+
+    ctx.resetDiagnostics();
+    ctx.withDiagnosticContext(mere.errors.DiagnosticContext.init().withSubject("/test/store/package"));
+    const subject_only_mapped = mapActivationFailure(&ctx, activation.ActivationError.CorruptData, "/test/profile", "failed to activate generation");
+    try std.testing.expectEqual(error.CorruptData, subject_only_mapped);
+    diagnostic = ctx.getDiagnosticContext();
+    try std.testing.expectEqualStrings("/test/store/package", diagnostic.subject.?);
+    try std.testing.expect(diagnostic.details == null);
+
+    ctx.resetDiagnostics();
+    const fallback_mapped = mapActivationFailure(&ctx, activation.ActivationError.OutOfMemory, "/test/profile", "failed to activate generation");
+    try std.testing.expectEqual(error.OutOfMemory, fallback_mapped);
+    diagnostic = ctx.getDiagnosticContext();
+    try std.testing.expectEqualStrings("/test/profile", diagnostic.subject.?);
+    try std.testing.expectEqualStrings("failed to activate generation", diagnostic.details.?);
 }
 
 fn mapGenerationError(err: generation.GenerationError) anyerror {
@@ -4900,7 +4950,8 @@ test "install mapActivationError preserves actionable classes" {
     try std.testing.expectEqual(error.PermissionDenied, mapActivationError(activation.ActivationError.PermissionDenied));
     try std.testing.expectEqual(error.InvalidInput, mapActivationError(activation.ActivationError.InvalidInput));
     try std.testing.expectEqual(error.ConflictingProvision, mapActivationError(activation.ActivationError.DuplicateEtcTemplate));
-    try std.testing.expectEqual(error.FileSystem, mapActivationError(activation.ActivationError.ManifestNotFound));
+    try std.testing.expectEqual(error.CorruptData, mapActivationError(activation.ActivationError.CorruptData));
+    try std.testing.expectEqual(error.CorruptData, mapActivationError(activation.ActivationError.ManifestNotFound));
 }
 
 test "install mapGenerationError preserves actionable classes" {

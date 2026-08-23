@@ -246,14 +246,7 @@ pub fn handleDiff(ctx: *mere.Context, args: *const types.ParsedArgs) MereError!t
 
     const left_path = if (entry.state == .missing) "/dev/null" else entry.etc_path;
     const diff_result = collectUnifiedDiff(ctx, left_path, entry.source_path) catch |err| {
-        return switch (err) {
-            MereError.OutOfMemory => MereError.OutOfMemory,
-            else => types.CommandResult{
-                .success = false,
-                .exit_code = 1,
-                .message = try ctx.allocator.dupe(u8, "failed to run diff -u"),
-            },
-        };
+        return try command.errorResult(ctx, err, "failed to run diff -u");
     };
     defer ctx.allocator.free(diff_result.output);
     defer ctx.allocator.free(diff_result.stderr);
@@ -307,58 +300,32 @@ fn mapEtcCommandError(ctx: *mere.Context, err: etc.EtcError, default_msg: []cons
         etc.EtcError.PermissionDenied => "permission denied",
         else => default_msg,
     };
-    return types.CommandResult{
-        .success = false,
-        .exit_code = 1,
-        .message = try ctx.allocator.dupe(u8, msg),
-    };
+    return command.errorResult(ctx, err, msg);
 }
 
-fn mapActiveStatusError(ctx: *mere.Context, err: etc.ActiveStatusError) types.CommandResult {
-    return switch (err) {
-        error.NoActiveGeneration => .{
-            .success = false,
-            .exit_code = 1,
-            .message = ctx.allocator.dupe(u8, "system profile has no active generation") catch "system profile has no active generation",
-        },
-        error.OutOfMemory => .{
-            .success = false,
-            .exit_code = 1,
-            .message = ctx.allocator.dupe(u8, "out of memory while loading active system generation") catch "out of memory while loading active system generation",
-        },
-        error.DuplicateTemplate => .{
-            .success = false,
-            .exit_code = 1,
-            .message = ctx.allocator.dupe(u8, "duplicate /etc template in active system generation") catch "duplicate /etc template in active system generation",
-        },
-        error.PermissionDenied => .{
-            .success = false,
-            .exit_code = 1,
-            .message = ctx.allocator.dupe(u8, "permission denied") catch "permission denied",
-        },
-        else => .{
-            .success = false,
-            .exit_code = 1,
-            .message = ctx.allocator.dupe(u8, "failed to inspect /etc state") catch "failed to inspect /etc state",
-        },
+fn mapActiveStatusError(ctx: *mere.Context, err: etc.ActiveStatusError) !types.CommandResult {
+    const message: ?[]const u8 = switch (err) {
+        error.NoActiveGeneration => "system profile has no active generation",
+        error.OutOfMemory => "out of memory while loading active system generation",
+        error.DuplicateTemplate => "duplicate /etc template in active system generation",
+        error.PermissionDenied => "permission denied",
+        else => "failed to inspect /etc state",
     };
+    return command.errorResult(ctx, err, message);
 }
 
 fn mapActiveLookupError(ctx: *mere.Context, raw_path: []const u8, err: etc.ActiveLookupError) !types.CommandResult {
-    return switch (err) {
-        error.TemplateNotFound => .{
-            .success = false,
-            .exit_code = 2,
-            .message = try std.fmt.allocPrint(ctx.allocator, "no active system default found for {s}", .{raw_path}),
-        },
-        else => mapActiveStatusError(ctx, switch (err) {
-            error.NoActiveGeneration => error.NoActiveGeneration,
-            error.OutOfMemory => error.OutOfMemory,
-            error.PermissionDenied => error.PermissionDenied,
-            error.DuplicateTemplate => error.DuplicateTemplate,
-            else => error.FileSystem,
-        }),
-    };
+    if (err == error.TemplateNotFound) {
+        ctx.withDiagnosticContext(mere.errors.DiagnosticContext.init().withSubject(raw_path));
+        return command.errorResult(ctx, MereError.InvalidInput, "no active system default found");
+    }
+    return mapActiveStatusError(ctx, switch (err) {
+        error.NoActiveGeneration => error.NoActiveGeneration,
+        error.OutOfMemory => error.OutOfMemory,
+        error.PermissionDenied => error.PermissionDenied,
+        error.DuplicateTemplate => error.DuplicateTemplate,
+        else => error.FileSystem,
+    });
 }
 
 /// Create the etc command with its subcommands

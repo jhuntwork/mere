@@ -113,18 +113,7 @@ fn handlePublish(ctx: *mere.Context, args: *const types.ParsedArgs) MereError!ty
     defer ctx.allocator.free(abs_output);
 
     mere.release.publish(ctx, abs_dev_repo, abs_output) catch |err| {
-        const mapped_error = mere.errors.ErrorMapping.mapModuleError(@TypeOf(err), err);
-        const user_message = mere.errors.getUserFriendlyMessage(err);
-        const error_ctx = ctx.getDiagnosticContext().toErrorContext();
-        const formatted_message = error_ctx.formatWithMessage(ctx.allocator, user_message) catch user_message;
-        defer if (formatted_message.ptr != user_message.ptr) ctx.allocator.free(formatted_message);
-        const exit_code = command.exitCodeForError(mapped_error);
-
-        return types.CommandResult{
-            .success = false,
-            .exit_code = exit_code,
-            .message = try ctx.allocator.dupe(u8, formatted_message),
-        };
+        return try command.errorResult(ctx, err, null);
     };
 
     const segments = [_]mere.ui.Segment{

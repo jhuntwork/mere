@@ -39,11 +39,7 @@ pub fn handleInit(ctx: *mere.Context, args: *const types.ParsedArgs) MereError!t
             init_mod.InitError.InvalidInput => "invalid filesystem state detected",
             init_mod.InitError.OutOfMemory => "out of memory",
         };
-        return types.CommandResult{
-            .success = false,
-            .exit_code = 1,
-            .message = try ctx.allocator.dupe(u8, msg),
-        };
+        return try command.errorResult(ctx, err, msg);
     };
     defer result.deinit();
 

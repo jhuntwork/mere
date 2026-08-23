@@ -8,8 +8,6 @@ const download = mere.download;
 const build = mere.build;
 const DiagnosticContext = mere.errors.DiagnosticContext;
 const getUserFriendlyMessage = mere.errors.getUserFriendlyMessage;
-const ui = mere.ui;
-const emit = ui.emit;
 
 /// Build (dev) subcommand metadata
 const build_meta = command.CommandMeta{
@@ -51,33 +49,14 @@ fn handleBuild(ctx: *mere.Context, args: *const types.ParsedArgs) MereError!type
 
     // Ensure configuration is loaded for dependency resolution
     _ = ctx.getConfig() catch |err| {
-        // Enrich diagnostic context for configuration load failures
         ctx.setDiagnosticContext("configuration", "failed to load configuration");
-        const user_message = getUserFriendlyMessage(err);
-        const error_ctx = ctx.getDiagnosticContext().toErrorContext();
-        const formatted_message = error_ctx.formatWithMessage(ctx.allocator, user_message) catch user_message;
-
-        return types.CommandResult{
-            .success = false,
-            .exit_code = 1,
-            .message = try std.fmt.allocPrint(ctx.allocator, "Configuration error: {s}", .{formatted_message}),
-        };
+        return try command.errorResult(ctx, err, "configuration error");
     };
 
     // Initialize real curl-backed transfer client for the build request.
     var curl_client = download.CurlTransferClient.init(ctx, command.user_agent) catch |err| {
-        // Add diagnostic context for download initialization failures
         ctx.setDiagnosticContext(recipe_path, "failed to initialize download client");
-        // Get user-friendly error message and format with context
-        const user_message = getUserFriendlyMessage(err);
-        const error_ctx = ctx.getDiagnosticContext().toErrorContext();
-        const formatted_message = error_ctx.formatWithMessage(ctx.allocator, user_message) catch user_message;
-
-        return types.CommandResult{
-            .success = false,
-            .exit_code = 1,
-            .message = try ctx.allocator.dupe(u8, formatted_message),
-        };
+        return try command.errorResult(ctx, err, null);
     };
     defer download.CurlTransferClient.cleanupFn(ctx, curl_client);
     const client = curl_client.client();
@@ -85,82 +64,38 @@ fn handleBuild(ctx: *mere.Context, args: *const types.ParsedArgs) MereError!type
     // Load recipe file contents into memory (allocator-owned buffer)
     var buf_path: [std.fs.max_path_bytes]u8 = undefined;
     const abs_recipe_path = path.resolveToAbsolutePath(recipe_path, &buf_path) catch |err| {
-        // Enrich diagnostic context for path resolution failures
         ctx.setDiagnosticContext(recipe_path, "failed to resolve recipe path");
-        // Get user-friendly error message
-        const user_message = getUserFriendlyMessage(err);
-
-        return types.CommandResult{
-            .success = false,
-            .exit_code = 1,
-            .message = try std.fmt.allocPrint(ctx.allocator, "Unable to resolve recipe path '{s}': {s}", .{ recipe_path, user_message }),
-        };
+        return try command.errorResult(ctx, err, null);
     };
 
     var recipe_file = path.openExistingFile(abs_recipe_path) catch |err| {
-        // Enrich diagnostic context for file open failures
         ctx.setDiagnosticContext(abs_recipe_path, "failed to open recipe file");
-        // Get user-friendly error message
-        const user_message = getUserFriendlyMessage(err);
-
-        return types.CommandResult{
-            .success = false,
-            .exit_code = 1,
-            .message = try std.fmt.allocPrint(ctx.allocator, "Unable to open recipe '{s}': {s}", .{ abs_recipe_path, user_message }),
-        };
+        return try command.errorResult(ctx, err, null);
     };
     defer recipe_file.close(path.currentIo());
 
     // Prefer explicit size read to avoid readToEndAlloc FileTooBig errors and to validate size.
     const file_size = (recipe_file.stat(path.currentIo()) catch |err| {
-        // Enrich diagnostic context for stat failures
         ctx.setDiagnosticContext(abs_recipe_path, "failed to stat recipe file");
-        // Get user-friendly error message
-        const user_message = getUserFriendlyMessage(err);
-
-        return types.CommandResult{
-            .success = false,
-            .exit_code = 1,
-            .message = try std.fmt.allocPrint(ctx.allocator, "Unable to stat recipe '{s}': {s}", .{ abs_recipe_path, user_message }),
-        };
+        return try command.errorResult(ctx, err, null);
     }).size;
 
     if (file_size > 1024 * 1024 * 10) {
-        // Enrich diagnostic context for oversized recipe files
         ctx.setDiagnosticContext(abs_recipe_path, "recipe file too large");
-
-        return types.CommandResult{
-            .success = false,
-            .exit_code = 1,
-            .message = try std.fmt.allocPrint(ctx.allocator, "Recipe file too large: {s}", .{abs_recipe_path}),
-        };
+        return try command.errorResult(ctx, MereError.InvalidInput, "recipe file too large");
     }
 
     const recipe_buf = try ctx.allocator.alloc(u8, file_size);
     defer ctx.allocator.free(recipe_buf);
 
     const bytes_read = recipe_file.readPositionalAll(path.currentIo(), recipe_buf, 0) catch |err| {
-        // Enrich diagnostic context for read failures
         ctx.setDiagnosticContext(abs_recipe_path, "failed to read recipe file");
-        // Get user-friendly error message
-        const user_message = getUserFriendlyMessage(err);
-
-        return types.CommandResult{
-            .success = false,
-            .exit_code = 1,
-            .message = try std.fmt.allocPrint(ctx.allocator, "Unable to read recipe '{s}': {s}", .{ abs_recipe_path, user_message }),
-        };
+        return try command.errorResult(ctx, err, null);
     };
 
     if (bytes_read != file_size) {
-        // Enrich diagnostic context for short reads
         ctx.setDiagnosticContext(abs_recipe_path, "short read while reading recipe file");
-
-        return types.CommandResult{
-            .success = false,
-            .exit_code = 1,
-            .message = try std.fmt.allocPrint(ctx.allocator, "Short read for recipe '{s}'", .{abs_recipe_path}),
-        };
+        return try command.errorResult(ctx, MereError.FileSystem, "short read while reading recipe file");
     }
 
     var request = build.BuildRequest.init();
@@ -212,11 +147,13 @@ fn handleBuild(ctx: *mere.Context, args: *const types.ParsedArgs) MereError!type
             }
         }
 
-        emit.diagnostic(ctx, .build, "build failed", diagnostic_subject, diagnostic_details, base_message);
-        return types.CommandResult{
-            .success = false,
-            .exit_code = 1,
-        };
+        if (diagnostic_subject != null or diagnostic_details != null) {
+            ctx.withDiagnosticContext(DiagnosticContext{
+                .subject = diagnostic_subject,
+                .details = diagnostic_details,
+            });
+        }
+        return try command.errorResult(ctx, err, base_message);
     };
     defer result.deinit();
 
