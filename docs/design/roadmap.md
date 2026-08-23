@@ -49,7 +49,7 @@ Format changes (detailed below):
 
 Capability removals:
 
-- **Remove ambient state.** Working-directory profile discovery and TTL-based metadata staleness.
+- **Remove ambient state.** Working-directory profile discovery still makes one command select a profile for reasons not visible in the command. Repository refresh is no longer part of this gap: repository-dependent operations use an explicit automatic refresh policy described below.
 - **Stop treating every installed package as a resolution root.** `mere install` moves every installed package, because nothing records which ones were asked for. Narrowing install is the removal; the additive half — recording intent, and a `mere upgrade` that moves the world deliberately — lands first. Detailed below.
 
 Closing the remaining conformance gaps:
@@ -102,7 +102,8 @@ Existing generations have no `requested`, so everything in them reads as request
 ### Interface and automation
 
 - **Interface contract and self-description.** Done: the contract section, and `mere describe`. Shipped early so the document's shape gets contact with real consumers while `schema_version: 1` is still free to revise.
-- **Remove ambient state.** Working-directory profile discovery and TTL-based metadata staleness both make one command mean different things on different runs for reasons not visible in the command. Where the convenience is worth keeping for interactive use, it should at least be resolvable to an explicit form.
+- **Repository refresh policy.** Repository-dependent operations automatically refresh signed metadata when a configured interval has elapsed, so rolling-release users do not need a separate update ritual. `--sync` forces an attempt while retaining verified-cache fallback for ordinary operations; `--no-sync` suppresses metadata refresh without suppressing package archive downloads. `mere sync [repositories...]` is the strict explicit form: it refreshes all enabled or named repositories regardless of interval, preserves the previous verified cache on failure, and reports failure rather than treating the stale cache as a successful refresh. Search uses the same policy and may return partial results from usable repositories. The canonical setting is `sync-interval`; `sync-ttl` remains a read-only compatibility alias because expiry triggers an attempt rather than invalidating cached metadata. Refresh publication is serialized per repository, and future last-sync timestamps never make a cache indefinitely fresh.
+- **Remove ambient profile selection.** Working-directory profile discovery makes one command mean different things on different runs for a reason not visible in the command. Where the convenience is worth keeping for interactive use, it should at least be resolvable to an explicit form.
 - **Attestation.** A signed, append-only record of what was done — who, which plan, which generation before and after.
 - **Plans as artifacts.** Separate deciding from doing: resolve an operation into a content-addressed plan, then apply the plan by its hash. Gives idempotent retry, a reviewable diff before anything mutates, and a natural identity for crash recovery.
 - **Concurrency.** Dropping the per-root lock for store admission waits for concurrent-mutator tests. Conditional activation is not scheduled: without a concrete split between observing state and applying a previously derived decision, an expected-generation argument merely asks callers to repeat state Mere can already read. Reconsider it if a real split-phase consumer or observed lost update establishes the need.

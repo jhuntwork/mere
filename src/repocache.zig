@@ -24,13 +24,16 @@ pub const RepoCacheError = Std.OutOfMemory || Std.FileSystem || Std.Network || S
 
 pub const SyncOptions = struct {
     force: bool = false,
-    ttl_seconds: u64 = default_sync_ttl_seconds,
+    interval_seconds: u64 = default_sync_interval_seconds,
     timeout_seconds: u32 = default_sync_timeout_seconds,
+    /// Ordinary operations retain availability by falling back to a verified
+    /// cache. The explicit `mere sync` operation disables this fallback.
+    allow_stale_fallback: bool = true,
     /// Override current time (unix seconds) for tests.
     now: ?u64 = null,
 };
 
-const default_sync_ttl_seconds: u64 = 15 * 60;
+const default_sync_interval_seconds: u64 = 15 * 60;
 const default_sync_timeout_seconds: u32 = 30;
 
 /// Compute the cache identity hash for a repo's trust context.
@@ -96,8 +99,8 @@ pub const RepoCache = struct {
     priority: u8 = 100,
     /// Whether this is a local (file://) repository
     is_local: bool = false,
-    /// Sync TTL in seconds (remote repos only; local repos ignore)
-    sync_ttl_seconds: u64 = default_sync_ttl_seconds,
+    /// Automatic refresh interval in seconds (remote repos only; local repos ignore)
+    sync_interval_seconds: u64 = default_sync_interval_seconds,
     /// Sync timeout in seconds (remote repos only; local repos ignore)
     sync_timeout_seconds: u32 = default_sync_timeout_seconds,
 
@@ -150,7 +153,7 @@ pub const RepoCache = struct {
             .repository = null,
             .priority = priority,
             .is_local = local,
-            .sync_ttl_seconds = default_sync_ttl_seconds,
+            .sync_interval_seconds = default_sync_interval_seconds,
             .sync_timeout_seconds = default_sync_timeout_seconds,
         };
     }
@@ -166,7 +169,7 @@ pub const RepoCache = struct {
             config.trusted_fingerprints.items,
             config.priority,
         );
-        cache.sync_ttl_seconds = config.sync_ttl_seconds;
+        cache.sync_interval_seconds = config.sync_interval_seconds;
         cache.sync_timeout_seconds = config.sync_timeout_seconds;
         return cache;
     }
@@ -268,6 +271,7 @@ pub const RepoCache = struct {
         // No download needed — just verify the signature in-place.
         if (self.is_local) {
             try self.syncLocal(loaded_keys);
+            ui.emit.logFmtSeverity(self.ctx, null, .info, "verified local repository metadata for {s}", .{self.name});
             return;
         }
 
@@ -275,14 +279,10 @@ pub const RepoCache = struct {
         const cache_dir = self.cache_dir;
         const now: u64 = if (options.now) |forced| forced else @intCast(std.Io.Clock.real.now(path.currentIo()).toSeconds());
 
-        if (!options.force) {
-            if (try shouldSkipSync(self, now, options.ttl_seconds)) {
-                return;
-            }
-        }
-
-        // Ensure cache directory exists with world-writable sticky bit (matches
-        // parent /mere/cache/repos/ so any user can sync).
+        // Synchronize the check/download/publish sequence per repository. The
+        // lock is deliberately narrower than Mere's root-wide mutation lock,
+        // so searches and operations using unrelated repositories do not
+        // serialize each other.
         var cache_dir_handle = path.makePathAndOpenDirMode(cache_dir, std.Io.File.Permissions.fromMode(0o1777)) catch |err| {
             return switch (err) {
                 error.FileNotFound => RepoCacheError.FileSystem,
@@ -291,6 +291,16 @@ pub const RepoCache = struct {
             };
         };
         cache_dir_handle.close(path.currentIo());
+        const sync_lock_fd = try acquireSyncLock(self);
+        defer releaseSyncLock(sync_lock_fd);
+
+        // Re-check freshness after acquiring the lock: another process may
+        // have completed the refresh while this caller was waiting.
+        if (!options.force) {
+            if (try shouldSkipSync(self, now, options.interval_seconds)) {
+                return;
+            }
+        }
 
         // Build remote URLs (null-terminated for curl client).
         // Remote repo URLs are directory roots that contain repo.db, repo.db.sig, and packages/.
@@ -344,14 +354,20 @@ pub const RepoCache = struct {
                 self.ctx.debug("failed to write last_sync.kdl for repo {s}: {s}", .{ self.name, @errorName(err) });
             };
 
+            ui.emit.logFmtSeverity(self.ctx, null, .info, "refreshed repository metadata for {s}", .{self.name});
             return;
         } else |err| {
-            if (try cacheUsable(self)) {
+            if (options.allow_stale_fallback and try cacheUsable(self)) {
                 const hint = if (err == RepoCacheError.PermissionDenied)
                     " (permission denied — check ownership of cache directory)"
                 else
                     "";
-                ui.emit.logFmtSeverity(self.ctx, null, .warn, "sync failed for repo {s}{s}; using cached metadata", .{ self.name, hint });
+                const age = try cacheAgeSeconds(self, now);
+                if (age) |seconds| {
+                    ui.emit.logFmtSeverity(self.ctx, null, .warn, "sync failed for repo {s}{s}; using verified cached metadata ({d}s old)", .{ self.name, hint, seconds });
+                } else {
+                    ui.emit.logFmtSeverity(self.ctx, null, .warn, "sync failed for repo {s}{s}; using verified cached metadata", .{ self.name, hint });
+                }
                 return;
             }
             return err;
@@ -600,15 +616,40 @@ fn cacheFilesExist(self: *RepoCache) RepoCacheError!bool {
     return true;
 }
 
-fn shouldSkipSync(self: *RepoCache, now: u64, ttl_seconds: u64) RepoCacheError!bool {
+fn cacheAgeSeconds(self: *RepoCache, now: u64) RepoCacheError!?u64 {
+    const last_sync = try readLastSync(self, self.ctx.allocator);
+    if (last_sync == null or now < last_sync.?) return null;
+    return now - last_sync.?;
+}
+
+fn acquireSyncLock(self: *RepoCache) RepoCacheError!std.posix.fd_t {
+    const lock_path = std.fs.path.join(self.ctx.allocator, &.{ self.cache_dir, ".sync.lock" }) catch return RepoCacheError.OutOfMemory;
+    defer self.ctx.allocator.free(lock_path);
+    const lock_file = std.Io.Dir.createFileAbsolute(path.currentIo(), lock_path, .{ .truncate = false }) catch |err| return mapFsAccessError(err);
+    const fd = lock_file.handle;
+    if (std.posix.errno(std.c.flock(fd, std.c.LOCK.EX)) != .SUCCESS) {
+        _ = std.c.close(fd);
+        return RepoCacheError.FileSystem;
+    }
+    return fd;
+}
+
+fn releaseSyncLock(fd: std.posix.fd_t) void {
+    _ = std.c.flock(fd, std.c.LOCK.UN);
+    _ = std.c.close(fd);
+}
+
+fn shouldSkipSync(self: *RepoCache, now: u64, interval_seconds: u64) RepoCacheError!bool {
     const last_sync = try readLastSync(self, self.ctx.allocator);
     if (last_sync == null) return false;
-    if (ttl_seconds == 0) return false;
+    if (interval_seconds == 0) return false;
 
     if (!try cacheFilesExist(self)) return false;
 
-    if (now <= last_sync.?) return true;
-    if (now - last_sync.? <= ttl_seconds) {
+    // Equal timestamps are common for immediate repeat operations. A future
+    // timestamp, however, is not evidence that metadata remains fresh.
+    if (now < last_sync.?) return false;
+    if (now - last_sync.? <= interval_seconds) {
         return true;
     }
     return false;
@@ -774,6 +815,37 @@ test "remote repo urls resolve to repo.db and repo.db.sig under repo directory" 
     const sig_url = try remoteRepoSigUrl(std.testing.allocator, "https://repo.example.com/core/new/");
     defer std.testing.allocator.free(sig_url);
     try std.testing.expectEqualStrings("https://repo.example.com/core/new/repo.db.sig", sig_url);
+}
+
+test "future last-sync timestamps do not suppress refresh" {
+    const th = @import("test_helpers.zig");
+    var test_env = try th.createTestEnv();
+    defer {
+        test_env.cleanup();
+        std.testing.allocator.destroy(test_env);
+    }
+    const ctx = &test_env.ctx;
+    var cache = try RepoCache.init(ctx, "future", "https://repo.example.com/future", &.{}, 100);
+    defer cache.deinit();
+    try path.ensureDirExists(cache.cache_dir);
+
+    const db_path = try std.fs.path.join(ctx.allocator, &.{ cache.cache_dir, repo_history.REPO_DB_FILENAME });
+    defer ctx.allocator.free(db_path);
+    const sig_path = try std.fs.path.join(ctx.allocator, &.{ cache.cache_dir, repo_history.REPO_SIG_FILENAME });
+    defer ctx.allocator.free(sig_path);
+    {
+        const file = try std.Io.Dir.createFileAbsolute(path.currentIo(), db_path, .{});
+        file.close(path.currentIo());
+    }
+    {
+        const file = try std.Io.Dir.createFileAbsolute(path.currentIo(), sig_path, .{});
+        file.close(path.currentIo());
+    }
+    try writeLastSync(&cache, 200);
+
+    try std.testing.expect(!try shouldSkipSync(&cache, 100, 900));
+    try std.testing.expect(try shouldSkipSync(&cache, 200, 900));
+    try std.testing.expect(try shouldSkipSync(&cache, 250, 900));
 }
 
 test "RepoCache.sync downloads and verifies DB and signature" {

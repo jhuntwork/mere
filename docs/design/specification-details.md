@@ -34,6 +34,19 @@ Mere is driven by people at a terminal, by scripts, by CI, and by automated call
 
 Because a consumer may not remember its own past and may not be the only one running, an invocation SHOULD depend only on its arguments and on state it can observe. Behaviour that varies with ambient context — the working directory, elapsed time since some earlier action, what a previous invocation happened to leave behind — makes the same command mean different things on different runs for reasons not visible in the command. Where such conveniences exist for interactive use, they SHOULD be resolvable to an explicit form.
 
+### Repository metadata refresh
+
+Repository-dependent operations use an availability-first automatic refresh policy suitable for a rolling distribution:
+
+- By default, a remote repository is refreshed when its last successful refresh is older than `sync-interval`. A cache inside the interval is reused quietly.
+- `--sync` forces a refresh attempt regardless of the interval. On ordinary operations, a failed attempt MAY fall back to the prior verified cache and MUST warn with its age.
+- `--no-sync` performs no remote metadata refresh. It MUST still verify cached metadata before use and MUST fail or skip that repository when no verified cache exists. It does not prohibit downloading a selected package archive.
+- `--sync` and `--no-sync` are mutually exclusive invocation errors.
+- `mere sync [repositories...]` is strict: it refreshes all enabled repositories, or only the named enabled repositories, regardless of interval. Local repositories are signature-verified. Any requested repository that cannot be refreshed or found makes the command fail, while the previous verified cache remains intact.
+- Search follows the same policy. It MAY return partial results from repositories with usable verified metadata, MUST warn about unavailable repositories, and MUST fail when none can be searched.
+
+`sync-interval` is expressed in seconds and MAY be configured globally or per repository. `sync-ttl` remains accepted as a read-only compatibility alias; Mere writes only `sync-interval`, because reaching the interval triggers an attempt rather than invalidating cached metadata. A last-refresh timestamp in the future MUST NOT suppress refresh. Repository selection, policy application, verification, and per-repository outcomes MUST be implemented by one core repository-set operation shared by package resolution, search, and standalone sync; command handlers only select policy and render those outcomes. Refresh check, download, verification, and publication MUST serialize per repository so unrelated repositories do not block one another.
+
 ### Self-description
 
 `mere describe` writes a machine-readable description of the command surface to stdout, so a consumer can learn the interface at runtime instead of being told about it out of band. It reports the program name, the running version, global flags, and the command tree with each command's group, positional arguments, and flags — including each flag's type, short form, value name, default, and whether it is required.
@@ -72,7 +85,7 @@ Requirements:
 
 This contract is a design commitment, and Mere does not yet meet all of it. Known gaps, recorded here so they are not mistaken for intent:
 
-- **Ambient state.** `mere shell` resolves a profile from the working directory (§15.12), and repository sync is skipped on a TTL, so `mere install` may resolve against different metadata depending only on elapsed time. Neither is expressible as an explicit argument.
+- **Ambient profile selection.** `mere shell` still resolves a profile from the working directory (§15.12), so the selected profile is not always visible in the invocation. Repository refresh is explicit: repository-dependent commands automatically refresh on a configured interval and expose `--sync` and `--no-sync`; `mere sync` is the strict standalone operation.
 - **Concurrency granularity.** All mutating operations serialize on one exclusive lock per root. This is correct but coarse: unrelated work blocks, and there is no way to express "apply only if the profile is still at generation N".
 - **Self-description.** The command surface is machine-readable via `mere describe`. The schemas of on-disk artifacts are not, and the gap is uneven. A generation's `profile.kdl` (§6) is KDL, so a consumer can read which packages a generation selected and at which content hashes without being told anything. A package manifest (§17) and a realization manifest are hand-rolled binary encodings behind `MEREMFST` and `MERERLZ1` headers, and neither can be read without being told its shape out of band.
 - **No record of action.** Mere keeps no account of what it did, so a consumer cannot reconstruct its own prior operations, and an operator cannot audit another consumer's.

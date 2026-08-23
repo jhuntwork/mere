@@ -15,6 +15,7 @@ const etc_cmd = @import("commands/etc.zig");
 const shell_cmd = @import("commands/shell.zig");
 const profile_cmd = @import("commands/profile.zig");
 const search_cmd = @import("commands/search.zig");
+const sync_cmd = @import("commands/sync.zig");
 const store_cmd = @import("commands/store.zig");
 const service_cmd = @import("commands/service.zig");
 const describe = @import("describe.zig");
@@ -179,6 +180,11 @@ fn registerCommands(allocator: std.mem.Allocator, cli_system: *cli.CLI, root_com
     const profile_command = try profile_cmd.createCommand(allocator);
     try cli_system.registerCommand(profile_command);
     try root_command.addSubcommand(profile_command);
+
+    // Create repository sync command
+    const sync_command = try sync_cmd.createCommand(allocator);
+    try cli_system.registerCommand(sync_command);
+    try root_command.addSubcommand(sync_command);
 
     // Create search command
     const search_command = try search_cmd.createCommand(allocator);
