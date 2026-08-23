@@ -2549,38 +2549,198 @@ fn fsyncFd(fd: std.posix.fd_t) !void {
     if (std.os.linux.fsync(fd) != 0) return error.FileSystem;
 }
 
-// Recursively fsync every file's data and every directory's entries under
-// dir_path (including dir_path itself), so the staged payload is durable
-// on disk before it is made visible via rename into the content-addressed
-// store.
-fn fsyncTree(allocator: std.mem.Allocator, dir_path: []const u8) !void {
+const SyncEntryFn = *const fn (?*anyopaque, std.Io.Dir, []const u8) anyerror!void;
+const max_file_sync_workers: usize = 8;
+
+const FsyncTreeOptions = struct {
+    max_file_workers: usize = max_file_sync_workers,
+    sync_context: ?*anyopaque = null,
+    sync_file_fn: SyncEntryFn = syncRegularFile,
+    sync_directory_fn: SyncEntryFn = syncDirectory,
+};
+
+const FsyncTreeStats = struct {
+    files_synchronized: usize,
+    workers_started: usize,
+};
+
+fn syncRegularFile(_: ?*anyopaque, root: std.Io.Dir, rel_path: []const u8) !void {
     const io = path.currentIo();
-    var dir = try std.Io.Dir.openDirAbsolute(io, dir_path, .{ .iterate = true });
+    var file = try root.openFile(io, rel_path, .{});
+    defer file.close(io);
+    try fsyncFd(file.handle);
+}
+
+fn syncDirectory(_: ?*anyopaque, root: std.Io.Dir, rel_path: []const u8) !void {
+    if (rel_path.len == 0) return fsyncFd(root.handle);
+
+    const io = path.currentIo();
+    // iterate = true is required here: without it Zig opens the directory
+    // O_PATH, and fsync() on an O_PATH fd fails with EBADF.
+    var dir = try root.openDir(io, rel_path, .{ .iterate = true });
     defer dir.close(io);
+    try fsyncFd(dir.handle);
+}
 
-    var walker = try dir.walk(allocator);
-    defer walker.deinit();
+const FileSyncShared = struct {
+    root_path: []const u8,
+    file_paths: []const []const u8,
+    sync_context: ?*anyopaque,
+    sync_file_fn: SyncEntryFn,
+    mutex: std.Io.Mutex = .init,
+    next_index: usize = 0,
+    completed: usize = 0,
+    first_error: ?anyerror = null,
 
-    while (try walker.next(io)) |entry| {
-        switch (entry.kind) {
-            .file => {
-                var file = try dir.openFile(io, entry.path, .{});
-                defer file.close(io);
-                try fsyncFd(file.handle);
-            },
-            .directory => {
-                // iterate = true is required here: without it Zig opens
-                // the directory O_PATH, and fsync() on an O_PATH fd fails
-                // with EBADF.
-                var sub = try dir.openDir(io, entry.path, .{ .iterate = true });
-                defer sub.close(io);
-                try fsyncFd(sub.handle);
-            },
-            else => {},
-        }
+    fn nextIndex(self: *@This()) ?usize {
+        const io = path.currentIo();
+        self.mutex.lockUncancelable(io);
+        defer self.mutex.unlock(io);
+
+        if (self.first_error != null or self.next_index >= self.file_paths.len) return null;
+        const index = self.next_index;
+        self.next_index += 1;
+        return index;
     }
 
-    try fsyncFd(dir.handle);
+    fn noteSuccess(self: *@This()) void {
+        const io = path.currentIo();
+        self.mutex.lockUncancelable(io);
+        defer self.mutex.unlock(io);
+        self.completed += 1;
+    }
+
+    fn noteFailure(self: *@This(), err: anyerror) void {
+        const io = path.currentIo();
+        self.mutex.lockUncancelable(io);
+        defer self.mutex.unlock(io);
+        if (self.first_error == null) self.first_error = err;
+    }
+};
+
+const FileSyncWorker = struct {
+    shared: *FileSyncShared,
+
+    fn run(self: *@This()) void {
+        const io = path.currentIo();
+        var root = std.Io.Dir.openDirAbsolute(io, self.shared.root_path, .{ .iterate = true }) catch |err| {
+            self.shared.noteFailure(err);
+            return;
+        };
+        defer root.close(io);
+
+        while (self.shared.nextIndex()) |index| {
+            self.shared.sync_file_fn(
+                self.shared.sync_context,
+                root,
+                self.shared.file_paths[index],
+            ) catch |err| {
+                self.shared.noteFailure(err);
+                return;
+            };
+            self.shared.noteSuccess();
+        }
+    }
+};
+
+// Recursively synchronize every file's data and metadata, then every
+// directory's entries child-before-parent. The complete file barrier must
+// succeed before directory synchronization begins, so callers cannot publish
+// a partially synchronized staging tree via rename.
+fn fsyncTreeWithOptions(
+    allocator: std.mem.Allocator,
+    dir_path: []const u8,
+    options: FsyncTreeOptions,
+) !FsyncTreeStats {
+    const io = path.currentIo();
+    var root = try std.Io.Dir.openDirAbsolute(io, dir_path, .{ .iterate = true });
+    defer root.close(io);
+
+    var file_paths: std.ArrayList([]const u8) = .empty;
+    defer {
+        for (file_paths.items) |rel_path| allocator.free(rel_path);
+        file_paths.deinit(allocator);
+    }
+    var directory_paths: std.ArrayList([]const u8) = .empty;
+    defer {
+        for (directory_paths.items) |rel_path| allocator.free(rel_path);
+        directory_paths.deinit(allocator);
+    }
+
+    var walker = try root.walk(allocator);
+    defer walker.deinit();
+    while (try walker.next(io)) |entry| switch (entry.kind) {
+        .file => {
+            const rel_path = try allocator.dupe(u8, entry.path);
+            file_paths.append(allocator, rel_path) catch |err| {
+                allocator.free(rel_path);
+                return err;
+            };
+        },
+        .directory => {
+            const rel_path = try allocator.dupe(u8, entry.path);
+            directory_paths.append(allocator, rel_path) catch |err| {
+                allocator.free(rel_path);
+                return err;
+            };
+        },
+        else => {},
+    };
+
+    var stats = FsyncTreeStats{
+        .files_synchronized = 0,
+        .workers_started = 0,
+    };
+    if (file_paths.items.len > 0) {
+        const worker_limit = @max(@as(usize, 1), options.max_file_workers);
+        const worker_count = @min(file_paths.items.len, worker_limit);
+        var shared = FileSyncShared{
+            .root_path = dir_path,
+            .file_paths = file_paths.items,
+            .sync_context = options.sync_context,
+            .sync_file_fn = options.sync_file_fn,
+        };
+        var workers = try allocator.alloc(FileSyncWorker, worker_count);
+        defer allocator.free(workers);
+        var threads = try allocator.alloc(std.Thread, worker_count);
+        defer allocator.free(threads);
+
+        var spawned: usize = 0;
+        while (spawned < worker_count) : (spawned += 1) {
+            workers[spawned] = .{ .shared = &shared };
+            threads[spawned] = std.Thread.spawn(.{}, FileSyncWorker.run, .{&workers[spawned]}) catch |err| {
+                for (threads[0..spawned]) |thread| thread.join();
+                return err;
+            };
+        }
+        stats.workers_started = spawned;
+        for (threads[0..spawned]) |thread| thread.join();
+        stats.files_synchronized = shared.completed;
+        if (shared.first_error) |err| return err;
+    }
+
+    std.mem.sort([]const u8, directory_paths.items, {}, struct {
+        fn depth(rel_path: []const u8) usize {
+            return std.mem.count(u8, rel_path, "/");
+        }
+
+        fn lessThan(_: void, a: []const u8, b: []const u8) bool {
+            const a_depth = depth(a);
+            const b_depth = depth(b);
+            if (a_depth != b_depth) return a_depth > b_depth;
+            return std.mem.lessThan(u8, b, a);
+        }
+    }.lessThan);
+    for (directory_paths.items) |rel_path| {
+        try options.sync_directory_fn(options.sync_context, root, rel_path);
+    }
+    try options.sync_directory_fn(options.sync_context, root, "");
+
+    return stats;
+}
+
+fn fsyncTree(allocator: std.mem.Allocator, dir_path: []const u8) !void {
+    _ = try fsyncTreeWithOptions(allocator, dir_path, .{});
 }
 
 fn finalizeAdmittedStoreObject(
@@ -4793,6 +4953,129 @@ test "fsyncTree recursively syncs nested files and directories without following
     try std.Io.Dir.symLinkAbsolute(path.currentIo(), dangling_target, dangling_link, .{});
 
     try fsyncTree(ctx.allocator, root_dir);
+}
+
+test "fsyncTree bounds workers and synchronizes every regular file once" {
+    const file_count = 20;
+    const TestState = struct {
+        mutex: std.Io.Mutex = .init,
+        calls: [file_count]usize = @splat(0),
+
+        fn syncFile(raw: ?*anyopaque, _: std.Io.Dir, rel_path: []const u8) anyerror!void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            const index = try std.fmt.parseInt(usize, rel_path["file-".len..], 10);
+            const io = path.currentIo();
+            self.mutex.lockUncancelable(io);
+            defer self.mutex.unlock(io);
+            self.calls[index] += 1;
+        }
+
+        fn syncDirectory(_: ?*anyopaque, _: std.Io.Dir, _: []const u8) anyerror!void {}
+    };
+
+    const th = @import("test_helpers.zig");
+    var test_env = try th.createTestEnv();
+    defer {
+        test_env.cleanup();
+        std.testing.allocator.destroy(test_env);
+    }
+    const ctx = &test_env.ctx;
+    const root_dir = try std.fs.path.join(ctx.allocator, &.{ test_env.path, "fsync-worker-bound" });
+    defer ctx.allocator.free(root_dir);
+    try path.ensureDirExists(root_dir);
+
+    for (0..file_count) |index| {
+        const file_path = try std.fmt.allocPrint(ctx.allocator, "{s}/file-{d}", .{ root_dir, index });
+        defer ctx.allocator.free(file_path);
+        var file = try std.Io.Dir.createFileAbsolute(path.currentIo(), file_path, .{});
+        file.close(path.currentIo());
+    }
+    const dangling_link = try std.fs.path.join(ctx.allocator, &.{ root_dir, "ignored-link" });
+    defer ctx.allocator.free(dangling_link);
+    const dangling_target = try std.fs.path.join(ctx.allocator, &.{ root_dir, "missing-target" });
+    defer ctx.allocator.free(dangling_target);
+    try std.Io.Dir.symLinkAbsolute(path.currentIo(), dangling_target, dangling_link, .{});
+
+    var state = TestState{};
+    const stats = try fsyncTreeWithOptions(ctx.allocator, root_dir, .{
+        .max_file_workers = 3,
+        .sync_context = &state,
+        .sync_file_fn = TestState.syncFile,
+        .sync_directory_fn = TestState.syncDirectory,
+    });
+
+    try std.testing.expectEqual(@as(usize, 3), stats.workers_started);
+    try std.testing.expectEqual(@as(usize, file_count), stats.files_synchronized);
+    for (state.calls) |calls| try std.testing.expectEqual(@as(usize, 1), calls);
+}
+
+test "fsyncTree completes the file barrier before child-first directory sync" {
+    const TestState = struct {
+        mutex: std.Io.Mutex = .init,
+        file_calls: usize = 0,
+        directory_calls: usize = 0,
+        directory_order: [3]u8 = undefined,
+        fail_file_sync: bool = false,
+
+        fn syncFile(raw: ?*anyopaque, _: std.Io.Dir, _: []const u8) anyerror!void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            const io = path.currentIo();
+            self.mutex.lockUncancelable(io);
+            defer self.mutex.unlock(io);
+            self.file_calls += 1;
+            if (self.fail_file_sync) return error.InjectedSyncFailure;
+        }
+
+        fn syncDirectory(raw: ?*anyopaque, _: std.Io.Dir, rel_path: []const u8) anyerror!void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            self.directory_order[self.directory_calls] = if (rel_path.len == 0)
+                0
+            else if (std.mem.eql(u8, rel_path, "sub"))
+                1
+            else if (std.mem.eql(u8, rel_path, "sub/nested"))
+                2
+            else
+                return error.UnexpectedDirectory;
+            self.directory_calls += 1;
+        }
+    };
+
+    const th = @import("test_helpers.zig");
+    var test_env = try th.createTestEnv();
+    defer {
+        test_env.cleanup();
+        std.testing.allocator.destroy(test_env);
+    }
+    const ctx = &test_env.ctx;
+    const root_dir = try std.fs.path.join(ctx.allocator, &.{ test_env.path, "fsync-barrier" });
+    defer ctx.allocator.free(root_dir);
+    const nested_dir = try std.fs.path.join(ctx.allocator, &.{ root_dir, "sub", "nested" });
+    defer ctx.allocator.free(nested_dir);
+    try path.ensureDirExists(nested_dir);
+    const file_path = try std.fs.path.join(ctx.allocator, &.{ nested_dir, "data" });
+    defer ctx.allocator.free(file_path);
+    var file = try std.Io.Dir.createFileAbsolute(path.currentIo(), file_path, .{});
+    file.close(path.currentIo());
+
+    var state = TestState{};
+    _ = try fsyncTreeWithOptions(ctx.allocator, root_dir, .{
+        .max_file_workers = 2,
+        .sync_context = &state,
+        .sync_file_fn = TestState.syncFile,
+        .sync_directory_fn = TestState.syncDirectory,
+    });
+    try std.testing.expectEqual(@as(usize, 1), state.file_calls);
+    try std.testing.expectEqual(@as(usize, 3), state.directory_calls);
+    try std.testing.expectEqualSlices(u8, &.{ 2, 1, 0 }, &state.directory_order);
+
+    state = TestState{ .fail_file_sync = true };
+    try std.testing.expectError(error.InjectedSyncFailure, fsyncTreeWithOptions(ctx.allocator, root_dir, .{
+        .max_file_workers = 2,
+        .sync_context = &state,
+        .sync_file_fn = TestState.syncFile,
+        .sync_directory_fn = TestState.syncDirectory,
+    }));
+    try std.testing.expectEqual(@as(usize, 0), state.directory_calls);
 }
 
 test "fsyncTree fails for a nonexistent directory" {
