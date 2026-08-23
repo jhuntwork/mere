@@ -35,11 +35,14 @@ const InstallRootRequirement = struct {
     name: []const u8,
     constraint_expr: ?[]const u8 = null,
     content_hash: ?[]const u8 = null,
+    requested: bool = true,
+    intent_constraint: ?[]const u8 = null,
 
     fn deinit(self: *InstallRootRequirement, allocator: std.mem.Allocator) void {
         allocator.free(self.name);
         if (self.constraint_expr) |expr| allocator.free(expr);
         if (self.content_hash) |h| allocator.free(h);
+        if (self.intent_constraint) |expr| allocator.free(expr);
     }
 };
 
@@ -158,17 +161,24 @@ fn profileMatchesResolution(ctx: *Context, profile_name: []const u8, sorted: []c
 
     if (current.packages.items.len != sorted.len) return false;
 
-    var current_hashes = std.StringHashMap(void).init(ctx.allocator);
-    defer current_hashes.deinit();
+    var current_by_hash = std.StringHashMap(generation.PackageEntry).init(ctx.allocator);
+    defer current_by_hash.deinit();
     for (current.packages.items) |pkg| {
-        current_hashes.put(pkg.content_hash, {}) catch return false;
+        current_by_hash.put(pkg.content_hash, pkg) catch return false;
     }
 
     for (sorted) |resolved| {
-        if (!current_hashes.contains(resolved.pkg.content_hash)) return false;
+        const current_pkg = current_by_hash.get(resolved.pkg.content_hash) orelse return false;
+        if (current_pkg.requested != resolved.requested) return false;
+        if (!optionalStringEqual(current_pkg.constraint_expr, resolved.constraint_expr)) return false;
     }
 
     return true;
+}
+
+fn optionalStringEqual(left: ?[]const u8, right: ?[]const u8) bool {
+    if (left == null or right == null) return left == null and right == null;
+    return std.mem.eql(u8, left.?, right.?);
 }
 
 fn emitResolutionDiff(
@@ -410,6 +420,7 @@ pub fn installPackagesFromConfig(
     // Resolve
     var resolution = try resolveProfile(ctx, repocaches.items, resolver_requirements, preferred_selections, client, force_sync, true);
     defer resolution.deinit();
+    if (requested_state) |*state| resolution.setRequestedIntent(state.packages.items);
 
     // Realize
     const result_behavior = try realizeProfile(ctx, &resolution, client, reinstall, verify_store, profile_name, null, .install);
@@ -490,12 +501,99 @@ pub fn installPackageSpecsFromConfig(
     // Resolve
     var resolution = try resolveProfile(ctx, repocaches.items, resolver_requirements, preferred_selections, client, force_sync, true);
     defer resolution.deinit();
+    resolution.setRequirementIntent(input_requirements.items);
 
     // Realize
     const result_behavior = try realizeProfile(ctx, &resolution, client, reinstall, verify_store, profile_name, null, .install);
 
     emit.phaseEnd(ctx, .install, true);
     return switch (result_behavior) {
+        .store_only_system_deferred => .store_only_system_activation_deferred,
+        .store_only_requested, .activate_profile => .completed,
+    };
+}
+
+pub fn upgradePackagesFromConfig(
+    ctx: *Context,
+    pkg_names: []const []const u8,
+    client: download.TransferClient,
+    verify_store: bool,
+    force_sync: bool,
+    profile_name: []const u8,
+    dry_run: bool,
+) !InstallCommandOutcome {
+    const config = ctx.configuration orelse {
+        return ctx.fail(error.InvalidConfig, "configuration", "no configuration loaded");
+    };
+    config.validate() catch {
+        return ctx.fail(error.InvalidConfig, "configuration", "invalid repository configuration");
+    };
+
+    const phase_name: []const u8 = if (pkg_names.len == 0) profile_name else if (pkg_names.len == 1) pkg_names[0] else "multiple";
+    emit.phaseStart(ctx, .install, .{ .name = phase_name });
+    errdefer emit.phaseEnd(ctx, .install, false);
+
+    var repocaches = try repo_sources.createCaches(ctx, &config);
+    defer {
+        for (repocaches.items) |rc| {
+            rc.deinit();
+            ctx.allocator.destroy(rc);
+        }
+        repocaches.deinit(ctx.allocator);
+    }
+
+    var requested_state = try loadRequestedRootsState(ctx, profile_name);
+    defer requested_state.deinit(ctx.allocator);
+    if (requested_state.packages.items.len == 0) {
+        return ctx.fail(error.InvalidInput, profile_name, "profile has no requested packages to upgrade");
+    }
+
+    for (pkg_names) |name| {
+        var found = false;
+        for (requested_state.packages.items) |root| {
+            if (std.mem.eql(u8, root.name, name)) {
+                found = true;
+                break;
+            }
+        }
+        if (!found) return ctx.fail(error.InvalidInput, name, "package is not an explicitly requested root");
+    }
+
+    const resolver_requirements = try ctx.allocator.alloc(resolver.Requirement, requested_state.packages.items.len);
+    defer ctx.allocator.free(resolver_requirements);
+    for (requested_state.packages.items, 0..) |pkg, index| {
+        resolver_requirements[index] = .{
+            .name = pkg.name,
+            .constraint_expr = pkg.constraint_expr,
+        };
+    }
+
+    var preferred_selections_state = try loadCurrentGenerationPreferences(ctx, profile_name);
+    defer preferred_selections_state.deinit();
+    preferred_selections_state.setUpgradeTargets(requested_state.packages.items, pkg_names);
+
+    var resolution = try resolveProfile(
+        ctx,
+        repocaches.items,
+        resolver_requirements,
+        preferred_selections_state.selections,
+        client,
+        force_sync,
+        true,
+    );
+    defer resolution.deinit();
+    resolution.setRequestedIntent(requested_state.packages.items);
+
+    if (dry_run) {
+        emitResolutionDiff(ctx, profile_name, resolution.plan.sorted, .install);
+        emit.logLineSeverity(ctx, .install, .info, "dry run: no changes made");
+        emit.phaseEnd(ctx, .install, true);
+        return .completed;
+    }
+
+    const behavior = try realizeProfile(ctx, &resolution, client, false, verify_store, profile_name, null, .install);
+    emit.phaseEnd(ctx, .install, true);
+    return switch (behavior) {
         .store_only_system_deferred => .store_only_system_activation_deferred,
         .store_only_requested, .activate_profile => .completed,
     };
@@ -543,7 +641,7 @@ pub fn uninstallPackagesFromConfig(
         for (requested_state.packages.items, 0..) |pkg, i| {
             resolver_requirements[i] = .{
                 .name = pkg.name,
-                .constraint_expr = pkg.version,
+                .constraint_expr = pkg.constraint_expr,
             };
         }
 
@@ -624,7 +722,7 @@ pub fn uninstallPackagesFromConfig(
                 const new_reqs = try ctx.allocator.alloc(resolver.Requirement, requested_state.packages.items.len);
                 defer ctx.allocator.free(new_reqs);
                 for (requested_state.packages.items, 0..) |pkg, ri| {
-                    new_reqs[ri] = .{ .name = pkg.name, .constraint_expr = pkg.version };
+                    new_reqs[ri] = .{ .name = pkg.name, .constraint_expr = pkg.constraint_expr };
                 }
                 resolution = try resolveProfile(ctx, repocaches.items, new_reqs, preferred_selections_state.selections, client, force_sync, false);
             } else {
@@ -717,6 +815,7 @@ pub fn installPackagesToProfile(
     // Resolve
     var resolution = try resolveProfile(ctx, repocaches, resolver_requirements, preferred_selections, client, force_sync, true);
     defer resolution.deinit();
+    if (requested_state) |*state| resolution.setRequestedIntent(state.packages.items);
 
     // Realize
     _ = try realizeProfile(ctx, &resolution, client, reinstall, verify_store, profile_name, target_profile_path, .install);
@@ -735,11 +834,11 @@ const RequestedRootsState = struct {
 
 const RequestedPackage = struct {
     name: []const u8,
-    version: ?[]const u8,
+    constraint_expr: ?[]const u8,
 
     fn deinit(self: *RequestedPackage, allocator: std.mem.Allocator) void {
         allocator.free(self.name);
-        if (self.version) |v| allocator.free(v);
+        if (self.constraint_expr) |constraint| allocator.free(constraint);
     }
 };
 
@@ -754,6 +853,31 @@ const PreferredSelectionsState = struct {
             .manifest = null,
             .allocator = allocator,
         };
+    }
+
+    fn setUpgradeTargets(
+        self: *PreferredSelectionsState,
+        roots: []const RequestedPackage,
+        names: []const []const u8,
+    ) void {
+        for (self.selections) |*selection| {
+            selection.allow_upgrade = false;
+            if (names.len == 0) {
+                for (roots) |root| {
+                    if (std.mem.eql(u8, selection.name, root.name)) {
+                        selection.allow_upgrade = true;
+                        break;
+                    }
+                }
+            } else {
+                for (names) |name| {
+                    if (std.mem.eql(u8, selection.name, name)) {
+                        selection.allow_upgrade = true;
+                        break;
+                    }
+                }
+            }
+        }
     }
 
     fn deinit(self: *PreferredSelectionsState) void {
@@ -793,9 +917,18 @@ fn loadRequestedRootsState(ctx: *Context, profile_name: []const u8) !RequestedRo
         defer current.deinit();
 
         for (current.packages.items) |pkg| {
+            if (!pkg.requested) continue;
             const name_copy = ctx.allocator.dupe(u8, pkg.name) catch return error.OutOfMemory;
             errdefer ctx.allocator.free(name_copy);
-            packages.append(ctx.allocator, .{ .name = name_copy, .version = null }) catch return error.OutOfMemory;
+            const constraint_copy = if (pkg.constraint_expr) |constraint|
+                ctx.allocator.dupe(u8, constraint) catch return error.OutOfMemory
+            else
+                null;
+            errdefer if (constraint_copy) |constraint| ctx.allocator.free(constraint);
+            packages.append(ctx.allocator, .{
+                .name = name_copy,
+                .constraint_expr = constraint_copy,
+            }) catch return error.OutOfMemory;
         }
     }
 
@@ -845,34 +978,27 @@ fn buildRequestedRootsAfterAdd(
     for (requirements) |req| {
         if (package_index.get(req.name)) |idx| {
             const existing = &state.packages.items[idx];
-            if (existing.version) |old_version| {
-                if (req.constraint_expr) |new_version| {
-                    if (!std.mem.eql(u8, old_version, new_version)) {
-                        ctx.allocator.free(old_version);
-                        existing.version = try ctx.allocator.dupe(u8, new_version);
-                        state.changed = true;
-                    }
-                } else {
-                    ctx.allocator.free(old_version);
-                    existing.version = null;
+            // Repeating an unconstrained install preserves an existing
+            // constraint. Supplying a new constraint deliberately replaces it.
+            if (req.intent_constraint) |new_constraint| {
+                if (existing.constraint_expr == null or !std.mem.eql(u8, existing.constraint_expr.?, new_constraint)) {
+                    if (existing.constraint_expr) |old_constraint| ctx.allocator.free(old_constraint);
+                    existing.constraint_expr = try ctx.allocator.dupe(u8, new_constraint);
                     state.changed = true;
                 }
-            } else if (req.constraint_expr) |new_version| {
-                existing.version = try ctx.allocator.dupe(u8, new_version);
-                state.changed = true;
             }
             continue;
         }
 
         const name_copy = try ctx.allocator.dupe(u8, req.name);
-        const version_copy = if (req.constraint_expr) |expr|
+        const constraint_copy = if (req.intent_constraint) |expr|
             try ctx.allocator.dupe(u8, expr)
         else
             null;
-        errdefer if (version_copy) |v| ctx.allocator.free(v);
+        errdefer if (constraint_copy) |constraint| ctx.allocator.free(constraint);
         try state.packages.append(ctx.allocator, .{
             .name = name_copy,
-            .version = version_copy,
+            .constraint_expr = constraint_copy,
         });
         try package_index.put(state.packages.items[state.packages.items.len - 1].name, state.packages.items.len - 1);
         state.changed = true;
@@ -1025,6 +1151,10 @@ fn parseInstallRootRequirements(
         try requirements.append(allocator, .{
             .name = name_copy,
             .constraint_expr = canonical_constraint,
+            .intent_constraint = if (canonical_constraint) |constraint|
+                try allocator.dupe(u8, constraint)
+            else
+                null,
         });
         try requirement_index.put(requirements.items[requirements.items.len - 1].name, requirements.items.len - 1);
     }
@@ -1072,6 +1202,13 @@ fn specsToInstallRequirements(
             .name = name_copy,
             .constraint_expr = constraint,
             .content_hash = content_hash_copy,
+            .requested = spec.requested,
+            .intent_constraint = if (spec.constraint_expr) |intent|
+                try allocator.dupe(u8, intent)
+            else if (spec.requested)
+                if (constraint) |resolved_constraint| try allocator.dupe(u8, resolved_constraint) else null
+            else
+                null,
         });
     }
 
@@ -1117,7 +1254,7 @@ fn buildProfileResolverRequirements(
         if (seen.contains(pkg.name)) continue;
         out[idx] = .{
             .name = pkg.name,
-            .constraint_expr = pkg.version,
+            .constraint_expr = pkg.constraint_expr,
         };
         idx += 1;
     }
@@ -1149,6 +1286,19 @@ pub const ProfileResolution = struct {
         self.arena.deinit();
     }
 
+    /// Mark the durable roots whose intent should be written into the next
+    /// profile generation. Constraints are borrowed until realization copies
+    /// them into owned PackageEntry values.
+    fn setRequestedIntent(self: *ProfileResolution, roots: []const RequestedPackage) void {
+        for (self.plan.resolution.packages) |*resolved| setResolvedIntent(resolved, roots);
+        for (self.plan.sorted) |*resolved| setResolvedIntent(resolved, roots);
+    }
+
+    fn setRequirementIntent(self: *ProfileResolution, requirements: []const InstallRootRequirement) void {
+        for (self.plan.resolution.packages) |*resolved| setResolvedRequirementIntent(resolved, requirements);
+        for (self.plan.sorted) |*resolved| setResolvedRequirementIntent(resolved, requirements);
+    }
+
     /// Check whether a package name appears in the resolved set.
     pub fn containsPackage(self: *const ProfileResolution, name: []const u8) bool {
         for (self.plan.sorted) |resolved| {
@@ -1159,6 +1309,32 @@ pub const ProfileResolution = struct {
         return false;
     }
 };
+
+fn setResolvedIntent(resolved: *resolver.ResolvedPackage, roots: []const RequestedPackage) void {
+    resolved.requested = false;
+    resolved.constraint_expr = null;
+    const name = resolved.pkg.name orelse return;
+    for (roots) |root| {
+        if (std.mem.eql(u8, root.name, name)) {
+            resolved.requested = true;
+            resolved.constraint_expr = root.constraint_expr;
+            return;
+        }
+    }
+}
+
+fn setResolvedRequirementIntent(resolved: *resolver.ResolvedPackage, requirements: []const InstallRootRequirement) void {
+    resolved.requested = false;
+    resolved.constraint_expr = null;
+    const name = resolved.pkg.name orelse return;
+    for (requirements) |requirement| {
+        if (requirement.requested and std.mem.eql(u8, requirement.name, name)) {
+            resolved.requested = true;
+            resolved.constraint_expr = requirement.intent_constraint;
+            return;
+        }
+    }
+}
 
 /// Resolve a list of package-name tokens (each optionally carrying a
 /// version constraint, e.g. "openssl>=3.0" — the same syntax
@@ -1415,11 +1591,16 @@ fn installResolvedPackages(
                 .arch = try ctx.allocator.dupe(u8, resolved.pkg.arch.?),
                 .store_path = store_path,
                 .content_hash = try ctx.allocator.dupe(u8, resolved.pkg.content_hash),
+                .requested = resolved.requested,
+                .constraint_expr = if (resolved.constraint_expr) |constraint|
+                    try ctx.allocator.dupe(u8, constraint)
+                else
+                    null,
             });
             continue;
         }
 
-        const pkg_info = try installSinglePackageToStore(
+        var pkg_info = try installSinglePackageToStore(
             ctx,
             &resolved.pkg,
             resolved.repocache,
@@ -1427,6 +1608,11 @@ fn installResolvedPackages(
             reinstall,
             loaded_keys,
         );
+        pkg_info.requested = resolved.requested;
+        pkg_info.constraint_expr = if (resolved.constraint_expr) |constraint|
+            try ctx.allocator.dupe(u8, constraint)
+        else
+            null;
         try installed_packages.append(ctx.allocator, pkg_info);
     }
 
@@ -2746,11 +2932,11 @@ test "buildProfileResolverRequirements orders explicit roots before existing req
     }
     try requested_packages.append(allocator, .{
         .name = try allocator.dupe(u8, "A"),
-        .version = null,
+        .constraint_expr = null,
     });
     try requested_packages.append(allocator, .{
         .name = try allocator.dupe(u8, "X"),
-        .version = null,
+        .constraint_expr = null,
     });
 
     const requirements = try buildProfileResolverRequirements(
@@ -2763,6 +2949,29 @@ test "buildProfileResolverRequirements orders explicit roots before existing req
     try std.testing.expectEqual(@as(usize, 2), requirements.len);
     try std.testing.expectEqualStrings("X", requirements[0].name);
     try std.testing.expectEqualStrings("A", requirements[1].name);
+}
+
+test "upgrade targeting holds unrelated requested roots" {
+    var selections = [_]resolver.PreferredSelection{
+        .{ .name = "app", .version = "1", .release = 1, .arch = "x86_64", .content_hash = "a" },
+        .{ .name = "tool", .version = "1", .release = 1, .arch = "x86_64", .content_hash = "b" },
+        .{ .name = "dependency", .version = "1", .release = 1, .arch = "x86_64", .content_hash = "c" },
+    };
+    var state = PreferredSelectionsState{
+        .allocator = std.testing.allocator,
+        .selections = selections[0..],
+    };
+    const roots = [_]RequestedPackage{
+        .{ .name = "app", .constraint_expr = ">=1" },
+        .{ .name = "tool", .constraint_expr = null },
+    };
+    const targets = [_][]const u8{"app"};
+
+    state.setUpgradeTargets(&roots, &targets);
+
+    try std.testing.expect(selections[0].allow_upgrade);
+    try std.testing.expect(!selections[1].allow_upgrade);
+    try std.testing.expect(!selections[2].allow_upgrade);
 }
 
 /// Assert a profile entry exists and is backed by a real store object.
