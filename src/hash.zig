@@ -368,6 +368,10 @@ fn isExcludedStoreHashPath(entry_path: []const u8, include_metadata: bool) bool 
         std.mem.eql(u8, entry_path, ".mere/manifest.v1.sig") or
         std.mem.eql(u8, entry_path, ".mere/manifest.v2") or
         std.mem.eql(u8, entry_path, ".mere/manifest.v2.sig") or
+        std.mem.eql(u8, entry_path, ".mere/manifest.v3") or
+        std.mem.eql(u8, entry_path, ".mere/manifest.v3.sig") or
+        std.mem.eql(u8, entry_path, ".mere/manifest.v4") or
+        std.mem.eql(u8, entry_path, ".mere/manifest.v4.sig") or
         std.mem.eql(u8, entry_path, ".mere/manifest.v5") or
         std.mem.eql(u8, entry_path, ".mere/manifest.v5.sig") or
         std.mem.eql(u8, entry_path, ".mere/projection.v1");
@@ -1079,7 +1083,7 @@ test "calculateStoreContentHashV4 authenticates canonical permission classes" {
     try std.testing.expect(!std.mem.eql(u8, public_read, owner_read));
 }
 
-test "calculateStoreContentHashV4 excludes manifest v5 but includes canonical metadata" {
+test "calculateStoreContentHashV4 excludes derived manifests but includes canonical metadata" {
     const th = @import("test_helpers.zig");
     var test_env = try th.createTestEnv();
     defer {
@@ -1105,7 +1109,14 @@ test "calculateStoreContentHashV4 excludes manifest v5 but includes canonical me
     const before_manifest = try calculateStoreContentHashV4(test_env.ctx.allocator, test_env.path, null);
     defer test_env.ctx.allocator.free(before_manifest);
 
-    for ([_][]const u8{ "manifest.v5", "manifest.v5.sig" }) |name| {
+    for ([_][]const u8{
+        "manifest.v3",
+        "manifest.v3.sig",
+        "manifest.v4",
+        "manifest.v4.sig",
+        "manifest.v5",
+        "manifest.v5.sig",
+    }) |name| {
         const manifest_path = try std.fs.path.join(test_env.ctx.allocator, &.{ mere_dir, name });
         defer test_env.ctx.allocator.free(manifest_path);
         var manifest_file = try std.Io.Dir.createFileAbsolute(path.currentIo(), manifest_path, .{});
