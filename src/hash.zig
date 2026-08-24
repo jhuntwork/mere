@@ -368,6 +368,8 @@ fn isExcludedStoreHashPath(entry_path: []const u8, include_metadata: bool) bool 
         std.mem.eql(u8, entry_path, ".mere/manifest.v1.sig") or
         std.mem.eql(u8, entry_path, ".mere/manifest.v2") or
         std.mem.eql(u8, entry_path, ".mere/manifest.v2.sig") or
+        std.mem.eql(u8, entry_path, ".mere/manifest.v5") or
+        std.mem.eql(u8, entry_path, ".mere/manifest.v5.sig") or
         std.mem.eql(u8, entry_path, ".mere/projection.v1");
 }
 
@@ -1075,6 +1077,52 @@ test "calculateStoreContentHashV4 authenticates canonical permission classes" {
     const owner_read = try calculateStoreContentHashV4(test_env.ctx.allocator, test_env.path, null);
     defer test_env.ctx.allocator.free(owner_read);
     try std.testing.expect(!std.mem.eql(u8, public_read, owner_read));
+}
+
+test "calculateStoreContentHashV4 excludes manifest v5 but includes canonical metadata" {
+    const th = @import("test_helpers.zig");
+    var test_env = try th.createTestEnv();
+    defer {
+        test_env.cleanup();
+        std.testing.allocator.destroy(test_env);
+    }
+
+    const payload_path = try std.fs.path.join(test_env.ctx.allocator, &.{ test_env.path, "payload" });
+    defer test_env.ctx.allocator.free(payload_path);
+    var payload = try std.Io.Dir.createFileAbsolute(path.currentIo(), payload_path, .{});
+    try payload.writeStreamingAll(path.currentIo(), "payload\n");
+    payload.close(path.currentIo());
+
+    const mere_dir = try std.fs.path.join(test_env.ctx.allocator, &.{ test_env.path, ".mere" });
+    defer test_env.ctx.allocator.free(mere_dir);
+    try path.ensureDirExists(mere_dir);
+    const meta_path = try std.fs.path.join(test_env.ctx.allocator, &.{ mere_dir, "meta.kdl" });
+    defer test_env.ctx.allocator.free(meta_path);
+    var meta = try std.Io.Dir.createFileAbsolute(path.currentIo(), meta_path, .{});
+    try meta.writeStreamingAll(path.currentIo(), "metadata { description \"first\" }\n");
+    meta.close(path.currentIo());
+
+    const before_manifest = try calculateStoreContentHashV4(test_env.ctx.allocator, test_env.path, null);
+    defer test_env.ctx.allocator.free(before_manifest);
+
+    for ([_][]const u8{ "manifest.v5", "manifest.v5.sig" }) |name| {
+        const manifest_path = try std.fs.path.join(test_env.ctx.allocator, &.{ mere_dir, name });
+        defer test_env.ctx.allocator.free(manifest_path);
+        var manifest_file = try std.Io.Dir.createFileAbsolute(path.currentIo(), manifest_path, .{});
+        try manifest_file.writeStreamingAll(path.currentIo(), "derived manifest data\n");
+        manifest_file.close(path.currentIo());
+    }
+
+    const with_manifest = try calculateStoreContentHashV4(test_env.ctx.allocator, test_env.path, null);
+    defer test_env.ctx.allocator.free(with_manifest);
+    try std.testing.expectEqualStrings(before_manifest, with_manifest);
+
+    meta = try std.Io.Dir.createFileAbsolute(path.currentIo(), meta_path, .{ .truncate = true });
+    try meta.writeStreamingAll(path.currentIo(), "metadata { description \"second\" }\n");
+    meta.close(path.currentIo());
+    const changed_meta = try calculateStoreContentHashV4(test_env.ctx.allocator, test_env.path, null);
+    defer test_env.ctx.allocator.free(changed_meta);
+    try std.testing.expect(!std.mem.eql(u8, before_manifest, changed_meta));
 }
 
 test "calculateStoreContentHashV4 fixed protocol vector" {
