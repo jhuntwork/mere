@@ -501,22 +501,11 @@ pub const CLI = struct {
 
     /// Handle help requests by determining the correct context
     fn handleHelpRequest(self: *CLI, args: []const []const u8) u8 {
-        // Find the command path before the help flag
-        var command_path = std.ArrayList([]const u8).empty;
+        var command_path = self.inferHelpCommandPath(args) catch {
+            self.showRootHelp() catch {};
+            return 0;
+        };
         defer command_path.deinit(self.allocator);
-
-        for (args[1..]) |arg| {
-            if (std.mem.eql(u8, arg, "help") or
-                std.mem.eql(u8, arg, "--help") or
-                std.mem.eql(u8, arg, "-h"))
-            {
-                break;
-            }
-            if (std.mem.startsWith(u8, arg, "-")) {
-                break; // Stop at flags
-            }
-            command_path.append(self.allocator, arg) catch break;
-        }
 
         if (command_path.items.len == 0) {
             // Root help
@@ -532,6 +521,24 @@ pub const CLI = struct {
             self.showRootHelp() catch {};
         }
         return 0;
+    }
+
+    /// Resolve help with the same global flag and command rules as execution.
+    fn inferHelpCommandPath(self: *CLI, args: []const []const u8) !CommandPath {
+        const help_index = for (args[1..], 1..) |arg, i| {
+            if (std.mem.eql(u8, arg, "help") or
+                std.mem.eql(u8, arg, "--help") or
+                std.mem.eql(u8, arg, "-h")) break i;
+        } else args.len;
+
+        var prescan = try prescanGlobalFlags(self.allocator, args[1..help_index], self.global_flags);
+        defer prescan.deinit(self.allocator);
+
+        var filtered_args = std.ArrayList([]const u8).empty;
+        defer filtered_args.deinit(self.allocator);
+        try filtered_args.append(self.allocator, args[0]);
+        try filtered_args.appendSlice(self.allocator, prescan.filtered_args);
+        return self.inferCommandPath(filtered_args.items);
     }
 
     const CommandPath = struct {
@@ -788,3 +795,44 @@ pub const CLI = struct {
         }
     }
 };
+
+test "help resolves nested commands through global flags" {
+    const allocator = std.testing.allocator;
+    const flags = [_]types.Flag{
+        .{ .name = "root", .short = 'r', .description = "Root", .flag_type = .string },
+        .{ .name = "verbose", .short = 'v', .description = "Verbose", .flag_type = .bool },
+    };
+    var cli = CLI.init(allocator, "mere", &flags);
+    defer cli.deinit();
+    const handler = struct {
+        fn run(_: *mere.Context, _: *const types.ParsedArgs) MereError!types.CommandResult {
+            return .{ .success = true };
+        }
+    }.run;
+    var store = command.Command.init(allocator, .{ .name = "store", .description = "Store" }, handler);
+    defer store.deinit();
+    var verify = command.Command.init(allocator, .{ .name = "verify", .description = "Verify" }, handler);
+    defer verify.deinit();
+    try store.addSubcommand(&verify);
+    try cli.registerCommand(&store);
+
+    const cases = [_][]const []const u8{
+        &.{ "mere", "store", "verify", "--help" },
+        &.{ "mere", "--root", "/tmp/test", "store", "verify", "--help" },
+        &.{ "mere", "--root=/tmp/test", "store", "verify", "-h" },
+        &.{ "mere", "-r/tmp/test", "store", "verify", "help" },
+        &.{ "mere", "store", "--root", "/tmp/test", "verify", "--help" },
+        &.{ "mere", "-v", "store", "verify", "--help" },
+        &.{ "mere", "store", "verify", "object", "--help" },
+    };
+    for (cases) |args| {
+        var resolved = try cli.inferHelpCommandPath(args);
+        defer resolved.deinit(allocator);
+        try std.testing.expectEqual(@as(usize, 2), resolved.items.len);
+        try std.testing.expectEqualStrings("store", resolved.items[0]);
+        try std.testing.expectEqualStrings("verify", resolved.items[1]);
+    }
+    var root = try cli.inferHelpCommandPath(&.{ "mere", "--help" });
+    defer root.deinit(allocator);
+    try std.testing.expectEqual(@as(usize, 0), root.items.len);
+}
