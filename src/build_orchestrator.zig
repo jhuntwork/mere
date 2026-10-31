@@ -1836,7 +1836,7 @@ fn runOneNamespacePhase(
     const phase_script_full = std.fmt.allocPrint(
         exec_ctx.allocator,
         \\cd {s}
-        \\trap 'retval=$?; echo "Build failed. Spawning debug shell..."; echo "Exit the shell to continue."; /bin/sh -i; exit $retval' ERR
+        \\trap 'retval=$?; trap - 0; if [ "$retval" -ne 0 ]; then echo "Build failed. Spawning debug shell..."; echo "Exit the shell to continue."; /bin/sh -i || :; fi; exit "$retval"' 0
         \\set -e
         \\{s}
     ,
