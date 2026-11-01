@@ -335,11 +335,15 @@ pub const CLI = struct {
         // Execute the command. This is the final error boundary: handlers may
         // return a CommandResult themselves, but any propagated MereError still
         // receives the same diagnostic formatting and exit-code mapping.
+        var diagnostic_message: ?[]const u8 = null;
+        defer if (diagnostic_message) |message| ctx.allocator.free(message);
         const result = cmd.handler(ctx, args) catch |err| blk: {
-            break :blk command.errorResult(ctx, err, null) catch {
+            const failure = command.errorResult(ctx, err, null) catch {
                 emitFormattedCliError(ctx, commandPhase(args.command_path), err, null);
                 return command.exitCodeForError(err);
             };
+            diagnostic_message = failure.message;
+            break :blk failure;
         };
 
         if (result.segments) |segments| {
