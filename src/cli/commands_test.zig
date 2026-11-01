@@ -262,12 +262,14 @@ test "profile packages distinguishes missing and empty active state" {
     var args = types.ParsedArgs.init(testing.allocator);
     defer args.deinit();
 
-    const missing = try profile_cmd.handlePackages(&ctx, &args);
-    defer if (missing.message) |message| testing.allocator.free(message);
-    try testing.expectEqualStrings("Profile 'system' has no active generation", missing.message.?);
-
     const profile_dir = try std.fs.path.join(testing.allocator, &.{ ctx.root_path, "mere", "profiles", "system" });
     defer testing.allocator.free(profile_dir);
+    try mere.path.ensureDirExists(profile_dir);
+    const missing = try profile_cmd.handlePackages(&ctx, &args);
+    defer if (missing.message) |message| testing.allocator.free(message);
+    try testing.expect(missing.success);
+    try testing.expectEqualStrings("Profile 'system' has no active generation", missing.message.?);
+
     const gen_path = try std.fs.path.join(testing.allocator, &.{ profile_dir, "gen-1" });
     defer testing.allocator.free(gen_path);
     try writeProfileManifest(&ctx, gen_path, 1, &.{});
@@ -278,4 +280,40 @@ test "profile packages distinguishes missing and empty active state" {
     const empty = try profile_cmd.handlePackages(&ctx, &args);
     defer if (empty.message) |message| testing.allocator.free(message);
     try testing.expectEqualStrings("Packages in profile 'system' (gen-1):\n  (none)\n", empty.message.?);
+}
+
+test "profile packages rejects missing profiles and accepts existing empty profiles" {
+    const testing = std.testing;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(mere.path.currentIo(), &path_buf);
+    var ctx = mere.Context.init(testing.allocator, path_buf[0..root_len]);
+    defer ctx.deinit();
+    var args = types.ParsedArgs.init(testing.allocator);
+    defer args.deinit();
+
+    for ([_][]const u8{ "system", "tools" }) |name| {
+        try args.flags.put("profile", .{ .string = name });
+        const profile_dir = try std.fs.path.join(testing.allocator, &.{ ctx.root_path, "mere", "profiles", name });
+        defer testing.allocator.free(profile_dir);
+        const missing = try profile_cmd.handlePackages(&ctx, &args);
+        defer if (missing.message) |message| testing.allocator.free(message);
+        try testing.expect(!missing.success);
+        try testing.expectEqual(@as(u8, 2), missing.exit_code);
+        try testing.expect(std.mem.indexOf(u8, missing.message.?, "profile does not exist") != null);
+        try testing.expect(std.mem.indexOf(u8, missing.message.?, profile_dir) != null);
+        try testing.expectError(error.FileNotFound, mere.path.openExistingDir(profile_dir));
+
+        try mere.path.ensureDirExists(profile_dir);
+        const empty = try profile_cmd.handlePackages(&ctx, &args);
+        defer if (empty.message) |message| testing.allocator.free(message);
+        try testing.expect(empty.success);
+        try testing.expectEqual(@as(u8, 0), empty.exit_code);
+        const expected = if (std.mem.eql(u8, name, "system"))
+            "Profile 'system' has no active generation"
+        else
+            "Profile 'tools' has no active realized state";
+        try testing.expectEqualStrings(expected, empty.message.?);
+    }
 }

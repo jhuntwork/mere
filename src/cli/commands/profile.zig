@@ -244,6 +244,15 @@ pub fn handlePackages(ctx: *mere.Context, args: *const types.ParsedArgs) MereErr
     };
     defer ctx.allocator.free(profile_dir);
 
+    var profile_dir_handle = path.openExistingDir(profile_dir) catch |err| {
+        ctx.withDiagnosticContext(mere.errors.DiagnosticContext.init().withSubject(profile_dir));
+        if (err == error.FileNotFound) {
+            return try command.errorResult(ctx, MereError.InvalidInput, "profile does not exist");
+        }
+        return try command.errorResult(ctx, err, "failed to open profile");
+    };
+    profile_dir_handle.close(path.currentIo());
+
     const store_root = std.fs.path.join(ctx.allocator, &.{ ctx.root_path, "mere", "store" }) catch {
         return MereError.OutOfMemory;
     };
