@@ -6,6 +6,7 @@ const posix = std.posix;
 
 const c = @cImport({
     @cInclude("sched.h");
+    @cInclude("fcntl.h");
     @cInclude("unistd.h");
     @cInclude("poll.h");
     @cInclude("sys/mount.h");
@@ -281,23 +282,38 @@ pub fn enterEnv(allocator: std.mem.Allocator, mode: EnvMode, opts: EnvOptions) E
 }
 
 pub fn forkAndEnterEnv(allocator: std.mem.Allocator, mode: EnvMode, opts: EnvOptions) EnvError!u8 {
+    return forkAndEnterEnvWith(allocator, mode, opts, enterEnv);
+}
+
+fn forkAndEnterEnvWith(allocator: std.mem.Allocator, mode: EnvMode, opts: EnvOptions, enter_fn: *const fn (std.mem.Allocator, EnvMode, EnvOptions) EnvError!void) EnvError!u8 {
     var stdout_pipe: [2]posix.fd_t = undefined;
     if (c.pipe(&stdout_pipe) != 0) return EnvError.ForkError;
-    errdefer {
+    var child_started = false;
+    errdefer if (!child_started) {
         _ = c.close(stdout_pipe[0]);
         _ = c.close(stdout_pipe[1]);
-    }
+    };
     var stderr_pipe: [2]posix.fd_t = undefined;
     if (c.pipe(&stderr_pipe) != 0) return EnvError.ForkError;
-    errdefer {
+    errdefer if (!child_started) {
         _ = c.close(stderr_pipe[0]);
         _ = c.close(stderr_pipe[1]);
+    };
+
+    // Separate setup errors from command output and exit status. Close on exec
+    // ensures an executed command cannot keep or write this control channel.
+    var setup_pipe: [2]posix.fd_t = undefined;
+    if (c.pipe2(&setup_pipe, c.O_CLOEXEC) != 0) return EnvError.ForkError;
+    defer {
+        _ = c.close(setup_pipe[0]);
+        if (setup_pipe[1] >= 0) _ = c.close(setup_pipe[1]);
     }
 
     const pid = c.fork();
     if (pid < 0) return EnvError.ForkError;
 
     if (pid == 0) {
+        _ = c.close(setup_pipe[0]);
         _ = c.close(stdout_pipe[0]);
         _ = c.close(stderr_pipe[0]);
         _ = c.dup2(stdout_pipe[1], c.STDOUT_FILENO);
@@ -305,12 +321,23 @@ pub fn forkAndEnterEnv(allocator: std.mem.Allocator, mode: EnvMode, opts: EnvOpt
         _ = c.close(stdout_pipe[1]);
         _ = c.close(stderr_pipe[1]);
 
-        enterEnv(allocator, mode, opts) catch {
+        enter_fn(allocator, mode, opts) catch |err| {
+            const name = @errorName(err);
+            var offset: usize = 0;
+            while (offset < name.len) {
+                const n = c.write(setup_pipe[1], name.ptr + offset, name.len - offset);
+                if (n < 0 and std.c._errno().* == c.EINTR) continue;
+                if (n <= 0) break;
+                offset += @intCast(n);
+            }
             std.process.exit(1);
         };
         unreachable;
     }
 
+    child_started = true;
+    _ = c.close(setup_pipe[1]);
+    setup_pipe[1] = -1;
     _ = c.close(stdout_pipe[1]);
     _ = c.close(stderr_pipe[1]);
 
@@ -372,7 +399,25 @@ pub fn forkAndEnterEnv(allocator: std.mem.Allocator, mode: EnvMode, opts: EnvOpt
         }
     }
 
-    return waitForExitStatus(@intCast(pid));
+    // The output descriptors have already been closed above. The remaining
+    // failure path must not run their pre-fork cleanup a second time.
+    const status = waitForExitStatus(@intCast(pid));
+    var error_buf: [128]u8 = undefined;
+    var error_len: usize = 0;
+    while (error_len < error_buf.len) {
+        const n = c.read(setup_pipe[0], error_buf[error_len..].ptr, error_buf.len - error_len);
+        if (n < 0 and std.c._errno().* == c.EINTR) continue;
+        if (n < 0) return EnvError.FileSystem;
+        if (n == 0) break;
+        error_len += @intCast(n);
+    }
+    if (error_len != 0) {
+        inline for (@typeInfo(EnvError).error_set.?) |field| {
+            if (std.mem.eql(u8, error_buf[0..error_len], field.name)) return @field(EnvError, field.name);
+        }
+        return EnvError.FileSystem;
+    }
+    return status;
 }
 
 fn validateInputs(opts: EnvOptions, mode: EnvMode) EnvError!void {
@@ -1470,6 +1515,44 @@ test "bindDeviceNode fails when bind mount fails" {
 
     // Use a guaranteed-nonexistent host device path segment to force bind failure.
     try std.testing.expectError(EnvError.MountSourceMissing, bindDeviceNode(target, "__definitely_missing_device__"));
+}
+
+test "forkAndEnterEnv returns typed setup failure without script output" {
+    const Capture = struct {
+        bytes: [512]u8 = undefined,
+        len: usize = 0,
+        fn handle(ctx: *anyopaque, bytes: []const u8, is_stderr: bool) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            if (!is_stderr) return;
+            const n = @min(bytes.len, self.bytes.len - self.len);
+            @memcpy(self.bytes[self.len..][0..n], bytes[0..n]);
+            self.len += n;
+        }
+    };
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const len = try tmp.dir.realPath(path_mod.currentIo(), &path_buf);
+    const missing = try std.fs.path.join(std.testing.allocator, &.{ path_buf[0..len], "missing-profile" });
+    defer std.testing.allocator.free(missing);
+    var capture: Capture = .{};
+    try std.testing.expectError(EnvError.ProfileNotFound, forkAndEnterEnv(std.testing.allocator, .build, .{
+        .profile_root = missing,
+        .output_handler = .{ .ctx = &capture, .handleFn = Capture.handle },
+    }));
+    try std.testing.expectEqual(@as(usize, 0), capture.len);
+}
+
+test "forkAndEnterEnv preserves command exit status across exec" {
+    const Runner = struct {
+        fn enter(allocator: std.mem.Allocator, _: EnvMode, _: EnvOptions) EnvError!void {
+            try execCommand(allocator, &.{ "/bin/sh", "-c", "exit 7" }, null);
+        }
+    };
+    const status = try forkAndEnterEnvWith(std.testing.allocator, .build, .{
+        .profile_root = "/",
+    }, Runner.enter);
+    try std.testing.expectEqual(@as(u8, 7), status);
 }
 
 test "EnvError covers all error cases" {
