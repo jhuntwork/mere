@@ -43,7 +43,7 @@ const global_flags = [_]types.Flag{
     .{
         .name = "root",
         .short = 'r',
-        .description = "Install prefix (default: /, env: MERE_ROOT). Store and profiles are created at <prefix>/mere/",
+        .description = "Storage root (default: /, env: MERE_ROOT). Files live at <root>/mere; shell/build expose it as /mere",
         .flag_type = .string,
         .value_name = "PATH",
     },
