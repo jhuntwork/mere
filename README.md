@@ -111,6 +111,42 @@ mere store clean --dry-run
 mere store verify
 ```
 
+## Alternate roots
+
+`--root PATH` (or `MERE_ROOT`) selects the physical storage root. Configuration,
+the store, and profiles live under `PATH/mere/`. For example, a profile stored
+under `/tmp/mere-test` can be entered with:
+
+```sh
+mere --root /tmp/mere-test shell -p test
+```
+
+This assumes the alternate root is configured and the `test` profile already has
+packages installed. Use the same `--root` when configuring, installing into, or
+inspecting that root.
+
+Profile links deliberately target `/mere/store/...`, including when an alternate
+root is selected. Builds and `mere shell` bind-mount `PATH/mere` at `/mere` inside
+their synthetic filesystem root, so those links resolve against the selected
+store. Embedding the host's storage path in the links would make them depend on
+that path being available inside the build environment.
+
+An alternate-root profile is therefore not a directly usable host `PATH` tree.
+From the host, its links may appear broken, or resolve against a different store
+already mounted at `/mere`. Enter it through `mere shell` to use the selected
+store and profile together. This requires the namespace, ID-mapping, and mount
+permissions used by Mere's environment setup. If those are unavailable, storage
+operations such as installation, profile inspection, and store verification can
+still be used, subject to their own permissions and prerequisites; standard
+isolated builds and profile shells cannot.
+
+### Future considerations
+
+Direct host use of alternate-root profiles remains an open design question.
+Concrete user needs should guide whether Mere adds such a workflow and how it
+would preserve consistent package paths across host, shell, and build contexts.
+This is not currently a supported mode or a committed feature.
+
 ## Service Management
 
 On a native Mere system, `mere` provides integrated service management as
