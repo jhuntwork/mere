@@ -213,8 +213,10 @@ fn collectSplitStagingReport(
             report.total_assigned_paths += 1;
             if (path_owner.get(rel_path)) |owner_pkg_idx| {
                 if (owner_pkg_idx != staged.pkg_index) {
+                    const conflict_path = try allocator.dupe(u8, rel_path);
+                    errdefer allocator.free(conflict_path);
                     try report.conflicts.append(allocator, .{
-                        .path = try allocator.dupe(u8, rel_path),
+                        .path = conflict_path,
                         .first_pkg = owner_pkg_idx,
                         .second_pkg = staged.pkg_index,
                     });
@@ -263,7 +265,9 @@ fn collectSplitStagingReport(
         if (entry_val.kind != .file and entry_val.kind != .sym_link) continue;
 
         if (!path_owner.contains(entry_val.path)) {
-            try report.unassigned_paths.append(allocator, try allocator.dupe(u8, entry_val.path));
+            const owned = try allocator.dupe(u8, entry_val.path);
+            errdefer allocator.free(owned);
+            try report.unassigned_paths.append(allocator, owned);
         }
     }
 
@@ -3980,4 +3984,46 @@ test "executeBuild reruns changed check phase while restoring build" {
     try std.testing.expect(second_capture.contains("dependency profile restored from cache"));
     try std.testing.expect(second_capture.contains("phase restored from cache: build"));
     try std.testing.expect(!second_capture.contains("phase restored from cache: check"));
+}
+
+fn sweepSplitReport(allocator: std.mem.Allocator, destdir: []const u8, root: []const u8) error{OutOfMemory}!void {
+    // The context is built on a reliable allocator; only the allocator the
+    // report uses is made to fail.
+    var base = mere.Context.init(std.testing.allocator, root);
+    defer base.deinit();
+    var ctx = base;
+    ctx.allocator = allocator;
+
+    // The report only reads these; the staging directory names are never used.
+    var dir_a = [_]u8{'a'};
+    var dir_b = [_]u8{'b'};
+    var copied_a = [_][]const u8{ "usr/bin/shared", "usr/bin/only-a" };
+    var copied_b = [_][]const u8{"usr/bin/shared"};
+    const staged = [_]StagedPackage{
+        .{ .pkg_index = 0, .staging_dir = dir_a[0..], .copied_files = copied_a[0..] },
+        .{ .pkg_index = 1, .staging_dir = dir_b[0..], .copied_files = copied_b[0..] },
+    };
+    var report = collectSplitStagingReport(&ctx, &staged, destdir) catch return error.OutOfMemory;
+    report.deinit(allocator);
+}
+
+test "collectSplitStagingReport releases its allocations on every failure point" {
+    const th = @import("test_helpers.zig");
+    var env = try th.createTestEnv();
+    defer {
+        env.cleanup();
+        std.testing.allocator.destroy(env);
+    }
+    const a = env.ctx.allocator;
+    const destdir = try std.fs.path.join(a, &.{ env.path, "sweep-dest" });
+    defer a.free(destdir);
+    for ([_][]const u8{ "shared", "only-a", "orphan-one", "orphan-two" }) |name| {
+        const file = try std.fs.path.join(a, &.{ destdir, "usr", "bin", name });
+        defer a.free(file);
+        var parent = try path_mod.makePathAndOpenDir(std.fs.path.dirname(file).?);
+        parent.close(path_mod.currentIo());
+        var handle = try std.Io.Dir.createFileAbsolute(path_mod.currentIo(), file, .{});
+        handle.close(path_mod.currentIo());
+    }
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, sweepSplitReport, .{ destdir, env.path });
 }
