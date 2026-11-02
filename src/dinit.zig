@@ -24,9 +24,28 @@ pub const paths = struct {
 
 /// Start a service now via dinitctl.
 pub fn startService(allocator: std.mem.Allocator, name: []const u8) !void {
-    const started = isStarted(allocator, name) catch return error.ProcessFailed;
-    if (!started) try exec(allocator, &.{ "dinitctl", "reload", name });
-    try exec(allocator, &.{ "dinitctl", "start", name });
+    // Refresh the description only for a service that is stopped. A service
+    // that is starting, stopping or already started is left to dinit: reload
+    // is not valid mid-transition and would block a start that is a no-op.
+    if (try isStopped(allocator, name)) try execStep(allocator, "reload", &.{ "dinitctl", "reload", name });
+    try execStep(allocator, "start", &.{ "dinitctl", "start", name });
+}
+
+/// True only when dinit reports the service as loaded and stopped. A service
+/// dinit has not loaded, or a state mere does not recognise, is not "stopped":
+/// start then proceeds without a reload and dinit loads the fresh definition.
+fn isStopped(allocator: std.mem.Allocator, name: []const u8) !bool {
+    const content = checkedOutput(allocator, &.{ "dinitctl", "status", name }) catch return false;
+    defer allocator.free(content);
+    var lines = std.mem.splitScalar(u8, content, '\n');
+    while (lines.next()) |line| {
+        const trimmed = std.mem.trim(u8, line, " \t\r");
+        if (!std.mem.startsWith(u8, trimmed, "State:")) continue;
+        var fields = std.mem.tokenizeAny(u8, trimmed[6..], " \t");
+        const state = fields.next() orelse return false;
+        return std.ascii.eqlIgnoreCase(state, "stopped");
+    }
+    return false;
 }
 
 /// Stop a service now via dinitctl.
@@ -38,8 +57,8 @@ pub fn stopService(allocator: std.mem.Allocator, name: []const u8) !void {
 pub fn restartService(allocator: std.mem.Allocator, name: []const u8) !void {
     // Refresh first: native restart otherwise reuses the cached command.
     // Dinit validates compatible live changes without dropping dependents.
-    try exec(allocator, &.{ "dinitctl", "reload", name });
-    try exec(allocator, &.{ "dinitctl", "restart", name });
+    try execStep(allocator, "reload", &.{ "dinitctl", "reload", name });
+    try execStep(allocator, "restart", &.{ "dinitctl", "restart", name });
 }
 
 /// Signal the running process to reload its configuration without restarting.
@@ -268,6 +287,18 @@ fn succeeds(allocator: std.mem.Allocator, argv: []const []const u8) !bool {
 
 // ── Helpers ───────────────────────────────────────────────────────
 
+/// Like `exec`, but names the failing step so a refused reload is not
+/// mistaken for a failed start.
+fn execStep(allocator: std.mem.Allocator, step: []const u8, argv: []const []const u8) !void {
+    exec(allocator, argv) catch |err| {
+        var buf: [256]u8 = undefined;
+        var writer = std.Io.File.stderr().writer(io(), &buf);
+        writer.interface.print("dinitctl {s} failed for '{s}'\n", .{ step, argv[argv.len - 1] }) catch {};
+        writer.interface.flush() catch {};
+        return err;
+    };
+}
+
 fn exec(allocator: std.mem.Allocator, argv: []const []const u8) !void {
     const result = run(allocator, argv) catch return error.ProcessFailed;
     if (result.term != .exited or result.term.exited != 0) {
@@ -282,8 +313,23 @@ fn exec(allocator: std.mem.Allocator, argv: []const []const u8) !void {
     }
 }
 
-pub fn run(allocator: std.mem.Allocator, argv: []const []const u8) !std.process.RunResult {
+/// Runs a command and returns its result. Replaced in tests so the exact
+/// dinitctl calls can be recorded and canned answers returned.
+pub const Runner = *const fn (std.mem.Allocator, []const []const u8) anyerror!std.process.RunResult;
+
+var runner: Runner = defaultRunner;
+
+fn defaultRunner(allocator: std.mem.Allocator, argv: []const []const u8) anyerror!std.process.RunResult {
     return std.process.run(allocator, io(), .{ .argv = argv });
+}
+
+/// Test hook: route every dinitctl call through `replacement`. Pass null to restore.
+pub fn setRunnerForTest(replacement: ?Runner) void {
+    runner = replacement orelse defaultRunner;
+}
+
+pub fn run(allocator: std.mem.Allocator, argv: []const []const u8) !std.process.RunResult {
+    return runner(allocator, argv);
 }
 
 test "boot intent reads native dependencies and directory entries" {
@@ -324,8 +370,111 @@ test "boot intent live-state parsing fails closed and matches complete names" {
     try std.testing.expectError(error.ProcessFailed, statusIsActive("socket error\n"));
 }
 
-// ── Template handling ──────────────────────────────
+// ── Command sequencing and template handling ──────────────────────────────
 // Test names contain "boot intent" so the existing build.zig filter runs them.
+
+var recorded: std.ArrayList([]const u8) = .empty;
+var canned_status: []const u8 = "";
+var canned_failures: []const []const u8 = &.{};
+
+fn recordingRunner(allocator: std.mem.Allocator, argv: []const []const u8) anyerror!std.process.RunResult {
+    var joined: std.ArrayList(u8) = .empty;
+    defer joined.deinit(std.testing.allocator);
+    for (argv, 0..) |part, i| {
+        if (i > 0) try joined.append(std.testing.allocator, ' ');
+        try joined.appendSlice(std.testing.allocator, part);
+    }
+    try recorded.append(std.testing.allocator, try std.testing.allocator.dupe(u8, joined.items));
+    var code: u8 = 0;
+    for (canned_failures) |prefix| {
+        if (std.mem.startsWith(u8, joined.items, prefix)) code = 1;
+    }
+    const is_status = argv.len > 1 and std.mem.eql(u8, argv[1], "status");
+    return .{
+        .term = .{ .exited = code },
+        .stdout = try allocator.dupe(u8, if (is_status) canned_status else ""),
+        .stderr = try allocator.dupe(u8, ""),
+    };
+}
+
+fn resetRecording() void {
+    for (recorded.items) |item| std.testing.allocator.free(item);
+    recorded.clearAndFree(std.testing.allocator);
+    canned_status = "";
+    canned_failures = &.{};
+}
+
+fn expectCalls(expected: []const []const u8) !void {
+    try std.testing.expectEqual(expected.len, recorded.items.len);
+    for (expected, recorded.items) |want, got| try std.testing.expectEqualStrings(want, got);
+}
+
+test "boot intent start reloads a stopped service before starting it" {
+    setRunnerForTest(recordingRunner);
+    defer setRunnerForTest(null);
+    defer resetRecording();
+    resetRecording();
+    canned_status = "    State: stopped\n";
+    try startService(std.testing.allocator, "worker");
+    try expectCalls(&.{ "dinitctl status worker", "dinitctl reload worker", "dinitctl start worker" });
+}
+
+test "boot intent start does not reload a started service" {
+    setRunnerForTest(recordingRunner);
+    defer setRunnerForTest(null);
+    defer resetRecording();
+    resetRecording();
+    canned_status = "    State: started\n";
+    try startService(std.testing.allocator, "worker");
+    try expectCalls(&.{ "dinitctl status worker", "dinitctl start worker" });
+}
+
+test "boot intent start does not reload a service that is starting or stopping" {
+    setRunnerForTest(recordingRunner);
+    defer setRunnerForTest(null);
+    defer resetRecording();
+    for ([_][]const u8{ "    State: starting\n", "    State: stopping\n" }) |state| {
+        resetRecording();
+        canned_status = state;
+        try startService(std.testing.allocator, "worker");
+        try expectCalls(&.{ "dinitctl status worker", "dinitctl start worker" });
+    }
+}
+
+test "boot intent start proceeds without reload when the service is not loaded" {
+    setRunnerForTest(recordingRunner);
+    defer setRunnerForTest(null);
+    defer resetRecording();
+    resetRecording();
+    canned_failures = &.{"dinitctl status"};
+    try startService(std.testing.allocator, "worker");
+    try expectCalls(&.{ "dinitctl status worker", "dinitctl start worker" });
+}
+
+test "boot intent start stops before starting when the reload is refused" {
+    setRunnerForTest(recordingRunner);
+    defer setRunnerForTest(null);
+    defer resetRecording();
+    resetRecording();
+    canned_status = "    State: stopped\n";
+    canned_failures = &.{"dinitctl reload"};
+    try std.testing.expectError(error.ProcessFailed, startService(std.testing.allocator, "worker"));
+    try expectCalls(&.{ "dinitctl status worker", "dinitctl reload worker" });
+}
+
+test "boot intent restart reloads then restarts and stops if the reload fails" {
+    setRunnerForTest(recordingRunner);
+    defer setRunnerForTest(null);
+    defer resetRecording();
+    resetRecording();
+    try restartService(std.testing.allocator, "worker");
+    try expectCalls(&.{ "dinitctl reload worker", "dinitctl restart worker" });
+
+    resetRecording();
+    canned_failures = &.{"dinitctl reload"};
+    try std.testing.expectError(error.ProcessFailed, restartService(std.testing.allocator, "worker"));
+    try expectCalls(&.{"dinitctl reload worker"});
+}
 
 test "boot intent template ownership matches instances only of a template" {
     try std.testing.expect(ownsLoadedService("getty@", "getty@tty1"));
