@@ -29,6 +29,22 @@ fn probeServiceStatus(allocator: std.mem.Allocator, name: []const u8) anyerror![
     return dinit.status(allocator, name);
 }
 
+/// True when the transition must be checked against live dinit at all: a host
+/// root running the dinit provider. Alternate roots and other providers never
+/// query the host, so they must not pay for (or fail on) reading the current
+/// generation either.
+pub fn appliesTo(ctx: *mere.Context) bool {
+    return appliesToWith(ctx, .{});
+}
+
+pub fn appliesToWith(ctx: *mere.Context, probe: Probe) bool {
+    const provider = if (ctx.configuration) |*cfg| cfg.effectiveInitProvider() else .s6rc;
+    if (provider != .dinit) return false;
+    // An unresolvable root is not provably an alternate root, so fail closed
+    // and let checkTransition report it.
+    return probe.is_host_root(ctx.root_path) catch true;
+}
+
 pub fn checkTransition(ctx: *mere.Context, previous: []const generation.PackageEntry, target: []const generation.PackageEntry) !void {
     return checkTransitionWith(ctx, previous, target, .{});
 }

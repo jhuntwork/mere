@@ -89,20 +89,26 @@ pub fn activateSystemGeneration(
     var manifest = try loadValidatedTargetManifest(ctx, profile_dir, gen_num, verificationEnabled(verification));
     defer manifest.deinit();
 
-    const previous_num = generation.getCurrentGeneration(profile_dir) catch return ActivationError.FileSystem;
-    if (previous_num) |number| {
-        const previous_path = generation.getGenerationPath(ctx.allocator, profile_dir, number) catch return ActivationError.InvalidInput;
-        defer ctx.allocator.free(previous_path);
-        const store_root = try std.fs.path.join(ctx.allocator, &.{ ctx.root_path, "mere", "store" });
-        defer ctx.allocator.free(store_root);
-        var previous = generation.readManifest(ctx.allocator, store_root, previous_path) catch return ActivationError.CorruptData;
-        defer previous.deinit();
-        service_policy.checkTransition(ctx, previous.packages.items, manifest.packages.items) catch |err| {
-            return switch (err) {
-                error.OutOfMemory => ActivationError.OutOfMemory,
-                else => ActivationError.InvalidInput,
+    // Reading the current generation is only needed to compare live service
+    // ownership, which applies solely to the host root under the dinit
+    // provider. Skipping it elsewhere keeps rollback away from a damaged
+    // generation, alternate-root activation and other providers working.
+    if (service_policy.appliesTo(ctx)) {
+        const previous_num = generation.getCurrentGeneration(profile_dir) catch return ActivationError.FileSystem;
+        if (previous_num) |number| {
+            const previous_path = generation.getGenerationPath(ctx.allocator, profile_dir, number) catch return ActivationError.InvalidInput;
+            defer ctx.allocator.free(previous_path);
+            const store_root = try std.fs.path.join(ctx.allocator, &.{ ctx.root_path, "mere", "store" });
+            defer ctx.allocator.free(store_root);
+            var previous = generation.readManifest(ctx.allocator, store_root, previous_path) catch return ActivationError.CorruptData;
+            defer previous.deinit();
+            service_policy.checkTransition(ctx, previous.packages.items, manifest.packages.items) catch |err| {
+                return switch (err) {
+                    error.OutOfMemory => ActivationError.OutOfMemory,
+                    else => ActivationError.InvalidInput,
+                };
             };
-        };
+        }
     }
 
     const provider = if (ctx.configuration) |*cfg| cfg.effectiveInitProvider() else .s6rc;
@@ -1189,4 +1195,55 @@ test "system profile activation rejects mismatched content hash without verify-s
 
     // Should not have switched
     try std.testing.expectEqual(@as(?u32, 1), try generation.getCurrentGeneration(profile_dir));
+}
+
+// A damaged current generation must not block activation when the service
+// policy cannot apply (alternate root or non-dinit provider). Rolling away from
+// a damaged generation is the case where activation matters most.
+test "system activation does not read the current generation when service policy cannot apply" {
+    const th = @import("test_helpers.zig");
+    var test_env = try th.createTestEnv();
+    defer {
+        test_env.cleanup();
+        std.testing.allocator.destroy(test_env);
+    }
+
+    const allocator = test_env.ctx.allocator;
+    const io = path_mod.currentIo();
+
+    const profile_dir = try std.fs.path.join(allocator, &.{ test_env.path, "mere", "profiles", "system" });
+    defer allocator.free(profile_dir);
+    {
+        var dir = try path_mod.makePathAndOpenDir(profile_dir);
+        dir.close(io);
+    }
+
+    var gens: [2][]const u8 = undefined;
+    for (&gens, 1..) |*slot, n| {
+        const name = try std.fmt.allocPrint(allocator, "gen-{d}", .{n});
+        defer allocator.free(name);
+        slot.* = try std.fs.path.join(allocator, &.{ profile_dir, name });
+        var dir = try path_mod.makePathAndOpenDir(slot.*);
+        dir.close(io);
+        var manifest = generation.GenerationManifest.init(allocator, @intCast(n));
+        defer manifest.deinit();
+        try generation.writeManifest(allocator, slot.*, &manifest);
+    }
+    defer for (gens) |g| allocator.free(g);
+
+    _ = try switchProfileGeneration(&test_env.ctx, "system", 1, .fast);
+
+    // Damage the generation that is currently active.
+    const damaged = try std.fs.path.join(allocator, &.{ gens[0], generation.MANIFEST_FILENAME });
+    defer allocator.free(damaged);
+    {
+        var file = try std.Io.Dir.createFileAbsolute(io, damaged, .{});
+        defer file.close(io);
+        try file.writeStreamingAll(io, "this is not a valid profile {{{\n");
+    }
+
+    // The test root is not the host root, so the policy does not apply and the
+    // damaged current generation must not be consulted.
+    _ = try activateSystemGeneration(&test_env.ctx, 2, .fast);
+    try std.testing.expectEqual(@as(?u32, 2), try generation.getCurrentGeneration(profile_dir));
 }
