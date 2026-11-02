@@ -78,7 +78,11 @@ pub const TestEnv = struct {
         makeWritable(self.path);
         self.tmp.cleanup();
         allocator.free(self.path);
-        // Check for leaks, but don't crash the test if there are any.
+        // A leak through ctx.allocator is reported here and fails the run: the
+        // debug allocator logs it at error level, which the test runner counts,
+        // and the leaked bytes are handed back to std.testing.allocator, which
+        // reports them too. The returned verdict is not needed because those two
+        // paths already fail the run, but the test body itself is not aborted.
         _ = self.debug_allocator.deinit();
     }
 };
