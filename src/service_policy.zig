@@ -16,6 +16,15 @@ pub const Probe = struct {
     service_status: *const fn (std.mem.Allocator, []const u8) anyerror![]const u8 = probeServiceStatus,
 };
 
+var default_probe: Probe = .{};
+
+/// Test hook: answer `appliesTo` and `checkTransition` from `probe` so code
+/// that calls them without a probe, such as activation, can be exercised
+/// without a live dinit. Pass null to restore the real host queries.
+pub fn setProbeForTest(probe: ?Probe) void {
+    default_probe = probe orelse .{};
+}
+
 fn probeIsHostRoot(root: []const u8) anyerror!bool {
     return isHostRoot(root);
 }
@@ -34,7 +43,7 @@ fn probeServiceStatus(allocator: std.mem.Allocator, name: []const u8) anyerror![
 /// query the host, so they must not pay for (or fail on) reading the current
 /// generation either.
 pub fn appliesTo(ctx: *mere.Context) bool {
-    return appliesToWith(ctx, .{});
+    return appliesToWith(ctx, default_probe);
 }
 
 pub fn appliesToWith(ctx: *mere.Context, probe: Probe) bool {
@@ -46,7 +55,7 @@ pub fn appliesToWith(ctx: *mere.Context, probe: Probe) bool {
 }
 
 pub fn checkTransition(ctx: *mere.Context, previous: []const generation.PackageEntry, target: []const generation.PackageEntry) !void {
-    return checkTransitionWith(ctx, previous, target, .{});
+    return checkTransitionWith(ctx, previous, target, default_probe);
 }
 
 pub fn checkTransitionWith(ctx: *mere.Context, previous: []const generation.PackageEntry, target: []const generation.PackageEntry, probe: Probe) !void {

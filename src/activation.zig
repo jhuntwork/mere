@@ -19,6 +19,7 @@ const generation = @import("generation.zig");
 const gcroots = @import("gcroots.zig");
 const etc = @import("etc.zig");
 const mere = @import("mere.zig");
+const meta = @import("meta.zig");
 const errors = @import("errors.zig");
 const hash = @import("hash.zig");
 const package_manifest = @import("manifest.zig");
@@ -1265,4 +1266,170 @@ test "service tree failures keep their failure class" {
     try std.testing.expectEqual(ActivationError.OutOfMemory, mapReconcileError(error.OutOfMemory));
     try std.testing.expectEqual(ActivationError.InvalidInput, mapReconcileError(error.InvalidInput));
     try std.testing.expectEqual(ActivationError.InvalidInput, mapReconcileError(error.DuplicateService));
+}
+
+// ── Rollback and live-service policy at the activation boundary ───────────
+
+const PolicyHost = struct {
+    var host_root: bool = true;
+    var live: bool = true;
+    var list_text: []const u8 = "";
+    var status_text: []const u8 = "    State: started\n";
+    var list_calls: usize = 0;
+
+    fn isHostRoot(_: []const u8) anyerror!bool {
+        return host_root;
+    }
+    fn isLive(_: std.mem.Allocator) anyerror!bool {
+        return live;
+    }
+    fn listServices(allocator: std.mem.Allocator) anyerror![]const u8 {
+        list_calls += 1;
+        return allocator.dupe(u8, list_text);
+    }
+    fn serviceStatus(allocator: std.mem.Allocator, _: []const u8) anyerror![]const u8 {
+        return allocator.dupe(u8, status_text);
+    }
+
+    fn install() void {
+        host_root = true;
+        live = true;
+        list_text = "";
+        status_text = "    State: started\n";
+        list_calls = 0;
+        service_policy.setProbeForTest(.{
+            .is_host_root = isHostRoot,
+            .is_live_dinit = isLive,
+            .list_services = listServices,
+            .service_status = serviceStatus,
+        });
+    }
+};
+
+/// A two-generation system profile: generation 1 carries `before`, generation 2
+/// carries `after`, and generation 1 is current. Each package declares one
+/// daemon service named after itself and lives in the store with its real hash.
+const RollbackFixture = struct {
+    env: *@import("test_helpers.zig").TestEnv,
+    arena: std.heap.ArenaAllocator,
+    profile_dir: []const u8,
+    services_dir: []const u8,
+
+    fn init(before: []const []const u8, after: []const []const u8) !RollbackFixture {
+        const th = @import("test_helpers.zig");
+        const env = try th.createTestEnv();
+        var fx: RollbackFixture = .{
+            .env = env,
+            .arena = std.heap.ArenaAllocator.init(std.testing.allocator),
+            .profile_dir = "",
+            .services_dir = "",
+        };
+        errdefer fx.deinit();
+        const a = fx.arena.allocator();
+        var cfg = mere.config.Config.init(&env.ctx, env.ctx.allocator);
+        cfg.init_provider = .dinit;
+        env.ctx.configuration = cfg;
+
+        fx.profile_dir = try std.fs.path.join(a, &.{ env.path, "mere", "profiles", "system" });
+        fx.services_dir = try std.fs.path.join(a, &.{ env.path, "usr", "share", "dinit.d" });
+        const store_root = try std.fs.path.join(a, &.{ env.path, "mere", "store" });
+        try path_mod.ensureDirExists(fx.profile_dir);
+        try path_mod.ensureDirExists(store_root);
+
+        try fx.makeGeneration(a, store_root, 1, before);
+        try fx.makeGeneration(a, store_root, 2, after);
+        _ = try switchProfileGeneration(&env.ctx, "system", 1, .fast);
+        PolicyHost.install();
+        return fx;
+    }
+
+    fn makeGeneration(self: *RollbackFixture, a: std.mem.Allocator, store_root: []const u8, number: u32, services: []const []const u8) !void {
+        const env = self.env;
+        const gen_name = try std.fmt.allocPrint(a, "gen-{d}", .{number});
+        const gen_dir = try std.fs.path.join(a, &.{ self.profile_dir, gen_name });
+        try path_mod.ensureDirExists(gen_dir);
+        var manifest = generation.GenerationManifest.init(env.ctx.allocator, number);
+        defer manifest.deinit();
+        for (services) |service_name| {
+            const staging = try std.fs.path.join(a, &.{ store_root, try std.fmt.allocPrint(a, "tmp-{s}-{d}", .{ service_name, number }) });
+            try path_mod.ensureDirExists(staging);
+            var data = meta.Data.init(env.ctx.allocator);
+            defer data.deinit();
+            var service = meta.Service.init(env.ctx.allocator);
+            service.name = try env.ctx.allocator.dupe(u8, service_name);
+            service.service_type = .daemon;
+            try service.command.append(env.ctx.allocator, try env.ctx.allocator.dupe(u8, "/bin/true"));
+            try data.services.append(env.ctx.allocator, service);
+            try meta.writeFile(env.ctx.allocator, staging, &data);
+            const digest = try hash.calculateStoreContentHash(env.ctx.allocator, staging, null);
+            defer env.ctx.allocator.free(digest);
+            const final = try std.fs.path.join(a, &.{ store_root, try std.fmt.allocPrint(a, "{s}-{s}-1.0", .{ digest, service_name }) });
+            // The same package in two generations has one store path.
+            if (std.Io.Dir.accessAbsolute(path_mod.currentIo(), final, .{})) |_| {
+                try path_mod.deleteTreeAbsolute(staging);
+            } else |_| {
+                try std.Io.Dir.renameAbsolute(staging, final, path_mod.currentIo());
+            }
+            try manifest.addPackage(service_name, "1.0", 1, "x86_64", final, digest);
+        }
+        try generation.writeManifest(env.ctx.allocator, gen_dir, &manifest);
+    }
+
+    fn deinit(self: *RollbackFixture) void {
+        service_policy.setProbeForTest(null);
+        self.arena.deinit();
+        self.env.cleanup();
+        std.testing.allocator.destroy(self.env);
+    }
+
+    fn current(self: *RollbackFixture) !?u32 {
+        return generation.getCurrentGeneration(self.profile_dir);
+    }
+};
+
+test "rollback to a generation without a running service is refused and leaves the profile unchanged" {
+    var fx = try RollbackFixture.init(&.{"worker"}, &.{});
+    defer fx.deinit();
+    PolicyHost.list_text = "[[+]     ] worker (pid: 7)\n";
+    PolicyHost.status_text = "    State: started\n";
+
+    try std.testing.expectError(ActivationError.InvalidInput, activateSystemGeneration(&fx.env.ctx, 2, .fast));
+    try std.testing.expectEqual(@as(?u32, 1), try fx.current());
+    // Refusal comes before the service tree is rewritten.
+    const published = try std.fs.path.join(fx.arena.allocator(), &.{ fx.profile_dir, "gen-2", "usr", "share", "dinit.d" });
+    try std.testing.expectError(error.FileNotFound, std.Io.Dir.accessAbsolute(path_mod.currentIo(), published, .{}));
+}
+
+test "rollback to a generation without a stopped service is allowed" {
+    var fx = try RollbackFixture.init(&.{"worker"}, &.{});
+    defer fx.deinit();
+    PolicyHost.list_text = "[{ }     ] worker\n";
+    PolicyHost.status_text = "    State: stopped\n";
+
+    _ = try activateSystemGeneration(&fx.env.ctx, 2, .fast);
+    try std.testing.expectEqual(@as(?u32, 2), try fx.current());
+}
+
+test "activation that removes no service succeeds even when live state cannot be read" {
+    var fx = try RollbackFixture.init(&.{"worker"}, &.{"worker"});
+    defer fx.deinit();
+    PolicyHost.live = false;
+    PolicyHost.list_text = "unreadable\n";
+
+    _ = try activateSystemGeneration(&fx.env.ctx, 2, .fast);
+    try std.testing.expectEqual(@as(?u32, 2), try fx.current());
+    try std.testing.expectEqual(@as(usize, 0), PolicyHost.list_calls);
+}
+
+test "activation realizes the target generation's service tree and its essential bundle" {
+    var fx = try RollbackFixture.init(&.{}, &.{"worker"});
+    defer fx.deinit();
+    PolicyHost.live = false;
+
+    _ = try activateSystemGeneration(&fx.env.ctx, 2, .fast);
+    const tree = try std.fs.path.join(fx.arena.allocator(), &.{ fx.profile_dir, "gen-2", "usr", "share", "dinit.d" });
+    const worker = try std.fs.path.join(fx.arena.allocator(), &.{ tree, "worker" });
+    const bundle = try std.fs.path.join(fx.arena.allocator(), &.{ tree, "mere-essential" });
+    try std.Io.Dir.accessAbsolute(path_mod.currentIo(), worker, .{});
+    try std.Io.Dir.accessAbsolute(path_mod.currentIo(), bundle, .{});
 }
