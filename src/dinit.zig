@@ -144,9 +144,45 @@ fn findSourcePath(allocator: std.mem.Allocator, name: []const u8) !?[]const u8 {
     return null;
 }
 
+/// A template is a service named with a trailing '@' (for example "getty@").
+/// dinit loads an instance such as "getty@tty1" from the template file
+/// "getty@". A plain service name never owns instances.
+pub fn isTemplateName(name: []const u8) bool {
+    return name.len > 1 and name[name.len - 1] == '@';
+}
+
+/// The definition file that backs a loaded service name: the name itself, or
+/// for an instance "base@arg" the template "base@".
+pub fn definitionName(name: []const u8) []const u8 {
+    const at = std.mem.indexOfScalar(u8, name, '@') orelse return name;
+    if (at == 0 or at + 1 >= name.len) return name;
+    return name[0 .. at + 1];
+}
+
+/// True when a loaded service belongs to a package-owned definition: an exact
+/// match, or an instance of that definition when it is a template.
+pub fn ownsLoadedService(definition: []const u8, loaded: []const u8) bool {
+    if (std.mem.eql(u8, definition, loaded)) return true;
+    if (!isTemplateName(definition)) return false;
+    return loaded.len > definition.len and std.mem.startsWith(u8, loaded, definition);
+}
+
 /// Essential intent belongs to package metadata, even with an admin override.
 pub fn isEssential(allocator: std.mem.Allocator, name: []const u8) !bool {
-    const source = try std.fs.path.join(allocator, &.{ paths.pkg_sources, name });
+    return isEssentialIn(allocator, paths.pkg_sources, name);
+}
+
+/// Look up the essential marker in `source_dir`. An instance such as "foo@x"
+/// has no file of its own, so fall back to its template "foo@".
+pub fn isEssentialIn(allocator: std.mem.Allocator, source_dir: []const u8, name: []const u8) !bool {
+    if (try essentialMarker(allocator, source_dir, name)) return true;
+    const definition = definitionName(name);
+    if (std.mem.eql(u8, definition, name)) return false;
+    return essentialMarker(allocator, source_dir, definition);
+}
+
+fn essentialMarker(allocator: std.mem.Allocator, source_dir: []const u8, name: []const u8) !bool {
+    const source = try std.fs.path.join(allocator, &.{ source_dir, name });
     defer allocator.free(source);
     const content = std.Io.Dir.cwd().readFileAlloc(io(), source, allocator, .limited(1024 * 1024)) catch |err| switch (err) {
         error.FileNotFound => return false,
@@ -286,4 +322,34 @@ test "boot intent live-state parsing fails closed and matches complete names" {
     try std.testing.expect(try statusIsActive("    State: stopping\n"));
     try std.testing.expect(!try statusIsActive("    State: STOPPED (dependency failed/terminated)\n"));
     try std.testing.expectError(error.ProcessFailed, statusIsActive("socket error\n"));
+}
+
+// ── Template handling ──────────────────────────────
+// Test names contain "boot intent" so the existing build.zig filter runs them.
+
+test "boot intent template ownership matches instances only of a template" {
+    try std.testing.expect(ownsLoadedService("getty@", "getty@tty1"));
+    try std.testing.expect(ownsLoadedService("worker", "worker"));
+    try std.testing.expect(!ownsLoadedService("foo", "foo@x"));
+    try std.testing.expect(!ownsLoadedService("getty@", "getty"));
+    try std.testing.expect(ownsLoadedService("getty@", "getty@"));
+}
+
+test "boot intent essential lookup falls back from an instance to its template" {
+    const th = @import("test_helpers.zig");
+    var env = try th.createTestEnv();
+    defer {
+        env.cleanup();
+        std.testing.allocator.destroy(env);
+    }
+    const allocator = env.ctx.allocator;
+    const template = try std.fs.path.join(allocator, &.{ env.path, "getty@" });
+    defer allocator.free(template);
+    var file = try std.Io.Dir.createFileAbsolute(io(), template, .{});
+    try file.writeStreamingAll(io(), "type = process\n# mere: essential = true\n");
+    file.close(io());
+    try std.testing.expect(try isEssentialIn(allocator, env.path, "getty@"));
+    try std.testing.expect(try isEssentialIn(allocator, env.path, "getty@tty1"));
+    try std.testing.expect(!try isEssentialIn(allocator, env.path, "other@tty1"));
+    try std.testing.expect(!try isEssentialIn(allocator, env.path, "getty"));
 }

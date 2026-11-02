@@ -66,7 +66,7 @@ pub fn checkTransitionWith(ctx: *mere.Context, previous: []const generation.Pack
             return ctx.fail(error.InvalidInput, "dinit", "unrecognized service list; generation not activated")) orelse continue;
         var owned = false;
         for (removed.items) |definition| {
-            if (std.mem.eql(u8, definition, name) or (std.mem.startsWith(u8, name, definition) and name.len > definition.len and name[definition.len] == '@')) owned = true;
+            if (dinit.ownsLoadedService(definition, name)) owned = true;
         }
         if (!owned) continue;
         const status = probe.service_status(ctx.allocator, name) catch
@@ -306,4 +306,26 @@ test "service policy still fails closed on an unreadable init identity when a se
     const before = try fx.package("daemon-pkg", &.{"worker"});
     fake_live_error = error.FileNotFound;
     try std.testing.expectError(error.InvalidInput, checkTransitionWith(&fx.env.ctx, &.{before}, &.{}, fake_probe));
+}
+
+// A template ("name@") owns its instances ("name@arg"); a plain service owns none.
+test "service policy refuses removing a template while one of its instances is active" {
+    var fx = try PolicyFixture.init();
+    defer fx.deinit();
+    const before = try fx.package("getty-pkg", &.{"getty@"});
+    fake_list_text = "[[+]     ] getty@tty1 (pid: 9)\n";
+    fake_status_text = "    State: started\n";
+    try std.testing.expectError(error.InvalidInput, checkTransitionWith(&fx.env.ctx, &.{before}, &.{}, fake_probe));
+}
+
+test "service policy does not treat an instance of a surviving template as owned by a removed plain service" {
+    var fx = try PolicyFixture.init();
+    defer fx.deinit();
+    // Distinct package names give distinct store paths; reusing one name would
+    // overwrite the first metadata file and leave nothing removed.
+    const before = try fx.package("foo-pkg-v1", &.{ "foo", "foo@" });
+    const after = try fx.package("foo-pkg-v2", &.{"foo@"});
+    fake_list_text = "[[+]     ] foo@x (pid: 4)\n";
+    fake_status_text = "    State: started\n";
+    try checkTransitionWith(&fx.env.ctx, &.{before}, &.{after}, fake_probe);
 }
