@@ -13,6 +13,24 @@ fn io() std.Io {
     return path_mod.currentIo();
 }
 
+/// Directories searched for service definitions. Production always uses
+/// `paths`; tests point these at a temporary tree.
+var source_dirs_override: ?struct { pkg: []const u8, admin: []const u8 } = null;
+
+fn pkgSources() []const u8 {
+    return if (source_dirs_override) |dirs| dirs.pkg else paths.pkg_sources;
+}
+
+fn adminSources() []const u8 {
+    return if (source_dirs_override) |dirs| dirs.admin else paths.admin_sources;
+}
+
+/// Test hook: search `pkg` and `admin` instead of the system directories.
+/// Pass null for both to restore the defaults.
+pub fn setSourceDirsForTest(pkg: ?[]const u8, admin: ?[]const u8) void {
+    source_dirs_override = if (pkg != null and admin != null) .{ .pkg = pkg.?, .admin = admin.? } else null;
+}
+
 pub const paths = struct {
     pub const pkg_sources = "/usr/share/dinit.d";
     pub const admin_sources = "/etc/dinit.d";
@@ -68,20 +86,24 @@ pub fn reloadService(allocator: std.mem.Allocator, name: []const u8) !void {
 
 /// Add a service to the boot bundle without changing its live state.
 pub fn enableService(allocator: std.mem.Allocator, name: []const u8) !void {
-    try exec(allocator, &.{ "dinitctl", "--offline", "-d", paths.admin_sources, "-d", paths.pkg_sources, "enable", "--from", paths.boot_bundle, name });
+    try exec(allocator, &.{ "dinitctl", "--offline", "-d", adminSources(), "-d", pkgSources(), "enable", "--from", paths.boot_bundle, name });
 }
 
 /// Remove a service from the boot bundle without changing its live state.
 pub fn disableService(allocator: std.mem.Allocator, name: []const u8) !void {
-    try exec(allocator, &.{ "dinitctl", "--offline", "-d", paths.admin_sources, "-d", paths.pkg_sources, "disable", "--from", paths.boot_bundle, name });
+    try exec(allocator, &.{ "dinitctl", "--offline", "-d", adminSources(), "-d", pkgSources(), "disable", "--from", paths.boot_bundle, name });
 }
 
 /// Scan source paths and return every available service name.
 pub fn scanSourceNames(allocator: std.mem.Allocator) ![]const []const u8 {
     var names = std.StringHashMap(void).init(allocator);
 
-    scanNamesFromPath(allocator, paths.pkg_sources, &names);
-    scanNamesFromPath(allocator, paths.admin_sources, &names);
+    // The keys are handed to the caller through `list`; only the map's own
+    // storage is released here.
+    defer names.deinit();
+
+    scanNamesFromPath(allocator, pkgSources(), &names);
+    scanNamesFromPath(allocator, adminSources(), &names);
 
     var list: std.ArrayList([]const u8) = .empty;
     var it = names.keyIterator();
@@ -99,6 +121,9 @@ fn scanNamesFromPath(allocator: std.mem.Allocator, base: []const u8, names: *std
         if (entry.name[0] == '.') continue;
         if (entry.kind != .file) continue;
         if (std.mem.eql(u8, entry.name, paths.boot_bundle)) continue;
+        // A name present in both directories (an administrator override) is
+        // already recorded; duplicating it again would leak the second copy.
+        if (names.contains(entry.name)) continue;
         const name = allocator.dupe(u8, entry.name) catch continue;
         names.put(name, {}) catch continue;
     }
@@ -156,7 +181,7 @@ fn bootFileEnables(allocator: std.mem.Allocator, source: []const u8, name: []con
 }
 
 fn findSourcePath(allocator: std.mem.Allocator, name: []const u8) !?[]const u8 {
-    for ([_][]const u8{ paths.admin_sources, paths.pkg_sources }) |base| {
+    for ([_][]const u8{ adminSources(), pkgSources() }) |base| {
         const candidate = try std.fs.path.join(allocator, &.{ base, name });
         if (std.Io.Dir.accessAbsolute(io(), candidate, .{})) |_| return candidate else |_| allocator.free(candidate);
     }
@@ -188,7 +213,7 @@ pub fn ownsLoadedService(definition: []const u8, loaded: []const u8) bool {
 
 /// Essential intent belongs to package metadata, even with an admin override.
 pub fn isEssential(allocator: std.mem.Allocator, name: []const u8) !bool {
-    return isEssentialIn(allocator, paths.pkg_sources, name);
+    return isEssentialIn(allocator, pkgSources(), name);
 }
 
 /// Look up the essential marker in `source_dir`. An instance such as "foo@x"

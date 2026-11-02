@@ -259,6 +259,7 @@ pub fn build(b: *std.Build) void {
         .{ .name = "download", .path = "src/download.zig" },
         .{ .name = "service_policy", .path = "src/service_policy.zig", .filters = &.{"service policy"} },
         .{ .name = "service_reconcile", .path = "src/service_reconcile.zig", .filters = &.{"reconcileDinit"} },
+        .{ .name = "services", .path = "src/services.zig", .filters = &.{"dinit"} },
         .{ .name = "dinit", .path = "src/dinit.zig", .filters = &.{"boot intent"} },
         .{ .name = "elf", .path = "src/elf.zig" },
         .{ .name = "errors", .path = "src/errors.zig" },

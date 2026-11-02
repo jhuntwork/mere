@@ -257,6 +257,8 @@ fn listS6Rc(ctx: *mere.Context) ServiceError![]ListEntry {
 fn listDinit(ctx: *mere.Context) ServiceError![]ListEntry {
     const allocator = ctx.allocator;
     const all_names = try dinit.scanSourceNames(allocator);
+    // Each name is moved into an entry below; only the slice itself is freed.
+    defer allocator.free(all_names);
     var entries: std.ArrayList(ListEntry) = .empty;
     errdefer {
         for (entries.items) |entry| allocator.free(entry.name);
@@ -526,4 +528,137 @@ test "service operations preserve config load diagnostics" {
     const diag = test_env.ctx.getDiagnosticContext();
     try std.testing.expectEqualStrings("settings.init-provider", diag.subject.?);
     try std.testing.expect(std.mem.indexOf(u8, diag.details.?, "systemd") != null);
+}
+
+// ── Essential services through the dinit facade ───────────────────────────
+
+var test_status_text: []const u8 = "    State: started\n";
+var test_failing_prefix: ?[]const u8 = null;
+var test_commands_run: usize = 0;
+
+fn essentialFacadeRunner(allocator: std.mem.Allocator, argv: []const []const u8) anyerror!std.process.RunResult {
+    test_commands_run += 1;
+    const verb = if (argv.len > 1) argv[1] else "";
+    var code: u8 = 0;
+    // is-started / is-failed answer through the exit code; status through stdout.
+    if (std.mem.eql(u8, verb, "is-failed")) code = 1;
+    if (std.mem.eql(u8, verb, "is-started")) code = 0;
+    if (test_failing_prefix) |prefix| {
+        if (std.mem.eql(u8, verb, prefix)) code = 1;
+    }
+    return .{
+        .term = .{ .exited = code },
+        .stdout = try allocator.dupe(u8, if (std.mem.eql(u8, verb, "status")) test_status_text else ""),
+        .stderr = try allocator.dupe(u8, ""),
+    };
+}
+
+const DinitFixture = struct {
+    env: *@import("test_helpers.zig").TestEnv,
+    pkg_dir: []const u8,
+    admin_dir: []const u8,
+
+    fn init() !DinitFixture {
+        const th = @import("test_helpers.zig");
+        const env = try th.createTestEnv();
+        const a = env.ctx.allocator;
+        var cfg = mere.config.Config.init(&env.ctx, a);
+        cfg.init_provider = .dinit;
+        env.ctx.configuration = cfg;
+        const pkg_dir = try std.fs.path.join(a, &.{ env.path, "pkg.d" });
+        const admin_dir = try std.fs.path.join(a, &.{ env.path, "admin.d" });
+        try path_mod.ensureDirExists(pkg_dir);
+        try path_mod.ensureDirExists(admin_dir);
+        dinit.setSourceDirsForTest(pkg_dir, admin_dir);
+        dinit.setRunnerForTest(essentialFacadeRunner);
+        test_status_text = "    State: started\n";
+        test_failing_prefix = null;
+        test_commands_run = 0;
+        return .{ .env = env, .pkg_dir = pkg_dir, .admin_dir = admin_dir };
+    }
+
+    fn deinit(self: *DinitFixture) void {
+        dinit.setRunnerForTest(null);
+        dinit.setSourceDirsForTest(null, null);
+        const a = self.env.ctx.allocator;
+        a.free(self.pkg_dir);
+        a.free(self.admin_dir);
+        self.env.cleanup();
+        std.testing.allocator.destroy(self.env);
+    }
+
+    fn write(self: *DinitFixture, dir: []const u8, name: []const u8, content: []const u8) !void {
+        const full = try std.fs.path.join(self.env.ctx.allocator, &.{ dir, name });
+        defer self.env.ctx.allocator.free(full);
+        var file = try std.Io.Dir.createFileAbsolute(path_mod.currentIo(), full, .{});
+        defer file.close(path_mod.currentIo());
+        try file.writeStreamingAll(path_mod.currentIo(), content);
+    }
+};
+
+test "dinit disable refuses an essential service and runs no command" {
+    var fx = try DinitFixture.init();
+    defer fx.deinit();
+    try fx.write(fx.pkg_dir, "must-run", "type = process\ncommand = /bin/true\n# mere: essential = true\n");
+    try std.testing.expectError(error.InvalidInput, disable(&fx.env.ctx, "must-run"));
+    try std.testing.expectEqual(@as(usize, 0), test_commands_run);
+}
+
+test "dinit disable refuses an essential service even when an administrator overrides its definition" {
+    var fx = try DinitFixture.init();
+    defer fx.deinit();
+    try fx.write(fx.pkg_dir, "must-run", "type = process\ncommand = /bin/true\n# mere: essential = true\n");
+    // The override replaces the command but carries no marker; the package
+    // definition still decides whether the service is essential.
+    try fx.write(fx.admin_dir, "must-run", "type = process\ncommand = /bin/other\n");
+    try std.testing.expectError(error.InvalidInput, disable(&fx.env.ctx, "must-run"));
+    try std.testing.expectEqual(@as(usize, 0), test_commands_run);
+}
+
+test "dinit disable of an ordinary service reaches dinitctl" {
+    var fx = try DinitFixture.init();
+    defer fx.deinit();
+    try fx.write(fx.pkg_dir, "ordinary", "type = process\ncommand = /bin/true\n");
+    try disable(&fx.env.ctx, "ordinary");
+    try std.testing.expectEqual(@as(usize, 1), test_commands_run);
+}
+
+test "dinit disable refuses an instance of an essential template" {
+    var fx = try DinitFixture.init();
+    defer fx.deinit();
+    try fx.write(fx.pkg_dir, "getty@", "type = process\ncommand = /bin/true\n# mere: essential = true\n");
+    try std.testing.expectError(error.InvalidInput, disable(&fx.env.ctx, "getty@tty1"));
+    try std.testing.expectEqual(@as(usize, 0), test_commands_run);
+}
+
+test "dinit status and list report an essential service as essential" {
+    var fx = try DinitFixture.init();
+    defer fx.deinit();
+    try fx.write(fx.pkg_dir, "must-run", "type = process\ncommand = /bin/true\n# mere: essential = true\n");
+    try fx.write(fx.pkg_dir, "ordinary", "type = process\ncommand = /bin/true\n");
+
+    var detail = try status(&fx.env.ctx, "must-run");
+    defer detail.deinit(&fx.env.ctx);
+    try std.testing.expectEqual(BootState.essential, detail.boot_state);
+    try std.testing.expectEqualStrings("essential", detail.boot_state.label());
+
+    var plain = try status(&fx.env.ctx, "ordinary");
+    defer plain.deinit(&fx.env.ctx);
+    try std.testing.expect(plain.boot_state != BootState.essential);
+
+    const entries = try list(&fx.env.ctx);
+    defer freeList(&fx.env.ctx, entries);
+    var seen_essential = false;
+    var seen_other = false;
+    for (entries) |entry| {
+        if (std.mem.eql(u8, entry.name, "must-run")) {
+            try std.testing.expectEqual(BootState.essential, entry.boot_state);
+            seen_essential = true;
+        }
+        if (std.mem.eql(u8, entry.name, "ordinary")) {
+            try std.testing.expect(entry.boot_state != BootState.essential);
+            seen_other = true;
+        }
+    }
+    try std.testing.expect(seen_essential and seen_other);
 }
