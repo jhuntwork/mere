@@ -14,6 +14,7 @@ test {
     _ = @import("build_orchestrator.zig");
     _ = @import("config.zig");
     _ = @import("download.zig");
+    _ = @import("dinit.zig");
     _ = @import("dev_cleanup.zig");
     _ = @import("elf.zig");
     _ = @import("errors.zig");
