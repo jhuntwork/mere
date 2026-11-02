@@ -39,10 +39,6 @@ pub fn checkTransitionWith(ctx: *mere.Context, previous: []const generation.Pack
     if (!(probe.is_host_root(ctx.root_path) catch return ctx.fail(error.InvalidInput, ctx.root_path, "cannot resolve activation root; generation not activated"))) return;
     const provider = if (ctx.configuration) |*cfg| cfg.effectiveInitProvider() else .s6rc;
     if (provider != .dinit) return;
-    const live = probe.is_live_dinit(ctx.allocator) catch
-        return ctx.fail(error.InvalidInput, "dinit", "cannot determine the active init system; generation not activated");
-    ctx.debug("service policy live={}", .{live});
-    if (!live) return;
     var old_names = try serviceNames(ctx, previous);
     defer freeNames(ctx.allocator, &old_names);
     var new_names = try serviceNames(ctx, target);
@@ -53,7 +49,13 @@ pub fn checkTransitionWith(ctx: *mere.Context, previous: []const generation.Pack
     while (names.next()) |name| {
         if (!new_names.contains(name.*)) try removed.append(ctx.allocator, name.*);
     }
+    // Nothing is removed, so no live service can be affected. Do not require
+    // a readable init identity for a transition that cannot touch one.
     if (removed.items.len == 0) return;
+    const live = probe.is_live_dinit(ctx.allocator) catch
+        return ctx.fail(error.InvalidInput, "dinit", "cannot determine the active init system; generation not activated");
+    ctx.debug("service policy live={}", .{live});
+    if (!live) return;
     // A successful list distinguishes an unloaded service from a lost socket.
     const loaded = probe.list_services(ctx.allocator) catch
         return ctx.fail(error.InvalidInput, "dinit", "cannot inspect live services; generation not activated");
@@ -286,6 +288,16 @@ test "service policy fails closed when the service state is unrecognised" {
     fake_list_text = "[[+]     ] worker (pid: 7)\n";
     fake_status_text = "socket error\n";
     try std.testing.expectError(error.InvalidInput, checkTransitionWith(&fx.env.ctx, &.{before}, &.{}, fake_probe));
+}
+
+// An unreadable init identity must not block a transition that removes
+// nothing: no live service can be affected by it.
+test "service policy ignores an unreadable init identity when nothing is removed" {
+    var fx = try PolicyFixture.init();
+    defer fx.deinit();
+    const before = try fx.package("daemon-pkg", &.{"worker"});
+    fake_live_error = error.FileNotFound;
+    try checkTransitionWith(&fx.env.ctx, &.{before}, &.{before}, fake_probe);
 }
 
 test "service policy still fails closed on an unreadable init identity when a service is removed" {
