@@ -254,16 +254,16 @@ pub const Data = struct {
         service.log = source.log;
 
         for (source.command.items) |value| {
-            try service.command.append(self.allocator, try self.allocator.dupe(u8, value));
+            try appendDuped(self.allocator, &service.command, value);
         }
         for (source.up.items) |value| {
-            try service.up.append(self.allocator, try self.allocator.dupe(u8, value));
+            try appendDuped(self.allocator, &service.up, value);
         }
         for (source.down.items) |value| {
-            try service.down.append(self.allocator, try self.allocator.dupe(u8, value));
+            try appendDuped(self.allocator, &service.down, value);
         }
         for (source.depends_on.items) |value| {
-            try service.depends_on.append(self.allocator, try self.allocator.dupe(u8, value));
+            try appendDuped(self.allocator, &service.depends_on, value);
         }
 
         try self.services.append(self.allocator, service);
@@ -274,10 +274,10 @@ pub const Data = struct {
         errdefer realizer.deinit(self.allocator);
         realizer.name = self.allocator.dupe(u8, source.name) catch return MetaError.OutOfMemory;
         for (source.inputs.items) |value| {
-            try realizer.inputs.append(self.allocator, try self.allocator.dupe(u8, value));
+            try appendDuped(self.allocator, &realizer.inputs, value);
         }
         for (source.command.items) |value| {
-            try realizer.command.append(self.allocator, try self.allocator.dupe(u8, value));
+            try appendDuped(self.allocator, &realizer.command, value);
         }
         try self.realizers.append(self.allocator, realizer);
     }
@@ -572,6 +572,14 @@ fn appendMetaArgs(
     buffer.append(allocator, '\n') catch return MetaError.OutOfMemory;
 }
 
+/// Duplicate `value` and append it to `list`, freeing the copy if the append
+/// fails so a failure never leaves an unowned allocation behind.
+fn appendDuped(allocator: std.mem.Allocator, list: *std.ArrayList([]const u8), value: []const u8) MetaError!void {
+    const owned = allocator.dupe(u8, value) catch return MetaError.OutOfMemory;
+    errdefer allocator.free(owned);
+    list.append(allocator, owned) catch return MetaError.OutOfMemory;
+}
+
 fn appendIndent(buffer: *std.ArrayList(u8), allocator: std.mem.Allocator, count: usize) MetaError!void {
     var i: usize = 0;
     while (i < count) : (i += 1) buffer.append(allocator, ' ') catch return MetaError.OutOfMemory;
@@ -586,9 +594,7 @@ fn parseServiceArgs(
     if (node.findChild(name)) |child| {
         for (child.arguments.items) |arg| {
             const value = arg.getString() orelse return MetaError.InvalidInput;
-            const owned = try allocator.dupe(u8, value);
-            errdefer allocator.free(owned);
-            try values.append(allocator, owned);
+            try appendDuped(allocator, values, value);
         }
     }
 }
@@ -946,4 +952,40 @@ test "Data generation realizer metadata roundtrip" {
     try std.testing.expectEqualStrings("!usr/share/glib-2.0/schemas/ignored.xml", parsed_realizer.inputs.items[1]);
     try std.testing.expectEqualStrings("/usr/bin/glib-compile-schemas", parsed_realizer.command.items[0]);
     try std.testing.expectEqualStrings("usr/share/glib-2.0/schemas", parsed_realizer.command.items[1]);
+}
+
+fn sweepAddService(allocator: std.mem.Allocator) error{OutOfMemory}!void {
+    var source = Service.init(std.testing.allocator);
+    defer source.deinit(std.testing.allocator);
+    source.name = try std.testing.allocator.dupe(u8, "svc");
+    try source.command.append(std.testing.allocator, try std.testing.allocator.dupe(u8, "/bin/a"));
+    try source.command.append(std.testing.allocator, try std.testing.allocator.dupe(u8, "-x"));
+    try source.up.append(std.testing.allocator, try std.testing.allocator.dupe(u8, "/bin/up"));
+    try source.down.append(std.testing.allocator, try std.testing.allocator.dupe(u8, "/bin/down"));
+    try source.depends_on.append(std.testing.allocator, try std.testing.allocator.dupe(u8, "dep"));
+
+    var data = Data.init(allocator);
+    defer data.deinit();
+    data.addService(source) catch return error.OutOfMemory;
+}
+
+test "addService releases its allocations on every failure point" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, sweepAddService, .{});
+}
+
+fn sweepAddRealizer(allocator: std.mem.Allocator) error{OutOfMemory}!void {
+    var source = Realizer.init();
+    defer source.deinit(std.testing.allocator);
+    source.name = try std.testing.allocator.dupe(u8, "r");
+    try source.inputs.append(std.testing.allocator, try std.testing.allocator.dupe(u8, "a/*.xml"));
+    try source.inputs.append(std.testing.allocator, try std.testing.allocator.dupe(u8, "b"));
+    try source.command.append(std.testing.allocator, try std.testing.allocator.dupe(u8, "/bin/tool"));
+
+    var data = Data.init(allocator);
+    defer data.deinit();
+    data.addRealizer(source) catch return error.OutOfMemory;
+}
+
+test "addRealizer releases its allocations on every failure point" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, sweepAddRealizer, .{});
 }
