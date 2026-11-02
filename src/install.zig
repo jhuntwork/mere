@@ -25,7 +25,6 @@ const path_safety = @import("path_safety.zig");
 const profile = @import("profile.zig");
 const generation = @import("generation.zig");
 const activation = @import("activation.zig");
-const service_reconcile = @import("service_reconcile.zig");
 const gcroots = @import("gcroots.zig");
 const scratch = @import("scratch.zig");
 const version_mod = @import("version.zig");
@@ -1864,19 +1863,6 @@ fn applyProfileRealization(ctx: *Context, prof_name: []const u8, installed_packa
         const current_gen = generation.getCurrentGeneration(profile_dir) catch |err| {
             return ctx.failFmt(mapGenerationError(err), profile_dir, "failed to read current generation: {s}", .{@errorName(err)});
         };
-        var previous_manifest: ?generation.GenerationManifest = null;
-        defer if (previous_manifest) |*manifest_data| manifest_data.deinit();
-
-        if (current_gen) |gen_num| {
-            const previous_path = generation.getGenerationPath(ctx.allocator, profile_dir, gen_num) catch |err| {
-                return ctx.failFmt(mapGenerationError(err), profile_dir, "failed to construct current generation path: {s}", .{@errorName(err)});
-            };
-            defer ctx.allocator.free(previous_path);
-            previous_manifest = generation.readManifest(ctx.allocator, store_root, previous_path) catch |err| {
-                return ctx.failFmt(mapGenerationError(err), previous_path, "failed to read current generation manifest: {s}", .{@errorName(err)});
-            };
-        }
-
         const gen_num = profile.createGeneration(
             ctx,
             profile_dir,
@@ -1900,22 +1886,6 @@ fn applyProfileRealization(ctx: *Context, prof_name: []const u8, installed_packa
 
         emitGenerationStatus(ctx, "created", gen_num, prof_name, phase);
 
-        const provider = if (ctx.configuration) |*cfg| cfg.effectiveInitProvider() else .s6rc;
-        var staged_dinit: ?service_reconcile.StagedDinit = null;
-        defer if (staged_dinit) |*staged| staged.discard();
-        if (provider == .dinit) {
-            const generation_path = generation.getGenerationPath(ctx.allocator, profile_dir, gen_num) catch {
-                return ctx.fail(error.OutOfMemory, profile_dir, "failed to construct generation path for dinit services");
-            };
-            defer ctx.allocator.free(generation_path);
-            staged_dinit = try service_reconcile.stageDinit(
-                ctx,
-                generation_path,
-                installed_packages,
-                if (previous_manifest) |*manifest_data| manifest_data.packages.items else &.{},
-            );
-        }
-
         const result = activation.activateSystemGeneration(
             ctx,
             gen_num,
@@ -1924,18 +1894,6 @@ fn applyProfileRealization(ctx: *Context, prof_name: []const u8, installed_packa
             ctx.debug("failed to activate generation: {}", .{err});
             return mapActivationFailure(ctx, err, profile_dir, "failed to activate generation");
         };
-
-        if (staged_dinit) |*staged| {
-            staged.commit() catch |err| {
-                ctx.debug("failed to commit dinit services: {}", .{err});
-                return ctx.fail(switch (err) {
-                    service_reconcile.ReconcileError.OutOfMemory => error.OutOfMemory,
-                    service_reconcile.ReconcileError.PermissionDenied => error.PermissionDenied,
-                    service_reconcile.ReconcileError.InvalidInput, service_reconcile.ReconcileError.DuplicateService => error.InvalidInput,
-                    else => error.FileSystem,
-                }, profile_dir, "failed to commit dinit services");
-            };
-        }
 
         var gen_buf: [32]u8 = undefined;
         var copied_buf: [32]u8 = undefined;

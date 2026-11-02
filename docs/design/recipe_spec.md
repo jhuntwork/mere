@@ -361,7 +361,7 @@ package "ntpd" {
 | `down` | string(s) | no (oneshot) | Command to bring the service down |
 | `depends-on` | string(s) | no | Service names this service depends on |
 | `ready-notification` | integer | no | File descriptor for readiness notification (daemon only) |
-| `essential` | boolean | no | Mark as essential boot infrastructure (default: `false`). Essential services are hidden from `mere status` and placed in the `always` bundle. |
+| `essential` | boolean | no | Mark as required boot infrastructure (default: `false`). With dinit, services enter the required `mere-essential` bundle, remain visible as essential in status, and cannot be disabled normally. This does not start them during installation. Legacy s6-rc uses its `always` bundle. |
 | `log` | boolean | no | Generate logging pipeline (default: `true`). Set to `false` for services that feed another logger (e.g., klogd → syslogd). |
 | `env` | properties | no | Environment variables to set (e.g., `env { XDG_RUNTIME_DIR "/run/xdg/greeter" }`) |
 

@@ -257,6 +257,8 @@ pub fn build(b: *std.Build) void {
         .{ .name = "commands_test", .path = "src/cli/commands_test.zig" },
         .{ .name = "config", .path = "src/config.zig" },
         .{ .name = "download", .path = "src/download.zig" },
+        .{ .name = "service_policy", .path = "src/service_policy.zig", .filters = &.{"service policy"} },
+        .{ .name = "service_reconcile", .path = "src/service_reconcile.zig", .filters = &.{"reconcileDinit"} },
         .{ .name = "dinit", .path = "src/dinit.zig", .filters = &.{"boot intent"} },
         .{ .name = "elf", .path = "src/elf.zig" },
         .{ .name = "errors", .path = "src/errors.zig" },

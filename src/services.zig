@@ -131,7 +131,11 @@ pub fn disable(ctx: *mere.Context, name: []const u8) ServiceError!void {
             try s6rc.setCommit(allocator);
             try s6rc.setInstall(allocator);
         },
-        .dinit => try dinit.disableService(ctx.allocator, name),
+        .dinit => {
+            if (dinit.isEssential(ctx.allocator, name) catch return error.ProcessFailed)
+                return ctx.fail(error.InvalidInput, name, "essential boot services cannot be disabled");
+            try dinit.disableService(ctx.allocator, name);
+        },
     }
 }
 
@@ -179,7 +183,7 @@ fn statusDinit(ctx: *mere.Context, name: []const u8) ServiceError!StatusDetail {
 
     const kind = dinit.serviceKind(allocator, name) catch return error.ProcessFailed;
     const state = try dinitState(allocator, raw);
-    const boot_state: BootState = if (dinit.isBootEnabled(allocator, name) catch return error.ProcessFailed) .enabled else .disabled;
+    const boot_state: BootState = if (dinit.isEssential(allocator, name) catch return error.ProcessFailed) .essential else if (dinit.isBootEnabled(allocator, name) catch return error.ProcessFailed) .enabled else .disabled;
     const is_daemon = kind == .daemon;
 
     return .{
@@ -266,7 +270,7 @@ fn listDinit(ctx: *mere.Context) ServiceError![]ListEntry {
         const boot_enabled = dinit.isBootEnabled(allocator, name) catch return error.ProcessFailed;
         try entries.append(allocator, .{
             .name = owned_name,
-            .boot_state = if (boot_enabled) .enabled else .disabled,
+            .boot_state = if (dinit.isEssential(allocator, name) catch return error.ProcessFailed) .essential else if (boot_enabled) .enabled else .disabled,
             .state = if (failed) "failed" else if (started) "started" else "stopped",
         });
     }

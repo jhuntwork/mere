@@ -432,6 +432,8 @@ pub fn handleActivate(ctx: *mere.Context, args: *const types.ParsedArgs) MereErr
     };
 
     const verify_store = args.getBool("verify-store");
+    // Rollback must use the selected init provider just like install/upgrade.
+    _ = ctx.getConfig() catch |err| return try command.errorResult(ctx, err, "failed to load configuration");
 
     if (try command.acquireStoreLockOrResult(ctx)) |result| return result;
     defer ctx.releaseStoreLock();

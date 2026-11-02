@@ -24,6 +24,8 @@ pub const paths = struct {
 
 /// Start a service now via dinitctl.
 pub fn startService(allocator: std.mem.Allocator, name: []const u8) !void {
+    const started = isStarted(allocator, name) catch return error.ProcessFailed;
+    if (!started) try exec(allocator, &.{ "dinitctl", "reload", name });
     try exec(allocator, &.{ "dinitctl", "start", name });
 }
 
@@ -34,6 +36,9 @@ pub fn stopService(allocator: std.mem.Allocator, name: []const u8) !void {
 
 /// Restart a running service via dinitctl.
 pub fn restartService(allocator: std.mem.Allocator, name: []const u8) !void {
+    // Refresh first: native restart otherwise reuses the cached command.
+    // Dinit validates compatible live changes without dropping dependents.
+    try exec(allocator, &.{ "dinitctl", "reload", name });
     try exec(allocator, &.{ "dinitctl", "restart", name });
 }
 
@@ -139,6 +144,51 @@ fn findSourcePath(allocator: std.mem.Allocator, name: []const u8) !?[]const u8 {
     return null;
 }
 
+/// Essential intent belongs to package metadata, even with an admin override.
+pub fn isEssential(allocator: std.mem.Allocator, name: []const u8) !bool {
+    const source = try std.fs.path.join(allocator, &.{ paths.pkg_sources, name });
+    defer allocator.free(source);
+    const content = std.Io.Dir.cwd().readFileAlloc(io(), source, allocator, .limited(1024 * 1024)) catch |err| switch (err) {
+        error.FileNotFound => return false,
+        else => return err,
+    };
+    defer allocator.free(content);
+    var lines = std.mem.splitScalar(u8, content, '\n');
+    while (lines.next()) |line| {
+        if (std.mem.eql(u8, std.mem.trim(u8, line, " \t\r"), "# mere: essential = true")) return true;
+    }
+    return false;
+}
+
+pub fn listServices(allocator: std.mem.Allocator) ![]const u8 {
+    return checkedOutput(allocator, &.{ "dinitctl", "list" });
+}
+
+pub fn listedServiceName(line: []const u8) !?[]const u8 {
+    if (std.mem.trim(u8, line, " \t\r").len == 0) return null;
+    // Dinit 0.22.1 emits a ten-column status field, including nested brackets
+    // for an explicitly started service: [[+]     ] name (pid: ...).
+    if (line.len < 11 or line[0] != '[' or line[9] != ']' or line[10] != ' ')
+        return error.ProcessFailed;
+    var fields = std.mem.tokenizeAny(u8, line[11..], " \t\r");
+    return fields.next() orelse error.ProcessFailed;
+}
+
+pub fn statusIsActive(content: []const u8) !bool {
+    var lines = std.mem.splitScalar(u8, content, '\n');
+    while (lines.next()) |line| {
+        const trimmed = std.mem.trim(u8, line, " \t\r");
+        if (!std.mem.startsWith(u8, trimmed, "State:")) continue;
+        var fields = std.mem.tokenizeAny(u8, trimmed[6..], " \t");
+        const state = fields.next() orelse return error.ProcessFailed;
+        if (std.ascii.eqlIgnoreCase(state, "stopped")) return false;
+        if (std.ascii.eqlIgnoreCase(state, "started") or std.ascii.eqlIgnoreCase(state, "starting") or
+            std.ascii.eqlIgnoreCase(state, "stopping")) return true;
+        return error.ProcessFailed;
+    }
+    return error.ProcessFailed;
+}
+
 // ── Introspection ─────────────────────────────────────────────────
 
 /// Return dinit's human-readable status output for a service.
@@ -226,4 +276,14 @@ test "boot intent reads native dependencies and directory entries" {
     try std.testing.expect(try bootFileEnables(allocator, boot, "daemon"));
     try std.Io.Dir.deleteFileAbsolute(io(), link);
     try std.testing.expect(!try bootFileEnables(allocator, boot, "daemon"));
+}
+
+test "boot intent live-state parsing fails closed and matches complete names" {
+    try std.testing.expectEqualStrings("worker", (try listedServiceName("[[+]     ] worker (pid: 7)")).?);
+    try std.testing.expectEqualStrings("worker-old", (try listedServiceName("[{+}     ] worker-old")).?);
+    try std.testing.expectError(error.ProcessFailed, listedServiceName("unknown list format"));
+    try std.testing.expect(try statusIsActive("    State: started\n"));
+    try std.testing.expect(try statusIsActive("    State: stopping\n"));
+    try std.testing.expect(!try statusIsActive("    State: STOPPED (dependency failed/terminated)\n"));
+    try std.testing.expectError(error.ProcessFailed, statusIsActive("socket error\n"));
 }

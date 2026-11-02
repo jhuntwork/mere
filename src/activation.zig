@@ -25,6 +25,8 @@ const package_manifest = @import("manifest.zig");
 const path_mod = @import("path.zig");
 const path_safety = @import("path_safety.zig");
 const store = @import("store.zig");
+const service_policy = @import("service_policy.zig");
+const service_reconcile = @import("service_reconcile.zig");
 
 /// Activation error set
 const Std = errors.StandardErrors;
@@ -86,6 +88,33 @@ pub fn activateSystemGeneration(
 
     var manifest = try loadValidatedTargetManifest(ctx, profile_dir, gen_num, verificationEnabled(verification));
     defer manifest.deinit();
+
+    const previous_num = generation.getCurrentGeneration(profile_dir) catch return ActivationError.FileSystem;
+    if (previous_num) |number| {
+        const previous_path = generation.getGenerationPath(ctx.allocator, profile_dir, number) catch return ActivationError.InvalidInput;
+        defer ctx.allocator.free(previous_path);
+        const store_root = try std.fs.path.join(ctx.allocator, &.{ ctx.root_path, "mere", "store" });
+        defer ctx.allocator.free(store_root);
+        var previous = generation.readManifest(ctx.allocator, store_root, previous_path) catch return ActivationError.CorruptData;
+        defer previous.deinit();
+        service_policy.checkTransition(ctx, previous.packages.items, manifest.packages.items) catch |err| {
+            return switch (err) {
+                error.OutOfMemory => ActivationError.OutOfMemory,
+                else => ActivationError.InvalidInput,
+            };
+        };
+    }
+
+    const provider = if (ctx.configuration) |*cfg| cfg.effectiveInitProvider() else .s6rc;
+    if (provider == .dinit) {
+        const target_path = generation.getGenerationPath(ctx.allocator, profile_dir, gen_num) catch return ActivationError.InvalidInput;
+        defer ctx.allocator.free(target_path);
+        var staged = service_reconcile.stageDinit(ctx, target_path, manifest.packages.items, &.{}) catch |err| {
+            return ctx.failFmt(if (err == error.OutOfMemory) ActivationError.OutOfMemory else ActivationError.InvalidInput, "dinit", "cannot realize generation services: {s}", .{@errorName(err)});
+        };
+        defer staged.discard();
+        staged.commit() catch return ctx.fail(ActivationError.FileSystem, "dinit", "cannot publish generation services");
+    }
 
     const etc_dir = try getEtcDir(ctx.allocator, ctx.root_path);
     defer ctx.allocator.free(etc_dir);
