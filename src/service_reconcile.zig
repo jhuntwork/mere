@@ -432,3 +432,32 @@ test "reconcileDinit rejects package services named like the essential bundle" {
         try std.testing.expectError(error.DuplicateService, reconcileDinit(&env.ctx, &.{entry}, &.{}));
     }
 }
+
+fn sweepStage(allocator: std.mem.Allocator, a_dir: []const u8, b_dir: []const u8, root: []const u8) !void {
+    var base = mere.Context.init(std.testing.allocator, root);
+    defer base.deinit();
+    var ctx = base;
+    ctx.allocator = allocator;
+    const a: generation.PackageEntry = .{ .name = "a", .version = "1", .release = 1, .arch = "any", .store_path = a_dir, .content_hash = "0" ** 64 };
+    const b: generation.PackageEntry = .{ .name = "b", .version = "1", .release = 1, .arch = "any", .store_path = b_dir, .content_hash = "0" ** 64 };
+    reconcileDinit(&ctx, &.{ a, b }, &.{}) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return err,
+    };
+}
+
+test "reconcileDinit releases its allocations on every failure point" {
+    const th = @import("test_helpers.zig");
+    var env = try th.createTestEnv();
+    defer {
+        env.cleanup();
+        std.testing.allocator.destroy(env);
+    }
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const aa = arena.allocator();
+    const a = try writeEssentialFixture(&env.ctx, aa, env.path, "svc-a", true);
+    const b = try writeEssentialFixture(&env.ctx, aa, env.path, "svc-b", false);
+    // Each run replaces the tree from the previous one, so the sweep is repeatable.
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, sweepStage, .{ a.store_path, b.store_path, env.path });
+}

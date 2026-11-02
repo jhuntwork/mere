@@ -586,7 +586,9 @@ fn parseServiceArgs(
     if (node.findChild(name)) |child| {
         for (child.arguments.items) |arg| {
             const value = arg.getString() orelse return MetaError.InvalidInput;
-            try values.append(allocator, try allocator.dupe(u8, value));
+            const owned = try allocator.dupe(u8, value);
+            errdefer allocator.free(owned);
+            try values.append(allocator, owned);
         }
     }
 }
