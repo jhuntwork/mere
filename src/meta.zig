@@ -292,19 +292,17 @@ pub const Data = struct {
         source_urls: []const []const u8,
     ) MetaError!void {
         if (description.len > 0) {
-            self.description = self.allocator.dupe(u8, description) catch return MetaError.OutOfMemory;
+            const owned = self.allocator.dupe(u8, description) catch return MetaError.OutOfMemory;
+            if (self.description) |previous| self.allocator.free(previous);
+            self.description = owned;
         }
         if (url) |u| {
-            self.url = self.allocator.dupe(u8, u) catch return MetaError.OutOfMemory;
+            const owned = self.allocator.dupe(u8, u) catch return MetaError.OutOfMemory;
+            if (self.url) |previous| self.allocator.free(previous);
+            self.url = owned;
         }
-        for (licenses) |l| {
-            const copy = self.allocator.dupe(u8, l) catch return MetaError.OutOfMemory;
-            self.licenses.append(self.allocator, copy) catch return MetaError.OutOfMemory;
-        }
-        for (source_urls) |s| {
-            const copy = self.allocator.dupe(u8, s) catch return MetaError.OutOfMemory;
-            self.source_urls.append(self.allocator, copy) catch return MetaError.OutOfMemory;
-        }
+        for (licenses) |l| try appendDuped(self.allocator, &self.licenses, l);
+        for (source_urls) |s| try appendDuped(self.allocator, &self.source_urls, s);
     }
 
     pub fn encode(self: *const Data, allocator: std.mem.Allocator) MetaError![]u8 {
@@ -528,21 +526,23 @@ pub const Data = struct {
                 for (node.children.items) |*child| {
                     if (std.mem.eql(u8, child.name, "description")) {
                         if (child.getFirstArgString()) |value| {
-                            meta.description = allocator.dupe(u8, value) catch return MetaError.OutOfMemory;
+                            const owned = allocator.dupe(u8, value) catch return MetaError.OutOfMemory;
+                            if (meta.description) |previous| allocator.free(previous);
+                            meta.description = owned;
                         }
                     } else if (std.mem.eql(u8, child.name, "url")) {
                         if (child.getFirstArgString()) |value| {
-                            meta.url = allocator.dupe(u8, value) catch return MetaError.OutOfMemory;
+                            const owned = allocator.dupe(u8, value) catch return MetaError.OutOfMemory;
+                            if (meta.url) |previous| allocator.free(previous);
+                            meta.url = owned;
                         }
                     } else if (std.mem.eql(u8, child.name, "license")) {
                         if (child.getFirstArgString()) |value| {
-                            const copy = allocator.dupe(u8, value) catch return MetaError.OutOfMemory;
-                            meta.licenses.append(allocator, copy) catch return MetaError.OutOfMemory;
+                            try appendDuped(allocator, &meta.licenses, value);
                         }
                     } else if (std.mem.eql(u8, child.name, "source")) {
                         if (child.getFirstArgString()) |value| {
-                            const copy = allocator.dupe(u8, value) catch return MetaError.OutOfMemory;
-                            meta.source_urls.append(allocator, copy) catch return MetaError.OutOfMemory;
+                            try appendDuped(allocator, &meta.source_urls, value);
                         }
                     }
                 }
@@ -988,4 +988,39 @@ fn sweepAddRealizer(allocator: std.mem.Allocator) error{OutOfMemory}!void {
 
 test "addRealizer releases its allocations on every failure point" {
     try std.testing.checkAllAllocationFailures(std.testing.allocator, sweepAddRealizer, .{});
+}
+
+fn sweepRecipeMetadata(allocator: std.mem.Allocator) error{OutOfMemory}!void {
+    var data = Data.init(allocator);
+    defer data.deinit();
+    data.populateRecipeMetadata(
+        "a description",
+        "https://example.org/pkg",
+        &.{ "MIT", "BSD-3-Clause" },
+        &.{ "https://example.org/a.tar.xz", "https://example.org/b.patch" },
+    ) catch return error.OutOfMemory;
+}
+
+test "populateRecipeMetadata releases its allocations on every failure point" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, sweepRecipeMetadata, .{});
+}
+
+test "a repeated description or url replaces the earlier value without leaking it" {
+    const allocator = std.testing.allocator;
+    var data = try Data.parse(allocator,
+        \\metadata {
+        \\    description "first"
+        \\    url "https://example.org/first"
+        \\    description "second"
+        \\    url "https://example.org/second"
+        \\}
+        \\
+    );
+    defer data.deinit();
+    try std.testing.expectEqualStrings("second", data.description.?);
+    try std.testing.expectEqualStrings("https://example.org/second", data.url.?);
+
+    try data.populateRecipeMetadata("third", "https://example.org/third", &.{}, &.{});
+    try std.testing.expectEqualStrings("third", data.description.?);
+    try std.testing.expectEqualStrings("https://example.org/third", data.url.?);
 }
