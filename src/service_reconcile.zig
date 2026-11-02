@@ -377,3 +377,58 @@ test "reconcileDinit materializes metadata and removes stale services" {
     defer allocator.free(empty);
     try std.testing.expect(std.mem.indexOf(u8, empty, "depends-on") == null);
 }
+
+fn writeEssentialFixture(ctx: *mere.Context, arena: std.mem.Allocator, root: []const u8, name: []const u8, essential: bool) !generation.PackageEntry {
+    const dir = try std.fs.path.join(arena, &.{ root, name });
+    try path.ensureDirExists(dir);
+    var data = meta.Data.init(ctx.allocator);
+    defer data.deinit();
+    var service = meta.Service.init(ctx.allocator);
+    service.name = try ctx.allocator.dupe(u8, name);
+    service.service_type = .daemon;
+    service.essential = essential;
+    try service.command.append(ctx.allocator, try ctx.allocator.dupe(u8, "/bin/true"));
+    try data.services.append(ctx.allocator, service);
+    try meta.writeFile(ctx.allocator, dir, &data);
+    return .{ .name = name, .version = "1", .release = 1, .arch = "any", .store_path = dir, .content_hash = "0" ** 64 };
+}
+
+test "reconcileDinit exposes the essential bundle through mere-essential.d" {
+    const th = @import("test_helpers.zig");
+    var env = try th.createTestEnv();
+    defer {
+        env.cleanup();
+        std.testing.allocator.destroy(env);
+    }
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const entry = try writeEssentialFixture(&env.ctx, a, env.path, "must-run", true);
+
+    try reconcileDinit(&env.ctx, &.{entry}, &.{});
+
+    const link = try std.fs.path.join(a, &.{ env.path, "usr", "share", "dinit.d", "mere-essential.d", "mere-essential" });
+    var target_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const target_len = try std.Io.Dir.readLinkAbsolute(path.currentIo(), link, &target_buf);
+    try std.testing.expectEqualStrings("../mere-essential", target_buf[0..target_len]);
+    // The link must resolve to the generated bundle, since dinit follows it.
+    const bundle = try std.Io.Dir.cwd().readFileAlloc(path.currentIo(), link, a, .limited(4096));
+    try std.testing.expect(std.mem.indexOf(u8, bundle, "depends-on = must-run\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, bundle, "# mere: essential = true\n") != null);
+}
+
+test "reconcileDinit rejects package services named like the essential bundle" {
+    const th = @import("test_helpers.zig");
+    var env = try th.createTestEnv();
+    defer {
+        env.cleanup();
+        std.testing.allocator.destroy(env);
+    }
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    for ([_][]const u8{ "mere-essential", "mere-essential.d" }) |reserved| {
+        const entry = try writeEssentialFixture(&env.ctx, a, env.path, reserved, false);
+        try std.testing.expectError(error.DuplicateService, reconcileDinit(&env.ctx, &.{entry}, &.{}));
+    }
+}
