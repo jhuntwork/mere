@@ -95,25 +95,27 @@ pub fn disableService(allocator: std.mem.Allocator, name: []const u8) !void {
 }
 
 /// Scan source paths and return every available service name.
-pub fn scanSourceNames(allocator: std.mem.Allocator) ![]const []const u8 {
+pub fn scanSourceNames(allocator: std.mem.Allocator) error{OutOfMemory}![]const []const u8 {
     var names = std.StringHashMap(void).init(allocator);
-
-    // The keys are handed to the caller through `list`; only the map's own
-    // storage is released here.
+    // The keys are returned to the caller; only the map's own storage is
+    // released on success. On failure the keys go too.
     defer names.deinit();
-
-    scanNamesFromPath(allocator, pkgSources(), &names);
-    scanNamesFromPath(allocator, adminSources(), &names);
-
-    var list: std.ArrayList([]const u8) = .empty;
-    var it = names.keyIterator();
-    while (it.next()) |key| {
-        list.append(allocator, key.*) catch continue;
+    errdefer {
+        var keys = names.keyIterator();
+        while (keys.next()) |key| allocator.free(key.*);
     }
-    return list.toOwnedSlice(allocator) catch return error.OutOfMemory;
+
+    try scanNamesFromPath(allocator, pkgSources(), &names);
+    try scanNamesFromPath(allocator, adminSources(), &names);
+
+    var list = try std.ArrayList([]const u8).initCapacity(allocator, names.count());
+    errdefer list.deinit(allocator);
+    var it = names.keyIterator();
+    while (it.next()) |key| list.appendAssumeCapacity(key.*);
+    return list.toOwnedSlice(allocator);
 }
 
-fn scanNamesFromPath(allocator: std.mem.Allocator, base: []const u8, names: *std.StringHashMap(void)) void {
+fn scanNamesFromPath(allocator: std.mem.Allocator, base: []const u8, names: *std.StringHashMap(void)) error{OutOfMemory}!void {
     var dir = std.Io.Dir.cwd().openDir(io(), base, .{ .iterate = true }) catch return;
     defer dir.close(io());
     var iter = dir.iterate();
@@ -122,10 +124,11 @@ fn scanNamesFromPath(allocator: std.mem.Allocator, base: []const u8, names: *std
         if (entry.kind != .file) continue;
         if (std.mem.eql(u8, entry.name, paths.boot_bundle)) continue;
         // A name present in both directories (an administrator override) is
-        // already recorded; duplicating it again would leak the second copy.
+        // already recorded; recording it again would leak the second copy.
         if (names.contains(entry.name)) continue;
-        const name = allocator.dupe(u8, entry.name) catch continue;
-        names.put(name, {}) catch continue;
+        const name = try allocator.dupe(u8, entry.name);
+        errdefer allocator.free(name);
+        try names.put(name, {});
     }
 }
 
@@ -326,6 +329,8 @@ fn execStep(allocator: std.mem.Allocator, step: []const u8, argv: []const []cons
 
 fn exec(allocator: std.mem.Allocator, argv: []const []const u8) !void {
     const result = run(allocator, argv) catch return error.ProcessFailed;
+    defer allocator.free(result.stdout);
+    defer allocator.free(result.stderr);
     if (result.term != .exited or result.term.exited != 0) {
         if (result.stderr.len > 0) {
             const stderr = std.Io.File.stderr();
@@ -415,11 +420,10 @@ fn recordingRunner(allocator: std.mem.Allocator, argv: []const []const u8) anyer
         if (std.mem.startsWith(u8, joined.items, prefix)) code = 1;
     }
     const is_status = argv.len > 1 and std.mem.eql(u8, argv[1], "status");
-    return .{
-        .term = .{ .exited = code },
-        .stdout = try allocator.dupe(u8, if (is_status) canned_status else ""),
-        .stderr = try allocator.dupe(u8, ""),
-    };
+    const stdout = try allocator.dupe(u8, if (is_status) canned_status else "ok\n");
+    errdefer allocator.free(stdout);
+    const stderr = try allocator.dupe(u8, if (code != 0) "refused\n" else "note\n");
+    return .{ .term = .{ .exited = code }, .stdout = stdout, .stderr = stderr };
 }
 
 fn resetRecording() void {
@@ -526,4 +530,59 @@ test "boot intent essential lookup falls back from an instance to its template" 
     try std.testing.expect(try isEssentialIn(allocator, env.path, "getty@tty1"));
     try std.testing.expect(!try isEssentialIn(allocator, env.path, "other@tty1"));
     try std.testing.expect(!try isEssentialIn(allocator, env.path, "getty"));
+}
+
+// Inject an allocation failure at every allocation in turn. Each function must
+// either succeed or return OutOfMemory, and must release everything either way.
+
+fn sweepStart(allocator: std.mem.Allocator) error{OutOfMemory}!void {
+    setRunnerForTest(recordingRunner);
+    defer setRunnerForTest(null);
+    canned_status = "    State: stopped\n";
+    // startService reports any failure as ProcessFailed; the sweep only cares
+    // that nothing is left behind, so fold the outcome into OutOfMemory/success.
+    startService(allocator, "worker") catch return error.OutOfMemory;
+    restartService(allocator, "worker") catch return error.OutOfMemory;
+}
+
+test "boot intent start and restart release their allocations on every failure point" {
+    defer resetRecording();
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, sweepStart, .{});
+}
+
+fn sweepScan(allocator: std.mem.Allocator, pkg: []const u8, admin: []const u8) !void {
+    setSourceDirsForTest(pkg, admin);
+    defer setSourceDirsForTest(null, null);
+    const names = try scanSourceNames(allocator);
+    for (names) |name| allocator.free(name);
+    allocator.free(names);
+}
+
+test "boot intent scanning service names releases its allocations on every failure point" {
+    const th = @import("test_helpers.zig");
+    var env = try th.createTestEnv();
+    defer {
+        env.cleanup();
+        std.testing.allocator.destroy(env);
+    }
+    const a = env.ctx.allocator;
+    const pkg = try std.fs.path.join(a, &.{ env.path, "pkg.d" });
+    defer a.free(pkg);
+    const admin = try std.fs.path.join(a, &.{ env.path, "admin.d" });
+    defer a.free(admin);
+    try path_mod.ensureDirExists(pkg);
+    try path_mod.ensureDirExists(admin);
+    for ([_][]const u8{ "alpha", "beta", "gamma" }) |name| {
+        const f = try std.fs.path.join(a, &.{ pkg, name });
+        defer a.free(f);
+        var file = try std.Io.Dir.createFileAbsolute(io(), f, .{});
+        file.close(io());
+    }
+    // An override present in both directories exercises the duplicate path.
+    const over = try std.fs.path.join(a, &.{ admin, "beta" });
+    defer a.free(over);
+    var file = try std.Io.Dir.createFileAbsolute(io(), over, .{});
+    file.close(io());
+
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, sweepScan, .{ pkg, admin });
 }
