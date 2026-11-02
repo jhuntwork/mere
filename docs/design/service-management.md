@@ -65,14 +65,18 @@ prescriptions. No command does both.
 
 **`mere enable ntpd`**:
 1. For s6-rc, assemble sources, sync the repo, and set the active prescription.
-2. For dinit, add the service to the `boot` bundle with `dinitctl enable`.
-3. Neither provider starts the service as a side effect.
+2. For dinit, add the service to the `boot` bundle with offline `dinitctl enable`, using
+   `/etc/dinit.d` and `/usr/share/dinit.d` as service paths.
+3. Neither provider starts the service as a side effect. dinit enable/disable
+   edit the persistent dependency directory without modifying the loaded graph.
 
 **`mere start ntpd`** changes live state only; **`mere disable ntpd`** removes
 boot intent but leaves a running service alone; **`mere stop ntpd`** changes
 live state only. dinit status/list/logs use its native `dinitctl` protocol;
 when buffered output is unavailable, logs fall back to the configured service
-log file.
+log file. dinit boot status reads persistent native dependencies and dependency
+directory entries, independently of live state. `mere reload` sends SIGHUP to the
+service process; it does not reload dinit's service description.
 
 ## Recipe Service Definitions
 

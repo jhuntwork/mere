@@ -37,19 +37,19 @@ pub fn restartService(allocator: std.mem.Allocator, name: []const u8) !void {
     try exec(allocator, &.{ "dinitctl", "restart", name });
 }
 
-/// Ask dinit to reload the running service's configuration.
+/// Signal the running process to reload its configuration without restarting.
 pub fn reloadService(allocator: std.mem.Allocator, name: []const u8) !void {
-    try exec(allocator, &.{ "dinitctl", "reload", name });
+    try exec(allocator, &.{ "dinitctl", "signal", "HUP", name });
 }
 
 /// Add a service to the boot bundle without changing its live state.
 pub fn enableService(allocator: std.mem.Allocator, name: []const u8) !void {
-    try exec(allocator, &.{ "dinitctl", "enable", "--from", paths.boot_bundle, name });
+    try exec(allocator, &.{ "dinitctl", "--offline", "-d", paths.admin_sources, "-d", paths.pkg_sources, "enable", "--from", paths.boot_bundle, name });
 }
 
 /// Remove a service from the boot bundle without changing its live state.
 pub fn disableService(allocator: std.mem.Allocator, name: []const u8) !void {
-    try exec(allocator, &.{ "dinitctl", "disable", "--from", paths.boot_bundle, name });
+    try exec(allocator, &.{ "dinitctl", "--offline", "-d", paths.admin_sources, "-d", paths.pkg_sources, "disable", "--from", paths.boot_bundle, name });
 }
 
 /// Scan source paths and return every available service name.
@@ -91,21 +91,41 @@ pub fn serviceKind(allocator: std.mem.Allocator, name: []const u8) !enum { daemo
     return .daemon;
 }
 
-/// Return whether the boot bundle declares a dependency on the service.
+/// Read persistent boot intent, independently of dinit's loaded/live graph.
 pub fn isBootEnabled(allocator: std.mem.Allocator, name: []const u8) !bool {
-    const content = std.Io.Dir.cwd().readFileAlloc(io(), paths.admin_sources ++ "/" ++ paths.boot_bundle, allocator, .limited(1024 * 1024)) catch |err| {
-        return switch (err) {
-            error.FileNotFound => false,
-            else => error.ProcessFailed,
-        };
-    };
+    const source = try findSourcePath(allocator, paths.boot_bundle);
+    defer if (source) |value| allocator.free(value);
+    return bootFileEnables(allocator, source orelse return false, name);
+}
+
+fn bootFileEnables(allocator: std.mem.Allocator, source: []const u8, name: []const u8) !bool {
+    const content = try std.Io.Dir.cwd().readFileAlloc(io(), source, allocator, .limited(1024 * 1024));
     defer allocator.free(content);
     var lines = std.mem.splitScalar(u8, content, '\n');
     while (lines.next()) |line| {
-        const trimmed = std.mem.trim(u8, line, " \t");
-        if (std.mem.startsWith(u8, trimmed, "depends-on:")) {
-            const dependency = std.mem.trim(u8, trimmed["depends-on:".len..], " \t");
-            if (std.mem.eql(u8, dependency, name)) return true;
+        const uncommented = line[0 .. std.mem.indexOfScalar(u8, line, '#') orelse line.len];
+        const separator = std.mem.indexOfAny(u8, uncommented, "=:") orelse continue;
+        const key = std.mem.trim(u8, uncommented[0..separator], " \t");
+        const value = std.mem.trim(u8, uncommented[separator + 1 ..], " \t\r");
+        if (std.mem.eql(u8, key, "depends-on") or std.mem.eql(u8, key, "waits-for") or
+            std.mem.eql(u8, key, "depends-ms"))
+        {
+            if (std.mem.eql(u8, value, name)) return true;
+        } else if (std.mem.eql(u8, key, "waits-for.d") or std.mem.eql(u8, key, "depends-on.d") or
+            std.mem.eql(u8, key, "depends-ms.d"))
+        {
+            const directory = try std.fs.path.resolve(allocator, &.{ std.fs.path.dirname(source).?, value });
+            defer allocator.free(directory);
+            var dir = std.Io.Dir.openDirAbsolute(io(), directory, .{ .iterate = true }) catch |err| switch (err) {
+                error.FileNotFound => continue,
+                else => return err,
+            };
+            defer dir.close(io());
+            var entries = dir.iterate();
+            while (try entries.next(io())) |entry| {
+                // Dinit uses the entry name, even when the symlink target is stale.
+                if (std.mem.eql(u8, entry.name, name)) return true;
+            }
         }
     }
     return false;
@@ -178,4 +198,32 @@ fn exec(allocator: std.mem.Allocator, argv: []const []const u8) !void {
 
 pub fn run(allocator: std.mem.Allocator, argv: []const []const u8) !std.process.RunResult {
     return std.process.run(allocator, io(), .{ .argv = argv });
+}
+
+test "boot intent reads native dependencies and directory entries" {
+    const th = @import("test_helpers.zig");
+    var env = try th.createTestEnv();
+    defer {
+        env.cleanup();
+        std.testing.allocator.destroy(env);
+    }
+    const allocator = env.ctx.allocator;
+    const boot = try std.fs.path.join(allocator, &.{ env.path, "boot" });
+    defer allocator.free(boot);
+    const dependencies = try std.fs.path.join(allocator, &.{ env.path, "boot.d" });
+    defer allocator.free(dependencies);
+    try path_mod.ensureDirExists(dependencies);
+    var file = try std.Io.Dir.createFileAbsolute(io(), boot, .{});
+    try file.writeStreamingAll(io(), "type = internal\ndepends-on = core\nwaits-for: optional\nwaits-for.d = boot.d\n# depends-on = ignored\n");
+    file.close(io());
+    try std.testing.expect(try bootFileEnables(allocator, boot, "core"));
+    try std.testing.expect(try bootFileEnables(allocator, boot, "optional"));
+    try std.testing.expect(!try bootFileEnables(allocator, boot, "ignored"));
+    try std.testing.expect(!try bootFileEnables(allocator, boot, "daemon"));
+    const link = try std.fs.path.join(allocator, &.{ dependencies, "daemon" });
+    defer allocator.free(link);
+    try std.Io.Dir.symLinkAbsolute(io(), "/nonexistent-service-source", link, .{});
+    try std.testing.expect(try bootFileEnables(allocator, boot, "daemon"));
+    try std.Io.Dir.deleteFileAbsolute(io(), link);
+    try std.testing.expect(!try bootFileEnables(allocator, boot, "daemon"));
 }
