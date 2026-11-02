@@ -107,11 +107,15 @@ fn determineInstallTargetBehavior(
 
 /// Find all packages that transitively depend on `target_name` by walking
 /// reverse dependency edges. Returns the set of ancestor package names.
+///
+/// Running out of memory is reported. Dropping an edge or a visited package
+/// would return a smaller set than the truth, and `uninstall --cascade` would
+/// then leave a package installed whose dependency was just removed.
 fn findTransitiveDependents(
     allocator: std.mem.Allocator,
     sorted: []const resolver.ResolvedPackage,
     target_name: []const u8,
-) std.StringHashMap(void) {
+) error{OutOfMemory}!std.StringHashMap(void) {
     // Build reverse map: package name -> list of packages that depend on it
     var rdeps = std.StringHashMap(std.ArrayList([]const u8)).init(allocator);
     defer {
@@ -123,25 +127,26 @@ fn findTransitiveDependents(
     for (sorted) |resolved| {
         const pkg_name = resolved.pkg.name orelse continue;
         for (resolved.dependency_names) |dep_name| {
-            var entry = rdeps.getOrPut(dep_name) catch continue;
+            var entry = try rdeps.getOrPut(dep_name);
             if (!entry.found_existing) entry.value_ptr.* = .empty;
-            entry.value_ptr.append(allocator, pkg_name) catch continue;
+            try entry.value_ptr.append(allocator, pkg_name);
         }
     }
 
     // BFS upward from target
     var result = std.StringHashMap(void).init(allocator);
+    errdefer result.deinit();
     var queue: std.ArrayList([]const u8) = .empty;
     defer queue.deinit(allocator);
-    queue.append(allocator, target_name) catch return result;
+    try queue.append(allocator, target_name);
 
     while (queue.items.len > 0) {
         const name = queue.orderedRemove(0);
         if (rdeps.get(name)) |parents| {
             for (parents.items) |parent| {
                 if (!result.contains(parent)) {
-                    result.put(parent, {}) catch continue;
-                    queue.append(allocator, parent) catch continue;
+                    try result.put(parent, {});
+                    try queue.append(allocator, parent);
                 }
             }
         }
@@ -734,7 +739,7 @@ pub fn uninstallPackagesFromConfig(
             }
 
             // Cascade: find requested roots that transitively depend on the removed package
-            var all_dependents = findTransitiveDependents(ctx.allocator, resolution.plan.sorted, removed_name);
+            var all_dependents = try findTransitiveDependents(ctx.allocator, resolution.plan.sorted, removed_name);
             defer all_dependents.deinit();
 
             var roots_to_remove = std.StringHashMap(void).init(ctx.allocator);
@@ -5700,4 +5705,96 @@ test "finalizeAdmittedStoreObject makes unprivileged objects read-only" {
     const stat = try dir.stat(path.currentIo());
     try std.testing.expectEqual(@as(std.posix.mode_t, 0), stat.permissions.toMode() & 0o222);
     try dir.setPermissions(path.currentIo(), .fromMode(stat.permissions.toMode() | 0o200));
+}
+
+// ── findTransitiveDependents ──────────────────────────────────────────────
+
+fn dependentFixture(arena: std.mem.Allocator, name: []const u8, deps: []const []const u8) !resolver.ResolvedPackage {
+    return .{
+        .pkg = .{
+            .ctx = undefined,
+            .name = try arena.dupe(u8, name),
+            .dependencies = undefined,
+            .provisions = undefined,
+            .content_hash = "",
+        },
+        .repocache = undefined,
+        .install_order = 0,
+        .scc_id = 0,
+        .dependency_names = deps,
+    };
+}
+
+test "findTransitiveDependents returns every ancestor of the target" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    // app -> lib -> base, tool -> base, unrelated -> other
+    const sorted = [_]resolver.ResolvedPackage{
+        try dependentFixture(arena, "base", &.{}),
+        try dependentFixture(arena, "lib", &.{"base"}),
+        try dependentFixture(arena, "tool", &.{"base"}),
+        try dependentFixture(arena, "app", &.{"lib"}),
+        try dependentFixture(arena, "other", &.{}),
+        try dependentFixture(arena, "unrelated", &.{"other"}),
+    };
+    var found = try findTransitiveDependents(std.testing.allocator, &sorted, "base");
+    defer found.deinit();
+    try std.testing.expectEqual(@as(u32, 3), found.count());
+    try std.testing.expect(found.contains("lib"));
+    try std.testing.expect(found.contains("tool"));
+    try std.testing.expect(found.contains("app"));
+    try std.testing.expect(!found.contains("unrelated"));
+}
+
+fn sweepDependents(allocator: std.mem.Allocator, sorted: []const resolver.ResolvedPackage) error{ OutOfMemory, TestExpectedEqual }!void {
+    var found = findTransitiveDependents(allocator, sorted, "base") catch return error.OutOfMemory;
+    defer found.deinit();
+    // A swallowed allocation failure shows up as a smaller set, not an error,
+    // so the result itself is checked: lib, tool and app all depend on base.
+    if (found.count() != 3) return error.TestExpectedEqual;
+}
+
+test "findTransitiveDependents releases its allocations on every failure point" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const sorted = [_]resolver.ResolvedPackage{
+        try dependentFixture(arena, "base", &.{}),
+        try dependentFixture(arena, "lib", &.{"base"}),
+        try dependentFixture(arena, "tool", &.{"base"}),
+        try dependentFixture(arena, "app", &.{ "lib", "tool" }),
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, sweepDependents, .{@as([]const resolver.ResolvedPackage, &sorted)});
+}
+
+// The repo's own loop (see kdl.zig, build_orchestrator.zig): count allocations on a
+// clean run, then inject a failure at each index. A call that still succeeds must
+// return the same answer as the clean run; a smaller set means a failure was dropped.
+test "findTransitiveDependents never returns a smaller set when an allocation fails" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const sorted = [_]resolver.ResolvedPackage{
+        try dependentFixture(arena, "base", &.{}),
+        try dependentFixture(arena, "lib", &.{"base"}),
+        try dependentFixture(arena, "tool", &.{"base"}),
+        try dependentFixture(arena, "app", &.{ "lib", "tool" }),
+    };
+
+    var counting = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    var clean = try findTransitiveDependents(counting.allocator(), &sorted, "base");
+    const expected = clean.count();
+    clean.deinit();
+    const total = counting.alloc_index;
+
+    var idx: usize = 0;
+    while (idx < total) : (idx += 1) {
+        var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = idx });
+        if (findTransitiveDependents(failing.allocator(), &sorted, "base")) |found| {
+            var mutable = found;
+            defer mutable.deinit();
+            try std.testing.expectEqual(expected, mutable.count());
+        } else |_| {}
+    }
 }
