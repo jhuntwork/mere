@@ -77,6 +77,17 @@ pub fn switchProfileGeneration(
     };
 }
 
+/// Preserve the failure class of a service-tree error so callers and exit
+/// codes can tell a permission problem from a bad service definition.
+fn mapReconcileError(err: service_reconcile.ReconcileError) ActivationError {
+    return switch (err) {
+        error.OutOfMemory => ActivationError.OutOfMemory,
+        error.PermissionDenied => ActivationError.PermissionDenied,
+        error.InvalidInput, error.DuplicateService => ActivationError.InvalidInput,
+        error.FileSystem => ActivationError.FileSystem,
+    };
+}
+
 /// Switch the active generation for the system profile and apply system activation policy.
 pub fn activateSystemGeneration(
     ctx: *mere.Context,
@@ -116,10 +127,10 @@ pub fn activateSystemGeneration(
         const target_path = generation.getGenerationPath(ctx.allocator, profile_dir, gen_num) catch return ActivationError.InvalidInput;
         defer ctx.allocator.free(target_path);
         var staged = service_reconcile.stageDinit(ctx, target_path, manifest.packages.items, &.{}) catch |err| {
-            return ctx.failFmt(if (err == error.OutOfMemory) ActivationError.OutOfMemory else ActivationError.InvalidInput, "dinit", "cannot realize generation services: {s}", .{@errorName(err)});
+            return ctx.failFmt(mapReconcileError(err), "dinit", "cannot realize generation services: {s}", .{@errorName(err)});
         };
         defer staged.discard();
-        staged.commit() catch return ctx.fail(ActivationError.FileSystem, "dinit", "cannot publish generation services");
+        staged.commit() catch |err| return ctx.failFmt(mapReconcileError(err), "dinit", "cannot publish generation services: {s}", .{@errorName(err)});
     }
 
     const etc_dir = try getEtcDir(ctx.allocator, ctx.root_path);
@@ -1246,4 +1257,12 @@ test "system activation does not read the current generation when service policy
     // damaged current generation must not be consulted.
     _ = try activateSystemGeneration(&test_env.ctx, 2, .fast);
     try std.testing.expectEqual(@as(?u32, 2), try generation.getCurrentGeneration(profile_dir));
+}
+
+test "service tree failures keep their failure class" {
+    try std.testing.expectEqual(ActivationError.PermissionDenied, mapReconcileError(error.PermissionDenied));
+    try std.testing.expectEqual(ActivationError.FileSystem, mapReconcileError(error.FileSystem));
+    try std.testing.expectEqual(ActivationError.OutOfMemory, mapReconcileError(error.OutOfMemory));
+    try std.testing.expectEqual(ActivationError.InvalidInput, mapReconcileError(error.InvalidInput));
+    try std.testing.expectEqual(ActivationError.InvalidInput, mapReconcileError(error.DuplicateService));
 }
