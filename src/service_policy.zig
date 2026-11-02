@@ -354,3 +354,32 @@ test "service policy does not treat an instance of a surviving template as owned
     fake_status_text = "    State: started\n";
     try checkTransitionWith(&fx.env.ctx, &.{before}, &.{after}, fake_probe);
 }
+
+// Fail each allocation in turn. A failure may surface as OutOfMemory or, where
+// the check folds any inability to inspect live state into a refusal, as
+// InvalidInput; either way nothing may be left allocated. The scenario removes
+// a service that is stopped, so an uninterrupted run succeeds.
+fn sweepCheck(allocator: std.mem.Allocator, before_dir: []const u8, after_dir: []const u8, root: []const u8) error{OutOfMemory}!void {
+    // The context is built on a reliable allocator; only the allocator the
+    // check itself uses is made to fail.
+    var base = mere.Context.init(std.testing.allocator, root);
+    defer base.deinit();
+    var cfg = mere.config.Config.init(&base, std.testing.allocator);
+    cfg.init_provider = .dinit;
+    base.configuration = cfg;
+    var ctx = base;
+    ctx.allocator = allocator;
+    const before: generation.PackageEntry = .{ .name = "b", .version = "1", .release = 1, .arch = "any", .store_path = before_dir, .content_hash = "0" ** 64 };
+    const after: generation.PackageEntry = .{ .name = "a", .version = "1", .release = 1, .arch = "any", .store_path = after_dir, .content_hash = "0" ** 64 };
+    checkTransitionWith(&ctx, &.{before}, &.{after}, fake_probe) catch return error.OutOfMemory;
+}
+
+test "service policy releases its allocations on every failure point" {
+    var fx = try PolicyFixture.init();
+    defer fx.deinit();
+    const before = try fx.package("sweep-before", &.{ "worker", "other" });
+    const after = try fx.package("sweep-after", &.{"other"});
+    fake_list_text = "[{ }     ] worker\n[{ }     ] other\n";
+    fake_status_text = "    State: stopped\n";
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, sweepCheck, .{ before.store_path, after.store_path, fx.env.path });
+}
