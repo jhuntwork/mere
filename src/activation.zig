@@ -1270,11 +1270,13 @@ test "service tree failures keep their failure class" {
 
 // ── Rollback and live-service policy at the activation boundary ───────────
 
-const PolicyHost = struct {
+/// Test fixture shared with the install tests. It is never referenced outside
+/// tests, so it is not compiled into the binary.
+pub const PolicyHost = struct {
     var host_root: bool = true;
     var live: bool = true;
-    var list_text: []const u8 = "";
-    var status_text: []const u8 = "    State: started\n";
+    pub var list_text: []const u8 = "";
+    pub var status_text: []const u8 = "    State: started\n";
     var list_calls: usize = 0;
 
     fn isHostRoot(_: []const u8) anyerror!bool {
@@ -1309,13 +1311,13 @@ const PolicyHost = struct {
 /// A two-generation system profile: generation 1 carries `before`, generation 2
 /// carries `after`, and generation 1 is current. Each package declares one
 /// daemon service named after itself and lives in the store with its real hash.
-const RollbackFixture = struct {
+pub const RollbackFixture = struct {
     env: *@import("test_helpers.zig").TestEnv,
     arena: std.heap.ArenaAllocator,
     profile_dir: []const u8,
     services_dir: []const u8,
 
-    fn init(before: []const []const u8, after: []const []const u8) !RollbackFixture {
+    pub fn init(before: []const []const u8, after: []const []const u8) !RollbackFixture {
         const th = @import("test_helpers.zig");
         const env = try th.createTestEnv();
         var fx: RollbackFixture = .{
@@ -1373,16 +1375,22 @@ const RollbackFixture = struct {
             try manifest.addPackage(service_name, "1.0", 1, "x86_64", final, digest);
         }
         try generation.writeManifest(env.ctx.allocator, gen_dir, &manifest);
+        // A child generation reads its parent's realization, so a fixture
+        // generation needs one. It owns no files.
+        var realization = generation.RealizationData.init(env.ctx.allocator);
+        defer realization.deinit();
+        try realization.canonicalize();
+        try generation.writeRealization(env.ctx.allocator, gen_dir, &realization);
     }
 
-    fn deinit(self: *RollbackFixture) void {
+    pub fn deinit(self: *RollbackFixture) void {
         service_policy.setProbeForTest(null);
         self.arena.deinit();
         self.env.cleanup();
         std.testing.allocator.destroy(self.env);
     }
 
-    fn current(self: *RollbackFixture) !?u32 {
+    pub fn current(self: *RollbackFixture) !?u32 {
         return generation.getCurrentGeneration(self.profile_dir);
     }
 };

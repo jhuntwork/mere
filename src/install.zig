@@ -1846,6 +1846,31 @@ fn symlinkPackagesToProfile(ctx: *Context, profile_path: []const u8, installed_p
     emit.logSegmentsSeverity(ctx, phase, .info, &segments);
 }
 
+/// Remove a generation this call created when activating it failed. Left in
+/// place it sits above the current generation without ever having been
+/// activated, and GC retention counts it among the newest generations, so it
+/// takes a slot that an earlier generation, a possible rollback target, would
+/// otherwise have. The current generation is never removed, because
+/// activation can fail after the pointer has switched. A failure to remove the
+/// generation is logged at debug level and does not replace the activation
+/// error.
+fn discardUnactivatedGeneration(ctx: *Context, profile_dir: []const u8, gen_num: u32) void {
+    const current = generation.getCurrentGeneration(profile_dir) catch |err| {
+        ctx.debug("kept generation {d}: cannot read the current generation: {s}", .{ gen_num, @errorName(err) });
+        return;
+    };
+    if (current != null and current.? == gen_num) return;
+
+    const gen_path = generation.getGenerationPath(ctx.allocator, profile_dir, gen_num) catch |err| {
+        ctx.debug("kept generation {d}: {s}", .{ gen_num, @errorName(err) });
+        return;
+    };
+    defer ctx.allocator.free(gen_path);
+    path.deleteTreeAbsolute(gen_path) catch |err| {
+        ctx.debug("could not remove unactivated generation {d}: {s}", .{ gen_num, @errorName(err) });
+    };
+}
+
 /// Apply installed packages to the requested profile target.
 /// System profiles create and activate generations; named profiles publish a single root.
 fn applyProfileRealization(ctx: *Context, prof_name: []const u8, installed_packages: []const generation.PackageEntry, verify_store: bool, phase: ui.Phase) !void {
@@ -1897,6 +1922,7 @@ fn applyProfileRealization(ctx: *Context, prof_name: []const u8, installed_packa
             if (verify_store) .full_store else .fast,
         ) catch |err| {
             ctx.debug("failed to activate generation: {}", .{err});
+            discardUnactivatedGeneration(ctx, profile_dir, gen_num);
             return mapActivationFailure(ctx, err, profile_dir, "failed to activate generation");
         };
 
@@ -2289,6 +2315,42 @@ fn mapActivationError(err: activation.ActivationError) anyerror {
         activation.ActivationError.GenerationNotFound => error.InvalidInput,
         else => error.FileSystem,
     };
+}
+
+test "a refused uninstall does not leave an unactivated generation behind" {
+    // Generation 1 runs a service and is current; generation 2 is another
+    // generation that is not current. Removing the service is refused at
+    // activation, after generation 3 has been created for it.
+    var fx = try activation.RollbackFixture.init(&.{"worker"}, &.{});
+    defer fx.deinit();
+    activation.PolicyHost.list_text = "[[+]     ] worker (pid: 7)\n";
+    activation.PolicyHost.status_text = "    State: started\n";
+
+    const empty = [_]generation.PackageEntry{};
+    try std.testing.expectError(error.InvalidInput, applyProfileRealization(&fx.env.ctx, "system", &empty, false, .uninstall));
+
+    // The profile is unchanged, and the generation this call created (3) is gone.
+    try std.testing.expectEqual(@as(?u32, 1), try fx.current());
+    const created = try std.fs.path.join(fx.arena.allocator(), &.{ fx.profile_dir, "gen-3" });
+    try std.testing.expectError(error.FileNotFound, std.Io.Dir.accessAbsolute(path.currentIo(), created, .{}));
+    const history = try std.fs.path.join(fx.arena.allocator(), &.{ fx.profile_dir, "gen-2" });
+    try std.Io.Dir.accessAbsolute(path.currentIo(), history, .{});
+}
+
+test "discardUnactivatedGeneration never removes the current generation" {
+    // Activation can fail after the pointer has switched, for example while
+    // updating GC roots. The new generation is then current and must stay.
+    var fx = try activation.RollbackFixture.init(&.{}, &.{});
+    defer fx.deinit();
+
+    discardUnactivatedGeneration(&fx.env.ctx, fx.profile_dir, 1);
+    const kept = try std.fs.path.join(fx.arena.allocator(), &.{ fx.profile_dir, "gen-1" });
+    try std.Io.Dir.accessAbsolute(path.currentIo(), kept, .{});
+
+    // A generation that is not current is removed.
+    discardUnactivatedGeneration(&fx.env.ctx, fx.profile_dir, 2);
+    const removed = try std.fs.path.join(fx.arena.allocator(), &.{ fx.profile_dir, "gen-2" });
+    try std.testing.expectError(error.FileNotFound, std.Io.Dir.accessAbsolute(path.currentIo(), removed, .{}));
 }
 
 test "mapActivationFailure preserves specific lower-level diagnostics and supplies a fallback" {
