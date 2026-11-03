@@ -1106,7 +1106,9 @@ fn appendRecipeCompanionInputs(
             else => continue,
         }
         if (std.mem.eql(u8, entry.name, "recipe.kdl")) continue;
-        try names.append(ctx.allocator, try ctx.allocator.dupe(u8, entry.name));
+        const owned = try ctx.allocator.dupe(u8, entry.name);
+        errdefer ctx.allocator.free(owned);
+        try names.append(ctx.allocator, owned);
     }
 
     std.mem.sort([]const u8, names.items, {}, lessThan);
@@ -2293,4 +2295,38 @@ test "build_cache clear removes all cache entries" {
     const remaining = (try iter.next(io)).?;
     try std.testing.expectEqualStrings(".lock", remaining.name);
     try std.testing.expect((try iter.next(io)) == null);
+}
+
+fn sweepCompanions(allocator: std.mem.Allocator, recipe_dir: []const u8, root: []const u8) error{OutOfMemory}!void {
+    var base = mere.Context.init(std.testing.allocator, root);
+    defer base.deinit();
+    var ctx = base;
+    ctx.allocator = allocator;
+
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(allocator);
+    var out_buf: std.Io.Writer.Allocating = .fromArrayList(allocator, &buf);
+    defer out_buf.deinit();
+    appendRecipeCompanionInputs(&ctx, &out_buf.writer, recipe_dir) catch return error.OutOfMemory;
+}
+
+test "appendRecipeCompanionInputs releases its allocations on every failure point" {
+    const th = @import("test_helpers.zig");
+    var env = try th.createTestEnv();
+    defer {
+        env.cleanup();
+        std.testing.allocator.destroy(env);
+    }
+    const a = env.ctx.allocator;
+    const dir = try std.fs.path.join(a, &.{ env.path, "recipe-dir" });
+    defer a.free(dir);
+    try path_mod.ensureDirExists(dir);
+    for ([_][]const u8{ "recipe.kdl", "patch-one.patch", "patch-two.patch", "config" }) |name| {
+        const file = try std.fs.path.join(a, &.{ dir, name });
+        defer a.free(file);
+        var handle = try std.Io.Dir.createFileAbsolute(path_mod.currentIo(), file, .{});
+        try handle.writeStreamingAll(path_mod.currentIo(), name);
+        handle.close(path_mod.currentIo());
+    }
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, sweepCompanions, .{ dir, env.path });
 }

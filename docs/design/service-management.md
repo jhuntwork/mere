@@ -100,3 +100,47 @@ conflicting service names are rejected. Administrator overrides in
 
 The existing build-time native generators are transitional compatibility output
 while the remaining install-time/provider-switch coverage is completed.
+
+
+## dinit generation and live-state contract
+
+Package install, upgrade, and generation activation do not restart running
+services. The active profile and service files can therefore describe a newer
+(or older, after rollback) generation than a running process. Use explicit
+`mere restart` to adopt a changed definition: Mere refreshes dinit's description
+before requesting native restart, retaining dinit's dependent-service handling.
+If a definition change is incompatible with a running service (for example a
+type change), refresh fails before restart; stop the service explicitly first,
+then start it. Starting a stopped service also refreshes its description; starting
+an already-running service does not adopt a new definition.
+`mere reload` continues to mean SIGHUP to the process.
+
+On a live dinit system, a transition removing a package-owned service is refused
+while that service is started, starting, or stopping. Stop it before uninstalling
+or activating a generation without it. Rejection occurs before /etc templates,
+boot artifacts, or the active generation are changed. Failed live-state queries
+fail closed. Alternate-root/image activation never queries the host's service
+manager. This check is not a lock against concurrent manual dinit operations.
+
+Every dinit realization generates `mere-essential` with hard dependencies on
+all metadata-marked essential services. The reserved `mere-essential.d`
+directory exposes that bundle to the distro boot definition through:
+
+```ini
+depends-on.d = /usr/share/dinit.d/mere-essential.d
+```
+
+Essential services remain visible with `OnBoot: essential` and cannot be disabled
+through `mere disable`, including when an administrator overrides their command.
+Essential does not implicitly start a service on package installation, prevent
+explicit maintenance stop/restart, or introduce a reboot/crash policy. A required
+service failing at boot prevents boot completion under dinit's dependency rules.
+
+Existing administrator boot files are preserved. When adopting the updated
+mere-boot default, review its change and explicitly apply it with
+`mere etc apply /etc/dinit.d/boot` only if appropriate for the machine. Custom boot
+graphs must require the generated essential bundle themselves. `mere-essential`
+and `mere-essential.d` are reserved package-service names. Activation regenerates
+package-owned descriptions before switching the generation, including rollback
+to a generation first created by an older Mere version; administrator overrides
+are never regenerated.

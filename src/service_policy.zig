@@ -1,0 +1,385 @@
+//! Guard live service ownership before a system-generation switch.
+const std = @import("std");
+const mere = @import("mere.zig");
+const generation = @import("generation.zig");
+const meta = @import("meta.zig");
+const dinit = @import("dinit.zig");
+const path = @import("path.zig");
+
+/// Everything `checkTransition` learns from the running host. Production uses
+/// the defaults; tests substitute fixed answers so the policy can be exercised
+/// without a live dinit or a host-root activation.
+pub const Probe = struct {
+    is_host_root: *const fn ([]const u8) anyerror!bool = probeIsHostRoot,
+    is_live_dinit: *const fn (std.mem.Allocator) anyerror!bool = probeIsLiveDinit,
+    list_services: *const fn (std.mem.Allocator) anyerror![]const u8 = probeListServices,
+    service_status: *const fn (std.mem.Allocator, []const u8) anyerror![]const u8 = probeServiceStatus,
+};
+
+var default_probe: Probe = .{};
+
+/// Test hook: answer `appliesTo` and `checkTransition` from `probe` so code
+/// that calls them without a probe, such as activation, can be exercised
+/// without a live dinit. Pass null to restore the real host queries.
+pub fn setProbeForTest(probe: ?Probe) void {
+    default_probe = probe orelse .{};
+}
+
+fn probeIsHostRoot(root: []const u8) anyerror!bool {
+    return isHostRoot(root);
+}
+fn probeIsLiveDinit(allocator: std.mem.Allocator) anyerror!bool {
+    return isLiveDinit(allocator);
+}
+fn probeListServices(allocator: std.mem.Allocator) anyerror![]const u8 {
+    return dinit.listServices(allocator);
+}
+fn probeServiceStatus(allocator: std.mem.Allocator, name: []const u8) anyerror![]const u8 {
+    return dinit.status(allocator, name);
+}
+
+/// True when the transition must be checked against live dinit at all: a host
+/// root running the dinit provider. Alternate roots and other providers never
+/// query the host, so they must not pay for (or fail on) reading the current
+/// generation either.
+pub fn appliesTo(ctx: *mere.Context) bool {
+    return appliesToWith(ctx, default_probe);
+}
+
+pub fn appliesToWith(ctx: *mere.Context, probe: Probe) bool {
+    const provider = if (ctx.configuration) |*cfg| cfg.effectiveInitProvider() else .s6rc;
+    if (provider != .dinit) return false;
+    // An unresolvable root is not provably an alternate root, so fail closed
+    // and let checkTransition report it.
+    return probe.is_host_root(ctx.root_path) catch true;
+}
+
+pub fn checkTransition(ctx: *mere.Context, previous: []const generation.PackageEntry, target: []const generation.PackageEntry) !void {
+    return checkTransitionWith(ctx, previous, target, default_probe);
+}
+
+pub fn checkTransitionWith(ctx: *mere.Context, previous: []const generation.PackageEntry, target: []const generation.PackageEntry, probe: Probe) !void {
+    // An image/alternate root must never query the host service manager.
+    ctx.debug("service policy root: '{s}'", .{ctx.root_path});
+    if (!(probe.is_host_root(ctx.root_path) catch return ctx.fail(error.InvalidInput, ctx.root_path, "cannot resolve activation root; generation not activated"))) return;
+    const provider = if (ctx.configuration) |*cfg| cfg.effectiveInitProvider() else .s6rc;
+    if (provider != .dinit) return;
+    var old_names = try serviceNames(ctx, previous);
+    defer freeNames(ctx.allocator, &old_names);
+    var new_names = try serviceNames(ctx, target);
+    defer freeNames(ctx.allocator, &new_names);
+    var removed: std.ArrayList([]const u8) = .empty;
+    defer removed.deinit(ctx.allocator);
+    var names = old_names.keyIterator();
+    while (names.next()) |name| {
+        if (!new_names.contains(name.*)) try removed.append(ctx.allocator, name.*);
+    }
+    // Nothing is removed, so no live service can be affected. Do not require
+    // a readable init identity for a transition that cannot touch one.
+    if (removed.items.len == 0) return;
+    const live = probe.is_live_dinit(ctx.allocator) catch
+        return ctx.fail(error.InvalidInput, "dinit", "cannot determine the active init system; generation not activated");
+    ctx.debug("service policy live={}", .{live});
+    if (!live) return;
+    // A successful list distinguishes an unloaded service from a lost socket.
+    const loaded = probe.list_services(ctx.allocator) catch
+        return ctx.fail(error.InvalidInput, "dinit", "cannot inspect live services; generation not activated");
+    defer ctx.allocator.free(loaded);
+    var lines = std.mem.splitScalar(u8, loaded, '\n');
+    while (lines.next()) |line| {
+        const name = (dinit.listedServiceName(line) catch
+            return ctx.fail(error.InvalidInput, "dinit", "unrecognized service list; generation not activated")) orelse continue;
+        var owned = false;
+        for (removed.items) |definition| {
+            if (dinit.ownsLoadedService(definition, name)) owned = true;
+        }
+        if (!owned) continue;
+        const status = probe.service_status(ctx.allocator, name) catch
+            return ctx.fail(error.InvalidInput, name, "cannot inspect service state; generation not activated");
+        defer ctx.allocator.free(status);
+        const active = dinit.statusIsActive(status) catch
+            return ctx.fail(error.InvalidInput, name, "unrecognized service state; generation not activated");
+        if (active) return ctx.failFmt(error.InvalidInput, name, "service '{s}' is active; stop it before activating a generation that removes it", .{name});
+    }
+}
+
+fn isHostRoot(root: []const u8) !bool {
+    var resolved: [std.fs.max_path_bytes]u8 = undefined;
+    const len = try std.Io.Dir.realPathFileAbsolute(path.currentIo(), root, &resolved);
+    return std.mem.eql(u8, resolved[0..len], "/");
+}
+
+fn isLiveDinit(allocator: std.mem.Allocator) !bool {
+    if (std.Io.Dir.accessAbsolute(path.currentIo(), "/run/dinitctl", .{})) |_| return true else |_| {}
+    const comm = try readInitComm(allocator);
+    defer allocator.free(comm);
+    return std.mem.eql(u8, std.mem.trim(u8, comm, " \r\n"), "dinit");
+}
+
+fn readInitComm(allocator: std.mem.Allocator) ![]u8 {
+    var file = try std.Io.Dir.openFileAbsolute(path.currentIo(), "/proc/1/comm", .{});
+    defer file.close(path.currentIo());
+    var buffer: [256]u8 = undefined;
+    // procfs reports size zero; a positional reader can mistake it for empty.
+    var reader = file.readerStreaming(path.currentIo(), &buffer);
+    const comm = try reader.interface.allocRemaining(allocator, .limited(256));
+    if (std.mem.trim(u8, comm, " \r\n").len == 0) {
+        allocator.free(comm);
+        return error.ProcessFailed;
+    }
+    return comm;
+}
+
+fn serviceNames(ctx: *mere.Context, packages: []const generation.PackageEntry) !std.StringHashMap(void) {
+    var names = std.StringHashMap(void).init(ctx.allocator);
+    errdefer freeNames(ctx.allocator, &names);
+    for (packages) |pkg| {
+        var data = try meta.readFile(ctx.allocator, pkg.store_path);
+        defer data.deinit();
+        for (data.services.items) |service| {
+            const owned = try ctx.allocator.dupe(u8, service.name);
+            const result = names.getOrPut(owned) catch |err| {
+                ctx.allocator.free(owned);
+                return err;
+            };
+            if (result.found_existing) ctx.allocator.free(owned);
+        }
+    }
+    return names;
+}
+
+fn freeNames(allocator: std.mem.Allocator, names: *std.StringHashMap(void)) void {
+    var entries = names.keyIterator();
+    while (entries.next()) |name| allocator.free(name.*);
+    names.deinit();
+}
+
+test "service policy reads procfs init with a streaming reader" {
+    const th = @import("test_helpers.zig");
+    var env = try th.createTestEnv();
+    defer {
+        env.cleanup();
+        std.testing.allocator.destroy(env);
+    }
+    try std.testing.expect(try isHostRoot("/"));
+    try std.testing.expect(try isHostRoot("/."));
+    try std.testing.expect(!try isHostRoot(env.path));
+    const comm = readInitComm(env.ctx.allocator) catch |err| switch (err) {
+        error.FileNotFound => return error.SkipZigTest,
+        else => return err,
+    };
+    defer env.ctx.allocator.free(comm);
+    try std.testing.expect(std.mem.trim(u8, comm, " \r\n").len > 0);
+}
+
+// ── Behavioral tests for checkTransition ──────────────────────────────────
+// A fixed fake host stands in for dinit. Each test sets the canned answers
+// first; tests run sequentially so file-level state is safe.
+
+var fake_host_root: bool = true;
+var fake_live_error: ?anyerror = null;
+var fake_live: bool = true;
+var fake_list_text: []const u8 = "";
+var fake_status_text: []const u8 = "    State: started\n";
+var fake_list_calls: usize = 0;
+
+fn fakeIsHostRoot(_: []const u8) anyerror!bool {
+    return fake_host_root;
+}
+fn fakeIsLiveDinit(_: std.mem.Allocator) anyerror!bool {
+    if (fake_live_error) |err| return err;
+    return fake_live;
+}
+fn fakeListServices(allocator: std.mem.Allocator) anyerror![]const u8 {
+    fake_list_calls += 1;
+    return allocator.dupe(u8, fake_list_text);
+}
+fn fakeServiceStatus(allocator: std.mem.Allocator, _: []const u8) anyerror![]const u8 {
+    return allocator.dupe(u8, fake_status_text);
+}
+
+const fake_probe: Probe = .{
+    .is_host_root = fakeIsHostRoot,
+    .is_live_dinit = fakeIsLiveDinit,
+    .list_services = fakeListServices,
+    .service_status = fakeServiceStatus,
+};
+
+fn resetFakes() void {
+    fake_host_root = true;
+    fake_live_error = null;
+    fake_live = true;
+    fake_list_text = "";
+    fake_status_text = "    State: started\n";
+    fake_list_calls = 0;
+}
+
+/// Write a package whose metadata declares `names` as services and return an
+/// entry pointing at it. Strings live in `arena`.
+fn fixturePackage(
+    ctx: *mere.Context,
+    arena: std.mem.Allocator,
+    root: []const u8,
+    package_name: []const u8,
+    names: []const []const u8,
+) !generation.PackageEntry {
+    const dir = try std.fs.path.join(arena, &.{ root, package_name });
+    try path.ensureDirExists(dir);
+    var data = meta.Data.init(ctx.allocator);
+    defer data.deinit();
+    for (names) |service_name| {
+        var service = meta.Service.init(ctx.allocator);
+        service.name = try ctx.allocator.dupe(u8, service_name);
+        service.service_type = .daemon;
+        try service.command.append(ctx.allocator, try ctx.allocator.dupe(u8, "/bin/true"));
+        try data.services.append(ctx.allocator, service);
+    }
+    try meta.writeFile(ctx.allocator, dir, &data);
+    return .{
+        .name = package_name,
+        .version = "1",
+        .release = 1,
+        .arch = "any",
+        .store_path = dir,
+        .content_hash = "0" ** 64,
+    };
+}
+
+const PolicyFixture = struct {
+    env: *@import("test_helpers.zig").TestEnv,
+    arena: std.heap.ArenaAllocator,
+
+    fn init() !PolicyFixture {
+        const th = @import("test_helpers.zig");
+        const env = try th.createTestEnv();
+        var cfg = mere.config.Config.init(&env.ctx, env.ctx.allocator);
+        cfg.init_provider = .dinit;
+        env.ctx.configuration = cfg;
+        resetFakes();
+        return .{ .env = env, .arena = std.heap.ArenaAllocator.init(std.testing.allocator) };
+    }
+
+    fn deinit(self: *PolicyFixture) void {
+        self.arena.deinit();
+        self.env.cleanup();
+        std.testing.allocator.destroy(self.env);
+    }
+
+    fn package(self: *PolicyFixture, name: []const u8, services: []const []const u8) !generation.PackageEntry {
+        return fixturePackage(&self.env.ctx, self.arena.allocator(), self.env.path, name, services);
+    }
+};
+
+test "service policy refuses removing a service that is active" {
+    var fx = try PolicyFixture.init();
+    defer fx.deinit();
+    const before = try fx.package("daemon-pkg", &.{"worker"});
+    fake_list_text = "[[+]     ] worker (pid: 7)\n";
+    fake_status_text = "    State: started\n";
+    try std.testing.expectError(error.InvalidInput, checkTransitionWith(&fx.env.ctx, &.{before}, &.{}, fake_probe));
+}
+
+test "service policy allows removing a service that is stopped" {
+    var fx = try PolicyFixture.init();
+    defer fx.deinit();
+    const before = try fx.package("daemon-pkg", &.{"worker"});
+    fake_list_text = "[{ }     ] worker\n";
+    fake_status_text = "    State: stopped\n";
+    try checkTransitionWith(&fx.env.ctx, &.{before}, &.{}, fake_probe);
+}
+
+test "service policy never queries the service manager for an alternate root" {
+    var fx = try PolicyFixture.init();
+    defer fx.deinit();
+    const before = try fx.package("daemon-pkg", &.{"worker"});
+    fake_host_root = false;
+    fake_list_text = "[[+]     ] worker (pid: 7)\n";
+    try checkTransitionWith(&fx.env.ctx, &.{before}, &.{}, fake_probe);
+    try std.testing.expectEqual(@as(usize, 0), fake_list_calls);
+}
+
+test "service policy fails closed when the service list is malformed" {
+    var fx = try PolicyFixture.init();
+    defer fx.deinit();
+    const before = try fx.package("daemon-pkg", &.{"worker"});
+    fake_list_text = "unrecognised output\n";
+    try std.testing.expectError(error.InvalidInput, checkTransitionWith(&fx.env.ctx, &.{before}, &.{}, fake_probe));
+}
+
+test "service policy fails closed when the service state is unrecognised" {
+    var fx = try PolicyFixture.init();
+    defer fx.deinit();
+    const before = try fx.package("daemon-pkg", &.{"worker"});
+    fake_list_text = "[[+]     ] worker (pid: 7)\n";
+    fake_status_text = "socket error\n";
+    try std.testing.expectError(error.InvalidInput, checkTransitionWith(&fx.env.ctx, &.{before}, &.{}, fake_probe));
+}
+
+// An unreadable init identity must not block a transition that removes
+// nothing: no live service can be affected by it.
+test "service policy ignores an unreadable init identity when nothing is removed" {
+    var fx = try PolicyFixture.init();
+    defer fx.deinit();
+    const before = try fx.package("daemon-pkg", &.{"worker"});
+    fake_live_error = error.FileNotFound;
+    try checkTransitionWith(&fx.env.ctx, &.{before}, &.{before}, fake_probe);
+}
+
+test "service policy still fails closed on an unreadable init identity when a service is removed" {
+    var fx = try PolicyFixture.init();
+    defer fx.deinit();
+    const before = try fx.package("daemon-pkg", &.{"worker"});
+    fake_live_error = error.FileNotFound;
+    try std.testing.expectError(error.InvalidInput, checkTransitionWith(&fx.env.ctx, &.{before}, &.{}, fake_probe));
+}
+
+// A template ("name@") owns its instances ("name@arg"); a plain service owns none.
+test "service policy refuses removing a template while one of its instances is active" {
+    var fx = try PolicyFixture.init();
+    defer fx.deinit();
+    const before = try fx.package("getty-pkg", &.{"getty@"});
+    fake_list_text = "[[+]     ] getty@tty1 (pid: 9)\n";
+    fake_status_text = "    State: started\n";
+    try std.testing.expectError(error.InvalidInput, checkTransitionWith(&fx.env.ctx, &.{before}, &.{}, fake_probe));
+}
+
+test "service policy does not treat an instance of a surviving template as owned by a removed plain service" {
+    var fx = try PolicyFixture.init();
+    defer fx.deinit();
+    // Distinct package names give distinct store paths; reusing one name would
+    // overwrite the first metadata file and leave nothing removed.
+    const before = try fx.package("foo-pkg-v1", &.{ "foo", "foo@" });
+    const after = try fx.package("foo-pkg-v2", &.{"foo@"});
+    fake_list_text = "[[+]     ] foo@x (pid: 4)\n";
+    fake_status_text = "    State: started\n";
+    try checkTransitionWith(&fx.env.ctx, &.{before}, &.{after}, fake_probe);
+}
+
+// Fail each allocation in turn. A failure may surface as OutOfMemory or, where
+// the check folds any inability to inspect live state into a refusal, as
+// InvalidInput; either way nothing may be left allocated. The scenario removes
+// a service that is stopped, so an uninterrupted run succeeds.
+fn sweepCheck(allocator: std.mem.Allocator, before_dir: []const u8, after_dir: []const u8, root: []const u8) error{OutOfMemory}!void {
+    // The context is built on a reliable allocator; only the allocator the
+    // check itself uses is made to fail.
+    var base = mere.Context.init(std.testing.allocator, root);
+    defer base.deinit();
+    var cfg = mere.config.Config.init(&base, std.testing.allocator);
+    cfg.init_provider = .dinit;
+    base.configuration = cfg;
+    var ctx = base;
+    ctx.allocator = allocator;
+    const before: generation.PackageEntry = .{ .name = "b", .version = "1", .release = 1, .arch = "any", .store_path = before_dir, .content_hash = "0" ** 64 };
+    const after: generation.PackageEntry = .{ .name = "a", .version = "1", .release = 1, .arch = "any", .store_path = after_dir, .content_hash = "0" ** 64 };
+    checkTransitionWith(&ctx, &.{before}, &.{after}, fake_probe) catch return error.OutOfMemory;
+}
+
+test "service policy releases its allocations on every failure point" {
+    var fx = try PolicyFixture.init();
+    defer fx.deinit();
+    const before = try fx.package("sweep-before", &.{ "worker", "other" });
+    const after = try fx.package("sweep-after", &.{"other"});
+    fake_list_text = "[{ }     ] worker\n[{ }     ] other\n";
+    fake_status_text = "    State: stopped\n";
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, sweepCheck, .{ before.store_path, after.store_path, fx.env.path });
+}

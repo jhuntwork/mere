@@ -461,30 +461,27 @@ pub fn scanKeyDirectory(allocator: std.mem.Allocator, dir_path: []const u8) Sign
         if (entry.kind != .file) continue;
         if (!std.mem.endsWith(u8, entry.name, ".pub")) continue;
 
-        const full_path = std.fs.path.join(allocator, &.{ dir_path, entry.name }) catch {
-            continue; // Skip on allocation failure
-        };
+        // Running out of memory is reported, never treated as "this key is
+        // absent": dropping a key here would shrink the trusted set silently.
+        const full_path = std.fs.path.join(allocator, &.{ dir_path, entry.name }) catch return SignError.OutOfMemory;
         errdefer allocator.free(full_path);
 
-        const pub_key = PublicKey.loadFromFile(full_path) catch {
-            allocator.free(full_path);
-            continue; // Skip invalid key files
+        const pub_key = PublicKey.loadFromFile(full_path) catch |err| switch (err) {
+            error.OutOfMemory => return SignError.OutOfMemory,
+            else => {
+                allocator.free(full_path);
+                continue; // Skip invalid key files
+            },
         };
 
-        const fp = pub_key.fingerprint(allocator) catch {
-            allocator.free(full_path);
-            continue; // Skip on allocation failure
-        };
+        const fp = try pub_key.fingerprint(allocator);
+        errdefer allocator.free(fp);
 
-        keys.append(allocator, .{
+        try keys.append(allocator, .{
             .public_key = pub_key,
             .fingerprint = fp,
             .path = full_path,
-        }) catch {
-            allocator.free(full_path);
-            allocator.free(fp);
-            continue;
-        };
+        });
     }
 
     return keys;
@@ -540,12 +537,15 @@ fn moveLoadedKeys(
     dst: *std.ArrayList(LoadedKey),
     src: *std.ArrayList(LoadedKey),
 ) SignError!void {
+    // Each key is owned by exactly one list. `moved` counts those handed to
+    // `dst`; if an append fails, the rest are still owned here and must be freed.
+    var moved: usize = 0;
+    errdefer for (src.items[moved..]) |*key| key.deinit(allocator);
     for (src.items) |key| {
-        dst.append(allocator, key) catch {
-            return SignError.OutOfMemory;
-        };
+        dst.append(allocator, key) catch return SignError.OutOfMemory;
+        moved += 1;
     }
-    // Clear source list without freeing entries (ownership transferred to dst).
+    // Ownership has transferred to dst.
     src.clearRetainingCapacity();
 }
 

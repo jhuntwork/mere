@@ -25,7 +25,6 @@ const path_safety = @import("path_safety.zig");
 const profile = @import("profile.zig");
 const generation = @import("generation.zig");
 const activation = @import("activation.zig");
-const service_reconcile = @import("service_reconcile.zig");
 const gcroots = @import("gcroots.zig");
 const scratch = @import("scratch.zig");
 const version_mod = @import("version.zig");
@@ -108,11 +107,15 @@ fn determineInstallTargetBehavior(
 
 /// Find all packages that transitively depend on `target_name` by walking
 /// reverse dependency edges. Returns the set of ancestor package names.
+///
+/// Running out of memory is reported. Dropping an edge or a visited package
+/// would return a smaller set than the truth, and `uninstall --cascade` would
+/// then leave a package installed whose dependency was just removed.
 fn findTransitiveDependents(
     allocator: std.mem.Allocator,
     sorted: []const resolver.ResolvedPackage,
     target_name: []const u8,
-) std.StringHashMap(void) {
+) error{OutOfMemory}!std.StringHashMap(void) {
     // Build reverse map: package name -> list of packages that depend on it
     var rdeps = std.StringHashMap(std.ArrayList([]const u8)).init(allocator);
     defer {
@@ -124,25 +127,26 @@ fn findTransitiveDependents(
     for (sorted) |resolved| {
         const pkg_name = resolved.pkg.name orelse continue;
         for (resolved.dependency_names) |dep_name| {
-            var entry = rdeps.getOrPut(dep_name) catch continue;
+            var entry = try rdeps.getOrPut(dep_name);
             if (!entry.found_existing) entry.value_ptr.* = .empty;
-            entry.value_ptr.append(allocator, pkg_name) catch continue;
+            try entry.value_ptr.append(allocator, pkg_name);
         }
     }
 
     // BFS upward from target
     var result = std.StringHashMap(void).init(allocator);
+    errdefer result.deinit();
     var queue: std.ArrayList([]const u8) = .empty;
     defer queue.deinit(allocator);
-    queue.append(allocator, target_name) catch return result;
+    try queue.append(allocator, target_name);
 
     while (queue.items.len > 0) {
         const name = queue.orderedRemove(0);
         if (rdeps.get(name)) |parents| {
             for (parents.items) |parent| {
                 if (!result.contains(parent)) {
-                    result.put(parent, {}) catch continue;
-                    queue.append(allocator, parent) catch continue;
+                    try result.put(parent, {});
+                    try queue.append(allocator, parent);
                 }
             }
         }
@@ -735,7 +739,7 @@ pub fn uninstallPackagesFromConfig(
             }
 
             // Cascade: find requested roots that transitively depend on the removed package
-            var all_dependents = findTransitiveDependents(ctx.allocator, resolution.plan.sorted, removed_name);
+            var all_dependents = try findTransitiveDependents(ctx.allocator, resolution.plan.sorted, removed_name);
             defer all_dependents.deinit();
 
             var roots_to_remove = std.StringHashMap(void).init(ctx.allocator);
@@ -1864,19 +1868,6 @@ fn applyProfileRealization(ctx: *Context, prof_name: []const u8, installed_packa
         const current_gen = generation.getCurrentGeneration(profile_dir) catch |err| {
             return ctx.failFmt(mapGenerationError(err), profile_dir, "failed to read current generation: {s}", .{@errorName(err)});
         };
-        var previous_manifest: ?generation.GenerationManifest = null;
-        defer if (previous_manifest) |*manifest_data| manifest_data.deinit();
-
-        if (current_gen) |gen_num| {
-            const previous_path = generation.getGenerationPath(ctx.allocator, profile_dir, gen_num) catch |err| {
-                return ctx.failFmt(mapGenerationError(err), profile_dir, "failed to construct current generation path: {s}", .{@errorName(err)});
-            };
-            defer ctx.allocator.free(previous_path);
-            previous_manifest = generation.readManifest(ctx.allocator, store_root, previous_path) catch |err| {
-                return ctx.failFmt(mapGenerationError(err), previous_path, "failed to read current generation manifest: {s}", .{@errorName(err)});
-            };
-        }
-
         const gen_num = profile.createGeneration(
             ctx,
             profile_dir,
@@ -1900,22 +1891,6 @@ fn applyProfileRealization(ctx: *Context, prof_name: []const u8, installed_packa
 
         emitGenerationStatus(ctx, "created", gen_num, prof_name, phase);
 
-        const provider = if (ctx.configuration) |*cfg| cfg.effectiveInitProvider() else .s6rc;
-        var staged_dinit: ?service_reconcile.StagedDinit = null;
-        defer if (staged_dinit) |*staged| staged.discard();
-        if (provider == .dinit) {
-            const generation_path = generation.getGenerationPath(ctx.allocator, profile_dir, gen_num) catch {
-                return ctx.fail(error.OutOfMemory, profile_dir, "failed to construct generation path for dinit services");
-            };
-            defer ctx.allocator.free(generation_path);
-            staged_dinit = try service_reconcile.stageDinit(
-                ctx,
-                generation_path,
-                installed_packages,
-                if (previous_manifest) |*manifest_data| manifest_data.packages.items else &.{},
-            );
-        }
-
         const result = activation.activateSystemGeneration(
             ctx,
             gen_num,
@@ -1924,18 +1899,6 @@ fn applyProfileRealization(ctx: *Context, prof_name: []const u8, installed_packa
             ctx.debug("failed to activate generation: {}", .{err});
             return mapActivationFailure(ctx, err, profile_dir, "failed to activate generation");
         };
-
-        if (staged_dinit) |*staged| {
-            staged.commit() catch |err| {
-                ctx.debug("failed to commit dinit services: {}", .{err});
-                return ctx.fail(switch (err) {
-                    service_reconcile.ReconcileError.OutOfMemory => error.OutOfMemory,
-                    service_reconcile.ReconcileError.PermissionDenied => error.PermissionDenied,
-                    service_reconcile.ReconcileError.InvalidInput, service_reconcile.ReconcileError.DuplicateService => error.InvalidInput,
-                    else => error.FileSystem,
-                }, profile_dir, "failed to commit dinit services");
-            };
-        }
 
         var gen_buf: [32]u8 = undefined;
         var copied_buf: [32]u8 = undefined;
@@ -5742,4 +5705,96 @@ test "finalizeAdmittedStoreObject makes unprivileged objects read-only" {
     const stat = try dir.stat(path.currentIo());
     try std.testing.expectEqual(@as(std.posix.mode_t, 0), stat.permissions.toMode() & 0o222);
     try dir.setPermissions(path.currentIo(), .fromMode(stat.permissions.toMode() | 0o200));
+}
+
+// ── findTransitiveDependents ──────────────────────────────────────────────
+
+fn dependentFixture(arena: std.mem.Allocator, name: []const u8, deps: []const []const u8) !resolver.ResolvedPackage {
+    return .{
+        .pkg = .{
+            .ctx = undefined,
+            .name = try arena.dupe(u8, name),
+            .dependencies = undefined,
+            .provisions = undefined,
+            .content_hash = "",
+        },
+        .repocache = undefined,
+        .install_order = 0,
+        .scc_id = 0,
+        .dependency_names = deps,
+    };
+}
+
+test "findTransitiveDependents returns every ancestor of the target" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    // app -> lib -> base, tool -> base, unrelated -> other
+    const sorted = [_]resolver.ResolvedPackage{
+        try dependentFixture(arena, "base", &.{}),
+        try dependentFixture(arena, "lib", &.{"base"}),
+        try dependentFixture(arena, "tool", &.{"base"}),
+        try dependentFixture(arena, "app", &.{"lib"}),
+        try dependentFixture(arena, "other", &.{}),
+        try dependentFixture(arena, "unrelated", &.{"other"}),
+    };
+    var found = try findTransitiveDependents(std.testing.allocator, &sorted, "base");
+    defer found.deinit();
+    try std.testing.expectEqual(@as(u32, 3), found.count());
+    try std.testing.expect(found.contains("lib"));
+    try std.testing.expect(found.contains("tool"));
+    try std.testing.expect(found.contains("app"));
+    try std.testing.expect(!found.contains("unrelated"));
+}
+
+fn sweepDependents(allocator: std.mem.Allocator, sorted: []const resolver.ResolvedPackage) error{ OutOfMemory, TestExpectedEqual }!void {
+    var found = findTransitiveDependents(allocator, sorted, "base") catch return error.OutOfMemory;
+    defer found.deinit();
+    // A swallowed allocation failure shows up as a smaller set, not an error,
+    // so the result itself is checked: lib, tool and app all depend on base.
+    if (found.count() != 3) return error.TestExpectedEqual;
+}
+
+test "findTransitiveDependents releases its allocations on every failure point" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const sorted = [_]resolver.ResolvedPackage{
+        try dependentFixture(arena, "base", &.{}),
+        try dependentFixture(arena, "lib", &.{"base"}),
+        try dependentFixture(arena, "tool", &.{"base"}),
+        try dependentFixture(arena, "app", &.{ "lib", "tool" }),
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, sweepDependents, .{@as([]const resolver.ResolvedPackage, &sorted)});
+}
+
+// The repo's own loop (see kdl.zig, build_orchestrator.zig): count allocations on a
+// clean run, then inject a failure at each index. A call that still succeeds must
+// return the same answer as the clean run; a smaller set means a failure was dropped.
+test "findTransitiveDependents never returns a smaller set when an allocation fails" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const sorted = [_]resolver.ResolvedPackage{
+        try dependentFixture(arena, "base", &.{}),
+        try dependentFixture(arena, "lib", &.{"base"}),
+        try dependentFixture(arena, "tool", &.{"base"}),
+        try dependentFixture(arena, "app", &.{ "lib", "tool" }),
+    };
+
+    var counting = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    var clean = try findTransitiveDependents(counting.allocator(), &sorted, "base");
+    const expected = clean.count();
+    clean.deinit();
+    const total = counting.alloc_index;
+
+    var idx: usize = 0;
+    while (idx < total) : (idx += 1) {
+        var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = idx });
+        if (findTransitiveDependents(failing.allocator(), &sorted, "base")) |found| {
+            var mutable = found;
+            defer mutable.deinit();
+            try std.testing.expectEqual(expected, mutable.count());
+        } else |_| {}
+    }
 }

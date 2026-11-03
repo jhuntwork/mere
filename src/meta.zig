@@ -254,16 +254,16 @@ pub const Data = struct {
         service.log = source.log;
 
         for (source.command.items) |value| {
-            try service.command.append(self.allocator, try self.allocator.dupe(u8, value));
+            try appendDuped(self.allocator, &service.command, value);
         }
         for (source.up.items) |value| {
-            try service.up.append(self.allocator, try self.allocator.dupe(u8, value));
+            try appendDuped(self.allocator, &service.up, value);
         }
         for (source.down.items) |value| {
-            try service.down.append(self.allocator, try self.allocator.dupe(u8, value));
+            try appendDuped(self.allocator, &service.down, value);
         }
         for (source.depends_on.items) |value| {
-            try service.depends_on.append(self.allocator, try self.allocator.dupe(u8, value));
+            try appendDuped(self.allocator, &service.depends_on, value);
         }
 
         try self.services.append(self.allocator, service);
@@ -274,10 +274,10 @@ pub const Data = struct {
         errdefer realizer.deinit(self.allocator);
         realizer.name = self.allocator.dupe(u8, source.name) catch return MetaError.OutOfMemory;
         for (source.inputs.items) |value| {
-            try realizer.inputs.append(self.allocator, try self.allocator.dupe(u8, value));
+            try appendDuped(self.allocator, &realizer.inputs, value);
         }
         for (source.command.items) |value| {
-            try realizer.command.append(self.allocator, try self.allocator.dupe(u8, value));
+            try appendDuped(self.allocator, &realizer.command, value);
         }
         try self.realizers.append(self.allocator, realizer);
     }
@@ -292,19 +292,17 @@ pub const Data = struct {
         source_urls: []const []const u8,
     ) MetaError!void {
         if (description.len > 0) {
-            self.description = self.allocator.dupe(u8, description) catch return MetaError.OutOfMemory;
+            const owned = self.allocator.dupe(u8, description) catch return MetaError.OutOfMemory;
+            if (self.description) |previous| self.allocator.free(previous);
+            self.description = owned;
         }
         if (url) |u| {
-            self.url = self.allocator.dupe(u8, u) catch return MetaError.OutOfMemory;
+            const owned = self.allocator.dupe(u8, u) catch return MetaError.OutOfMemory;
+            if (self.url) |previous| self.allocator.free(previous);
+            self.url = owned;
         }
-        for (licenses) |l| {
-            const copy = self.allocator.dupe(u8, l) catch return MetaError.OutOfMemory;
-            self.licenses.append(self.allocator, copy) catch return MetaError.OutOfMemory;
-        }
-        for (source_urls) |s| {
-            const copy = self.allocator.dupe(u8, s) catch return MetaError.OutOfMemory;
-            self.source_urls.append(self.allocator, copy) catch return MetaError.OutOfMemory;
-        }
+        for (licenses) |l| try appendDuped(self.allocator, &self.licenses, l);
+        for (source_urls) |s| try appendDuped(self.allocator, &self.source_urls, s);
     }
 
     pub fn encode(self: *const Data, allocator: std.mem.Allocator) MetaError![]u8 {
@@ -528,21 +526,23 @@ pub const Data = struct {
                 for (node.children.items) |*child| {
                     if (std.mem.eql(u8, child.name, "description")) {
                         if (child.getFirstArgString()) |value| {
-                            meta.description = allocator.dupe(u8, value) catch return MetaError.OutOfMemory;
+                            const owned = allocator.dupe(u8, value) catch return MetaError.OutOfMemory;
+                            if (meta.description) |previous| allocator.free(previous);
+                            meta.description = owned;
                         }
                     } else if (std.mem.eql(u8, child.name, "url")) {
                         if (child.getFirstArgString()) |value| {
-                            meta.url = allocator.dupe(u8, value) catch return MetaError.OutOfMemory;
+                            const owned = allocator.dupe(u8, value) catch return MetaError.OutOfMemory;
+                            if (meta.url) |previous| allocator.free(previous);
+                            meta.url = owned;
                         }
                     } else if (std.mem.eql(u8, child.name, "license")) {
                         if (child.getFirstArgString()) |value| {
-                            const copy = allocator.dupe(u8, value) catch return MetaError.OutOfMemory;
-                            meta.licenses.append(allocator, copy) catch return MetaError.OutOfMemory;
+                            try appendDuped(allocator, &meta.licenses, value);
                         }
                     } else if (std.mem.eql(u8, child.name, "source")) {
                         if (child.getFirstArgString()) |value| {
-                            const copy = allocator.dupe(u8, value) catch return MetaError.OutOfMemory;
-                            meta.source_urls.append(allocator, copy) catch return MetaError.OutOfMemory;
+                            try appendDuped(allocator, &meta.source_urls, value);
                         }
                     }
                 }
@@ -572,6 +572,14 @@ fn appendMetaArgs(
     buffer.append(allocator, '\n') catch return MetaError.OutOfMemory;
 }
 
+/// Duplicate `value` and append it to `list`, freeing the copy if the append
+/// fails so a failure never leaves an unowned allocation behind.
+fn appendDuped(allocator: std.mem.Allocator, list: *std.ArrayList([]const u8), value: []const u8) MetaError!void {
+    const owned = allocator.dupe(u8, value) catch return MetaError.OutOfMemory;
+    errdefer allocator.free(owned);
+    list.append(allocator, owned) catch return MetaError.OutOfMemory;
+}
+
 fn appendIndent(buffer: *std.ArrayList(u8), allocator: std.mem.Allocator, count: usize) MetaError!void {
     var i: usize = 0;
     while (i < count) : (i += 1) buffer.append(allocator, ' ') catch return MetaError.OutOfMemory;
@@ -586,7 +594,7 @@ fn parseServiceArgs(
     if (node.findChild(name)) |child| {
         for (child.arguments.items) |arg| {
             const value = arg.getString() orelse return MetaError.InvalidInput;
-            try values.append(allocator, try allocator.dupe(u8, value));
+            try appendDuped(allocator, values, value);
         }
     }
 }
@@ -944,4 +952,75 @@ test "Data generation realizer metadata roundtrip" {
     try std.testing.expectEqualStrings("!usr/share/glib-2.0/schemas/ignored.xml", parsed_realizer.inputs.items[1]);
     try std.testing.expectEqualStrings("/usr/bin/glib-compile-schemas", parsed_realizer.command.items[0]);
     try std.testing.expectEqualStrings("usr/share/glib-2.0/schemas", parsed_realizer.command.items[1]);
+}
+
+fn sweepAddService(allocator: std.mem.Allocator) error{OutOfMemory}!void {
+    var source = Service.init(std.testing.allocator);
+    defer source.deinit(std.testing.allocator);
+    source.name = try std.testing.allocator.dupe(u8, "svc");
+    try source.command.append(std.testing.allocator, try std.testing.allocator.dupe(u8, "/bin/a"));
+    try source.command.append(std.testing.allocator, try std.testing.allocator.dupe(u8, "-x"));
+    try source.up.append(std.testing.allocator, try std.testing.allocator.dupe(u8, "/bin/up"));
+    try source.down.append(std.testing.allocator, try std.testing.allocator.dupe(u8, "/bin/down"));
+    try source.depends_on.append(std.testing.allocator, try std.testing.allocator.dupe(u8, "dep"));
+
+    var data = Data.init(allocator);
+    defer data.deinit();
+    data.addService(source) catch return error.OutOfMemory;
+}
+
+test "addService releases its allocations on every failure point" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, sweepAddService, .{});
+}
+
+fn sweepAddRealizer(allocator: std.mem.Allocator) error{OutOfMemory}!void {
+    var source = Realizer.init();
+    defer source.deinit(std.testing.allocator);
+    source.name = try std.testing.allocator.dupe(u8, "r");
+    try source.inputs.append(std.testing.allocator, try std.testing.allocator.dupe(u8, "a/*.xml"));
+    try source.inputs.append(std.testing.allocator, try std.testing.allocator.dupe(u8, "b"));
+    try source.command.append(std.testing.allocator, try std.testing.allocator.dupe(u8, "/bin/tool"));
+
+    var data = Data.init(allocator);
+    defer data.deinit();
+    data.addRealizer(source) catch return error.OutOfMemory;
+}
+
+test "addRealizer releases its allocations on every failure point" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, sweepAddRealizer, .{});
+}
+
+fn sweepRecipeMetadata(allocator: std.mem.Allocator) error{OutOfMemory}!void {
+    var data = Data.init(allocator);
+    defer data.deinit();
+    data.populateRecipeMetadata(
+        "a description",
+        "https://example.org/pkg",
+        &.{ "MIT", "BSD-3-Clause" },
+        &.{ "https://example.org/a.tar.xz", "https://example.org/b.patch" },
+    ) catch return error.OutOfMemory;
+}
+
+test "populateRecipeMetadata releases its allocations on every failure point" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, sweepRecipeMetadata, .{});
+}
+
+test "a repeated description or url replaces the earlier value without leaking it" {
+    const allocator = std.testing.allocator;
+    var data = try Data.parse(allocator,
+        \\metadata {
+        \\    description "first"
+        \\    url "https://example.org/first"
+        \\    description "second"
+        \\    url "https://example.org/second"
+        \\}
+        \\
+    );
+    defer data.deinit();
+    try std.testing.expectEqualStrings("second", data.description.?);
+    try std.testing.expectEqualStrings("https://example.org/second", data.url.?);
+
+    try data.populateRecipeMetadata("third", "https://example.org/third", &.{}, &.{});
+    try std.testing.expectEqualStrings("third", data.description.?);
+    try std.testing.expectEqualStrings("https://example.org/third", data.url.?);
 }

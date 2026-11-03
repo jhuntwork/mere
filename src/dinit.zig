@@ -13,6 +13,24 @@ fn io() std.Io {
     return path_mod.currentIo();
 }
 
+/// Directories searched for service definitions. Production always uses
+/// `paths`; tests point these at a temporary tree.
+var source_dirs_override: ?struct { pkg: []const u8, admin: []const u8 } = null;
+
+fn pkgSources() []const u8 {
+    return if (source_dirs_override) |dirs| dirs.pkg else paths.pkg_sources;
+}
+
+fn adminSources() []const u8 {
+    return if (source_dirs_override) |dirs| dirs.admin else paths.admin_sources;
+}
+
+/// Test hook: search `pkg` and `admin` instead of the system directories.
+/// Pass null for both to restore the defaults.
+pub fn setSourceDirsForTest(pkg: ?[]const u8, admin: ?[]const u8) void {
+    source_dirs_override = if (pkg != null and admin != null) .{ .pkg = pkg.?, .admin = admin.? } else null;
+}
+
 pub const paths = struct {
     pub const pkg_sources = "/usr/share/dinit.d";
     pub const admin_sources = "/etc/dinit.d";
@@ -24,7 +42,28 @@ pub const paths = struct {
 
 /// Start a service now via dinitctl.
 pub fn startService(allocator: std.mem.Allocator, name: []const u8) !void {
-    try exec(allocator, &.{ "dinitctl", "start", name });
+    // Refresh the description only for a service that is stopped. A service
+    // that is starting, stopping or already started is left to dinit: reload
+    // is not valid mid-transition and would block a start that is a no-op.
+    if (try isStopped(allocator, name)) try execStep(allocator, "reload", &.{ "dinitctl", "reload", name });
+    try execStep(allocator, "start", &.{ "dinitctl", "start", name });
+}
+
+/// True only when dinit reports the service as loaded and stopped. A service
+/// dinit has not loaded, or a state mere does not recognise, is not "stopped":
+/// start then proceeds without a reload and dinit loads the fresh definition.
+fn isStopped(allocator: std.mem.Allocator, name: []const u8) !bool {
+    const content = checkedOutput(allocator, &.{ "dinitctl", "status", name }) catch return false;
+    defer allocator.free(content);
+    var lines = std.mem.splitScalar(u8, content, '\n');
+    while (lines.next()) |line| {
+        const trimmed = std.mem.trim(u8, line, " \t\r");
+        if (!std.mem.startsWith(u8, trimmed, "State:")) continue;
+        var fields = std.mem.tokenizeAny(u8, trimmed[6..], " \t");
+        const state = fields.next() orelse return false;
+        return std.ascii.eqlIgnoreCase(state, "stopped");
+    }
+    return false;
 }
 
 /// Stop a service now via dinitctl.
@@ -34,7 +73,10 @@ pub fn stopService(allocator: std.mem.Allocator, name: []const u8) !void {
 
 /// Restart a running service via dinitctl.
 pub fn restartService(allocator: std.mem.Allocator, name: []const u8) !void {
-    try exec(allocator, &.{ "dinitctl", "restart", name });
+    // Refresh first: native restart otherwise reuses the cached command.
+    // Dinit validates compatible live changes without dropping dependents.
+    try execStep(allocator, "reload", &.{ "dinitctl", "reload", name });
+    try execStep(allocator, "restart", &.{ "dinitctl", "restart", name });
 }
 
 /// Signal the running process to reload its configuration without restarting.
@@ -44,30 +86,36 @@ pub fn reloadService(allocator: std.mem.Allocator, name: []const u8) !void {
 
 /// Add a service to the boot bundle without changing its live state.
 pub fn enableService(allocator: std.mem.Allocator, name: []const u8) !void {
-    try exec(allocator, &.{ "dinitctl", "--offline", "-d", paths.admin_sources, "-d", paths.pkg_sources, "enable", "--from", paths.boot_bundle, name });
+    try exec(allocator, &.{ "dinitctl", "--offline", "-d", adminSources(), "-d", pkgSources(), "enable", "--from", paths.boot_bundle, name });
 }
 
 /// Remove a service from the boot bundle without changing its live state.
 pub fn disableService(allocator: std.mem.Allocator, name: []const u8) !void {
-    try exec(allocator, &.{ "dinitctl", "--offline", "-d", paths.admin_sources, "-d", paths.pkg_sources, "disable", "--from", paths.boot_bundle, name });
+    try exec(allocator, &.{ "dinitctl", "--offline", "-d", adminSources(), "-d", pkgSources(), "disable", "--from", paths.boot_bundle, name });
 }
 
 /// Scan source paths and return every available service name.
-pub fn scanSourceNames(allocator: std.mem.Allocator) ![]const []const u8 {
+pub fn scanSourceNames(allocator: std.mem.Allocator) error{OutOfMemory}![]const []const u8 {
     var names = std.StringHashMap(void).init(allocator);
-
-    scanNamesFromPath(allocator, paths.pkg_sources, &names);
-    scanNamesFromPath(allocator, paths.admin_sources, &names);
-
-    var list: std.ArrayList([]const u8) = .empty;
-    var it = names.keyIterator();
-    while (it.next()) |key| {
-        list.append(allocator, key.*) catch continue;
+    // The keys are returned to the caller; only the map's own storage is
+    // released on success. On failure the keys go too.
+    defer names.deinit();
+    errdefer {
+        var keys = names.keyIterator();
+        while (keys.next()) |key| allocator.free(key.*);
     }
-    return list.toOwnedSlice(allocator) catch return error.OutOfMemory;
+
+    try scanNamesFromPath(allocator, pkgSources(), &names);
+    try scanNamesFromPath(allocator, adminSources(), &names);
+
+    var list = try std.ArrayList([]const u8).initCapacity(allocator, names.count());
+    errdefer list.deinit(allocator);
+    var it = names.keyIterator();
+    while (it.next()) |key| list.appendAssumeCapacity(key.*);
+    return list.toOwnedSlice(allocator);
 }
 
-fn scanNamesFromPath(allocator: std.mem.Allocator, base: []const u8, names: *std.StringHashMap(void)) void {
+fn scanNamesFromPath(allocator: std.mem.Allocator, base: []const u8, names: *std.StringHashMap(void)) error{OutOfMemory}!void {
     var dir = std.Io.Dir.cwd().openDir(io(), base, .{ .iterate = true }) catch return;
     defer dir.close(io());
     var iter = dir.iterate();
@@ -75,8 +123,12 @@ fn scanNamesFromPath(allocator: std.mem.Allocator, base: []const u8, names: *std
         if (entry.name[0] == '.') continue;
         if (entry.kind != .file) continue;
         if (std.mem.eql(u8, entry.name, paths.boot_bundle)) continue;
-        const name = allocator.dupe(u8, entry.name) catch continue;
-        names.put(name, {}) catch continue;
+        // A name present in both directories (an administrator override) is
+        // already recorded; recording it again would leak the second copy.
+        if (names.contains(entry.name)) continue;
+        const name = try allocator.dupe(u8, entry.name);
+        errdefer allocator.free(name);
+        try names.put(name, {});
     }
 }
 
@@ -132,11 +184,92 @@ fn bootFileEnables(allocator: std.mem.Allocator, source: []const u8, name: []con
 }
 
 fn findSourcePath(allocator: std.mem.Allocator, name: []const u8) !?[]const u8 {
-    for ([_][]const u8{ paths.admin_sources, paths.pkg_sources }) |base| {
+    for ([_][]const u8{ adminSources(), pkgSources() }) |base| {
         const candidate = try std.fs.path.join(allocator, &.{ base, name });
         if (std.Io.Dir.accessAbsolute(io(), candidate, .{})) |_| return candidate else |_| allocator.free(candidate);
     }
     return null;
+}
+
+/// A template is a service named with a trailing '@' (for example "getty@").
+/// dinit loads an instance such as "getty@tty1" from the template file
+/// "getty@". A plain service name never owns instances.
+pub fn isTemplateName(name: []const u8) bool {
+    return name.len > 1 and name[name.len - 1] == '@';
+}
+
+/// The definition file that backs a loaded service name: the name itself, or
+/// for an instance "base@arg" the template "base@".
+pub fn definitionName(name: []const u8) []const u8 {
+    const at = std.mem.indexOfScalar(u8, name, '@') orelse return name;
+    if (at == 0 or at + 1 >= name.len) return name;
+    return name[0 .. at + 1];
+}
+
+/// True when a loaded service belongs to a package-owned definition: an exact
+/// match, or an instance of that definition when it is a template.
+pub fn ownsLoadedService(definition: []const u8, loaded: []const u8) bool {
+    if (std.mem.eql(u8, definition, loaded)) return true;
+    if (!isTemplateName(definition)) return false;
+    return loaded.len > definition.len and std.mem.startsWith(u8, loaded, definition);
+}
+
+/// Essential intent belongs to package metadata, even with an admin override.
+pub fn isEssential(allocator: std.mem.Allocator, name: []const u8) !bool {
+    return isEssentialIn(allocator, pkgSources(), name);
+}
+
+/// Look up the essential marker in `source_dir`. An instance such as "foo@x"
+/// has no file of its own, so fall back to its template "foo@".
+pub fn isEssentialIn(allocator: std.mem.Allocator, source_dir: []const u8, name: []const u8) !bool {
+    if (try essentialMarker(allocator, source_dir, name)) return true;
+    const definition = definitionName(name);
+    if (std.mem.eql(u8, definition, name)) return false;
+    return essentialMarker(allocator, source_dir, definition);
+}
+
+fn essentialMarker(allocator: std.mem.Allocator, source_dir: []const u8, name: []const u8) !bool {
+    const source = try std.fs.path.join(allocator, &.{ source_dir, name });
+    defer allocator.free(source);
+    const content = std.Io.Dir.cwd().readFileAlloc(io(), source, allocator, .limited(1024 * 1024)) catch |err| switch (err) {
+        error.FileNotFound => return false,
+        else => return err,
+    };
+    defer allocator.free(content);
+    var lines = std.mem.splitScalar(u8, content, '\n');
+    while (lines.next()) |line| {
+        if (std.mem.eql(u8, std.mem.trim(u8, line, " \t\r"), "# mere: essential = true")) return true;
+    }
+    return false;
+}
+
+pub fn listServices(allocator: std.mem.Allocator) ![]const u8 {
+    return checkedOutput(allocator, &.{ "dinitctl", "list" });
+}
+
+pub fn listedServiceName(line: []const u8) !?[]const u8 {
+    if (std.mem.trim(u8, line, " \t\r").len == 0) return null;
+    // Dinit 0.22.1 emits a ten-column status field, including nested brackets
+    // for an explicitly started service: [[+]     ] name (pid: ...).
+    if (line.len < 11 or line[0] != '[' or line[9] != ']' or line[10] != ' ')
+        return error.ProcessFailed;
+    var fields = std.mem.tokenizeAny(u8, line[11..], " \t\r");
+    return fields.next() orelse error.ProcessFailed;
+}
+
+pub fn statusIsActive(content: []const u8) !bool {
+    var lines = std.mem.splitScalar(u8, content, '\n');
+    while (lines.next()) |line| {
+        const trimmed = std.mem.trim(u8, line, " \t\r");
+        if (!std.mem.startsWith(u8, trimmed, "State:")) continue;
+        var fields = std.mem.tokenizeAny(u8, trimmed[6..], " \t");
+        const state = fields.next() orelse return error.ProcessFailed;
+        if (std.ascii.eqlIgnoreCase(state, "stopped")) return false;
+        if (std.ascii.eqlIgnoreCase(state, "started") or std.ascii.eqlIgnoreCase(state, "starting") or
+            std.ascii.eqlIgnoreCase(state, "stopping")) return true;
+        return error.ProcessFailed;
+    }
+    return error.ProcessFailed;
 }
 
 // ── Introspection ─────────────────────────────────────────────────
@@ -182,8 +315,22 @@ fn succeeds(allocator: std.mem.Allocator, argv: []const []const u8) !bool {
 
 // ── Helpers ───────────────────────────────────────────────────────
 
+/// Like `exec`, but names the failing step so a refused reload is not
+/// mistaken for a failed start.
+fn execStep(allocator: std.mem.Allocator, step: []const u8, argv: []const []const u8) !void {
+    exec(allocator, argv) catch |err| {
+        var buf: [256]u8 = undefined;
+        var writer = std.Io.File.stderr().writer(io(), &buf);
+        writer.interface.print("dinitctl {s} failed for '{s}'\n", .{ step, argv[argv.len - 1] }) catch {};
+        writer.interface.flush() catch {};
+        return err;
+    };
+}
+
 fn exec(allocator: std.mem.Allocator, argv: []const []const u8) !void {
     const result = run(allocator, argv) catch return error.ProcessFailed;
+    defer allocator.free(result.stdout);
+    defer allocator.free(result.stderr);
     if (result.term != .exited or result.term.exited != 0) {
         if (result.stderr.len > 0) {
             const stderr = std.Io.File.stderr();
@@ -196,8 +343,23 @@ fn exec(allocator: std.mem.Allocator, argv: []const []const u8) !void {
     }
 }
 
-pub fn run(allocator: std.mem.Allocator, argv: []const []const u8) !std.process.RunResult {
+/// Runs a command and returns its result. Replaced in tests so the exact
+/// dinitctl calls can be recorded and canned answers returned.
+pub const Runner = *const fn (std.mem.Allocator, []const []const u8) anyerror!std.process.RunResult;
+
+var runner: Runner = defaultRunner;
+
+fn defaultRunner(allocator: std.mem.Allocator, argv: []const []const u8) anyerror!std.process.RunResult {
     return std.process.run(allocator, io(), .{ .argv = argv });
+}
+
+/// Test hook: route every dinitctl call through `replacement`. Pass null to restore.
+pub fn setRunnerForTest(replacement: ?Runner) void {
+    runner = replacement orelse defaultRunner;
+}
+
+pub fn run(allocator: std.mem.Allocator, argv: []const []const u8) !std.process.RunResult {
+    return runner(allocator, argv);
 }
 
 test "boot intent reads native dependencies and directory entries" {
@@ -226,4 +388,201 @@ test "boot intent reads native dependencies and directory entries" {
     try std.testing.expect(try bootFileEnables(allocator, boot, "daemon"));
     try std.Io.Dir.deleteFileAbsolute(io(), link);
     try std.testing.expect(!try bootFileEnables(allocator, boot, "daemon"));
+}
+
+test "boot intent live-state parsing fails closed and matches complete names" {
+    try std.testing.expectEqualStrings("worker", (try listedServiceName("[[+]     ] worker (pid: 7)")).?);
+    try std.testing.expectEqualStrings("worker-old", (try listedServiceName("[{+}     ] worker-old")).?);
+    try std.testing.expectError(error.ProcessFailed, listedServiceName("unknown list format"));
+    try std.testing.expect(try statusIsActive("    State: started\n"));
+    try std.testing.expect(try statusIsActive("    State: stopping\n"));
+    try std.testing.expect(!try statusIsActive("    State: STOPPED (dependency failed/terminated)\n"));
+    try std.testing.expectError(error.ProcessFailed, statusIsActive("socket error\n"));
+}
+
+// ── Command sequencing and template handling ──────────────────────────────
+// Test names contain "boot intent" so the existing build.zig filter runs them.
+
+var recorded: std.ArrayList([]const u8) = .empty;
+var canned_status: []const u8 = "";
+var canned_failures: []const []const u8 = &.{};
+
+fn recordingRunner(allocator: std.mem.Allocator, argv: []const []const u8) anyerror!std.process.RunResult {
+    var joined: std.ArrayList(u8) = .empty;
+    defer joined.deinit(std.testing.allocator);
+    for (argv, 0..) |part, i| {
+        if (i > 0) try joined.append(std.testing.allocator, ' ');
+        try joined.appendSlice(std.testing.allocator, part);
+    }
+    try recorded.append(std.testing.allocator, try std.testing.allocator.dupe(u8, joined.items));
+    var code: u8 = 0;
+    for (canned_failures) |prefix| {
+        if (std.mem.startsWith(u8, joined.items, prefix)) code = 1;
+    }
+    const is_status = argv.len > 1 and std.mem.eql(u8, argv[1], "status");
+    const stdout = try allocator.dupe(u8, if (is_status) canned_status else "ok\n");
+    errdefer allocator.free(stdout);
+    const stderr = try allocator.dupe(u8, if (code != 0) "refused\n" else "note\n");
+    return .{ .term = .{ .exited = code }, .stdout = stdout, .stderr = stderr };
+}
+
+fn resetRecording() void {
+    for (recorded.items) |item| std.testing.allocator.free(item);
+    recorded.clearAndFree(std.testing.allocator);
+    canned_status = "";
+    canned_failures = &.{};
+}
+
+fn expectCalls(expected: []const []const u8) !void {
+    try std.testing.expectEqual(expected.len, recorded.items.len);
+    for (expected, recorded.items) |want, got| try std.testing.expectEqualStrings(want, got);
+}
+
+test "boot intent start reloads a stopped service before starting it" {
+    setRunnerForTest(recordingRunner);
+    defer setRunnerForTest(null);
+    defer resetRecording();
+    resetRecording();
+    canned_status = "    State: stopped\n";
+    try startService(std.testing.allocator, "worker");
+    try expectCalls(&.{ "dinitctl status worker", "dinitctl reload worker", "dinitctl start worker" });
+}
+
+test "boot intent start does not reload a started service" {
+    setRunnerForTest(recordingRunner);
+    defer setRunnerForTest(null);
+    defer resetRecording();
+    resetRecording();
+    canned_status = "    State: started\n";
+    try startService(std.testing.allocator, "worker");
+    try expectCalls(&.{ "dinitctl status worker", "dinitctl start worker" });
+}
+
+test "boot intent start does not reload a service that is starting or stopping" {
+    setRunnerForTest(recordingRunner);
+    defer setRunnerForTest(null);
+    defer resetRecording();
+    for ([_][]const u8{ "    State: starting\n", "    State: stopping\n" }) |state| {
+        resetRecording();
+        canned_status = state;
+        try startService(std.testing.allocator, "worker");
+        try expectCalls(&.{ "dinitctl status worker", "dinitctl start worker" });
+    }
+}
+
+test "boot intent start proceeds without reload when the service is not loaded" {
+    setRunnerForTest(recordingRunner);
+    defer setRunnerForTest(null);
+    defer resetRecording();
+    resetRecording();
+    canned_failures = &.{"dinitctl status"};
+    try startService(std.testing.allocator, "worker");
+    try expectCalls(&.{ "dinitctl status worker", "dinitctl start worker" });
+}
+
+test "boot intent start stops before starting when the reload is refused" {
+    setRunnerForTest(recordingRunner);
+    defer setRunnerForTest(null);
+    defer resetRecording();
+    resetRecording();
+    canned_status = "    State: stopped\n";
+    canned_failures = &.{"dinitctl reload"};
+    try std.testing.expectError(error.ProcessFailed, startService(std.testing.allocator, "worker"));
+    try expectCalls(&.{ "dinitctl status worker", "dinitctl reload worker" });
+}
+
+test "boot intent restart reloads then restarts and stops if the reload fails" {
+    setRunnerForTest(recordingRunner);
+    defer setRunnerForTest(null);
+    defer resetRecording();
+    resetRecording();
+    try restartService(std.testing.allocator, "worker");
+    try expectCalls(&.{ "dinitctl reload worker", "dinitctl restart worker" });
+
+    resetRecording();
+    canned_failures = &.{"dinitctl reload"};
+    try std.testing.expectError(error.ProcessFailed, restartService(std.testing.allocator, "worker"));
+    try expectCalls(&.{"dinitctl reload worker"});
+}
+
+test "boot intent template ownership matches instances only of a template" {
+    try std.testing.expect(ownsLoadedService("getty@", "getty@tty1"));
+    try std.testing.expect(ownsLoadedService("worker", "worker"));
+    try std.testing.expect(!ownsLoadedService("foo", "foo@x"));
+    try std.testing.expect(!ownsLoadedService("getty@", "getty"));
+    try std.testing.expect(ownsLoadedService("getty@", "getty@"));
+}
+
+test "boot intent essential lookup falls back from an instance to its template" {
+    const th = @import("test_helpers.zig");
+    var env = try th.createTestEnv();
+    defer {
+        env.cleanup();
+        std.testing.allocator.destroy(env);
+    }
+    const allocator = env.ctx.allocator;
+    const template = try std.fs.path.join(allocator, &.{ env.path, "getty@" });
+    defer allocator.free(template);
+    var file = try std.Io.Dir.createFileAbsolute(io(), template, .{});
+    try file.writeStreamingAll(io(), "type = process\n# mere: essential = true\n");
+    file.close(io());
+    try std.testing.expect(try isEssentialIn(allocator, env.path, "getty@"));
+    try std.testing.expect(try isEssentialIn(allocator, env.path, "getty@tty1"));
+    try std.testing.expect(!try isEssentialIn(allocator, env.path, "other@tty1"));
+    try std.testing.expect(!try isEssentialIn(allocator, env.path, "getty"));
+}
+
+// Inject an allocation failure at every allocation in turn. Each function must
+// either succeed or return OutOfMemory, and must release everything either way.
+
+fn sweepStart(allocator: std.mem.Allocator) error{OutOfMemory}!void {
+    setRunnerForTest(recordingRunner);
+    defer setRunnerForTest(null);
+    canned_status = "    State: stopped\n";
+    // startService reports any failure as ProcessFailed; the sweep only cares
+    // that nothing is left behind, so fold the outcome into OutOfMemory/success.
+    startService(allocator, "worker") catch return error.OutOfMemory;
+    restartService(allocator, "worker") catch return error.OutOfMemory;
+}
+
+test "boot intent start and restart release their allocations on every failure point" {
+    defer resetRecording();
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, sweepStart, .{});
+}
+
+fn sweepScan(allocator: std.mem.Allocator, pkg: []const u8, admin: []const u8) !void {
+    setSourceDirsForTest(pkg, admin);
+    defer setSourceDirsForTest(null, null);
+    const names = try scanSourceNames(allocator);
+    for (names) |name| allocator.free(name);
+    allocator.free(names);
+}
+
+test "boot intent scanning service names releases its allocations on every failure point" {
+    const th = @import("test_helpers.zig");
+    var env = try th.createTestEnv();
+    defer {
+        env.cleanup();
+        std.testing.allocator.destroy(env);
+    }
+    const a = env.ctx.allocator;
+    const pkg = try std.fs.path.join(a, &.{ env.path, "pkg.d" });
+    defer a.free(pkg);
+    const admin = try std.fs.path.join(a, &.{ env.path, "admin.d" });
+    defer a.free(admin);
+    try path_mod.ensureDirExists(pkg);
+    try path_mod.ensureDirExists(admin);
+    for ([_][]const u8{ "alpha", "beta", "gamma" }) |name| {
+        const f = try std.fs.path.join(a, &.{ pkg, name });
+        defer a.free(f);
+        var file = try std.Io.Dir.createFileAbsolute(io(), f, .{});
+        file.close(io());
+    }
+    // An override present in both directories exercises the duplicate path.
+    const over = try std.fs.path.join(a, &.{ admin, "beta" });
+    defer a.free(over);
+    var file = try std.Io.Dir.createFileAbsolute(io(), over, .{});
+    file.close(io());
+
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, sweepScan, .{ pkg, admin });
 }

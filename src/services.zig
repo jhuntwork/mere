@@ -131,7 +131,11 @@ pub fn disable(ctx: *mere.Context, name: []const u8) ServiceError!void {
             try s6rc.setCommit(allocator);
             try s6rc.setInstall(allocator);
         },
-        .dinit => try dinit.disableService(ctx.allocator, name),
+        .dinit => {
+            if (dinit.isEssential(ctx.allocator, name) catch |err| return mapDinitQueryError(err))
+                return ctx.fail(error.InvalidInput, name, "essential boot services cannot be disabled");
+            try dinit.disableService(ctx.allocator, name);
+        },
     }
 }
 
@@ -179,7 +183,9 @@ fn statusDinit(ctx: *mere.Context, name: []const u8) ServiceError!StatusDetail {
 
     const kind = dinit.serviceKind(allocator, name) catch return error.ProcessFailed;
     const state = try dinitState(allocator, raw);
-    const boot_state: BootState = if (dinit.isBootEnabled(allocator, name) catch return error.ProcessFailed) .enabled else .disabled;
+    errdefer allocator.free(state);
+    const essential = dinit.isEssential(allocator, name) catch |err| return mapDinitQueryError(err);
+    const boot_state: BootState = if (essential) .essential else if (dinit.isBootEnabled(allocator, name) catch |err| return mapDinitQueryError(err)) .enabled else .disabled;
     const is_daemon = kind == .daemon;
 
     return .{
@@ -190,6 +196,12 @@ fn statusDinit(ctx: *mere.Context, name: []const u8) ServiceError!StatusDetail {
         .dependencies = .empty,
         .log_dir = if (is_daemon) try dinitLogPath(allocator, name) else null,
     };
+}
+
+/// A failed dinit query is a process failure, but running out of memory must
+/// stay out-of-memory so callers can tell the two apart.
+fn mapDinitQueryError(err: anyerror) ServiceError {
+    return if (err == error.OutOfMemory) error.OutOfMemory else error.ProcessFailed;
 }
 
 fn dinitState(allocator: std.mem.Allocator, raw: []const u8) ServiceError![]const u8 {
@@ -227,18 +239,26 @@ fn listS6Rc(ctx: *mere.Context) ServiceError![]ListEntry {
         entries.deinit(allocator);
     }
 
+    // Every scanned name is owned here and freed exactly once: either it moves
+    // into an entry, or it is released when skipped or when a failure stops the
+    // loop. `visited` is the number of names already settled.
+    var visited: usize = 0;
+    errdefer for (all_names[visited..]) |name| allocator.free(name);
+
     for (all_names) |name| {
-        defer allocator.free(name);
-
         const boot_state = queryBootState(ctx, name);
-        if (boot_state == .essential and queryKind(ctx, name) == .oneshot) continue;
+        if (boot_state == .essential and queryKind(ctx, name) == .oneshot) {
+            allocator.free(name);
+            visited += 1;
+            continue;
+        }
 
-        const owned_name = try allocator.dupe(u8, name);
         try entries.append(allocator, .{
-            .name = owned_name,
+            .name = name,
             .boot_state = boot_state,
             .state = if (isFailingLongrun(ctx, name)) "failing" else if (isUp(ctx, name)) "up" else "-",
         });
+        visited += 1;
     }
 
     std.mem.sort(ListEntry, entries.items, {}, struct {
@@ -253,22 +273,30 @@ fn listS6Rc(ctx: *mere.Context) ServiceError![]ListEntry {
 fn listDinit(ctx: *mere.Context) ServiceError![]ListEntry {
     const allocator = ctx.allocator;
     const all_names = try dinit.scanSourceNames(allocator);
+    defer allocator.free(all_names);
+
     var entries: std.ArrayList(ListEntry) = .empty;
     errdefer {
         for (entries.items) |entry| allocator.free(entry.name);
         entries.deinit(allocator);
     }
 
+    // Every scanned name is owned here. `moved` counts those already handed to
+    // an entry, so a failure part way releases exactly the rest.
+    var moved: usize = 0;
+    errdefer for (all_names[moved..]) |name| allocator.free(name);
+
     for (all_names) |name| {
-        const owned_name = name;
-        const failed = dinit.isFailed(allocator, name) catch return error.ProcessFailed;
-        const started = dinit.isStarted(allocator, name) catch return error.ProcessFailed;
-        const boot_enabled = dinit.isBootEnabled(allocator, name) catch return error.ProcessFailed;
+        const failed = dinit.isFailed(allocator, name) catch |err| return mapDinitQueryError(err);
+        const started = dinit.isStarted(allocator, name) catch |err| return mapDinitQueryError(err);
+        const boot_enabled = dinit.isBootEnabled(allocator, name) catch |err| return mapDinitQueryError(err);
+        const essential = dinit.isEssential(allocator, name) catch |err| return mapDinitQueryError(err);
         try entries.append(allocator, .{
-            .name = owned_name,
-            .boot_state = if (boot_enabled) .enabled else .disabled,
+            .name = name,
+            .boot_state = if (essential) .essential else if (boot_enabled) .enabled else .disabled,
             .state = if (failed) "failed" else if (started) "started" else "stopped",
         });
+        moved += 1;
     }
 
     std.mem.sort(ListEntry, entries.items, {}, struct {
@@ -445,7 +473,9 @@ fn queryDependencies(ctx: *mere.Context, name: []const u8, dependencies: *std.Ar
     var iter = std.mem.splitScalar(u8, std.mem.trimEnd(u8, result.stdout, "\n"), '\n');
     while (iter.next()) |dep| {
         if (dep.len == 0 or std.mem.startsWith(u8, dep, "s6rc-") or std.mem.endsWith(u8, dep, "-log")) continue;
-        try dependencies.append(allocator, try allocator.dupe(u8, dep));
+        const owned = try allocator.dupe(u8, dep);
+        errdefer allocator.free(owned);
+        try dependencies.append(allocator, owned);
     }
 }
 
@@ -522,4 +552,335 @@ test "service operations preserve config load diagnostics" {
     const diag = test_env.ctx.getDiagnosticContext();
     try std.testing.expectEqualStrings("settings.init-provider", diag.subject.?);
     try std.testing.expect(std.mem.indexOf(u8, diag.details.?, "systemd") != null);
+}
+
+// ── Essential services through the dinit facade ───────────────────────────
+
+var test_status_text: []const u8 = "    State: started\n";
+var test_failing_prefix: ?[]const u8 = null;
+var test_commands_run: usize = 0;
+var test_error_verb: ?[]const u8 = null;
+var test_error_after: usize = 0;
+
+fn essentialFacadeRunner(allocator: std.mem.Allocator, argv: []const []const u8) anyerror!std.process.RunResult {
+    test_commands_run += 1;
+    const verb = if (argv.len > 1) argv[1] else "";
+    // Model dinitctl being unreachable for one query, as opposed to answering "no".
+    if (test_error_verb) |failing| {
+        if (std.mem.eql(u8, verb, failing)) {
+            if (test_error_after == 0) return error.ProcessFailed;
+            test_error_after -= 1;
+        }
+    }
+    var code: u8 = 0;
+    // is-started / is-failed answer through the exit code; status through stdout.
+    if (std.mem.eql(u8, verb, "is-failed")) code = 1;
+    if (std.mem.eql(u8, verb, "is-started")) code = 0;
+    if (test_failing_prefix) |prefix| {
+        if (std.mem.eql(u8, verb, prefix)) code = 1;
+    }
+    const stdout = try allocator.dupe(u8, if (std.mem.eql(u8, verb, "status")) test_status_text else "ok\n");
+    errdefer allocator.free(stdout);
+    const stderr = try allocator.dupe(u8, if (code != 0) "refused\n" else "note\n");
+    return .{ .term = .{ .exited = code }, .stdout = stdout, .stderr = stderr };
+}
+
+const DinitFixture = struct {
+    env: *@import("test_helpers.zig").TestEnv,
+    pkg_dir: []const u8,
+    admin_dir: []const u8,
+
+    fn init() !DinitFixture {
+        const th = @import("test_helpers.zig");
+        const env = try th.createTestEnv();
+        const a = env.ctx.allocator;
+        var cfg = mere.config.Config.init(&env.ctx, a);
+        cfg.init_provider = .dinit;
+        env.ctx.configuration = cfg;
+        const pkg_dir = try std.fs.path.join(a, &.{ env.path, "pkg.d" });
+        const admin_dir = try std.fs.path.join(a, &.{ env.path, "admin.d" });
+        try path_mod.ensureDirExists(pkg_dir);
+        try path_mod.ensureDirExists(admin_dir);
+        dinit.setSourceDirsForTest(pkg_dir, admin_dir);
+        dinit.setRunnerForTest(essentialFacadeRunner);
+        test_status_text = "    State: started\n";
+        test_failing_prefix = null;
+        test_commands_run = 0;
+        test_error_verb = null;
+        test_error_after = 0;
+        return .{ .env = env, .pkg_dir = pkg_dir, .admin_dir = admin_dir };
+    }
+
+    fn deinit(self: *DinitFixture) void {
+        dinit.setRunnerForTest(null);
+        dinit.setSourceDirsForTest(null, null);
+        const a = self.env.ctx.allocator;
+        a.free(self.pkg_dir);
+        a.free(self.admin_dir);
+        self.env.cleanup();
+        std.testing.allocator.destroy(self.env);
+    }
+
+    fn write(self: *DinitFixture, dir: []const u8, name: []const u8, content: []const u8) !void {
+        const full = try std.fs.path.join(self.env.ctx.allocator, &.{ dir, name });
+        defer self.env.ctx.allocator.free(full);
+        var file = try std.Io.Dir.createFileAbsolute(path_mod.currentIo(), full, .{});
+        defer file.close(path_mod.currentIo());
+        try file.writeStreamingAll(path_mod.currentIo(), content);
+    }
+};
+
+test "dinit disable refuses an essential service and runs no command" {
+    var fx = try DinitFixture.init();
+    defer fx.deinit();
+    try fx.write(fx.pkg_dir, "must-run", "type = process\ncommand = /bin/true\n# mere: essential = true\n");
+    try std.testing.expectError(error.InvalidInput, disable(&fx.env.ctx, "must-run"));
+    try std.testing.expectEqual(@as(usize, 0), test_commands_run);
+}
+
+test "dinit disable refuses an essential service even when an administrator overrides its definition" {
+    var fx = try DinitFixture.init();
+    defer fx.deinit();
+    try fx.write(fx.pkg_dir, "must-run", "type = process\ncommand = /bin/true\n# mere: essential = true\n");
+    // The override replaces the command but carries no marker; the package
+    // definition still decides whether the service is essential.
+    try fx.write(fx.admin_dir, "must-run", "type = process\ncommand = /bin/other\n");
+    try std.testing.expectError(error.InvalidInput, disable(&fx.env.ctx, "must-run"));
+    try std.testing.expectEqual(@as(usize, 0), test_commands_run);
+}
+
+test "dinit disable of an ordinary service reaches dinitctl" {
+    var fx = try DinitFixture.init();
+    defer fx.deinit();
+    try fx.write(fx.pkg_dir, "ordinary", "type = process\ncommand = /bin/true\n");
+    try disable(&fx.env.ctx, "ordinary");
+    try std.testing.expectEqual(@as(usize, 1), test_commands_run);
+}
+
+test "dinit disable refuses an instance of an essential template" {
+    var fx = try DinitFixture.init();
+    defer fx.deinit();
+    try fx.write(fx.pkg_dir, "getty@", "type = process\ncommand = /bin/true\n# mere: essential = true\n");
+    try std.testing.expectError(error.InvalidInput, disable(&fx.env.ctx, "getty@tty1"));
+    try std.testing.expectEqual(@as(usize, 0), test_commands_run);
+}
+
+test "dinit status and list report an essential service as essential" {
+    var fx = try DinitFixture.init();
+    defer fx.deinit();
+    try fx.write(fx.pkg_dir, "must-run", "type = process\ncommand = /bin/true\n# mere: essential = true\n");
+    try fx.write(fx.pkg_dir, "ordinary", "type = process\ncommand = /bin/true\n");
+
+    var detail = try status(&fx.env.ctx, "must-run");
+    defer detail.deinit(&fx.env.ctx);
+    try std.testing.expectEqual(BootState.essential, detail.boot_state);
+    try std.testing.expectEqualStrings("essential", detail.boot_state.label());
+
+    var plain = try status(&fx.env.ctx, "ordinary");
+    defer plain.deinit(&fx.env.ctx);
+    try std.testing.expect(plain.boot_state != BootState.essential);
+
+    const entries = try list(&fx.env.ctx);
+    defer freeList(&fx.env.ctx, entries);
+    var seen_essential = false;
+    var seen_other = false;
+    for (entries) |entry| {
+        if (std.mem.eql(u8, entry.name, "must-run")) {
+            try std.testing.expectEqual(BootState.essential, entry.boot_state);
+            seen_essential = true;
+        }
+        if (std.mem.eql(u8, entry.name, "ordinary")) {
+            try std.testing.expect(entry.boot_state != BootState.essential);
+            seen_other = true;
+        }
+    }
+    try std.testing.expect(seen_essential and seen_other);
+}
+
+test "dinit list releases every name when a query fails part way" {
+    var fx = try DinitFixture.init();
+    defer fx.deinit();
+    try fx.write(fx.pkg_dir, "alpha", "type = process\ncommand = /bin/true\n");
+    try fx.write(fx.pkg_dir, "beta", "type = process\ncommand = /bin/true\n");
+    // An administrator override of beta must not produce a second copy of its name.
+    try fx.write(fx.admin_dir, "beta", "type = process\ncommand = /bin/other\n");
+    // Let the first name succeed so it has already moved into an entry, then
+    // fail the second query. Both the moved entry and the unvisited name must
+    // be released regardless of the order the directory scan returns them in.
+    test_error_verb = "is-started";
+    test_error_after = 1;
+    try std.testing.expectError(error.ProcessFailed, list(&fx.env.ctx));
+}
+
+// ── s6rc facade: nothing may leak, with realistic command output ──────────
+// Empty output cannot leak, so the fake answers every command with text, the
+// way the real s6 tools do.
+
+var s6_fail_verb: ?[]const u8 = null;
+var s6_calls: usize = 0;
+
+fn s6Runner(allocator: std.mem.Allocator, argv: []const []const u8) anyerror!std.process.RunResult {
+    s6_calls += 1;
+    const verb = argv[0];
+    var code: u8 = 0;
+    if (s6_fail_verb) |failing| {
+        if (std.mem.eql(u8, verb, failing)) code = 1;
+    }
+    const out: []const u8 = if (std.mem.eql(u8, verb, "s6-rc-set-status"))
+        "current/always\n"
+    else if (std.mem.eql(u8, verb, "s6-rc-db") and argv.len > 3 and std.mem.eql(u8, argv[3], "type"))
+        "longrun\n"
+    else if (std.mem.eql(u8, verb, "s6-rc-db"))
+        "dep-one\ns6rc-oneshot-runner\ndep-two\n"
+    else if (std.mem.eql(u8, verb, "s6-rc"))
+        "svc-a\nsvc-b\n"
+    else if (std.mem.eql(u8, verb, "s6-svstat"))
+        "up (pid 1) 5 seconds\n"
+    else
+        "output\n";
+    const stdout = try allocator.dupe(u8, out);
+    errdefer allocator.free(stdout);
+    const stderr = try allocator.dupe(u8, if (code != 0) "refused\n" else "note\n");
+    return .{ .term = .{ .exited = code }, .stdout = stdout, .stderr = stderr };
+}
+
+const S6Fixture = struct {
+    env: *@import("test_helpers.zig").TestEnv,
+    pkg_dir: []const u8,
+    admin_dir: []const u8,
+
+    fn init() !S6Fixture {
+        const th = @import("test_helpers.zig");
+        const env = try th.createTestEnv();
+        const a = env.ctx.allocator;
+        var cfg = mere.config.Config.init(&env.ctx, a);
+        cfg.init_provider = .s6rc;
+        env.ctx.configuration = cfg;
+        const pkg_dir = try std.fs.path.join(a, &.{ env.path, "pkg.s" });
+        const admin_dir = try std.fs.path.join(a, &.{ env.path, "admin.s" });
+        try path_mod.ensureDirExists(pkg_dir);
+        try path_mod.ensureDirExists(admin_dir);
+        s6rc.setSourceDirsForTest(pkg_dir, admin_dir);
+        s6rc.setRunnerForTest(s6Runner);
+        s6_fail_verb = null;
+        s6_calls = 0;
+        return .{ .env = env, .pkg_dir = pkg_dir, .admin_dir = admin_dir };
+    }
+
+    fn deinit(self: *S6Fixture) void {
+        s6rc.setRunnerForTest(null);
+        s6rc.setSourceDirsForTest(null, null);
+        const a = self.env.ctx.allocator;
+        a.free(self.pkg_dir);
+        a.free(self.admin_dir);
+        self.env.cleanup();
+        std.testing.allocator.destroy(self.env);
+    }
+
+    fn service(self: *S6Fixture, dir: []const u8, name: []const u8) !void {
+        const full = try std.fs.path.join(self.env.ctx.allocator, &.{ dir, name });
+        defer self.env.ctx.allocator.free(full);
+        try path_mod.ensureDirExists(full);
+    }
+};
+
+test "s6rc ensureRepo releases command output when the repository already exists" {
+    var fx = try S6Fixture.init();
+    defer fx.deinit();
+    try s6rc.ensureRepo(fx.env.ctx.allocator);
+    try std.testing.expect(s6_calls > 0);
+}
+
+test "s6rc ensureRepo releases command output when the repository must be created" {
+    var fx = try S6Fixture.init();
+    defer fx.deinit();
+    s6_fail_verb = "s6-rc-repo-list";
+    try s6rc.ensureRepo(fx.env.ctx.allocator);
+}
+
+test "s6rc status, list and lifecycle commands release their output" {
+    var fx = try S6Fixture.init();
+    defer fx.deinit();
+    try fx.service(fx.pkg_dir, "alpha");
+    try fx.service(fx.pkg_dir, "beta");
+    try fx.service(fx.admin_dir, "beta");
+
+    var detail = try status(&fx.env.ctx, "alpha");
+    detail.deinit(&fx.env.ctx);
+
+    const entries = try list(&fx.env.ctx);
+    freeList(&fx.env.ctx, entries);
+
+    try start(&fx.env.ctx, "alpha");
+    try stop(&fx.env.ctx, "alpha");
+    try restart(&fx.env.ctx, "alpha");
+    try reload(&fx.env.ctx, "alpha");
+    try enable(&fx.env.ctx, "alpha");
+    try disable(&fx.env.ctx, "alpha");
+}
+
+test "s6rc list releases every name when a query fails part way" {
+    var fx = try S6Fixture.init();
+    defer fx.deinit();
+    try fx.service(fx.pkg_dir, "alpha");
+    try fx.service(fx.pkg_dir, "beta");
+    try fx.service(fx.admin_dir, "beta");
+    // A refused command is a normal answer for the list queries, so they all
+    // tolerate it; the listing must still free what it scanned.
+    s6_fail_verb = "s6-rc-set-status";
+    const entries = try list(&fx.env.ctx);
+    freeList(&fx.env.ctx, entries);
+}
+
+test "s6rc scan releases its allocations on every failure point" {
+    var fx = try S6Fixture.init();
+    defer fx.deinit();
+    try fx.service(fx.pkg_dir, "alpha");
+    try fx.service(fx.pkg_dir, "beta");
+    try fx.service(fx.admin_dir, "beta");
+    try fx.service(fx.admin_dir, "gamma");
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, sweepS6Scan, .{});
+}
+
+fn sweepS6Scan(allocator: std.mem.Allocator) error{OutOfMemory}!void {
+    const names = try s6rc.scanSourceNames(allocator);
+    for (names) |name| allocator.free(name);
+    allocator.free(names);
+}
+
+// Fail each allocation made through the facade in turn. The context is built on
+// a reliable allocator; only the allocator the operation uses is made to fail.
+
+fn sweepFacade(allocator: std.mem.Allocator, root: []const u8, provider: mere.config.InitProvider) error{OutOfMemory}!void {
+    var base = mere.Context.init(std.testing.allocator, root);
+    defer base.deinit();
+    var cfg = mere.config.Config.init(&base, std.testing.allocator);
+    cfg.init_provider = provider;
+    base.configuration = cfg;
+    var ctx = base;
+    ctx.allocator = allocator;
+
+    const entries = list(&ctx) catch return error.OutOfMemory;
+    freeList(&ctx, entries);
+
+    var detail = status(&ctx, "alpha") catch return error.OutOfMemory;
+    detail.deinit(&ctx);
+}
+
+test "s6rc list and status release their allocations on every failure point" {
+    var fx = try S6Fixture.init();
+    defer fx.deinit();
+    try fx.service(fx.pkg_dir, "alpha");
+    try fx.service(fx.pkg_dir, "beta");
+    try fx.service(fx.admin_dir, "beta");
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, sweepFacade, .{ fx.env.path, .s6rc });
+}
+
+test "dinit list and status release their allocations on every failure point" {
+    var fx = try DinitFixture.init();
+    defer fx.deinit();
+    try fx.write(fx.pkg_dir, "alpha", "type = process\ncommand = /bin/true\n");
+    try fx.write(fx.pkg_dir, "beta", "type = process\ncommand = /bin/true\n# mere: essential = true\n");
+    try fx.write(fx.admin_dir, "beta", "type = process\ncommand = /bin/other\n");
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, sweepFacade, .{ fx.env.path, .dinit });
 }

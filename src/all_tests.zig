@@ -50,6 +50,7 @@ test {
     _ = @import("search.zig");
     _ = @import("services.zig");
     _ = @import("service_reconcile.zig");
+    _ = @import("service_policy.zig");
     _ = @import("sign.zig");
     _ = @import("sign_crypto.zig");
     _ = @import("sign_io.zig");

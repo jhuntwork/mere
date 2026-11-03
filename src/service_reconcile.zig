@@ -88,6 +88,9 @@ pub fn stageDinit(
     defer freeNames(allocator, &target_names);
     try collectNames(ctx, packages, &target_names);
 
+    if (target_names.contains("mere-essential") or target_names.contains("mere-essential.d"))
+        return ctx.fail(error.DuplicateService, "mere-essential", "service name reserved for the required boot bundle");
+
     // The complete package-owned tree is built off to the side. This avoids
     // exposing a partially updated service set to dinit.
     for (packages) |pkg| {
@@ -98,11 +101,12 @@ pub fn stageDinit(
         }
     }
 
+    try writeEssentialBundle(ctx, stage_root, packages);
     return .{ .allocator = allocator, .service_root = service_root, .stage_root = stage_root };
 }
 
 /// Prepare and immediately commit a dinit service tree. Install/profile code
-/// should prefer `stageDinit` so generation activation can happen first.
+/// should stage into the target generation and commit before activating it.
 pub fn reconcileDinit(
     ctx: *mere.Context,
     packages: []const generation.PackageEntry,
@@ -135,6 +139,52 @@ fn collectNames(
             };
         }
     }
+}
+
+fn writeEssentialBundle(ctx: *mere.Context, root: []const u8, packages: []const generation.PackageEntry) ReconcileError!void {
+    const allocator = ctx.allocator;
+    var names: std.ArrayList([]const u8) = .empty;
+    defer {
+        for (names.items) |name| allocator.free(name);
+        names.deinit(allocator);
+    }
+    for (packages) |pkg| {
+        var data = meta.readFile(allocator, pkg.store_path) catch |err| return mapMetaError(err);
+        defer data.deinit();
+        for (data.services.items) |service| {
+            if (service.essential) {
+                const owned = try allocator.dupe(u8, service.name);
+                names.append(allocator, owned) catch |err| {
+                    allocator.free(owned);
+                    return err;
+                };
+            }
+        }
+    }
+    std.mem.sort([]const u8, names.items, {}, struct {
+        fn lessThan(_: void, a: []const u8, b: []const u8) bool {
+            return std.mem.lessThan(u8, a, b);
+        }
+    }.lessThan);
+    var content: std.ArrayList(u8) = .empty;
+    defer content.deinit(allocator);
+    try content.appendSlice(allocator, "type = internal\n# mere: essential = true\n");
+    for (names.items) |name| {
+        try content.appendSlice(allocator, "depends-on = ");
+        try content.appendSlice(allocator, name);
+        try content.append(allocator, '\n');
+    }
+    const file_path = try std.fs.path.join(allocator, &.{ root, "mere-essential" });
+    defer allocator.free(file_path);
+    var file = std.Io.Dir.createFileAbsolute(path.currentIo(), file_path, .{}) catch |err| return mapFsError(err);
+    defer file.close(path.currentIo());
+    file.writeStreamingAll(path.currentIo(), content.items) catch |err| return mapFsError(err);
+    const directory = try std.fs.path.join(allocator, &.{ root, "mere-essential.d" });
+    defer allocator.free(directory);
+    path.ensureDirExists(directory) catch |err| return mapFsError(err);
+    var dir = std.Io.Dir.openDirAbsolute(path.currentIo(), directory, .{}) catch |err| return mapFsError(err);
+    defer dir.close(path.currentIo());
+    dir.symLink(path.currentIo(), "../mere-essential", "mere-essential", .{}) catch |err| return mapFsError(err);
 }
 
 fn writeDinitService(ctx: *mere.Context, service_root: []const u8, service: *const meta.Service) ReconcileError!void {
@@ -276,6 +326,7 @@ test "reconcileDinit materializes metadata and removes stale services" {
     var new_service = meta.Service.init(allocator);
     new_service.name = try allocator.dupe(u8, "new-service");
     new_service.service_type = .oneshot;
+    new_service.essential = true;
     try new_service.up.append(allocator, try allocator.dupe(u8, "/bin/new"));
     try new_meta.services.append(allocator, new_service);
     try meta.writeFile(allocator, new_pkg, &new_meta);
@@ -315,4 +366,98 @@ test "reconcileDinit materializes metadata and removes stale services" {
     const content = try std.Io.Dir.cwd().readFileAlloc(path.currentIo(), new_path, allocator, .limited(4096));
     defer allocator.free(content);
     try std.testing.expect(std.mem.startsWith(u8, content, "type = scripted\ncommand = /bin/new\n"));
+    const bundle = try std.fs.path.join(allocator, &.{ service_root, "mere-essential" });
+    defer allocator.free(bundle);
+    const required = try std.Io.Dir.cwd().readFileAlloc(path.currentIo(), bundle, allocator, .limited(4096));
+    defer allocator.free(required);
+    try std.testing.expect(std.mem.indexOf(u8, required, "depends-on = new-service\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, required, "old-service") == null);
+    try reconcileDinit(&test_env.ctx, &.{}, &.{new_entry});
+    const empty = try std.Io.Dir.cwd().readFileAlloc(path.currentIo(), bundle, allocator, .limited(4096));
+    defer allocator.free(empty);
+    try std.testing.expect(std.mem.indexOf(u8, empty, "depends-on") == null);
+}
+
+fn writeEssentialFixture(ctx: *mere.Context, arena: std.mem.Allocator, root: []const u8, name: []const u8, essential: bool) !generation.PackageEntry {
+    const dir = try std.fs.path.join(arena, &.{ root, name });
+    try path.ensureDirExists(dir);
+    var data = meta.Data.init(ctx.allocator);
+    defer data.deinit();
+    var service = meta.Service.init(ctx.allocator);
+    service.name = try ctx.allocator.dupe(u8, name);
+    service.service_type = .daemon;
+    service.essential = essential;
+    try service.command.append(ctx.allocator, try ctx.allocator.dupe(u8, "/bin/true"));
+    try data.services.append(ctx.allocator, service);
+    try meta.writeFile(ctx.allocator, dir, &data);
+    return .{ .name = name, .version = "1", .release = 1, .arch = "any", .store_path = dir, .content_hash = "0" ** 64 };
+}
+
+test "reconcileDinit exposes the essential bundle through mere-essential.d" {
+    const th = @import("test_helpers.zig");
+    var env = try th.createTestEnv();
+    defer {
+        env.cleanup();
+        std.testing.allocator.destroy(env);
+    }
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const entry = try writeEssentialFixture(&env.ctx, a, env.path, "must-run", true);
+
+    try reconcileDinit(&env.ctx, &.{entry}, &.{});
+
+    const link = try std.fs.path.join(a, &.{ env.path, "usr", "share", "dinit.d", "mere-essential.d", "mere-essential" });
+    var target_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const target_len = try std.Io.Dir.readLinkAbsolute(path.currentIo(), link, &target_buf);
+    try std.testing.expectEqualStrings("../mere-essential", target_buf[0..target_len]);
+    // The link must resolve to the generated bundle, since dinit follows it.
+    const bundle = try std.Io.Dir.cwd().readFileAlloc(path.currentIo(), link, a, .limited(4096));
+    try std.testing.expect(std.mem.indexOf(u8, bundle, "depends-on = must-run\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, bundle, "# mere: essential = true\n") != null);
+}
+
+test "reconcileDinit rejects package services named like the essential bundle" {
+    const th = @import("test_helpers.zig");
+    var env = try th.createTestEnv();
+    defer {
+        env.cleanup();
+        std.testing.allocator.destroy(env);
+    }
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    for ([_][]const u8{ "mere-essential", "mere-essential.d" }) |reserved| {
+        const entry = try writeEssentialFixture(&env.ctx, a, env.path, reserved, false);
+        try std.testing.expectError(error.DuplicateService, reconcileDinit(&env.ctx, &.{entry}, &.{}));
+    }
+}
+
+fn sweepStage(allocator: std.mem.Allocator, a_dir: []const u8, b_dir: []const u8, root: []const u8) !void {
+    var base = mere.Context.init(std.testing.allocator, root);
+    defer base.deinit();
+    var ctx = base;
+    ctx.allocator = allocator;
+    const a: generation.PackageEntry = .{ .name = "a", .version = "1", .release = 1, .arch = "any", .store_path = a_dir, .content_hash = "0" ** 64 };
+    const b: generation.PackageEntry = .{ .name = "b", .version = "1", .release = 1, .arch = "any", .store_path = b_dir, .content_hash = "0" ** 64 };
+    reconcileDinit(&ctx, &.{ a, b }, &.{}) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return err,
+    };
+}
+
+test "reconcileDinit releases its allocations on every failure point" {
+    const th = @import("test_helpers.zig");
+    var env = try th.createTestEnv();
+    defer {
+        env.cleanup();
+        std.testing.allocator.destroy(env);
+    }
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const aa = arena.allocator();
+    const a = try writeEssentialFixture(&env.ctx, aa, env.path, "svc-a", true);
+    const b = try writeEssentialFixture(&env.ctx, aa, env.path, "svc-b", false);
+    // Each run replaces the tree from the previous one, so the sweep is repeatable.
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, sweepStage, .{ a.store_path, b.store_path, env.path });
 }

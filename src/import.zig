@@ -304,9 +304,13 @@ fn readMetaAndPopulatePackage(ctx: *Context, temp_dir: []const u8, pkg: *package
 /// Reads meta.kdl from the extracted archive directory and builds a JSON
 /// string for the properties column containing recipe metadata (description,
 /// url, licenses, source URLs). Returns null if no metadata is present.
-fn buildPropertiesJson(ctx: *Context, temp_dir: []const u8) ?[]const u8 {
-    var pkg_meta = meta.readFile(ctx.allocator, temp_dir) catch {
-        return null;
+fn buildPropertiesJson(ctx: *Context, temp_dir: []const u8) !?[]const u8 {
+    // A package with no readable metadata simply has no properties. Running out
+    // of memory is not that: it is reported, so a package is never imported
+    // with silently missing metadata.
+    var pkg_meta = meta.readFile(ctx.allocator, temp_dir) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return null,
     };
     defer pkg_meta.deinit();
 
@@ -318,52 +322,53 @@ fn buildPropertiesJson(ctx: *Context, temp_dir: []const u8) ?[]const u8 {
     }
 
     var json: std.ArrayList(u8) = .empty;
-    json.appendSlice(ctx.allocator, "{") catch return null;
+    errdefer json.deinit(ctx.allocator);
+    try json.appendSlice(ctx.allocator, "{");
 
     var needs_comma = false;
 
     if (pkg_meta.description) |desc| {
-        json.appendSlice(ctx.allocator, "\"description\":\"") catch return null;
-        appendJsonEscaped(&json, ctx.allocator, desc) catch return null;
-        json.appendSlice(ctx.allocator, "\"") catch return null;
+        try json.appendSlice(ctx.allocator, "\"description\":\"");
+        try appendJsonEscaped(&json, ctx.allocator, desc);
+        try json.appendSlice(ctx.allocator, "\"");
         needs_comma = true;
     }
 
     if (pkg_meta.url) |u| {
-        if (needs_comma) json.appendSlice(ctx.allocator, ",") catch return null;
-        json.appendSlice(ctx.allocator, "\"url\":\"") catch return null;
-        appendJsonEscaped(&json, ctx.allocator, u) catch return null;
-        json.appendSlice(ctx.allocator, "\"") catch return null;
+        if (needs_comma) try json.appendSlice(ctx.allocator, ",");
+        try json.appendSlice(ctx.allocator, "\"url\":\"");
+        try appendJsonEscaped(&json, ctx.allocator, u);
+        try json.appendSlice(ctx.allocator, "\"");
         needs_comma = true;
     }
 
     if (pkg_meta.licenses.items.len > 0) {
-        if (needs_comma) json.appendSlice(ctx.allocator, ",") catch return null;
-        json.appendSlice(ctx.allocator, "\"licenses\":[") catch return null;
+        if (needs_comma) try json.appendSlice(ctx.allocator, ",");
+        try json.appendSlice(ctx.allocator, "\"licenses\":[");
         for (pkg_meta.licenses.items, 0..) |l, i| {
-            if (i > 0) json.appendSlice(ctx.allocator, ",") catch return null;
-            json.appendSlice(ctx.allocator, "\"") catch return null;
-            appendJsonEscaped(&json, ctx.allocator, l) catch return null;
-            json.appendSlice(ctx.allocator, "\"") catch return null;
+            if (i > 0) try json.appendSlice(ctx.allocator, ",");
+            try json.appendSlice(ctx.allocator, "\"");
+            try appendJsonEscaped(&json, ctx.allocator, l);
+            try json.appendSlice(ctx.allocator, "\"");
         }
-        json.appendSlice(ctx.allocator, "]") catch return null;
+        try json.appendSlice(ctx.allocator, "]");
         needs_comma = true;
     }
 
     if (pkg_meta.source_urls.items.len > 0) {
-        if (needs_comma) json.appendSlice(ctx.allocator, ",") catch return null;
-        json.appendSlice(ctx.allocator, "\"source_urls\":[") catch return null;
+        if (needs_comma) try json.appendSlice(ctx.allocator, ",");
+        try json.appendSlice(ctx.allocator, "\"source_urls\":[");
         for (pkg_meta.source_urls.items, 0..) |s, i| {
-            if (i > 0) json.appendSlice(ctx.allocator, ",") catch return null;
-            json.appendSlice(ctx.allocator, "\"") catch return null;
-            appendJsonEscaped(&json, ctx.allocator, s) catch return null;
-            json.appendSlice(ctx.allocator, "\"") catch return null;
+            if (i > 0) try json.appendSlice(ctx.allocator, ",");
+            try json.appendSlice(ctx.allocator, "\"");
+            try appendJsonEscaped(&json, ctx.allocator, s);
+            try json.appendSlice(ctx.allocator, "\"");
         }
-        json.appendSlice(ctx.allocator, "]") catch return null;
+        try json.appendSlice(ctx.allocator, "]");
     }
 
-    json.appendSlice(ctx.allocator, "}") catch return null;
-    return json.toOwnedSlice(ctx.allocator) catch return null;
+    try json.appendSlice(ctx.allocator, "}");
+    return try json.toOwnedSlice(ctx.allocator);
 }
 
 fn appendJsonEscaped(buf: *std.ArrayList(u8), allocator: std.mem.Allocator, value: []const u8) !void {
@@ -669,22 +674,24 @@ fn collectTrustedFingerprintsForImport(ctx: *Context) !std.ArrayList([]const u8)
         trusted_fingerprints.deinit(ctx.allocator);
     }
 
+    // A key that cannot be loaded is simply not trusted. Running out of memory
+    // is different: dropping a key silently would shrink the trusted set, so
+    // it is reported rather than skipped.
     if (ctx.signing_key_path) |key_path| {
         if (sign.SecretKey.loadFromFile(key_path)) |secret_key| {
             const pub_key = secret_key.derivePublicKey();
-            if (pub_key.fingerprint(ctx.allocator)) |fp| {
-                trusted_fingerprints.append(ctx.allocator, fp) catch {};
-            } else |_| {}
+            try appendFingerprint(ctx, &trusted_fingerprints, &pub_key);
         } else |_| {
             if (sign.PublicKey.loadFromFile(key_path)) |pub_key| {
-                if (pub_key.fingerprint(ctx.allocator)) |fp| {
-                    trusted_fingerprints.append(ctx.allocator, fp) catch {};
-                } else |_| {}
+                try appendFingerprint(ctx, &trusted_fingerprints, &pub_key);
             } else |_| {}
         }
     }
 
-    var loaded_keys = sign.loadAllKeys(ctx) catch std.ArrayList(sign.LoadedKey).empty;
+    var loaded_keys = sign.loadAllKeys(ctx) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => std.ArrayList(sign.LoadedKey).empty,
+    };
     defer {
         for (loaded_keys.items) |*key| {
             key.deinit(ctx.allocator);
@@ -692,13 +699,22 @@ fn collectTrustedFingerprintsForImport(ctx: *Context) !std.ArrayList([]const u8)
         loaded_keys.deinit(ctx.allocator);
     }
     for (loaded_keys.items) |loaded_key| {
-        const fp_copy = ctx.allocator.dupe(u8, loaded_key.fingerprint) catch continue;
-        trusted_fingerprints.append(ctx.allocator, fp_copy) catch {
-            ctx.allocator.free(fp_copy);
-        };
+        const fp_copy = try ctx.allocator.dupe(u8, loaded_key.fingerprint);
+        errdefer ctx.allocator.free(fp_copy);
+        try trusted_fingerprints.append(ctx.allocator, fp_copy);
     }
 
     return trusted_fingerprints;
+}
+
+/// Add the fingerprint of `pub_key`, if it can be computed, to the list.
+fn appendFingerprint(ctx: *Context, list: *std.ArrayList([]const u8), pub_key: *const sign.PublicKey) !void {
+    const fp = pub_key.fingerprint(ctx.allocator) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return,
+    };
+    errdefer ctx.allocator.free(fp);
+    try list.append(ctx.allocator, fp);
 }
 
 fn resolveOrBootstrapRepoDir(ctx: *Context, repo_name_or_path: []const u8) !RepoSourceResult {
@@ -801,7 +817,7 @@ fn insertPruneAndCommit(
         const pkg_ptr = &record.prepared.manifest.pkg;
 
         // Build properties JSON from meta.kdl metadata fields.
-        const properties = buildPropertiesJson(ctx, record.prepared.extract.temp_dir);
+        const properties = try buildPropertiesJson(ctx, record.prepared.extract.temp_dir);
         defer if (properties) |props| ctx.allocator.free(props);
 
         try insertPackageWithForce(ctx, staged.db, pkg_ptr, force, properties);
@@ -2146,4 +2162,76 @@ test "packages rejects missing projection.v1" {
     const repo_name = "import";
     const single = [_][]const u8{pkg_path};
     try std.testing.expectError(ImportError.InvalidInput, packages(&test_env.ctx, repo_name, single[0..], false));
+}
+
+fn sweepTrustedFingerprints(allocator: std.mem.Allocator, key_path: []const u8, root: []const u8) error{ OutOfMemory, TestExpectedEqual }!void {
+    // The context is built on a reliable allocator; only the allocator the
+    // function itself uses is made to fail.
+    var base = Context.init(std.testing.allocator, root);
+    defer base.deinit();
+    var ctx = base;
+    ctx.allocator = allocator;
+    ctx.signing_key_path = key_path;
+
+    var list = collectTrustedFingerprintsForImport(&ctx) catch return error.OutOfMemory;
+    defer {
+        for (list.items) |fp| allocator.free(fp);
+        list.deinit(allocator);
+    }
+    // One fingerprint from the signing key and one from the installed key.
+    if (list.items.len != 2) return error.TestExpectedEqual;
+}
+
+test "collectTrustedFingerprintsForImport releases its allocations on every failure point" {
+    const th = @import("test_helpers.zig");
+    var env = try th.createTestEnv();
+    defer {
+        env.cleanup();
+        std.testing.allocator.destroy(env);
+    }
+    const a = env.ctx.allocator;
+
+    // A signing key outside the keys directory ...
+    const signing_dir = try std.fs.path.join(a, &.{ env.path, "sweep-signing" });
+    defer a.free(signing_dir);
+    const signing = try sign.generateAndSaveKeyPair(&env.ctx, signing_dir);
+    defer a.free(signing.public_key_path);
+    defer a.free(signing.secret_key_path);
+
+    // ... and a different key installed where trusted keys are loaded from, so
+    // both the signing-key path and the loaded-key loop allocate.
+    const keys_dir = try std.fs.path.join(a, &.{ env.path, "mere", "keys" });
+    defer a.free(keys_dir);
+    const installed = try sign.generateAndSaveKeyPair(&env.ctx, keys_dir);
+    defer a.free(installed.public_key_path);
+    defer a.free(installed.secret_key_path);
+
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, sweepTrustedFingerprints, .{ signing.secret_key_path, env.path });
+}
+
+fn sweepPropertiesJson(allocator: std.mem.Allocator, dir: []const u8, root: []const u8) error{OutOfMemory}!void {
+    var base = Context.init(std.testing.allocator, root);
+    defer base.deinit();
+    var ctx = base;
+    ctx.allocator = allocator;
+    const json = buildPropertiesJson(&ctx, dir) catch return error.OutOfMemory;
+    if (json) |value| allocator.free(value);
+}
+
+test "buildPropertiesJson releases its allocations on every failure point" {
+    const th = @import("test_helpers.zig");
+    var env = try th.createTestEnv();
+    defer {
+        env.cleanup();
+        std.testing.allocator.destroy(env);
+    }
+    const a = env.ctx.allocator;
+    const dir = try std.fs.path.join(a, &.{ env.path, "props" });
+    defer a.free(dir);
+    try p.ensureDirExists(dir);
+    var data = meta.Data.init(a);
+    defer data.deinit();
+    try data.populateRecipeMetadata("desc with \"quotes\"", "https://example.org", &.{ "MIT", "GPL-2.0" }, &.{ "https://example.org/a.tar.xz", "https://example.org/b" });
+    try meta.writeFile(a, dir, &data);
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, sweepPropertiesJson, .{ dir, env.path });
 }
