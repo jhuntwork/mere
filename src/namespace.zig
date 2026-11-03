@@ -1227,17 +1227,9 @@ fn execCommand(allocator: std.mem.Allocator, command: ?[]const []const u8, env_o
     defer allocator.free(exec_path_z);
 
     _ = c.execve(exec_path_z.ptr, @ptrCast(argv.ptr), @ptrCast(envp));
-    // execve only returns on error; if we get here, exec failed
-    for (argv[0..allocated_argv]) |arg| {
-        if (arg) |ptr| {
-            const slice: [:0]const u8 = std.mem.span(ptr);
-            allocator.free(@constCast(slice));
-        }
-    }
-    allocator.free(argv);
-    if (owns_cmd) {
-        allocator.free(cmd);
-    }
+    // execve only returns on error. Returning the error runs the errdefer
+    // blocks above, which free the argument strings, argv and cmd. Freeing
+    // them here as well would free them twice.
     return EnvError.ExecError;
 }
 
@@ -1638,6 +1630,11 @@ test "writeIdMapFile reports the path and cause when the map cannot be opened" {
     const diag = ctx.getDiagnosticContext();
     try std.testing.expectEqualStrings(missing, diag.subject.?);
     try std.testing.expectEqualStrings("open failed: FileNotFound", diag.details.?);
+}
+
+test "execCommand returns ExecError without freeing its argument vector twice" {
+    // The path is absolute and does not exist, so execve fails and returns.
+    try std.testing.expectError(EnvError.ExecError, execCommand(std.testing.allocator, &.{ "/nonexistent-dir/definitely-not-here", "arg" }, null));
 }
 
 test "EnvError covers all error cases" {
