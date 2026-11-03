@@ -283,6 +283,59 @@ pub fn enterEnv(ctx: *Context, mode: EnvMode, opts: EnvOptions) EnvError!void {
     try execCommand(allocator, opts.command, opts.env);
 }
 
+/// Largest setup-failure report the forked child sends to the parent. The
+/// error name always fits; the subject and details are cut to the space left.
+const setup_report_max = 2048;
+
+/// Lay out a setup failure as `name NUL subject NUL details`. The name comes
+/// first so a report with no subject or details is just the name.
+fn encodeSetupFailure(buf: *[setup_report_max]u8, name: []const u8, subject: ?[]const u8, details: ?[]const u8) []const u8 {
+    var len: usize = 0;
+    const name_len = @min(name.len, buf.len);
+    @memcpy(buf[0..name_len], name[0..name_len]);
+    len = name_len;
+    if (subject == null and details == null) return buf[0..len];
+
+    for ([_]?[]const u8{ subject, details }) |field| {
+        if (len >= buf.len) break;
+        buf[len] = 0;
+        len += 1;
+        const text = field orelse "";
+        const room = buf.len - len;
+        const n = @min(text.len, room);
+        @memcpy(buf[len..][0..n], text[0..n]);
+        len += n;
+    }
+    return buf[0..len];
+}
+
+const SetupFailure = struct {
+    name: []const u8,
+    subject: ?[]const u8,
+    details: ?[]const u8,
+};
+
+fn decodeSetupFailure(bytes: []const u8) SetupFailure {
+    var it = std.mem.splitScalar(u8, bytes, 0);
+    const name = it.next() orelse "";
+    const subject = it.next();
+    const details = it.next();
+    return .{
+        .name = name,
+        .subject = if (subject) |v| (if (v.len > 0) v else null) else null,
+        .details = if (details) |v| (if (v.len > 0) v else null) else null,
+    };
+}
+
+/// Whether namespace setup reported diagnostic details of its own, given the
+/// details the context held before it ran. Callers use this to keep those
+/// details instead of replacing them with a generic message.
+pub fn reportedDetails(ctx: *Context, before: ?[]const u8) bool {
+    const now = ctx.getDiagnosticContext().details orelse return false;
+    const prior = before orelse return true;
+    return now.ptr != prior.ptr or now.len != prior.len;
+}
+
 pub fn forkAndEnterEnv(ctx: *Context, mode: EnvMode, opts: EnvOptions) EnvError!u8 {
     return forkAndEnterEnvWith(ctx, mode, opts, enterEnv);
 }
@@ -323,11 +376,16 @@ fn forkAndEnterEnvWith(ctx: *Context, mode: EnvMode, opts: EnvOptions, enter_fn:
         _ = c.close(stdout_pipe[1]);
         _ = c.close(stderr_pipe[1]);
 
+        // The child inherited the parent's diagnostics. Clear them so only what
+        // setup itself reports is sent back, not stale context from before the fork.
+        ctx.resetDiagnostics();
         enter_fn(ctx, mode, opts) catch |err| {
-            const name = @errorName(err);
+            const diag = ctx.getDiagnosticContext();
+            var report_buf: [setup_report_max]u8 = undefined;
+            const report = encodeSetupFailure(&report_buf, @errorName(err), diag.subject, diag.details);
             var offset: usize = 0;
-            while (offset < name.len) {
-                const n = c.write(setup_pipe[1], name.ptr + offset, name.len - offset);
+            while (offset < report.len) {
+                const n = c.write(setup_pipe[1], report.ptr + offset, report.len - offset);
                 if (n < 0 and std.c._errno().* == c.EINTR) continue;
                 if (n <= 0) break;
                 offset += @intCast(n);
@@ -404,7 +462,7 @@ fn forkAndEnterEnvWith(ctx: *Context, mode: EnvMode, opts: EnvOptions, enter_fn:
     // The output descriptors have already been closed above. The remaining
     // failure path must not run their pre-fork cleanup a second time.
     const status = waitForExitStatus(@intCast(pid));
-    var error_buf: [128]u8 = undefined;
+    var error_buf: [setup_report_max]u8 = undefined;
     var error_len: usize = 0;
     while (error_len < error_buf.len) {
         const n = c.read(setup_pipe[0], error_buf[error_len..].ptr, error_buf.len - error_len);
@@ -414,8 +472,15 @@ fn forkAndEnterEnvWith(ctx: *Context, mode: EnvMode, opts: EnvOptions, enter_fn:
         error_len += @intCast(n);
     }
     if (error_len != 0) {
+        const failure = decodeSetupFailure(error_buf[0..error_len]);
         inline for (@typeInfo(EnvError).error_set.?) |field| {
-            if (std.mem.eql(u8, error_buf[0..error_len], field.name)) return @field(EnvError, field.name);
+            if (std.mem.eql(u8, failure.name, field.name)) {
+                // The child's context did not survive the fork; restore what it reported.
+                if (failure.subject != null or failure.details != null) {
+                    ctx.setDiagnosticContext(failure.subject orelse "namespace", failure.details);
+                }
+                return @field(EnvError, field.name);
+            }
         }
         return EnvError.FileSystem;
     }
@@ -1635,6 +1700,81 @@ test "writeIdMapFile reports the path and cause when the map cannot be opened" {
 test "execCommand returns ExecError without freeing its argument vector twice" {
     // The path is absolute and does not exist, so execve fails and returns.
     try std.testing.expectError(EnvError.ExecError, execCommand(std.testing.allocator, &.{ "/nonexistent-dir/definitely-not-here", "arg" }, null));
+}
+
+test "setup failure report round-trips name, subject and details" {
+    var buf: [setup_report_max]u8 = undefined;
+    const report = encodeSetupFailure(&buf, "UidMapError", "/proc/self/uid_map", "write failed: AccessDenied");
+    const failure = decodeSetupFailure(report);
+    try std.testing.expectEqualStrings("UidMapError", failure.name);
+    try std.testing.expectEqualStrings("/proc/self/uid_map", failure.subject.?);
+    try std.testing.expectEqualStrings("write failed: AccessDenied", failure.details.?);
+}
+
+test "setup failure report with no context is just the error name" {
+    var buf: [setup_report_max]u8 = undefined;
+    const report = encodeSetupFailure(&buf, "ForkError", null, null);
+    try std.testing.expectEqualStrings("ForkError", report);
+    const failure = decodeSetupFailure(report);
+    try std.testing.expectEqualStrings("ForkError", failure.name);
+    try std.testing.expect(failure.subject == null);
+    try std.testing.expect(failure.details == null);
+}
+
+test "setup failure report keeps the error name when the text is too long" {
+    var buf: [setup_report_max]u8 = undefined;
+    const long = "x" ** (setup_report_max * 2);
+    const report = encodeSetupFailure(&buf, "MountBindError", long, long);
+    try std.testing.expect(report.len <= setup_report_max);
+    const failure = decodeSetupFailure(report);
+    try std.testing.expectEqualStrings("MountBindError", failure.name);
+    try std.testing.expect(failure.subject != null);
+}
+
+test "forkAndEnterEnv returns the child's subject and details to the parent context" {
+    const Runner = struct {
+        fn enter(enter_ctx: *Context, _: EnvMode, _: EnvOptions) EnvError!void {
+            return enter_ctx.failFmt(EnvError.UidMapError, "/proc/self/uid_map", "write failed: {s}", .{"AccessDenied"});
+        }
+    };
+    var ctx = Context.init(std.testing.allocator, "/test");
+    defer ctx.deinit();
+    // Context the parent already holds must not leak into the child's report.
+    ctx.setDiagnosticContext("stale-subject", "stale details");
+
+    try std.testing.expectError(EnvError.UidMapError, forkAndEnterEnvWith(&ctx, .build, .{ .profile_root = "/" }, Runner.enter));
+    const diag = ctx.getDiagnosticContext();
+    try std.testing.expectEqualStrings("/proc/self/uid_map", diag.subject.?);
+    try std.testing.expectEqualStrings("write failed: AccessDenied", diag.details.?);
+}
+
+test "forkAndEnterEnv leaves the parent context alone when the child reports nothing" {
+    const Runner = struct {
+        fn enter(_: *Context, _: EnvMode, _: EnvOptions) EnvError!void {
+            return EnvError.ForkError;
+        }
+    };
+    var ctx = Context.init(std.testing.allocator, "/test");
+    defer ctx.deinit();
+    ctx.setDiagnosticContext("parent-subject", "parent details");
+
+    try std.testing.expectError(EnvError.ForkError, forkAndEnterEnvWith(&ctx, .build, .{ .profile_root = "/" }, Runner.enter));
+    const diag = ctx.getDiagnosticContext();
+    try std.testing.expectEqualStrings("parent-subject", diag.subject.?);
+    try std.testing.expectEqualStrings("parent details", diag.details.?);
+}
+
+test "reportedDetails tells new details from the ones held before" {
+    var ctx = Context.init(std.testing.allocator, "/test");
+    defer ctx.deinit();
+
+    try std.testing.expect(!reportedDetails(&ctx, null));
+    ctx.setDiagnosticContext("a", "first");
+    const first = ctx.getDiagnosticContext().details;
+    try std.testing.expect(!reportedDetails(&ctx, first));
+    try std.testing.expect(reportedDetails(&ctx, null));
+    ctx.setDiagnosticContext("b", "second");
+    try std.testing.expect(reportedDetails(&ctx, first));
 }
 
 test "EnvError covers all error cases" {
