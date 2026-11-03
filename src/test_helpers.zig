@@ -609,10 +609,11 @@ fn rewriteNamespaceWorkPath(allocator: std.mem.Allocator, input: []const u8, wor
 }
 
 pub fn hostNamespaceRunner(
-    allocator: std.mem.Allocator,
+    ctx: *Context,
     _: namespace.EnvMode,
     opts: namespace.EnvOptions,
 ) anyerror!u8 {
+    const allocator = ctx.allocator;
     const argv = opts.command orelse return namespace.EnvError.InvalidInput;
     const workspace_root = opts.workspace orelse return namespace.EnvError.WorkspaceNotFound;
     const requested_cwd = opts.cwd orelse "/work";
