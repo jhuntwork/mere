@@ -935,7 +935,7 @@ fn runRealizerCommand(
         env_count += 1;
     }
 
-    const exit_code = namespace.forkAndEnterEnv(ctx.allocator, .build, .{
+    const exit_code = namespace.forkAndEnterEnv(ctx, .build, .{
         .profile_root = stage_path,
         .workspace = stage_path,
         .cwd = "/work",

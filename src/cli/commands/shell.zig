@@ -108,7 +108,7 @@ fn handleShell(ctx: *mere.Context, args: *const types.ParsedArgs) MereError!type
     };
 
     // Error boundary: catch all errors and map them to user-friendly messages at CLI boundary
-    namespace.enterEnv(ctx.allocator, .shell, opts) catch |err| {
+    namespace.enterEnv(ctx, .shell, opts) catch |err| {
         var owned_details: ?[]u8 = null;
         defer if (owned_details) |details| ctx.allocator.free(details);
 
@@ -135,17 +135,17 @@ fn handleShell(ctx: *mere.Context, args: *const types.ParsedArgs) MereError!type
             namespace.EnvError.MountOverlayError => "overlay mount failed - try --no-etc-overlay flag",
             namespace.EnvError.MountProcError => "proc mount failed",
             namespace.EnvError.MountPrivateError => "failed to make mounts private",
-            namespace.EnvError.UnshareError => "unshare failed",
             namespace.EnvError.ChrootError => "chroot failed",
             namespace.EnvError.ExecError => "shell not found or not executable - check /bin/sh exists in profile",
-            namespace.EnvError.UidMapError => "failed to write uid_map",
-            namespace.EnvError.GidMapError => "failed to write gid_map",
             namespace.EnvError.FileSystem => "filesystem error",
             else => @errorName(err),
         };
 
-        // Update diagnostic context with error details
-        ctx.withDiagnosticContext(diag_ctx.withDetails(details));
+        // Namespace setup reports the failing operation, path and cause through
+        // the context. Keep that, and use the static text only as a fallback.
+        if (ctx.getDiagnosticContext().details == null) {
+            ctx.withDiagnosticContext(diag_ctx.withDetails(details));
+        }
 
         return try command.errorResult(ctx, err, null);
     };

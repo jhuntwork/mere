@@ -2,6 +2,7 @@ const std = @import("std");
 const errors = @import("errors.zig");
 const path_mod = @import("path.zig");
 const scratch = @import("scratch.zig");
+const Context = @import("mere.zig").Context;
 const posix = std.posix;
 
 const c = @cImport({
@@ -230,7 +231,8 @@ pub const EnvError = Std.OutOfMemory || Std.FileSystem || Std.PermissionDenied |
     MknodError,
 };
 
-pub fn enterEnv(allocator: std.mem.Allocator, mode: EnvMode, opts: EnvOptions) EnvError!void {
+pub fn enterEnv(ctx: *Context, mode: EnvMode, opts: EnvOptions) EnvError!void {
+    const allocator = ctx.allocator;
     try validateInputs(opts, mode);
     try checkCapabilities(mode, opts.no_etc_overlay);
 
@@ -238,10 +240,10 @@ pub fn enterEnv(allocator: std.mem.Allocator, mode: EnvMode, opts: EnvOptions) E
     const original_gid = c.getgid();
     const identity = insideIdentity(mode, opts.needs_root, original_uid, original_gid);
 
-    try createUserNamespace();
-    try writeIdMappings(original_uid, original_gid, identity);
-    try createMountNamespace();
-    try createPidNamespace();
+    try createUserNamespace(ctx);
+    try writeIdMappings(ctx, original_uid, original_gid, identity);
+    try createMountNamespace(ctx);
+    try createPidNamespace(ctx);
     try makeMountsPrivate();
 
     // A private procfs can only be mounted by a process that is itself inside
@@ -281,11 +283,11 @@ pub fn enterEnv(allocator: std.mem.Allocator, mode: EnvMode, opts: EnvOptions) E
     try execCommand(allocator, opts.command, opts.env);
 }
 
-pub fn forkAndEnterEnv(allocator: std.mem.Allocator, mode: EnvMode, opts: EnvOptions) EnvError!u8 {
-    return forkAndEnterEnvWith(allocator, mode, opts, enterEnv);
+pub fn forkAndEnterEnv(ctx: *Context, mode: EnvMode, opts: EnvOptions) EnvError!u8 {
+    return forkAndEnterEnvWith(ctx, mode, opts, enterEnv);
 }
 
-fn forkAndEnterEnvWith(allocator: std.mem.Allocator, mode: EnvMode, opts: EnvOptions, enter_fn: *const fn (std.mem.Allocator, EnvMode, EnvOptions) EnvError!void) EnvError!u8 {
+fn forkAndEnterEnvWith(ctx: *Context, mode: EnvMode, opts: EnvOptions, enter_fn: *const fn (*Context, EnvMode, EnvOptions) EnvError!void) EnvError!u8 {
     var stdout_pipe: [2]posix.fd_t = undefined;
     if (c.pipe(&stdout_pipe) != 0) return EnvError.ForkError;
     var child_started = false;
@@ -321,7 +323,7 @@ fn forkAndEnterEnvWith(allocator: std.mem.Allocator, mode: EnvMode, opts: EnvOpt
         _ = c.close(stdout_pipe[1]);
         _ = c.close(stderr_pipe[1]);
 
-        enter_fn(allocator, mode, opts) catch |err| {
+        enter_fn(ctx, mode, opts) catch |err| {
             const name = @errorName(err);
             var offset: usize = 0;
             while (offset < name.len) {
@@ -474,18 +476,58 @@ fn checkCapabilities(mode: EnvMode, no_etc_overlay: bool) EnvError!void {
     }
 }
 
-fn createUserNamespace() EnvError!void {
-    const rc: c_int = c.unshare(c.CLONE_NEWUSER);
-    if (rc != 0) {
-        return EnvError.UnshareError;
-    }
+/// Hint appended when the kernel refuses a namespace operation for permission
+/// reasons, so the failure is not mistaken for a damaged profile or package.
+const namespace_denied_hint = "; the environment (sandbox, container or kernel policy) is restricting user namespaces. Profiles and packages are not affected";
+
+fn failNamespaceSetup(ctx: *Context, err: EnvError, subject: []const u8, operation: []const u8, cause: []const u8, denied: bool) EnvError {
+    if (denied) return ctx.failFmt(err, subject, "{s} failed: {s}{s}", .{ operation, cause, namespace_denied_hint });
+    return ctx.failFmt(err, subject, "{s} failed: {s}", .{ operation, cause });
 }
 
-fn writeIdMappings(uid: c_uint, gid: c_uint, identity: NamespaceIdentity) EnvError!void {
+/// Whether an unshare errno means the environment forbids or caps the
+/// namespace: refused outright (EPERM, EACCES) or the namespace limit is zero
+/// or exhausted (ENOSPC, as under `max_user_namespaces=0`).
+fn unshareRestricted(errno_value: std.posix.E) bool {
+    return errno_value == .PERM or errno_value == .ACCES or errno_value == .NOSPC;
+}
+
+fn reportUnshareFailure(ctx: *Context, name: []const u8, errno_value: std.posix.E) EnvError {
+    return failNamespaceSetup(ctx, EnvError.UnshareError, name, "unshare", std.enums.tagName(std.posix.E, errno_value) orelse "unknown errno", unshareRestricted(errno_value));
+}
+
+fn unshareNamespace(ctx: *Context, flags: c_int, name: []const u8) EnvError!void {
+    if (c.unshare(flags) == 0) return;
+    // Read errno before anything else can overwrite it.
+    return reportUnshareFailure(ctx, name, @enumFromInt(std.c._errno().*));
+}
+
+fn createUserNamespace(ctx: *Context) EnvError!void {
+    return unshareNamespace(ctx, c.CLONE_NEWUSER, "user namespace");
+}
+
+fn writeIdMapFile(ctx: *Context, map_path: []const u8, map: []const u8, err_tag: EnvError) EnvError!void {
+    const io = path_mod.currentIo();
+    var file = std.Io.Dir.openFileAbsolute(io, map_path, .{ .mode = .write_only }) catch |e| {
+        return failNamespaceSetup(ctx, err_tag, map_path, "open", @errorName(e), isPermissionError(e));
+    };
+    defer file.close(io);
+    file.writeStreamingAll(io, map) catch |e| {
+        return failNamespaceSetup(ctx, err_tag, map_path, "write", @errorName(e), isPermissionError(e));
+    };
+}
+
+fn isPermissionError(e: anyerror) bool {
+    return e == error.AccessDenied or e == error.PermissionDenied;
+}
+
+fn writeIdMappings(ctx: *Context, uid: c_uint, gid: c_uint, identity: NamespaceIdentity) EnvError!void {
     const io = path_mod.currentIo();
     // Disable setgroups before writing gid_map
     if (std.Io.Dir.openFileAbsolute(io, "/proc/self/setgroups", .{ .mode = .write_only })) |file| {
         defer file.close(io);
+        // Best effort. If this does not take effect, the gid_map write below
+        // fails and is reported.
         file.writeStreamingAll(io, "deny") catch {};
     } else |_| {}
 
@@ -494,14 +536,7 @@ fn writeIdMappings(uid: c_uint, gid: c_uint, identity: NamespaceIdentity) EnvErr
         const id_map = std.fmt.bufPrint(&buf, "{d} {d} 1\n", .{ identity.uid, uid }) catch {
             return EnvError.OutOfMemory;
         };
-
-        var file = std.Io.Dir.openFileAbsolute(io, "/proc/self/uid_map", .{ .mode = .write_only }) catch {
-            return EnvError.UidMapError;
-        };
-        defer file.close(io);
-        file.writeStreamingAll(io, id_map) catch {
-            return EnvError.UidMapError;
-        };
+        try writeIdMapFile(ctx, "/proc/self/uid_map", id_map, EnvError.UidMapError);
     }
 
     {
@@ -509,29 +544,16 @@ fn writeIdMappings(uid: c_uint, gid: c_uint, identity: NamespaceIdentity) EnvErr
         const id_map = std.fmt.bufPrint(&buf, "{d} {d} 1\n", .{ identity.gid, gid }) catch {
             return EnvError.OutOfMemory;
         };
-
-        var file = std.Io.Dir.openFileAbsolute(io, "/proc/self/gid_map", .{ .mode = .write_only }) catch {
-            return EnvError.GidMapError;
-        };
-        defer file.close(io);
-        file.writeStreamingAll(io, id_map) catch {
-            return EnvError.GidMapError;
-        };
+        try writeIdMapFile(ctx, "/proc/self/gid_map", id_map, EnvError.GidMapError);
     }
 }
 
-fn createMountNamespace() EnvError!void {
-    const rc: c_int = c.unshare(c.CLONE_NEWNS);
-    if (rc != 0) {
-        return EnvError.UnshareError;
-    }
+fn createMountNamespace(ctx: *Context) EnvError!void {
+    return unshareNamespace(ctx, c.CLONE_NEWNS, "mount namespace");
 }
 
-fn createPidNamespace() EnvError!void {
-    const rc: c_int = c.unshare(c.CLONE_NEWPID);
-    if (rc != 0) {
-        return EnvError.UnshareError;
-    }
+fn createPidNamespace(ctx: *Context) EnvError!void {
+    return unshareNamespace(ctx, c.CLONE_NEWPID, "pid namespace");
 }
 
 /// Fork so the child becomes PID 1 of the PID namespace created by
@@ -1518,6 +1540,8 @@ test "bindDeviceNode fails when bind mount fails" {
 }
 
 test "forkAndEnterEnv returns typed setup failure without script output" {
+    var test_ctx = Context.init(std.testing.allocator, "/test");
+    defer test_ctx.deinit();
     const Capture = struct {
         bytes: [512]u8 = undefined,
         len: usize = 0,
@@ -1536,7 +1560,7 @@ test "forkAndEnterEnv returns typed setup failure without script output" {
     const missing = try std.fs.path.join(std.testing.allocator, &.{ path_buf[0..len], "missing-profile" });
     defer std.testing.allocator.free(missing);
     var capture: Capture = .{};
-    try std.testing.expectError(EnvError.ProfileNotFound, forkAndEnterEnv(std.testing.allocator, .build, .{
+    try std.testing.expectError(EnvError.ProfileNotFound, forkAndEnterEnv(&test_ctx, .build, .{
         .profile_root = missing,
         .output_handler = .{ .ctx = &capture, .handleFn = Capture.handle },
     }));
@@ -1545,14 +1569,75 @@ test "forkAndEnterEnv returns typed setup failure without script output" {
 
 test "forkAndEnterEnv preserves command exit status across exec" {
     const Runner = struct {
-        fn enter(allocator: std.mem.Allocator, _: EnvMode, _: EnvOptions) EnvError!void {
-            try execCommand(allocator, &.{ "/bin/sh", "-c", "exit 7" }, null);
+        fn enter(enter_ctx: *Context, _: EnvMode, _: EnvOptions) EnvError!void {
+            try execCommand(enter_ctx.allocator, &.{ "/bin/sh", "-c", "exit 7" }, null);
         }
     };
-    const status = try forkAndEnterEnvWith(std.testing.allocator, .build, .{
+    var ctx = Context.init(std.testing.allocator, "/test");
+    defer ctx.deinit();
+    const status = try forkAndEnterEnvWith(&ctx, .build, .{
         .profile_root = "/",
     }, Runner.enter);
     try std.testing.expectEqual(@as(u8, 7), status);
+}
+
+test "reportUnshareFailure names the operation and errno, and hints only for restrictions" {
+    var ctx = Context.init(std.testing.allocator, "/test");
+    defer ctx.deinit();
+
+    // The errno is supplied, not produced by a real unshare call: whether a
+    // sandbox answers EPERM or EINVAL for a given call is up to its policy.
+    try std.testing.expectEqual(EnvError.UnshareError, reportUnshareFailure(&ctx, "test namespace", .INVAL));
+    const invalid = ctx.getDiagnosticContext();
+    try std.testing.expectEqualStrings("test namespace", invalid.subject.?);
+    try std.testing.expectEqualStrings("unshare failed: INVAL", invalid.details.?);
+
+    try std.testing.expectEqual(EnvError.UnshareError, reportUnshareFailure(&ctx, "user namespace", .PERM));
+    const denied = ctx.getDiagnosticContext();
+    try std.testing.expectEqualStrings("user namespace", denied.subject.?);
+    try std.testing.expect(std.mem.startsWith(u8, denied.details.?, "unshare failed: PERM; "));
+    try std.testing.expect(std.mem.indexOf(u8, denied.details.?, "restricting user namespaces") != null);
+}
+
+test "unshareRestricted treats permission and namespace-limit errors as environment restrictions" {
+    try std.testing.expect(unshareRestricted(.PERM));
+    try std.testing.expect(unshareRestricted(.ACCES));
+    try std.testing.expect(unshareRestricted(.NOSPC));
+    try std.testing.expect(!unshareRestricted(.INVAL));
+    try std.testing.expect(!unshareRestricted(.NOMEM));
+}
+
+test "failNamespaceSetup adds the environment hint only for permission denials" {
+    var ctx = Context.init(std.testing.allocator, "/test");
+    defer ctx.deinit();
+
+    try std.testing.expectEqual(EnvError.UidMapError, failNamespaceSetup(&ctx, EnvError.UidMapError, "/proc/self/uid_map", "write", "AccessDenied", true));
+    const denied = ctx.getDiagnosticContext();
+    try std.testing.expectEqualStrings("/proc/self/uid_map", denied.subject.?);
+    try std.testing.expect(std.mem.startsWith(u8, denied.details.?, "write failed: AccessDenied"));
+    try std.testing.expect(std.mem.indexOf(u8, denied.details.?, "restricting user namespaces") != null);
+    try std.testing.expect(std.mem.indexOf(u8, denied.details.?, "not affected") != null);
+
+    try std.testing.expectEqual(EnvError.GidMapError, failNamespaceSetup(&ctx, EnvError.GidMapError, "/proc/self/gid_map", "open", "FileNotFound", false));
+    const other = ctx.getDiagnosticContext();
+    try std.testing.expectEqualStrings("open failed: FileNotFound", other.details.?);
+}
+
+test "writeIdMapFile reports the path and cause when the map cannot be opened" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const len = try tmp.dir.realPath(path_mod.currentIo(), &path_buf);
+    const missing = try std.fs.path.join(std.testing.allocator, &.{ path_buf[0..len], "no_such_uid_map" });
+    defer std.testing.allocator.free(missing);
+
+    var ctx = Context.init(std.testing.allocator, "/test");
+    defer ctx.deinit();
+
+    try std.testing.expectError(EnvError.UidMapError, writeIdMapFile(&ctx, missing, "0 1000 1\n", EnvError.UidMapError));
+    const diag = ctx.getDiagnosticContext();
+    try std.testing.expectEqualStrings(missing, diag.subject.?);
+    try std.testing.expectEqualStrings("open failed: FileNotFound", diag.details.?);
 }
 
 test "EnvError covers all error cases" {

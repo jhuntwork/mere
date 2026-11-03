@@ -33,7 +33,7 @@ const packaging_stage = @import("build_orchestrator/packaging.zig");
 const ui = mere.ui;
 const emit = mere.ui.emit;
 
-const NamespaceRunnerFn = *const fn (std.mem.Allocator, namespace.EnvMode, namespace.EnvOptions) anyerror!u8;
+const NamespaceRunnerFn = *const fn (*mere.Context, namespace.EnvMode, namespace.EnvOptions) anyerror!u8;
 const StagePackageFilesFn = *const fn (*mere.Context, package_staging.PackageStagingConfig) anyerror!package_staging.PackageStagingResult;
 const CreatePackageArtifactFn = *const fn (*mere.Context, packaging.PackageArtifactConfig) anyerror!packaging.PackageArtifactResult;
 
@@ -1910,7 +1910,7 @@ fn runOneNamespacePhase(
         .mere_root = mere_root_path,
     };
 
-    const exit_code = state.namespace_runner(exec_ctx.allocator, .build, opts) catch |err| {
+    const exit_code = state.namespace_runner(exec_ctx.ctx, .build, opts) catch |err| {
         state.ctx.setDiagnosticContextFmt("namespace", "failed to fork and enter env: {s}", .{@errorName(err)});
         return switch (err) {
             namespace.EnvError.UserNamespacesDisabled => BuildError.PermissionDenied,
@@ -3559,8 +3559,8 @@ fn executeBuildPlanWithTestRunner(
     return result;
 }
 
-fn failingNamespaceRunner(allocator: std.mem.Allocator, mode: namespace.EnvMode, opts: namespace.EnvOptions) anyerror!u8 {
-    _ = allocator;
+fn failingNamespaceRunner(ctx: *mere.Context, mode: namespace.EnvMode, opts: namespace.EnvOptions) anyerror!u8 {
+    _ = ctx;
     _ = mode;
     _ = opts;
     return error.MknodError;

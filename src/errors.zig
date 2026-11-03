@@ -230,6 +230,9 @@ pub fn getUserFriendlyMessage(err: anyerror) []const u8 {
         error.MountRestricted => "mount operation not permitted in this environment",
         error.MountSourceMissing => "bind mount source path not found",
         error.MountBindError => "bind mount failed",
+        error.UnshareError => "failed to create a namespace",
+        error.UidMapError => "failed to set up the user namespace uid mapping",
+        error.GidMapError => "failed to set up the user namespace gid mapping",
 
         // Convert module errors
         error.PkginfoNotFound => ".PKGINFO file not found in package",
@@ -514,6 +517,11 @@ test "getUserFriendlyMessage returns user-readable messages" {
     try testing.expectEqualStrings("failed to persist package archive in shared pool", getUserFriendlyMessage(error.PackageImportFailed));
     try testing.expectEqualStrings("failed to extract package archive", getUserFriendlyMessage(error.PackageExtractFailed));
     try testing.expectEqualStrings("failed to sign repository metadata", getUserFriendlyMessage(error.SigningFailed));
+
+    // Namespace setup failures must not fall through to "unknown error".
+    try testing.expectEqualStrings("failed to create a namespace", getUserFriendlyMessage(error.UnshareError));
+    try testing.expectEqualStrings("failed to set up the user namespace uid mapping", getUserFriendlyMessage(error.UidMapError));
+    try testing.expectEqualStrings("failed to set up the user namespace gid mapping", getUserFriendlyMessage(error.GidMapError));
 
     // Test unknown error fallback
     const UnknownError = error{SomeUnknownError};
