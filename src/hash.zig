@@ -502,7 +502,6 @@ test "calculateStoreContentHashV2 includes meta but excludes derived metadata" {
     try std.testing.expect(!std.mem.eql(u8, hash1, hash3));
 }
 
-
 test "store hash formats preserve v1 and distinguish transitional and v2 identities" {
     const th = @import("test_helpers.zig");
     var test_env = try th.createTestEnv();
