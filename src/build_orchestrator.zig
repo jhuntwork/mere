@@ -1910,8 +1910,13 @@ fn runOneNamespacePhase(
         .mere_root = mere_root_path,
     };
 
+    const details_before = state.ctx.getDiagnosticContext().details;
     const exit_code = state.namespace_runner(exec_ctx.ctx, .build, opts) catch |err| {
-        state.ctx.setDiagnosticContextFmt("namespace", "failed to fork and enter env: {s}", .{@errorName(err)});
+        // Namespace setup reports the failing operation and cause; keep that,
+        // and name only the error when it reported nothing new.
+        if (!namespace.reportedDetails(state.ctx, details_before)) {
+            state.ctx.setDiagnosticContextFmt("namespace", "failed to fork and enter env: {s}", .{@errorName(err)});
+        }
         return switch (err) {
             namespace.EnvError.UserNamespacesDisabled => BuildError.PermissionDenied,
             namespace.EnvError.ProfileNotFound => BuildError.InvalidInput,

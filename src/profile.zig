@@ -935,6 +935,7 @@ fn runRealizerCommand(
         env_count += 1;
     }
 
+    const details_before = ctx.getDiagnosticContext().details;
     const exit_code = namespace.forkAndEnterEnv(ctx, .build, .{
         .profile_root = stage_path,
         .workspace = stage_path,
@@ -943,7 +944,10 @@ fn runRealizerCommand(
         .env = &envp,
         .mere_root = mere_root,
     }) catch |err| {
-        ctx.setDiagnosticContextFmt(realizer.name, "failed to enter generation realizer environment: {s}", .{@errorName(err)});
+        // Keep the operation and cause namespace setup reported, if any.
+        if (!namespace.reportedDetails(ctx, details_before)) {
+            ctx.setDiagnosticContextFmt(realizer.name, "failed to enter generation realizer environment: {s}", .{@errorName(err)});
+        }
         return switch (err) {
             error.OutOfMemory => ProfileError.OutOfMemory,
             error.PermissionDenied, error.UserNamespacesDisabled, error.MountRestricted => ProfileError.PermissionDenied,
