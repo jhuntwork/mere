@@ -255,6 +255,10 @@ pub fn download(ctx: *mere.Context, config: DownloadConfig) !DownloadResult {
                 .dest_path = cache_path_owned,
                 .options = .{
                     .expected_hash = expected_hash,
+                    // A file already at the cache path failed the hash check
+                    // above, so it is stale. The download is verified before
+                    // it replaces anything.
+                    .force = expected_hash != null,
                 },
             });
         }
@@ -997,6 +1001,88 @@ test "download rejects conflicting pre-existing workspace source" {
     try std.testing.expect(diag.details != null);
     try std.testing.expectEqualStrings(workspace_file_path, diag.subject.?);
     try std.testing.expectEqualStrings("existing workspace source conflicts with cached source", diag.details.?);
+}
+
+test "download replaces a cached source whose hash no longer matches the recipe" {
+    var test_env = try test_helpers.createTestEnv();
+    defer {
+        test_env.cleanup();
+        std.testing.allocator.destroy(test_env);
+    }
+
+    var dummy = test_helpers.DummyClient.init(test_env.ctx.allocator);
+    defer dummy.deinit();
+
+    const new_content = "helper version two";
+    const src_url = "http://example.com/helper.txt";
+    try dummy.set(src_url, new_content);
+    const new_hash = try hash_mod.calculateBytesHash(test_env.ctx.allocator, new_content);
+    defer test_env.ctx.allocator.free(new_hash);
+
+    var vtable = download_mod.TransferClient.VTable{ .download_file = test_helpers.dummy_download_file };
+    const client = download_mod.TransferClient{ .ptr = @ptrCast(&dummy), .vtable = &vtable };
+
+    const cache_dir = try std.fs.path.join(test_env.ctx.allocator, &.{ test_env.path, "stale_cache" });
+    defer test_env.ctx.allocator.free(cache_dir);
+    try path_mod.ensureDirExists(cache_dir);
+
+    // The cache still holds the previous version of the source.
+    const cache_file_path = try std.fs.path.join(test_env.ctx.allocator, &.{ cache_dir, "helper.txt" });
+    defer test_env.ctx.allocator.free(cache_file_path);
+    {
+        var cache_file = try std.Io.Dir.createFileAbsolute(path_mod.currentIo(), cache_file_path, .{});
+        defer cache_file.close(path_mod.currentIo());
+        try cache_file.writeStreamingAll(path_mod.currentIo(), "helper version one");
+    }
+
+    const sources_dir = try std.fs.path.join(test_env.ctx.allocator, &.{ test_env.path, "stale_sources" });
+    defer test_env.ctx.allocator.free(sources_dir);
+    try path_mod.ensureDirExists(sources_dir);
+
+    const kdl_text = try std.fmt.allocPrint(test_env.ctx.allocator,
+        \\recipe {{
+        \\    name "stale-cache"
+        \\    version "1.0"
+        \\    release 1
+        \\    archs "x86_64" "aarch64"
+        \\    description "stale cache test"
+        \\    url "http://example.com"
+        \\    licenses "MIT"
+        \\}}
+        \\source "{s}" {{
+        \\    blake3 "{s}"
+        \\}}
+        \\build {{
+        \\    script "true"
+        \\}}
+        \\package "stale-cache" {{
+        \\    files "usr/bin/*"
+        \\}}
+    , .{ src_url, new_hash });
+    defer test_env.ctx.allocator.free(kdl_text);
+
+    var parsed = try recipe.parse(&test_env.ctx, kdl_text);
+    defer parsed.deinit();
+
+    var result = try download(&test_env.ctx, .{
+        .sources = parsed.sources.items,
+        .client = client,
+        .cache_dir = cache_dir,
+        .workspace_sources_dir = sources_dir,
+        .recipe_dir = test_env.path,
+        .recipe = &parsed,
+    });
+    defer result.deinit(test_env.ctx.allocator);
+
+    const workspace_file_path = try std.fs.path.join(test_env.ctx.allocator, &.{ sources_dir, "helper.txt" });
+    defer test_env.ctx.allocator.free(workspace_file_path);
+    const workspace_content = try std.Io.Dir.readFileAlloc(std.Io.Dir.cwd(), path_mod.currentIo(), workspace_file_path, test_env.ctx.allocator, .limited(1024));
+    defer test_env.ctx.allocator.free(workspace_content);
+    try std.testing.expectEqualStrings(new_content, workspace_content);
+
+    const cached_content = try std.Io.Dir.readFileAlloc(std.Io.Dir.cwd(), path_mod.currentIo(), cache_file_path, test_env.ctx.allocator, .limited(1024));
+    defer test_env.ctx.allocator.free(cached_content);
+    try std.testing.expectEqualStrings(new_content, cached_content);
 }
 
 test "clearSharedCache removes cached source entries" {
