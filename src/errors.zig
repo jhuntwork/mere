@@ -231,6 +231,19 @@ pub fn getUserFriendlyMessage(err: anyerror) []const u8 {
         error.MountSourceMissing => "bind mount source path not found",
         error.MountBindError => "bind mount failed",
         error.UnshareError => "failed to create a namespace",
+        error.UserNamespacesDisabled => "user namespaces are disabled on this system",
+        error.OverlayFsUnavailable => "overlayfs is not available on this system",
+        error.ProfileNotFound => "profile not found",
+        error.WorkspaceNotFound => "build workspace not found",
+        error.MountPrivateError => "failed to make mounts private in the namespace",
+        error.MountTmpfsError => "failed to mount a tmpfs in the namespace",
+        error.MountProcError => "failed to mount /proc in the namespace",
+        error.MountOverlayError => "failed to mount the /etc overlay in the namespace",
+        error.ChrootError => "failed to change root into the namespace",
+        error.SetuidError => "failed to drop privileges inside the namespace",
+        error.ExecError => "command not found or not executable in the profile",
+        error.ForkError => "failed to start the namespace process",
+        error.MknodError => "failed to create a device node in the namespace",
         error.UidMapError => "failed to set up the user namespace uid mapping",
         error.GidMapError => "failed to set up the user namespace gid mapping",
 
@@ -519,6 +532,8 @@ test "getUserFriendlyMessage returns user-readable messages" {
     try testing.expectEqualStrings("failed to sign repository metadata", getUserFriendlyMessage(error.SigningFailed));
 
     // Namespace setup failures must not fall through to "unknown error".
+    try testing.expectEqualStrings("command not found or not executable in the profile", getUserFriendlyMessage(error.ExecError));
+    try testing.expectEqualStrings("user namespaces are disabled on this system", getUserFriendlyMessage(error.UserNamespacesDisabled));
     try testing.expectEqualStrings("failed to create a namespace", getUserFriendlyMessage(error.UnshareError));
     try testing.expectEqualStrings("failed to set up the user namespace uid mapping", getUserFriendlyMessage(error.UidMapError));
     try testing.expectEqualStrings("failed to set up the user namespace gid mapping", getUserFriendlyMessage(error.GidMapError));

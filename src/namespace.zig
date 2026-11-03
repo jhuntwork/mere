@@ -1777,6 +1777,17 @@ test "reportedDetails tells new details from the ones held before" {
     try std.testing.expect(reportedDetails(&ctx, first));
 }
 
+test "every EnvError has a friendly message" {
+    // A user must never see "unknown error" for a namespace failure.
+    inline for (@typeInfo(EnvError).error_set.?) |field| {
+        const msg = errors.getUserFriendlyMessage(@field(EnvError, field.name));
+        std.testing.expect(!std.mem.eql(u8, msg, "unknown error")) catch |err| {
+            std.debug.print("EnvError.{s} has no friendly message\n", .{field.name});
+            return err;
+        };
+    }
+}
+
 test "EnvError covers all error cases" {
     // Verify that we can create all error types
     const all_errors = [_]EnvError{
