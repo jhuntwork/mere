@@ -1684,15 +1684,33 @@ fn executePreparedPhases(
         .{ .name = "install", .script = parsed_recipe.install_phase },
     };
 
+    // Phase scripts can read every declared source through MERE_SOURCES_DIR,
+    // not only the first one unpacked into src_dir. Hash that directory once;
+    // the phases do not modify it.
+    const sources_dir_hash = hash.calculateStoreContentHash(state.allocator, workspace.sources_dir, null) catch |err| {
+        return switch (err) {
+            error.OutOfMemory => state.ctx.fail(BuildError.OutOfMemory, workspace.sources_dir, "failed to hash sources directory"),
+            error.PermissionDenied => state.ctx.fail(BuildError.PermissionDenied, workspace.sources_dir, "failed to hash sources directory"),
+            else => state.ctx.fail(BuildError.FileSystem, workspace.sources_dir, "failed to hash sources directory"),
+        };
+    };
+    defer state.allocator.free(sources_dir_hash);
+
     for (phases) |phase| {
         const phase_script = phase.script orelse continue;
         if (phase_script.len == 0) continue;
-        const source_tree_hash = hash.calculateStoreContentHash(state.allocator, workspace.src_dir, null) catch |err| {
+        const unpacked_tree_hash = hash.calculateStoreContentHash(state.allocator, workspace.src_dir, null) catch |err| {
             return switch (err) {
                 error.OutOfMemory => state.ctx.fail(BuildError.OutOfMemory, workspace.src_dir, "failed to hash source tree"),
                 error.PermissionDenied => state.ctx.fail(BuildError.PermissionDenied, workspace.src_dir, "failed to hash source tree"),
                 else => state.ctx.fail(BuildError.FileSystem, workspace.src_dir, "failed to hash source tree"),
             };
+        };
+        defer state.allocator.free(unpacked_tree_hash);
+
+        // The phase key takes one source identity covering both inputs.
+        const source_tree_hash = std.fmt.allocPrint(state.allocator, "unpacked={s}\nsources={s}", .{ unpacked_tree_hash, sources_dir_hash }) catch {
+            return state.ctx.fail(BuildError.OutOfMemory, phase.name, "failed to build source identity");
         };
         defer state.allocator.free(source_tree_hash);
 
@@ -3984,6 +4002,95 @@ test "executeBuild reruns changed check phase while restoring build" {
     try std.testing.expect(second_capture.contains("dependency profile restored from cache"));
     try std.testing.expect(second_capture.contains("phase restored from cache: build"));
     try std.testing.expect(!second_capture.contains("phase restored from cache: check"));
+}
+
+test "executeBuild reruns install when only a helper source read through MERE_SOURCES_DIR changes" {
+    const th = @import("test_helpers.zig");
+    var test_env = try th.createTestEnv();
+    defer {
+        test_env.cleanup();
+        std.testing.allocator.destroy(test_env);
+    }
+
+    // The first source is unpacked into the build directory. The helper is a
+    // second source that no phase sees there; the install script reads it
+    // through MERE_SOURCES_DIR, so the packaged payload depends on it.
+    const main_path = try std.fs.path.join(test_env.ctx.allocator, &.{ test_env.path, "main.txt" });
+    defer test_env.ctx.allocator.free(main_path);
+    {
+        var file = try std.Io.Dir.createFileAbsolute(path_mod.currentIo(), main_path, .{});
+        defer file.close(path_mod.currentIo());
+        try file.writeStreamingAll(path_mod.currentIo(), "main source\n");
+    }
+    const helper_path = try std.fs.path.join(test_env.ctx.allocator, &.{ test_env.path, "helper.txt" });
+    defer test_env.ctx.allocator.free(helper_path);
+
+    const kdl_text =
+        \\source "main.txt"
+        \\source "helper.txt"
+        \\recipe {
+        \\    name "helper-source"
+        \\    version "1.0"
+        \\    release 1
+        \\    archs "x86_64" "aarch64"
+        \\}
+        \\install {
+        \\    script "mkdir -p $DESTDIR/share && cp $MERE_SOURCES_DIR/helper.txt $DESTDIR/share/helper.txt"
+        \\}
+        \\package "helper-source" {
+        \\    files "share/helper.txt"
+        \\}
+    ;
+
+    var dummy = th.DummyClient.init(test_env.ctx.allocator);
+    defer dummy.deinit();
+    var vt: download.TransferClient.VTable = .{ .download_file = th.dummy_download_file };
+    const client = download.TransferClient{ .ptr = @ptrCast(&dummy), .vtable = &vt };
+
+    var first_archive: []u8 = &.{};
+    defer test_env.ctx.allocator.free(first_archive);
+    {
+        var file = try std.Io.Dir.createFileAbsolute(path_mod.currentIo(), helper_path, .{});
+        defer file.close(path_mod.currentIo());
+        try file.writeStreamingAll(path_mod.currentIo(), "helper version one\n");
+    }
+    {
+        const request = try makeHermeticTestBuildRequest(test_env, kdl_text, client);
+        defer test_env.ctx.allocator.free(request.cache_dir.?);
+        var result = try executeBuildPlanWithTestRunner(&test_env.ctx, request);
+        defer result.deinit();
+        try std.testing.expectEqual(BuildStatus.success, result.status);
+        try std.testing.expectEqual(@as(usize, 1), result.packages_created.items.len);
+        first_archive = try test_env.ctx.allocator.dupe(u8, std.fs.path.basename(result.packages_created.items[0]));
+    }
+
+    // Change only the helper. The build cache is kept, as in the reported
+    // case; the source cache and workspaces are cleared, as `mere dev clean
+    // --sources --workspaces` does.
+    {
+        const source_cache = try std.fs.path.join(test_env.ctx.allocator, &.{ test_env.path, "source-cache" });
+        defer test_env.ctx.allocator.free(source_cache);
+        path_mod.deleteTreeAbsolute(source_cache) catch {};
+        var file = try std.Io.Dir.createFileAbsolute(path_mod.currentIo(), helper_path, .{});
+        defer file.close(path_mod.currentIo());
+        try file.writeStreamingAll(path_mod.currentIo(), "helper version two, changed\n");
+    }
+    var second_capture = CaptureEmitter.init(test_env.ctx.allocator);
+    defer second_capture.deinit();
+    test_env.ctx.setEmitter(&second_capture.emitter);
+    {
+        const request = try makeHermeticTestBuildRequest(test_env, kdl_text, client);
+        defer test_env.ctx.allocator.free(request.cache_dir.?);
+        var result = try executeBuildPlanWithTestRunner(&test_env.ctx, request);
+        defer result.deinit();
+        try std.testing.expectEqual(BuildStatus.success, result.status);
+        try std.testing.expectEqual(@as(usize, 1), result.packages_created.items.len);
+        // The archive name carries the payload hash, so equal names mean the
+        // stale helper was packaged.
+        const second_archive = std.fs.path.basename(result.packages_created.items[0]);
+        try std.testing.expect(!std.mem.eql(u8, first_archive, second_archive));
+    }
+    try std.testing.expect(!second_capture.contains("phase restored from cache: install"));
 }
 
 fn sweepSplitReport(allocator: std.mem.Allocator, destdir: []const u8, root: []const u8) error{OutOfMemory}!void {
