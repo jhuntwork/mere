@@ -141,7 +141,10 @@ pub const HelpFormatter = struct {
                 // Ungrouped commands first
                 var has_ungrouped = false;
                 for (groups) |g| {
-                    if (g == null) { has_ungrouped = true; break; }
+                    if (g == null) {
+                        has_ungrouped = true;
+                        break;
+                    }
                 }
                 if (has_ungrouped) try group_order.append(self.allocator, null);
 
