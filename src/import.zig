@@ -148,7 +148,11 @@ fn extractArchiveToTemp(ctx: *Context, archive_path: []const u8) !ExtractResult 
 
     const temp_dir = try std.fmt.allocPrint(ctx.allocator, "/tmp/{s}", .{temp_dir_result.sub_path});
 
-    extract.into(ctx, archive_path, temp_dir) catch {
+    // The package manifest's content hash covers setuid, setgid and sticky bits,
+    // so the importer must restore them. libarchive drops them when the
+    // extracting user is not the owner the archive declares, which made the
+    // recomputed hash differ for any package with such a file.
+    extract.intoPreservingSpecialBits(ctx, archive_path, temp_dir) catch {
         const diag = ctx.getDiagnosticContext();
         if (diag.details == null) {
             ctx.setDiagnosticContext(archive_path, "failed to extract package");
@@ -2180,6 +2184,46 @@ fn sweepTrustedFingerprints(allocator: std.mem.Allocator, key_path: []const u8, 
     }
     // One fingerprint from the signing key and one from the installed key.
     if (list.items.len != 2) return error.TestExpectedEqual;
+}
+
+test "import extraction keeps the setuid bit when the archive owner is not the importer" {
+    const th = @import("test_helpers.zig");
+    var test_env = try th.createTestEnv();
+    defer {
+        test_env.cleanup();
+        std.testing.allocator.destroy(test_env);
+    }
+
+    // The package manifest's content hash covers setuid, so the extracted tree
+    // must keep it. libarchive drops it when the extracting user is not the
+    // owner the archive declares, so declare an owner that is not us.
+    const other_uid: i64 = @as(i64, std.os.linux.geteuid()) + 1;
+    const other_gid: i64 = @as(i64, std.os.linux.getegid()) + 1;
+
+    const tar_path = try std.fs.path.join(std.testing.allocator, &.{ test_env.path, "suid.tar" });
+    defer std.testing.allocator.free(tar_path);
+    try extract.writeTarWithOwnedFile(
+        std.testing.allocator,
+        tar_path,
+        "bin/suid-tool",
+        "#!/bin/sh\nexit 0\n",
+        std.Io.File.Permissions.fromMode(0o4755),
+        other_uid,
+        other_gid,
+    );
+
+    var extracted = try extractArchiveToTemp(&test_env.ctx, tar_path);
+    defer {
+        test_env.ctx.allocator.free(extracted.temp_dir);
+        extracted.temp.cleanup();
+    }
+
+    const tool_path = try std.fs.path.join(std.testing.allocator, &.{ extracted.temp_dir, "bin", "suid-tool" });
+    defer std.testing.allocator.free(tool_path);
+    var tool = try std.Io.Dir.openFileAbsolute(p.currentIo(), tool_path, .{});
+    defer tool.close(p.currentIo());
+    const stat = try tool.stat(p.currentIo());
+    try std.testing.expectEqual(@as(std.posix.mode_t, 0o4755), stat.permissions.toMode() & 0o7777);
 }
 
 test "collectTrustedFingerprintsForImport releases its allocations on every failure point" {

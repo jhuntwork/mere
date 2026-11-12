@@ -788,7 +788,7 @@ pub fn fileInto(ctx: *Context, archive_path: []const u8, target_dir: []const u8,
     try extractWithPolicy(ctx, archive_path, target_dir, target_file, .none);
 }
 
-fn writeTarWithOwnedFile(
+pub fn writeTarWithOwnedFile(
     allocator: std.mem.Allocator,
     tar_path: []const u8,
     entry_path: []const u8,
