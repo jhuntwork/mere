@@ -213,7 +213,7 @@ pub const Context = struct {
         const lock_path = try std.fs.path.join(self.allocator, &.{ mere_dir, ".lock" });
         defer self.allocator.free(lock_path);
 
-        const lock_file = try std.Io.Dir.createFileAbsolute(path.currentIo(), lock_path, .{ .truncate = false });
+        const lock_file = try path.openLockFile(lock_path);
         const lock_fd = lock_file.handle;
 
         // Try non-blocking first so we can tell the user we're waiting
@@ -260,7 +260,7 @@ pub const Context = struct {
         const lock_path = try std.fs.path.join(self.allocator, &.{ cache_root, ".lock" });
         defer self.allocator.free(lock_path);
 
-        const lock_file = try std.Io.Dir.createFileAbsolute(path.currentIo(), lock_path, .{ .truncate = false });
+        const lock_file = try path.openLockFile(lock_path);
         const lock_fd = lock_file.handle;
 
         if (std.posix.errno(std.c.flock(lock_fd, std.c.LOCK.EX | std.c.LOCK.NB)) != .SUCCESS) {
@@ -505,6 +505,94 @@ test "Context.acquireStoreLock actually excludes a second independent lock holde
     // Once released, the rival can now take it.
     try std.testing.expectEqual(std.posix.E.SUCCESS, std.posix.errno(std.c.flock(rival.handle, std.c.LOCK.EX | std.c.LOCK.NB)));
     _ = std.c.flock(rival.handle, std.c.LOCK.UN);
+}
+
+// #89: root creates these lock files mode 0644, so any other user can read them
+// but not write them. flock needs no write access, so taking the lock must not
+// require opening the file for writing.
+test "Context.acquireStoreLock works when the lock file is not writable by this user" {
+    if (std.os.linux.geteuid() == 0) return error.SkipZigTest;
+
+    const th = @import("test_helpers.zig");
+    var test_env = try th.createTestEnv();
+    defer {
+        test_env.cleanup();
+        std.testing.allocator.destroy(test_env);
+    }
+
+    const mere_dir = try std.fs.path.join(std.testing.allocator, &.{ test_env.path, "mere" });
+    defer std.testing.allocator.free(mere_dir);
+    try path.ensureDirExists(mere_dir);
+    const lock_path = try std.fs.path.join(std.testing.allocator, &.{ mere_dir, ".lock" });
+    defer std.testing.allocator.free(lock_path);
+    {
+        const created = try std.Io.Dir.createFileAbsolute(path.currentIo(), lock_path, .{ .truncate = false });
+        defer created.close(path.currentIo());
+        try created.setPermissions(path.currentIo(), .fromMode(0o444));
+    }
+
+    try test_env.ctx.acquireStoreLock();
+    defer test_env.ctx.releaseStoreLock();
+    try std.testing.expect(test_env.ctx.store_lock_fd != null);
+}
+
+test "Context.acquireStoreLock still excludes a second holder when the lock file is not writable" {
+    if (std.os.linux.geteuid() == 0) return error.SkipZigTest;
+
+    const th = @import("test_helpers.zig");
+    var test_env = try th.createTestEnv();
+    defer {
+        test_env.cleanup();
+        std.testing.allocator.destroy(test_env);
+    }
+
+    const mere_dir = try std.fs.path.join(std.testing.allocator, &.{ test_env.path, "mere" });
+    defer std.testing.allocator.free(mere_dir);
+    try path.ensureDirExists(mere_dir);
+    const lock_path = try std.fs.path.join(std.testing.allocator, &.{ mere_dir, ".lock" });
+    defer std.testing.allocator.free(lock_path);
+    {
+        const created = try std.Io.Dir.createFileAbsolute(path.currentIo(), lock_path, .{ .truncate = false });
+        defer created.close(path.currentIo());
+        try created.setPermissions(path.currentIo(), .fromMode(0o444));
+    }
+
+    try test_env.ctx.acquireStoreLock();
+    // An independent holder, opening the file read-only the same way, must be
+    // refused while the Context holds the lock: serialization is preserved.
+    const rival = try std.Io.Dir.openFileAbsolute(path.currentIo(), lock_path, .{});
+    defer rival.close(path.currentIo());
+    try std.testing.expect(std.posix.errno(std.c.flock(rival.handle, std.c.LOCK.EX | std.c.LOCK.NB)) != .SUCCESS);
+
+    test_env.ctx.releaseStoreLock();
+    try std.testing.expectEqual(std.posix.E.SUCCESS, std.posix.errno(std.c.flock(rival.handle, std.c.LOCK.EX | std.c.LOCK.NB)));
+    _ = std.c.flock(rival.handle, std.c.LOCK.UN);
+}
+
+test "Context.acquireBuildCacheLock works when the lock file is not writable by this user" {
+    if (std.os.linux.geteuid() == 0) return error.SkipZigTest;
+
+    const th = @import("test_helpers.zig");
+    var test_env = try th.createTestEnv();
+    defer {
+        test_env.cleanup();
+        std.testing.allocator.destroy(test_env);
+    }
+
+    const cache_root = try std.fs.path.join(std.testing.allocator, &.{ test_env.path, "mere", "dev", "cache", "build" });
+    defer std.testing.allocator.free(cache_root);
+    try path.ensureDirExists(cache_root);
+    const lock_path = try std.fs.path.join(std.testing.allocator, &.{ cache_root, ".lock" });
+    defer std.testing.allocator.free(lock_path);
+    {
+        const created = try std.Io.Dir.createFileAbsolute(path.currentIo(), lock_path, .{ .truncate = false });
+        defer created.close(path.currentIo());
+        try created.setPermissions(path.currentIo(), .fromMode(0o444));
+    }
+
+    try test_env.ctx.acquireBuildCacheLock(cache_root);
+    defer test_env.ctx.releaseBuildCacheLock();
+    try std.testing.expect(test_env.ctx.build_cache_lock_fd != null);
 }
 
 test "Context.acquireBuildCacheLock is reentrant within the same Context" {

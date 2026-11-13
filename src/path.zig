@@ -146,6 +146,21 @@ pub fn fileExists(path: []const u8) bool {
         return true;
     }
 }
+/// Open a file used only for `flock`, creating it if it does not exist.
+///
+/// `flock` needs no write access, so an existing lock file is opened read-only.
+/// Opening it read/write, as `createFile` does, fails with AccessDenied for any
+/// user who does not own it, and lock files are commonly created by root with
+/// mode 0644. Only when the file is missing is it created, which needs write
+/// access to its directory and so is the caller's problem, as it always was.
+pub fn openLockFile(lock_path: []const u8) !std.Io.File {
+    const io = currentIo();
+    return std.Io.Dir.openFileAbsolute(io, lock_path, .{}) catch |err| switch (err) {
+        error.FileNotFound => std.Io.Dir.createFileAbsolute(io, lock_path, .{ .truncate = false }),
+        else => err,
+    };
+}
+
 pub fn openExistingFile(file_path: []const u8) !std.Io.File {
     const io = currentIo();
     if (std.fs.path.isAbsolute(file_path)) {
