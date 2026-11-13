@@ -291,7 +291,22 @@ pub const RepoCache = struct {
             };
         };
         cache_dir_handle.close(path.currentIo());
-        const sync_lock_fd = try acquireSyncLock(self);
+        // A refresh needs the sync lock. If it cannot be taken, a cache that
+        // is already verified is still good to read: failing here would hide
+        // metadata the caller could have used, which is how an ordinary user
+        // lost `mere search` when root had created the lock.
+        const sync_lock_fd = acquireSyncLock(self) catch |err| {
+            if (options.allow_stale_fallback and try cacheUsable(self)) {
+                const age = try cacheAgeSeconds(self, now);
+                if (age) |seconds| {
+                    ui.emit.logFmtSeverity(self.ctx, null, .warn, "cannot refresh repo {s}: {s}; using verified cached metadata ({d}s old)", .{ self.name, @errorName(err), seconds });
+                } else {
+                    ui.emit.logFmtSeverity(self.ctx, null, .warn, "cannot refresh repo {s}: {s}; using verified cached metadata", .{ self.name, @errorName(err) });
+                }
+                return;
+            }
+            return err;
+        };
         defer releaseSyncLock(sync_lock_fd);
 
         // Re-check freshness after acquiring the lock: another process may
@@ -625,7 +640,7 @@ fn cacheAgeSeconds(self: *RepoCache, now: u64) RepoCacheError!?u64 {
 fn acquireSyncLock(self: *RepoCache) RepoCacheError!std.posix.fd_t {
     const lock_path = std.fs.path.join(self.ctx.allocator, &.{ self.cache_dir, ".sync.lock" }) catch return RepoCacheError.OutOfMemory;
     defer self.ctx.allocator.free(lock_path);
-    const lock_file = std.Io.Dir.createFileAbsolute(path.currentIo(), lock_path, .{ .truncate = false }) catch |err| return mapFsAccessError(err);
+    const lock_file = path.openLockFile(lock_path) catch |err| return mapFsAccessError(err);
     const fd = lock_file.handle;
     if (std.posix.errno(std.c.flock(fd, std.c.LOCK.EX)) != .SUCCESS) {
         _ = std.c.close(fd);
@@ -1123,6 +1138,120 @@ test "writeLastSync reports permission denied for read-only cache dir" {
     defer cache.deinit();
 
     try std.testing.expectError(RepoCacheError.PermissionDenied, writeLastSync(&cache, 12345));
+}
+
+fn syncFixture(test_env: anytype, name: []const u8) !RepoCache {
+    const ctx = &test_env.ctx;
+    const url = try std.fmt.allocPrint(ctx.allocator, "https://example.invalid/{s}", .{name});
+    defer ctx.allocator.free(url);
+    const no_fps = [_][]const u8{};
+    return RepoCache.init(ctx, name, url, &no_fps, 100);
+}
+
+fn writeLockFile(dir: []const u8, mode: u32) !void {
+    const lock_path = try std.fs.path.join(std.testing.allocator, &.{ dir, ".sync.lock" });
+    defer std.testing.allocator.free(lock_path);
+    const created = try std.Io.Dir.createFileAbsolute(path.currentIo(), lock_path, .{ .truncate = false });
+    defer created.close(path.currentIo());
+    try created.setPermissions(path.currentIo(), .fromMode(@intCast(mode)));
+}
+
+// #89: root creates .sync.lock mode 0644. Another user must still be able to take
+// it, because flock needs no write access.
+test "acquireSyncLock works when the lock file is not writable by this user" {
+    if (std.os.linux.geteuid() == 0) return error.SkipZigTest;
+
+    const th = @import("test_helpers.zig");
+    var test_env = try th.createTestEnv();
+    defer {
+        test_env.cleanup();
+        std.testing.allocator.destroy(test_env);
+    }
+
+    var cache = try syncFixture(test_env, "shared-repo");
+    defer cache.deinit();
+    try path.ensureDirExists(cache.cacheDir());
+    try writeLockFile(cache.cacheDir(), 0o444);
+
+    const fd = try acquireSyncLock(&cache);
+    releaseSyncLock(fd);
+}
+
+// #89: a lock the user cannot take must not hide a cache they can read. This is
+// the case `mere search` hit: repository "unavailable (PermissionDenied)" even
+// though verified metadata was sitting in the cache and `--no-sync` used it.
+test "sync falls back to usable cached metadata when the sync lock cannot be taken" {
+    if (std.os.linux.geteuid() == 0) return error.SkipZigTest;
+
+    const th = @import("test_helpers.zig");
+    var test_env = try th.createTestEnv();
+    defer {
+        test_env.cleanup();
+        std.testing.allocator.destroy(test_env);
+    }
+    const ctx = &test_env.ctx;
+
+    var cache = try syncFixture(test_env, "stale-ok");
+    defer cache.deinit();
+    const cache_dir = cache.cacheDir();
+    try path.ensureDirExists(cache_dir);
+
+    // A cache that looks usable: both files present and a recorded sync.
+    for ([_][]const u8{ repo_history.REPO_DB_FILENAME, repo_history.REPO_SIG_FILENAME }) |file_name| {
+        const file_path = try std.fs.path.join(ctx.allocator, &.{ cache_dir, file_name });
+        defer ctx.allocator.free(file_path);
+        const f = try std.Io.Dir.createFileAbsolute(path.currentIo(), file_path, .{});
+        defer f.close(path.currentIo());
+        try f.writeStreamingAll(path.currentIo(), "cached");
+    }
+    try writeLastSync(&cache, 1_000);
+
+    // The lock exists but this user cannot open it at all.
+    try writeLockFile(cache_dir, 0o000);
+
+    var curl_client = try download.CurlTransferClient.init(ctx, "mere");
+    defer download.CurlTransferClient.cleanupFn(ctx, curl_client);
+    const client = curl_client.client();
+    var loaded_keys = try sign.loadAllKeys(ctx);
+    defer {
+        for (loaded_keys.items) |*key| key.deinit(ctx.allocator);
+        loaded_keys.deinit(ctx.allocator);
+    }
+
+    // interval 0 forces a refresh attempt, which would need the lock.
+    try cache.sync(client, .{ .interval_seconds = 0 }, loaded_keys.items);
+}
+
+test "sync still fails when the lock cannot be taken and there is no usable cache" {
+    if (std.os.linux.geteuid() == 0) return error.SkipZigTest;
+
+    const th = @import("test_helpers.zig");
+    var test_env = try th.createTestEnv();
+    defer {
+        test_env.cleanup();
+        std.testing.allocator.destroy(test_env);
+    }
+    const ctx = &test_env.ctx;
+
+    var cache = try syncFixture(test_env, "no-cache");
+    defer cache.deinit();
+    try path.ensureDirExists(cache.cacheDir());
+    try writeLockFile(cache.cacheDir(), 0o000);
+
+    var curl_client = try download.CurlTransferClient.init(ctx, "mere");
+    defer download.CurlTransferClient.cleanupFn(ctx, curl_client);
+    const client = curl_client.client();
+    var loaded_keys = try sign.loadAllKeys(ctx);
+    defer {
+        for (loaded_keys.items) |*key| key.deinit(ctx.allocator);
+        loaded_keys.deinit(ctx.allocator);
+    }
+
+    // Nothing to fall back to: this must still report the permission problem.
+    try std.testing.expectError(
+        RepoCacheError.PermissionDenied,
+        cache.sync(client, .{ .interval_seconds = 0 }, loaded_keys.items),
+    );
 }
 
 test "replaceCachedDbAndSigWithRollback restores live pair when sig swap fails" {
