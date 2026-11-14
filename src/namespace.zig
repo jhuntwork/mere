@@ -846,29 +846,56 @@ fn buildSyntheticRoot(allocator: std.mem.Allocator, session: *const SessionInfo,
     try mountBind(mere_root, mere_target, read_only_mere);
 }
 
+const BindMountOptions = struct {
+    read_only: bool = false,
+    recursive: bool = true,
+    remount_flags: c_ulong = 0,
+
+    fn bindFlags(self: BindMountOptions) c_ulong {
+        return MS_BIND | (if (self.recursive) MS_REC else @as(c_ulong, 0));
+    }
+
+    fn readOnlyFlags(self: BindMountOptions) c_ulong {
+        return self.bindFlags() | MS_REMOUNT | MS_RDONLY | self.remount_flags;
+    }
+};
+
+const ShellBindMount = struct {
+    source: []const u8,
+    target: []const u8,
+    options: BindMountOptions = .{},
+};
+
+const shell_bind_mounts = [_]ShellBindMount{
+    .{ .source = "/home", .target = "home" },
+    .{ .source = "/var", .target = "var" },
+    .{ .source = "/run", .target = "run" },
+    .{ .source = "/dev", .target = "dev" },
+    // Mesa/libdrm need sysfs to discover the devices exposed through /dev.
+    // Do not import child mounts (debugfs, efivarfs, etc.): remounting the
+    // top-level bind read-only would not make those child mounts read-only.
+    .{ .source = "/sys", .target = "sys", .options = .{
+        .read_only = true,
+        .recursive = false,
+        .remount_flags = MS_NOSUID | MS_NODEV | MS_NOEXEC,
+    } },
+};
+
 fn applyShellMounts(allocator: std.mem.Allocator, session: *const SessionInfo, opts: EnvOptions) EnvError!void {
     const root = if (session.root_path.len > 0 and session.root_path[session.root_path.len - 1] == '/')
         session.root_path[0 .. session.root_path.len - 1]
     else
         session.root_path;
 
-    const bind_mounts = [_][2][]const u8{
-        .{ "/home", "home" },
-        .{ "/var", "var" },
-        .{ "/run", "run" },
-        .{ "/dev", "dev" },
-    };
-
-    for (bind_mounts) |mount_info| {
-        const source = mount_info[0];
-        const target_rel = mount_info[1];
-
-        const target = std.fs.path.join(allocator, &.{ root, target_rel }) catch {
+    for (shell_bind_mounts) |mount_info| {
+        const target = std.fs.path.join(allocator, &.{ root, mount_info.target }) catch {
             return EnvError.OutOfMemory;
         };
         defer allocator.free(target);
 
-        try mountBind(source, target, false);
+        // /sys is shell-only; buildSyntheticRoot deliberately does not expose it.
+        std.Io.Dir.cwd().createDirPath(path_mod.currentIo(), target) catch return EnvError.SyntheticRootSetupError;
+        try mountBindWithOptions(mount_info.source, target, mount_info.options);
     }
 
     const etc_target = std.fs.path.join(allocator, &.{ root, "etc" }) catch {
@@ -946,6 +973,10 @@ fn applyBuildMounts(allocator: std.mem.Allocator, session: *const SessionInfo, o
 }
 
 fn mountBind(source: []const u8, target: []const u8, read_only: bool) EnvError!void {
+    return mountBindWithOptions(source, target, .{ .read_only = read_only });
+}
+
+fn mountBindWithOptions(source: []const u8, target: []const u8, options: BindMountOptions) EnvError!void {
     std.Io.Dir.accessAbsolute(path_mod.currentIo(), source, .{}) catch |err| {
         return switch (err) {
             error.FileNotFound => EnvError.MountSourceMissing,
@@ -960,7 +991,7 @@ fn mountBind(source: []const u8, target: []const u8, read_only: bool) EnvError!v
     const tgt_c = toCString(target) catch return EnvError.OutOfMemory;
     defer std.heap.page_allocator.free(tgt_c);
 
-    var rc = c.mount(src_c.ptr, tgt_c.ptr, null, MS_BIND | MS_REC, null);
+    var rc = c.mount(src_c.ptr, tgt_c.ptr, null, options.bindFlags(), null);
     if (rc != 0) {
         switch (std.c._errno().*) {
             c.EPERM, c.EACCES => return EnvError.MountRestricted,
@@ -970,8 +1001,8 @@ fn mountBind(source: []const u8, target: []const u8, read_only: bool) EnvError!v
         return EnvError.MountBindError;
     }
 
-    if (read_only) {
-        rc = c.mount(null, tgt_c.ptr, null, MS_BIND | MS_REMOUNT | MS_RDONLY | MS_REC, null);
+    if (options.read_only) {
+        rc = c.mount(null, tgt_c.ptr, null, options.readOnlyFlags(), null);
         if (rc != 0) {
             switch (std.c._errno().*) {
                 c.EPERM, c.EACCES => return EnvError.MountRestricted,
@@ -1422,6 +1453,109 @@ test "SessionInfo deinit frees memory" {
     session.deinit();
     // If deinit works correctly, there should be no memory leaks
     // The testing allocator will detect leaks if any occur
+}
+
+test "shell namespace exposes sysfs read-only without host submounts" {
+    for (shell_bind_mounts) |mount_info| {
+        if (!std.mem.eql(u8, mount_info.source, "/sys")) continue;
+        try std.testing.expectEqualStrings("sys", mount_info.target);
+        try std.testing.expect(mount_info.options.read_only);
+        try std.testing.expectEqual(@as(c_ulong, MS_BIND), mount_info.options.bindFlags());
+        try std.testing.expectEqual(
+            @as(c_ulong, MS_BIND | MS_REMOUNT | MS_RDONLY | MS_NOSUID | MS_NODEV | MS_NOEXEC),
+            mount_info.options.readOnlyFlags(),
+        );
+        return;
+    }
+    return error.TestUnexpectedResult;
+}
+
+test "shell sysfs bind rejects writes and excludes nested mounts" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const io = path_mod.currentIo();
+    try tmp.dir.createDirPath(io, "source/nested");
+    try tmp.dir.createDirPath(io, "target");
+    try tmp.dir.writeFile(io, .{ .sub_path = "source/marker", .data = "visible" });
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path_len = try tmp.dir.realPath(io, &path_buf);
+    const source = try std.fs.path.join(std.testing.allocator, &.{ path_buf[0..path_len], "source" });
+    defer std.testing.allocator.free(source);
+    const target = try std.fs.path.join(std.testing.allocator, &.{ path_buf[0..path_len], "target" });
+    defer std.testing.allocator.free(target);
+
+    const Runner = struct {
+        fn enter(ctx: *Context, _: EnvMode, opts: EnvOptions) EnvError!void {
+            // All mounts are confined to this forked child's private namespace.
+            // The fixture contains no real sysfs knobs or host device state.
+            const uid = c.getuid();
+            const gid = c.getgid();
+            if (c.unshare(c.CLONE_NEWUSER) != 0) {
+                const errno = std.c._errno().*;
+                if (errno == c.EPERM or errno == c.EACCES) c._exit(77);
+                return reportUnshareFailure(ctx, "test user namespace", @enumFromInt(errno));
+            }
+            try writeIdMappings(ctx, uid, gid, .{ .uid = uid, .gid = gid });
+            try createMountNamespace(ctx);
+            try makeMountsPrivate();
+            var nested_buf: [std.fs.max_path_bytes]u8 = undefined;
+            const nested = std.fmt.bufPrintZ(&nested_buf, "{s}/nested", .{opts.workspace.?}) catch c._exit(2);
+            try mountTmpfs(nested, "size=64k,mode=755");
+            var sentinel_buf: [std.fs.max_path_bytes]u8 = undefined;
+            const sentinel = std.fmt.bufPrintZ(&sentinel_buf, "{s}/sentinel", .{nested}) catch c._exit(3);
+            const fd = c.open(sentinel, c.O_WRONLY | c.O_CREAT | c.O_EXCL, @as(c_uint, 0o600));
+            if (fd < 0) c._exit(4);
+            _ = c.close(fd);
+
+            for (shell_bind_mounts) |mount_info| {
+                if (!std.mem.eql(u8, mount_info.source, "/sys")) continue;
+                try mountBindWithOptions(opts.workspace.?, opts.profile_root, mount_info.options);
+                var marker_buf: [std.fs.max_path_bytes]u8 = undefined;
+                const marker = std.fmt.bufPrintZ(&marker_buf, "{s}/marker", .{opts.profile_root}) catch c._exit(5);
+                const readable = c.open(marker, c.O_RDONLY);
+                if (readable < 0) c._exit(6);
+                _ = c.close(readable);
+                const writable = c.open(marker, c.O_WRONLY);
+                if (writable >= 0) {
+                    _ = c.close(writable);
+                    c._exit(7);
+                }
+                if (std.c._errno().* != c.EROFS) c._exit(8);
+                var hidden_buf: [std.fs.max_path_bytes]u8 = undefined;
+                const hidden = std.fmt.bufPrintZ(&hidden_buf, "{s}/nested/sentinel", .{opts.profile_root}) catch c._exit(9);
+                const child = c.open(hidden, c.O_RDONLY);
+                if (child >= 0) {
+                    _ = c.close(child);
+                    c._exit(10);
+                }
+                if (std.c._errno().* != c.ENOENT) c._exit(11);
+                return;
+            }
+            c._exit(12);
+        }
+    };
+    var ctx = Context.init(std.testing.allocator, "/test");
+    defer ctx.deinit();
+    const status = try forkAndEnterEnvWith(&ctx, .shell, .{
+        .profile_root = target,
+        .workspace = source,
+    }, Runner.enter);
+    if (status == 77) return error.SkipZigTest;
+    try std.testing.expectEqual(@as(u8, 0), status);
+}
+
+test "shell namespace keeps existing writable recursive bind mounts" {
+    const expected = [_][]const u8{ "/home", "/var", "/run", "/dev" };
+    for (expected) |source| {
+        var found = false;
+        for (shell_bind_mounts) |mount_info| {
+            if (!std.mem.eql(u8, source, mount_info.source)) continue;
+            found = true;
+            try std.testing.expect(!mount_info.options.read_only);
+            try std.testing.expectEqual(@as(c_ulong, MS_BIND | MS_REC), mount_info.options.bindFlags());
+        }
+        try std.testing.expect(found);
+    }
 }
 
 test "EnvMode enum values" {
