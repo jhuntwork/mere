@@ -2,6 +2,7 @@
 const std = @import("std");
 const mere = @import("mere.zig");
 const package = @import("package.zig");
+const fault_injection = @import("fault_injection.zig");
 const path = @import("path.zig");
 const ver = @import("version.zig");
 const errors = @import("errors.zig");
@@ -1168,12 +1169,18 @@ pub const RepoDB = struct {
             return RepoDBError.CorruptData;
         }
 
+        var transaction_open = true;
+        errdefer {
+            if (transaction_open) {
+                var rbmsg: [*c]u8 = null;
+                _ = c.sqlite3_exec(self.db, "ROLLBACK;", null, null, &rbmsg);
+                if (rbmsg != null) c.sqlite3_free(rbmsg);
+            }
+        }
+
         // Insert package row
         var pkg_id: i64 = 0;
         pkg_id = self.insertPackage(pkg, properties) catch |err| {
-            var rbmsg: [*c]u8 = null;
-            _ = c.sqlite3_exec(self.db, "ROLLBACK;", null, null, &rbmsg);
-            if (rbmsg != null) c.sqlite3_free(rbmsg);
             return err;
         };
 
@@ -1181,9 +1188,6 @@ pub const RepoDB = struct {
         const deps_slice = pkg.dependencies.items;
         if (deps_slice.len > 0) {
             self.insertDependencies(pkg_id, deps_slice) catch |err| {
-                var rbmsg: [*c]u8 = null;
-                _ = c.sqlite3_exec(self.db, "ROLLBACK;", null, null, &rbmsg);
-                if (rbmsg != null) c.sqlite3_free(rbmsg);
                 return err;
             };
         }
@@ -1192,18 +1196,18 @@ pub const RepoDB = struct {
         const provs_slice = pkg.provisions.items;
         if (provs_slice.len > 0) {
             self.insertProvisions(pkg_id, provs_slice) catch |err| {
-                var rbmsg: [*c]u8 = null;
-                _ = c.sqlite3_exec(self.db, "ROLLBACK;", null, null, &rbmsg);
-                if (rbmsg != null) c.sqlite3_free(rbmsg);
                 return err;
             };
         }
 
+        try fault_injection.hit(.repository_before_database_publish);
         const commit_rc = c.sqlite3_exec(self.db, "COMMIT;", null, null, &err_msg);
         if (commit_rc != c.SQLITE_OK) {
             if (err_msg != null) c.sqlite3_free(err_msg);
             return RepoDBError.CorruptData;
         }
+        transaction_open = false;
+        try fault_injection.hit(.repository_after_database_publish);
 
         return pkg_id;
     }
@@ -1493,6 +1497,10 @@ pub const RepoDB = struct {
             .version_constraint = null,
         };
 
+        defer fault_injection.clearForTest();
+        fault_injection.setForTest(.repository_before_database_publish, .fail);
+        try std.testing.expectError(error.InjectedFailure, db.insertPackageTransaction(&pkg, null));
+        fault_injection.clearForTest();
         _ = try db.insertPackageTransaction(&pkg, null);
 
         const sql = "SELECT version_constraint FROM dependencies LIMIT 1;";

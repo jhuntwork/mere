@@ -28,6 +28,7 @@ const activation = @import("activation.zig");
 const gcroots = @import("gcroots.zig");
 const scratch = @import("scratch.zig");
 const version_mod = @import("version.zig");
+const fault_injection = @import("fault_injection.zig");
 const version_constraint = @import("version_constraint.zig");
 const ui = mere.ui;
 const emit = ui.emit;
@@ -1653,8 +1654,12 @@ fn installResolvedPackages(
         // If cache_path is empty, the package is already in the store — construct entry directly
         if (cache_path.len == 0) {
             const store_path = try store.constructStorePath(ctx, resolved.pkg.content_hash, resolved.pkg.name.?, resolved.pkg.version.?);
+            finalizeAdmittedStoreObject(ctx, store_path, true) catch |err| {
+                ctx.allocator.free(store_path);
+                return err;
+            };
 
-            try installed_packages.append(ctx.allocator, generation.PackageEntry{
+            installed_packages.append(ctx.allocator, generation.PackageEntry{
                 .name = try ctx.allocator.dupe(u8, resolved.pkg.name.?),
                 .version = try ctx.allocator.dupe(u8, resolved.pkg.version.?),
                 .release = resolved.pkg.release.?,
@@ -1666,7 +1671,10 @@ fn installResolvedPackages(
                     try ctx.allocator.dupe(u8, constraint)
                 else
                     null,
-            });
+            }) catch |err| {
+                ctx.allocator.free(store_path);
+                return err;
+            };
             continue;
         }
 
@@ -1916,11 +1924,23 @@ fn applyProfileRealization(ctx: *Context, prof_name: []const u8, installed_packa
 
         emitGenerationStatus(ctx, "created", gen_num, prof_name, phase);
 
+        fault_injection.hit(.install_before_activation) catch |err| switch (err) {
+            error.InjectedFailure => {
+                discardUnactivatedGeneration(ctx, profile_dir, gen_num);
+                return error.FileSystem;
+            },
+        };
         const result = activation.activateSystemGeneration(
             ctx,
             gen_num,
             if (verify_store) .full_store else .fast,
         );
+        fault_injection.hit(.install_after_activation) catch |err| switch (err) {
+            error.InjectedFailure => {
+                discardUnactivatedGeneration(ctx, profile_dir, gen_num);
+                return error.FileSystem;
+            },
+        };
 
         if (result.outcome == .not_committed) {
             const failure = result.failure orelse activation.ActivationError.FileSystem;
@@ -2123,6 +2143,7 @@ fn installSinglePackageToStore(
     };
 
     // === Step 4: Atomic rename to final path ===
+    try fault_injection.hit(.store_before_admission);
     const staging_z = try ctx.allocator.dupeZ(u8, staging.staging_dir);
     defer ctx.allocator.free(staging_z);
     const install_z = try ctx.allocator.dupeZ(u8, staging.install_dir);
@@ -2147,6 +2168,7 @@ fn installSinglePackageToStore(
             ctx.debug("fsync of store parent directory failed: {}", .{err});
         };
     }
+    try fault_injection.hit(.store_after_admission);
     ctx.debug("package admitted to store: {s}", .{staging.install_dir});
 
     try finalizeAdmittedStoreObject(ctx, staging.install_dir, false);
@@ -2347,6 +2369,20 @@ test "a refused uninstall does not leave an unactivated generation behind" {
     try std.testing.expectError(error.FileNotFound, std.Io.Dir.accessAbsolute(path.currentIo(), created, .{}));
     const history = try std.fs.path.join(fx.arena.allocator(), &.{ fx.profile_dir, "gen-2" });
     try std.Io.Dir.accessAbsolute(path.currentIo(), history, .{});
+}
+
+test "install activation checkpoints discard unactivated generations" {
+    var fx = try activation.RollbackFixture.init(&.{}, &.{});
+    defer fx.deinit();
+    defer fault_injection.clearForTest();
+
+    const empty = [_]generation.PackageEntry{};
+    fault_injection.setForTest(.install_before_activation, .fail);
+    try std.testing.expectError(error.FileSystem, applyProfileRealization(&fx.env.ctx, "system", &empty, false, .install));
+
+    try std.testing.expectEqual(@as(?u32, 1), try fx.current());
+    const created = try std.fs.path.join(fx.arena.allocator(), &.{ fx.profile_dir, "gen-3" });
+    try std.testing.expectError(error.FileNotFound, std.Io.Dir.accessAbsolute(path.currentIo(), created, .{}));
 }
 
 test "discardUnactivatedGeneration never removes the current generation" {

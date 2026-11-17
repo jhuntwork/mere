@@ -25,6 +25,7 @@ const repodb = @import("repodb.zig");
 const repo_history = @import("repo_history.zig");
 const store = @import("store.zig");
 const activation_lock = @import("activation_lock.zig");
+const fault_injection = @import("fault_injection.zig");
 
 /// GC error set
 const Std = errors.StandardErrors;
@@ -142,7 +143,15 @@ pub fn collectGarbage(
         else => return ctx.fail(mapGcFsError(err), system_profile_dir, "failed to inspect system profile for GC recovery"),
     }
 
-    return collectGarbageAtPathsWithPackagePool(ctx, gc_roots_dir, store_dir, profiles_dir, package_pool_dir, repo_root_dir, options);
+    fault_injection.hit(.gc_before_collection) catch |err| switch (err) {
+        error.InjectedFailure => return ctx.fail(GCError.FileSystem, gc_roots_dir, "fault injection checkpoint failed"),
+    };
+    var result = try collectGarbageAtPathsWithPackagePool(ctx, gc_roots_dir, store_dir, profiles_dir, package_pool_dir, repo_root_dir, options);
+    errdefer result.deinit();
+    fault_injection.hit(.gc_after_collection) catch |err| switch (err) {
+        error.InjectedFailure => return ctx.fail(GCError.FileSystem, gc_roots_dir, "fault injection checkpoint failed"),
+    };
+    return result;
 }
 
 fn collectGarbageAtPaths(
