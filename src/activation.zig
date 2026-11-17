@@ -15,6 +15,7 @@
 //   └── ...
 
 const std = @import("std");
+const builtin = @import("builtin");
 const generation = @import("generation.zig");
 const gcroots = @import("gcroots.zig");
 const etc = @import("etc.zig");
@@ -28,6 +29,7 @@ const path_safety = @import("path_safety.zig");
 const store = @import("store.zig");
 const service_policy = @import("service_policy.zig");
 const service_reconcile = @import("service_reconcile.zig");
+const activation_lock = @import("activation_lock.zig");
 
 /// Activation error set
 const Std = errors.StandardErrors;
@@ -45,37 +47,106 @@ pub const VerificationMode = enum {
     full_store,
 };
 
-pub const SystemActivationResult = struct {
-    etc_copied: usize,
-    etc_skipped: usize,
-    etc_differing: usize,
-    boot_artifacts_staged: usize,
+pub const ActivationOutcome = enum {
+    /// Preparation failed before the generation pointer changed.
+    not_committed,
+    /// The pointer changed and post-commit maintenance completed.
+    committed,
+    /// The pointer changed but post-commit maintenance must be retried.
+    committed_needs_repair,
 };
 
+pub const SystemActivationResult = struct {
+    outcome: ActivationOutcome,
+    /// Set when activation did not commit or when post-commit maintenance
+    /// failed. The pointer state is authoritative when outcome is not_committed
+    /// or committed_needs_repair; callers must never infer it from the error
+    /// alone.
+    failure: ?ActivationError = null,
+    etc_copied: usize = 0,
+    etc_skipped: usize = 0,
+    etc_differing: usize = 0,
+    boot_artifacts_staged: usize = 0,
+};
+
+/// Deterministic fault points used by activation tests. The setter ignores
+/// them in production builds.
+pub const FailurePoint = enum {
+    before_pointer_switch,
+    after_pointer_switch,
+    gc_root_update,
+};
+
+var failure_point_for_test: ?FailurePoint = null;
+
+pub fn setFailurePointForTest(point: ?FailurePoint) void {
+    if (builtin.is_test) failure_point_for_test = point;
+}
+
+fn failAt(point: FailurePoint) ActivationError!void {
+    if (failure_point_for_test == point) {
+        failure_point_for_test = null;
+        return ActivationError.FileSystem;
+    }
+}
+
 /// Switch the active generation for a profile and update its GC roots.
+/// The pointer switch is the commit point; a post-switch maintenance failure
+/// is returned as `committed_needs_repair` rather than as an ambiguous error.
 pub fn switchProfileGeneration(
     ctx: *mere.Context,
     profile_name: []const u8,
     gen_num: u32,
     verification: VerificationMode,
-) ActivationError!void {
+) SystemActivationResult {
+    return switchProfileGenerationInternal(ctx, profile_name, gen_num, verification) catch |err| .{
+        .outcome = .not_committed,
+        .failure = err,
+    };
+}
+
+fn switchProfileGenerationInternal(
+    ctx: *mere.Context,
+    profile_name: []const u8,
+    gen_num: u32,
+    verification: VerificationMode,
+) ActivationError!SystemActivationResult {
+    activation_lock.mutex.lockUncancelable(path_mod.currentIo());
+    defer activation_lock.mutex.unlock(path_mod.currentIo());
+
     const profile_dir = try getProfileDir(ctx.allocator, ctx.root_path, profile_name);
     defer ctx.allocator.free(profile_dir);
 
     var manifest = try loadValidatedTargetManifest(ctx, profile_dir, gen_num, verificationEnabled(verification));
     defer manifest.deinit();
 
-    try switchProfileGenerationAtPath(ctx, profile_dir, gen_num);
-
+    // Prepare all paths before the pointer switch. Once it succeeds, only
+    // maintenance operations represented by an explicit repair outcome remain.
     const gc_roots_dir = try getGCRootsDir(ctx.allocator, ctx.root_path);
     defer ctx.allocator.free(gc_roots_dir);
-    const store_root_a = std.fs.path.join(ctx.allocator, &.{ ctx.root_path, "mere", "store" }) catch {
+    const store_root = std.fs.path.join(ctx.allocator, &.{ ctx.root_path, "mere", "store" }) catch {
         return ActivationError.OutOfMemory;
     };
-    defer ctx.allocator.free(store_root_a);
-    gcroots.updateRoots(ctx.allocator, store_root_a, gc_roots_dir, profile_dir, gcroots.DEFAULT_RETENTION_COUNT) catch |err| {
-        return ctx.fail(mapGCRootError(err), gc_roots_dir, "failed to update GC roots after activation");
+    defer ctx.allocator.free(store_root);
+
+    try switchProfileGenerationAtPath(ctx, profile_dir, gen_num);
+
+    failAt(.after_pointer_switch) catch |err| {
+        ctx.setDiagnosticContext(gc_roots_dir, "generation committed; GC roots need repair");
+        return .{ .outcome = .committed_needs_repair, .failure = err };
     };
+    failAt(.gc_root_update) catch |err| {
+        ctx.setDiagnosticContext(gc_roots_dir, "generation committed; GC roots need repair");
+        return .{ .outcome = .committed_needs_repair, .failure = err };
+    };
+
+    gcroots.updateRoots(ctx.allocator, store_root, gc_roots_dir, profile_dir, gcroots.DEFAULT_RETENTION_COUNT) catch |err| {
+        const mapped = mapGCRootError(err);
+        ctx.setDiagnosticContext(gc_roots_dir, "generation committed; GC roots need repair");
+        return .{ .outcome = .committed_needs_repair, .failure = mapped };
+    };
+
+    return .{ .outcome = .committed };
 }
 
 /// Preserve the failure class of a service-tree error so callers and exit
@@ -89,12 +160,31 @@ fn mapReconcileError(err: service_reconcile.ReconcileError) ActivationError {
     };
 }
 
-/// Switch the active generation for the system profile and apply system activation policy.
+/// Attempt activation and always return an explicit commit outcome.
+///
+/// Failures before the pointer switch are returned as `not_committed`. Once
+/// the pointer switch succeeds, the function never reports an uncommitted
+/// result, even when GC-root maintenance needs repair.
 pub fn activateSystemGeneration(
     ctx: *mere.Context,
     gen_num: u32,
     verification: VerificationMode,
+) SystemActivationResult {
+    return activateSystemGenerationInternal(ctx, gen_num, verification) catch |err| .{
+        .outcome = .not_committed,
+        .failure = err,
+    };
+}
+
+/// Switch the active generation for the system profile and apply system activation policy.
+fn activateSystemGenerationInternal(
+    ctx: *mere.Context,
+    gen_num: u32,
+    verification: VerificationMode,
 ) ActivationError!SystemActivationResult {
+    activation_lock.mutex.lockUncancelable(path_mod.currentIo());
+    defer activation_lock.mutex.unlock(path_mod.currentIo());
+
     const profile_dir = try getProfileDir(ctx.allocator, ctx.root_path, "system");
     defer ctx.allocator.free(profile_dir);
 
@@ -124,60 +214,195 @@ pub fn activateSystemGeneration(
     }
 
     const provider = if (ctx.configuration) |*cfg| cfg.effectiveInitProvider() else .s6rc;
+    var pointer_committed = false;
+    var staged_dinit: ?service_reconcile.StagedDinit = null;
+    defer if (staged_dinit) |*staged| {
+        if (!pointer_committed) {
+            staged.rollback() catch {
+                ctx.setDiagnosticContext("dinit", "failed to restore the previous service tree before activation commit");
+            };
+        }
+        staged.discard();
+    };
+
     if (provider == .dinit) {
         const target_path = generation.getGenerationPath(ctx.allocator, profile_dir, gen_num) catch return ActivationError.InvalidInput;
         defer ctx.allocator.free(target_path);
-        var staged = service_reconcile.stageDinit(ctx, target_path, manifest.packages.items, &.{}) catch |err| {
+        const current_num = generation.getCurrentGeneration(profile_dir) catch return ActivationError.FileSystem;
+        if (current_num == gen_num) {
+            service_reconcile.finalizeDinitBackup(ctx.allocator, target_path) catch |err| {
+                return ctx.failFmt(mapReconcileError(err), "dinit", "cannot repair the previous service-tree backup: {s}", .{@errorName(err)});
+            };
+        }
+        // The dinit tree is inside the target generation, not the provider's
+        // live service root. Publishing it here is still preparation. The
+        // rollback guard restores an existing tree when the target is already
+        // current, and discarding a new generation removes its tree.
+        staged_dinit = service_reconcile.stageDinit(ctx, target_path, manifest.packages.items, &.{}) catch |err| {
             return ctx.failFmt(mapReconcileError(err), "dinit", "cannot realize generation services: {s}", .{@errorName(err)});
         };
-        defer staged.discard();
-        staged.commit() catch |err| return ctx.failFmt(mapReconcileError(err), "dinit", "cannot publish generation services: {s}", .{@errorName(err)});
+        if (staged_dinit) |*staged| {
+            staged.commit() catch |err| return ctx.failFmt(mapReconcileError(err), "dinit", "cannot publish generation services: {s}", .{@errorName(err)});
+        }
     }
 
     const etc_dir = try getEtcDir(ctx.allocator, ctx.root_path);
     defer ctx.allocator.free(etc_dir);
 
     var etc_result = try applyEtcTemplatesForManifest(ctx, &manifest, etc_dir);
-    errdefer {
-        etc.rollbackCreatedFiles(ctx, &etc_result) catch {};
-        etc_result.deinit();
+    var boot_artifacts_created: std.ArrayList([]const u8) = .empty;
+    defer {
+        for (boot_artifacts_created.items) |artifact| ctx.allocator.free(artifact);
+        boot_artifacts_created.deinit(ctx.allocator);
     }
+    errdefer if (!pointer_committed) {
+        etc.rollbackCreatedFiles(ctx, &etc_result) catch {};
+        rollbackBootArtifacts(&boot_artifacts_created);
+        etc_result.deinit();
+    };
 
-    // Boot artifacts are staged under unique names before the generation
-    // pointer changes. A failed activation may leave an unused artifact, but
-    // it cannot leave /boot partially written or replace the selected kernel.
-    const boot_artifacts_staged = try stageBootArtifacts(ctx, &manifest);
-
-    try switchProfileGenerationAtPath(ctx, profile_dir, gen_num);
-
+    // Allocate every post-commit path before the pointer switch. After the
+    // switch, only operations whose result can be represented as
+    // `committed_needs_repair` are allowed to fail.
     const gc_roots_dir = try getGCRootsDir(ctx.allocator, ctx.root_path);
     defer ctx.allocator.free(gc_roots_dir);
     const store_root_b = std.fs.path.join(ctx.allocator, &.{ ctx.root_path, "mere", "store" }) catch {
         return ActivationError.OutOfMemory;
     };
     defer ctx.allocator.free(store_root_b);
+
+    // Boot artifacts are staged under unique names before the generation
+    // pointer changes. Newly published artifacts are tracked so an ordinary
+    // pre-commit failure can remove them again.
+    const boot_artifacts_staged = try stageBootArtifacts(ctx, &manifest, &boot_artifacts_created);
+
+    try failAt(.before_pointer_switch);
+    try switchProfileGenerationAtPath(ctx, profile_dir, gen_num);
+    pointer_committed = true;
+
+    const committedResult = struct {
+        fn make(
+            outcome: ActivationOutcome,
+            failure: ?ActivationError,
+            copied: usize,
+            skipped: usize,
+            differing: usize,
+            boot: usize,
+        ) SystemActivationResult {
+            return .{
+                .outcome = outcome,
+                .failure = failure,
+                .etc_copied = copied,
+                .etc_skipped = skipped,
+                .etc_differing = differing,
+                .boot_artifacts_staged = boot,
+            };
+        }
+    }.make;
+
+    if (staged_dinit) |*staged| {
+        staged.finalize() catch |err| {
+            const mapped = mapReconcileError(err);
+            ctx.setDiagnosticContext("dinit", "generation committed; previous service tree cleanup needs repair");
+            const result = committedResult(.committed_needs_repair, mapped, etc_result.copied, etc_result.skipped, etc_result.differing, boot_artifacts_staged);
+            etc_result.deinit();
+            return result;
+        };
+    }
+
+    // The pointer switch is the commit point. From here on, never run the
+    // preparation rollback handler, even when maintenance fails.
+    failAt(.after_pointer_switch) catch |err| {
+        ctx.setDiagnosticContext(gc_roots_dir, "generation committed; GC roots need repair");
+        const result = committedResult(.committed_needs_repair, err, etc_result.copied, etc_result.skipped, etc_result.differing, boot_artifacts_staged);
+        etc_result.deinit();
+        return result;
+    };
+
+    failAt(.gc_root_update) catch |err| {
+        ctx.setDiagnosticContext(gc_roots_dir, "generation committed; GC roots need repair");
+        const result = committedResult(.committed_needs_repair, err, etc_result.copied, etc_result.skipped, etc_result.differing, boot_artifacts_staged);
+        etc_result.deinit();
+        return result;
+    };
+
     gcroots.updateRoots(ctx.allocator, store_root_b, gc_roots_dir, profile_dir, gcroots.DEFAULT_RETENTION_COUNT) catch |err| {
-        return ctx.fail(mapGCRootError(err), gc_roots_dir, "failed to update GC roots after activation");
+        const mapped = mapGCRootError(err);
+        ctx.setDiagnosticContext(gc_roots_dir, "generation committed; GC roots need repair");
+        const result = committedResult(.committed_needs_repair, mapped, etc_result.copied, etc_result.skipped, etc_result.differing, boot_artifacts_staged);
+        etc_result.deinit();
+        return result;
     };
 
-    const result = SystemActivationResult{
-        .etc_copied = etc_result.copied,
-        .etc_skipped = etc_result.skipped,
-        .etc_differing = etc_result.differing,
-        .boot_artifacts_staged = boot_artifacts_staged,
-    };
+    const result = committedResult(.committed, null, etc_result.copied, etc_result.skipped, etc_result.differing, boot_artifacts_staged);
     etc_result.deinit();
-
     return result;
 }
 
-/// Stage boot artifacts for the active system generation without changing the
-/// generation pointer or bootloader selection. This is used by idempotent
-/// installs that otherwise take the profile-up-to-date fast path.
+/// Repair post-commit activation maintenance without changing the generation
+/// pointer or reapplying `/etc`. This is safe to retry after a process crash or
+/// a failed GC-root update.
+pub fn repairSystemGeneration(
+    ctx: *mere.Context,
+    verification: VerificationMode,
+) ActivationError!void {
+    activation_lock.mutex.lockUncancelable(path_mod.currentIo());
+    defer activation_lock.mutex.unlock(path_mod.currentIo());
+
+    const profile_dir = try getProfileDir(ctx.allocator, ctx.root_path, "system");
+    defer ctx.allocator.free(profile_dir);
+
+    const gen_num = generation.getCurrentGeneration(profile_dir) catch |err| {
+        return switch (err) {
+            generation.GenerationError.OutOfMemory => ActivationError.OutOfMemory,
+            generation.GenerationError.PermissionDenied => ActivationError.PermissionDenied,
+            generation.GenerationError.InvalidInput => ActivationError.InvalidInput,
+            else => ActivationError.FileSystem,
+        };
+    } orelse return ActivationError.GenerationNotFound;
+
+    const current_generation_path = generation.getGenerationPath(ctx.allocator, profile_dir, gen_num) catch |err| {
+        return switch (err) {
+            generation.GenerationError.OutOfMemory => ActivationError.OutOfMemory,
+            generation.GenerationError.InvalidInput => ActivationError.InvalidInput,
+            else => ActivationError.FileSystem,
+        };
+    };
+    defer ctx.allocator.free(current_generation_path);
+
+    const gc_roots_dir = try getGCRootsDir(ctx.allocator, ctx.root_path);
+    defer ctx.allocator.free(gc_roots_dir);
+    const store_root = std.fs.path.join(ctx.allocator, &.{ ctx.root_path, "mere", "store" }) catch {
+        return ActivationError.OutOfMemory;
+    };
+    defer ctx.allocator.free(store_root);
+
+    // Protect the generation selected by `current` before validating any
+    // store object. If validation reports corruption, GC still sees the active
+    // generation and cannot collect its reachable objects.
+    gcroots.ensureCurrentRootForProfile(ctx.allocator, gc_roots_dir, profile_dir) catch |err| {
+        return ctx.fail(mapGCRootError(err), gc_roots_dir, "failed to protect the active generation during repair");
+    };
+    service_reconcile.finalizeDinitBackup(ctx.allocator, current_generation_path) catch |err| {
+        return ctx.failFmt(mapReconcileError(err), "dinit", "failed to repair the previous service-tree backup: {s}", .{@errorName(err)});
+    };
+
+    var manifest = try loadValidatedTargetManifest(ctx, profile_dir, gen_num, verificationEnabled(verification));
+    defer manifest.deinit();
+
+    try failAt(.gc_root_update);
+    gcroots.updateRoots(ctx.allocator, store_root, gc_roots_dir, profile_dir, gcroots.DEFAULT_RETENTION_COUNT) catch |err| {
+        return ctx.fail(mapGCRootError(err), gc_roots_dir, "failed to repair GC roots after activation");
+    };
+}
+
 pub fn stageCurrentSystemBootArtifacts(
     ctx: *mere.Context,
     verification: VerificationMode,
 ) ActivationError!usize {
+    activation_lock.mutex.lockUncancelable(path_mod.currentIo());
+    defer activation_lock.mutex.unlock(path_mod.currentIo());
+
     const profile_dir = try getProfileDir(ctx.allocator, ctx.root_path, "system");
     defer ctx.allocator.free(profile_dir);
 
@@ -192,7 +417,17 @@ pub fn stageCurrentSystemBootArtifacts(
 
     var manifest = try loadValidatedTargetManifest(ctx, profile_dir, gen_num, verificationEnabled(verification));
     defer manifest.deinit();
-    return stageBootArtifacts(ctx, &manifest);
+
+    var created: std.ArrayList([]const u8) = .empty;
+    defer {
+        for (created.items) |artifact| ctx.allocator.free(artifact);
+        created.deinit(ctx.allocator);
+    }
+    const staged = stageBootArtifacts(ctx, &manifest, &created) catch |err| {
+        rollbackBootArtifacts(&created);
+        return err;
+    };
+    return staged;
 }
 
 /// Activate a specific generation atomically.
@@ -360,11 +595,22 @@ const BOOT_ARTIFACT_HASH_PREFIX_LEN: usize = 16;
 fn stageBootArtifacts(
     ctx: *mere.Context,
     manifest: *const generation.GenerationManifest,
+    created: ?*std.ArrayList([]const u8),
 ) ActivationError!usize {
     const boot_dir = std.fs.path.join(ctx.allocator, &.{ ctx.root_path, "boot" }) catch {
         return ActivationError.OutOfMemory;
     };
     defer ctx.allocator.free(boot_dir);
+
+    if (created) |list| {
+        var linux_packages: usize = 0;
+        for (manifest.packages.items) |pkg| {
+            if (std.mem.eql(u8, pkg.name, "linux")) linux_packages += 2;
+        }
+        list.ensureTotalCapacity(ctx.allocator, list.items.len + linux_packages) catch {
+            return ActivationError.OutOfMemory;
+        };
+    }
 
     var staged: usize = 0;
     for (manifest.packages.items) |pkg| {
@@ -418,11 +664,20 @@ fn stageBootArtifacts(
         };
         defer ctx.allocator.free(config_name);
 
-        staged += try stageOneBootArtifact(ctx, boot_dir, source_vmlinux, vmlinux_name);
-        staged += try stageOneBootArtifact(ctx, boot_dir, source_config, config_name);
+        const vmlinux_staged = try stageOneBootArtifact(ctx, boot_dir, source_vmlinux, vmlinux_name, created);
+        staged += vmlinux_staged;
+
+        const config_staged = try stageOneBootArtifact(ctx, boot_dir, source_config, config_name, created);
+        staged += config_staged;
     }
 
     return staged;
+}
+
+fn rollbackBootArtifacts(created: *std.ArrayList([]const u8)) void {
+    for (created.items) |artifact| {
+        std.Io.Dir.deleteFileAbsolute(path_mod.currentIo(), artifact) catch {};
+    }
 }
 
 fn stageOneBootArtifact(
@@ -430,6 +685,7 @@ fn stageOneBootArtifact(
     boot_dir: []const u8,
     source: []const u8,
     name: []const u8,
+    created: ?*std.ArrayList([]const u8),
 ) ActivationError!usize {
     const destination = std.fs.path.join(ctx.allocator, &.{ boot_dir, name }) catch {
         return ActivationError.OutOfMemory;
@@ -440,6 +696,18 @@ fn stageOneBootArtifact(
     // kernel payloads. Do not replace an existing artifact merely because a
     // same-version package was selected again.
     if (path_mod.fileExists(destination)) return 0;
+
+    // Reserve the rollback record before publishing. Every later failure can
+    // then safely remove this path, while a concurrent winner removes the
+    // record before returning the idempotent success result.
+    var recorded_list: ?*std.ArrayList([]const u8) = null;
+    if (created) |list| {
+        const owned = ctx.allocator.dupe(u8, destination) catch {
+            return ActivationError.OutOfMemory;
+        };
+        list.appendAssumeCapacity(owned);
+        recorded_list = list;
+    }
 
     var random_bytes: [8]u8 = undefined;
     path_mod.currentIo().random(&random_bytes);
@@ -462,9 +730,15 @@ fn stageOneBootArtifact(
 
     std.Io.Dir.renameAbsolute(temp_path, destination, path_mod.currentIo()) catch |err| {
         // Another activation may have staged the same content concurrently.
-        // Preserve that winner and discard only our temporary file.
+        // Preserve that winner and discard only our temporary file and record.
         if (err == error.PathAlreadyExists or err == error.AccessDenied) {
-            if (path_mod.fileExists(destination)) return 0;
+            if (path_mod.fileExists(destination)) {
+                if (recorded_list) |list| {
+                    const owned = list.pop() orelse unreachable;
+                    ctx.allocator.free(owned);
+                }
+                return 0;
+            }
         }
         return ctx.fail(switch (err) {
             error.AccessDenied => ActivationError.PermissionDenied,
@@ -515,8 +789,8 @@ test "stageBootArtifacts publishes versioned linux payloads idempotently" {
         "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789",
     );
 
-    try std.testing.expectEqual(@as(usize, 2), try stageBootArtifacts(&test_env.ctx, &manifest));
-    try std.testing.expectEqual(@as(usize, 0), try stageBootArtifacts(&test_env.ctx, &manifest));
+    try std.testing.expectEqual(@as(usize, 2), try stageBootArtifacts(&test_env.ctx, &manifest, null));
+    try std.testing.expectEqual(@as(usize, 0), try stageBootArtifacts(&test_env.ctx, &manifest, null));
 
     const staged_vmlinux = try std.fs.path.join(allocator, &.{ test_env.path, "boot", "vmlinux-1.2.3-abcdef0123456789" });
     defer allocator.free(staged_vmlinux);
@@ -524,6 +798,22 @@ test "stageBootArtifacts publishes versioned linux payloads idempotently" {
     defer allocator.free(staged_config);
     try std.testing.expect(path_mod.fileExists(staged_vmlinux));
     try std.testing.expect(path_mod.fileExists(staged_config));
+
+    // The activation transaction records newly published artifacts before
+    // returning. A pre-commit rollback removes both files without touching
+    // artifacts that already existed.
+    try std.Io.Dir.deleteFileAbsolute(path_mod.currentIo(), staged_vmlinux);
+    try std.Io.Dir.deleteFileAbsolute(path_mod.currentIo(), staged_config);
+    var created: std.ArrayList([]const u8) = .empty;
+    defer {
+        for (created.items) |artifact| allocator.free(artifact);
+        created.deinit(allocator);
+    }
+    try std.testing.expectEqual(@as(usize, 2), try stageBootArtifacts(&test_env.ctx, &manifest, &created));
+    try std.testing.expectEqual(@as(usize, 2), created.items.len);
+    rollbackBootArtifacts(&created);
+    try std.testing.expectError(error.FileNotFound, std.Io.Dir.accessAbsolute(path_mod.currentIo(), staged_vmlinux, .{}));
+    try std.testing.expectError(error.FileNotFound, std.Io.Dir.accessAbsolute(path_mod.currentIo(), staged_config, .{}));
 }
 
 fn mapEtcError(err: etc.EtcError) ActivationError {
@@ -673,8 +963,7 @@ test "switchProfileGeneration creates atomic symlink" {
     defer manifest.deinit();
     try generation.writeManifest(allocator, gen_path, &manifest);
 
-    // Activate the generation
-    _ = try switchProfileGeneration(&test_env.ctx, "system", 1, .fast);
+    _ = switchProfileGeneration(&test_env.ctx, "system", 1, .fast);
 
     // Verify symlink was created
     const current = try generation.getCurrentGeneration(profile_dir);
@@ -699,9 +988,9 @@ test "switchProfileGeneration fails for non-existent generation" {
         dir.close(io);
     }
 
-    // Try to activate non-existent generation
     const result = switchProfileGeneration(&test_env.ctx, "system", 999, .fast);
-    try std.testing.expectError(ActivationError.GenerationNotFound, result);
+    try std.testing.expectEqual(ActivationOutcome.not_committed, result.outcome);
+    try std.testing.expectEqual(ActivationError.GenerationNotFound, result.failure.?);
 }
 
 test "switchProfileGeneration cleans up stale temp symlink" {
@@ -740,8 +1029,7 @@ test "switchProfileGeneration cleans up stale temp symlink" {
     defer manifest.deinit();
     try generation.writeManifest(allocator, gen_path, &manifest);
 
-    // Activate should succeed despite stale temp symlink
-    _ = try switchProfileGeneration(&test_env.ctx, "system", 1, .fast);
+    _ = switchProfileGeneration(&test_env.ctx, "system", 1, .fast);
 
     // Verify correct generation is active
     const current = try generation.getCurrentGeneration(profile_dir);
@@ -781,16 +1069,13 @@ test "switchProfileGeneration can switch between generations" {
         try generation.writeManifest(allocator, gen_path, &manifest);
     }
 
-    // Activate gen 1
-    _ = try switchProfileGeneration(&test_env.ctx, "system", 1, .fast);
+    _ = switchProfileGeneration(&test_env.ctx, "system", 1, .fast);
     try std.testing.expectEqual(@as(?u32, 1), try generation.getCurrentGeneration(profile_dir));
 
-    // Switch to gen 2
-    _ = try switchProfileGeneration(&test_env.ctx, "system", 2, .fast);
+    _ = switchProfileGeneration(&test_env.ctx, "system", 2, .fast);
     try std.testing.expectEqual(@as(?u32, 2), try generation.getCurrentGeneration(profile_dir));
 
-    // Switch back to gen 1
-    _ = try switchProfileGeneration(&test_env.ctx, "system", 1, .fast);
+    _ = switchProfileGeneration(&test_env.ctx, "system", 1, .fast);
     try std.testing.expectEqual(@as(?u32, 1), try generation.getCurrentGeneration(profile_dir));
 }
 
@@ -830,8 +1115,7 @@ test "switchProfileGeneration creates GC roots" {
         try generation.writeManifest(allocator, gen_path, &manifest);
     }
 
-    // Activate generation 3 with roots (retention_count=2)
-    _ = try switchProfileGeneration(&test_env.ctx, "system", 3, .fast);
+    _ = switchProfileGeneration(&test_env.ctx, "system", 3, .fast);
 
     // Check that current root was created in the nested structure (profiles/system/current)
     const profile_gc_dir = try std.fs.path.join(allocator, &.{ gc_roots_dir, "profiles", "system" });
@@ -897,12 +1181,9 @@ test "switchProfileGeneration rejects store path that shares prefix but escapes 
     // with our crafted one for validation testing.
     try generation.writeManifest(allocator, gen_path, &manifest);
 
-    // The derived store path will be valid, so we need to test validation
-    // directly. Create a manifest with the escaped path and validate it.
-    try std.testing.expectError(
-        ActivationError.FileSystem,
-        switchProfileGeneration(&test_env.ctx, "system", 1, .fast),
-    );
+    const result = switchProfileGeneration(&test_env.ctx, "system", 1, .fast);
+    try std.testing.expectEqual(ActivationOutcome.not_committed, result.outcome);
+    try std.testing.expectEqual(ActivationError.FileSystem, result.failure.?);
 }
 
 test "applyEtcTemplatesForManifest preserves PermissionDenied from etc template processing" {
@@ -1014,7 +1295,7 @@ test "activateSystemGeneration rolls back created /etc files and does not switch
     defer manifest1.deinit();
     try generation.writeManifest(allocator, gen1_path, &manifest1);
 
-    _ = try switchProfileGeneration(&test_env.ctx, "system", 1, .fast);
+    _ = switchProfileGeneration(&test_env.ctx, "system", 1, .fast);
 
     const gen2_path = try std.fs.path.join(allocator, &.{ profile_dir, "gen-2" });
     defer allocator.free(gen2_path);
@@ -1124,10 +1405,9 @@ test "activateSystemGeneration rolls back created /etc files and does not switch
     try etc_handle.setPermissions(io, .fromMode(0o555));
     defer etc_handle.setPermissions(io, .fromMode(0o755)) catch {};
 
-    try std.testing.expectError(
-        ActivationError.PermissionDenied,
-        activateSystemGeneration(&test_env.ctx, 2, .fast),
-    );
+    const activation_result = activateSystemGeneration(&test_env.ctx, 2, .fast);
+    try std.testing.expectEqual(ActivationOutcome.not_committed, activation_result.outcome);
+    try std.testing.expectEqual(ActivationError.PermissionDenied, activation_result.failure.?);
 
     try std.testing.expectEqual(@as(?u32, 1), try generation.getCurrentGeneration(profile_dir));
 
@@ -1167,7 +1447,7 @@ test "system profile activation rejects mismatched content hash without verify-s
     var manifest1 = generation.GenerationManifest.init(allocator, 1);
     defer manifest1.deinit();
     try generation.writeManifest(allocator, gen1_path, &manifest1);
-    _ = try switchProfileGeneration(&test_env.ctx, "system", 1, .fast);
+    _ = switchProfileGeneration(&test_env.ctx, "system", 1, .fast);
 
     // Gen 2: references a store path with a WRONG content hash
     const gen2_path = try std.fs.path.join(allocator, &.{ profile_dir, "gen-2" });
@@ -1200,10 +1480,9 @@ test "system profile activation rejects mismatched content hash without verify-s
 
     // Activate with .fast (no explicit verify-store) — should STILL fail
     // because system profile hash verification is now mandatory
-    try std.testing.expectError(
-        ActivationError.CorruptData,
-        activateSystemGeneration(&test_env.ctx, 2, .fast),
-    );
+    const activation_result = activateSystemGeneration(&test_env.ctx, 2, .fast);
+    try std.testing.expectEqual(ActivationOutcome.not_committed, activation_result.outcome);
+    try std.testing.expectEqual(ActivationError.CorruptData, activation_result.failure.?);
 
     // Should not have switched
     try std.testing.expectEqual(@as(?u32, 1), try generation.getCurrentGeneration(profile_dir));
@@ -1243,7 +1522,7 @@ test "system activation does not read the current generation when service policy
     }
     defer for (gens) |g| allocator.free(g);
 
-    _ = try switchProfileGeneration(&test_env.ctx, "system", 1, .fast);
+    _ = switchProfileGeneration(&test_env.ctx, "system", 1, .fast);
 
     // Damage the generation that is currently active.
     const damaged = try std.fs.path.join(allocator, &.{ gens[0], generation.MANIFEST_FILENAME });
@@ -1256,7 +1535,7 @@ test "system activation does not read the current generation when service policy
 
     // The test root is not the host root, so the policy does not apply and the
     // damaged current generation must not be consulted.
-    _ = try activateSystemGeneration(&test_env.ctx, 2, .fast);
+    _ = activateSystemGeneration(&test_env.ctx, 2, .fast);
     try std.testing.expectEqual(@as(?u32, 2), try generation.getCurrentGeneration(profile_dir));
 }
 
@@ -1340,7 +1619,7 @@ pub const RollbackFixture = struct {
 
         try fx.makeGeneration(a, store_root, 1, before);
         try fx.makeGeneration(a, store_root, 2, after);
-        _ = try switchProfileGeneration(&env.ctx, "system", 1, .fast);
+        _ = switchProfileGeneration(&env.ctx, "system", 1, .fast);
         PolicyHost.install();
         return fx;
     }
@@ -1395,13 +1674,84 @@ pub const RollbackFixture = struct {
     }
 };
 
+test "activation failure before the pointer switch is explicitly uncommitted" {
+    var fx = try RollbackFixture.init(&.{}, &.{});
+    defer fx.deinit();
+    defer setFailurePointForTest(null);
+
+    setFailurePointForTest(.before_pointer_switch);
+    const result = activateSystemGeneration(&fx.env.ctx, 2, .fast);
+    try std.testing.expectEqual(ActivationOutcome.not_committed, result.outcome);
+    try std.testing.expectEqual(ActivationError.FileSystem, result.failure.?);
+    try std.testing.expectEqual(@as(?u32, 1), try fx.current());
+}
+
+test "profile switch reports committed GC-root repair separately" {
+    var fx = try RollbackFixture.init(&.{}, &.{});
+    defer fx.deinit();
+    defer setFailurePointForTest(null);
+
+    setFailurePointForTest(.gc_root_update);
+    const result = switchProfileGeneration(&fx.env.ctx, "system", 2, .fast);
+    try std.testing.expectEqual(ActivationOutcome.committed_needs_repair, result.outcome);
+    try std.testing.expectEqual(ActivationError.FileSystem, result.failure.?);
+    try std.testing.expectEqual(@as(?u32, 2), try fx.current());
+
+    setFailurePointForTest(null);
+    try repairSystemGeneration(&fx.env.ctx, .fast);
+}
+
+test "GC-root failure after commit leaves the new generation active" {
+    var fx = try RollbackFixture.init(&.{}, &.{});
+    defer fx.deinit();
+    defer setFailurePointForTest(null);
+
+    setFailurePointForTest(.gc_root_update);
+    const result = activateSystemGeneration(&fx.env.ctx, 2, .fast);
+    try std.testing.expectEqual(ActivationOutcome.committed_needs_repair, result.outcome);
+    try std.testing.expectEqual(ActivationError.FileSystem, result.failure.?);
+    try std.testing.expectEqual(@as(?u32, 2), try fx.current());
+
+    setFailurePointForTest(null);
+    try repairSystemGeneration(&fx.env.ctx, .fast);
+}
+
+test "activation failure after the pointer switch is repairable and idempotent" {
+    var fx = try RollbackFixture.init(&.{}, &.{});
+    defer fx.deinit();
+    defer setFailurePointForTest(null);
+
+    setFailurePointForTest(.after_pointer_switch);
+    const result = activateSystemGeneration(&fx.env.ctx, 2, .fast);
+    try std.testing.expectEqual(ActivationOutcome.committed_needs_repair, result.outcome);
+    try std.testing.expectEqual(ActivationError.FileSystem, result.failure.?);
+    try std.testing.expectEqual(@as(?u32, 2), try fx.current());
+
+    setFailurePointForTest(null);
+    try repairSystemGeneration(&fx.env.ctx, .fast);
+    try repairSystemGeneration(&fx.env.ctx, .fast);
+    try std.testing.expectEqual(@as(?u32, 2), try fx.current());
+
+    const gc_current = try std.fs.path.join(fx.arena.allocator(), &.{
+        fx.env.path,
+        "mere",
+        "gc-roots",
+        "profiles",
+        "system",
+        "current",
+    });
+    try std.Io.Dir.accessAbsolute(path_mod.currentIo(), gc_current, .{});
+}
+
 test "rollback to a generation without a running service is refused and leaves the profile unchanged" {
     var fx = try RollbackFixture.init(&.{"worker"}, &.{});
     defer fx.deinit();
     PolicyHost.list_text = "[[+]     ] worker (pid: 7)\n";
     PolicyHost.status_text = "    State: started\n";
 
-    try std.testing.expectError(ActivationError.InvalidInput, activateSystemGeneration(&fx.env.ctx, 2, .fast));
+    const result = activateSystemGeneration(&fx.env.ctx, 2, .fast);
+    try std.testing.expectEqual(ActivationOutcome.not_committed, result.outcome);
+    try std.testing.expectEqual(ActivationError.InvalidInput, result.failure.?);
     try std.testing.expectEqual(@as(?u32, 1), try fx.current());
     // Refusal comes before the service tree is rewritten.
     const published = try std.fs.path.join(fx.arena.allocator(), &.{ fx.profile_dir, "gen-2", "usr", "share", "dinit.d" });
@@ -1414,7 +1764,9 @@ test "rollback to a generation without a stopped service is allowed" {
     PolicyHost.list_text = "[{ }     ] worker\n";
     PolicyHost.status_text = "    State: stopped\n";
 
-    _ = try activateSystemGeneration(&fx.env.ctx, 2, .fast);
+    const activation_result = activateSystemGeneration(&fx.env.ctx, 2, .fast);
+    try std.testing.expectEqual(ActivationOutcome.committed, activation_result.outcome);
+    try std.testing.expectEqual(@as(?ActivationError, null), activation_result.failure);
     try std.testing.expectEqual(@as(?u32, 2), try fx.current());
 }
 
@@ -1424,20 +1776,64 @@ test "activation that removes no service succeeds even when live state cannot be
     PolicyHost.live = false;
     PolicyHost.list_text = "unreadable\n";
 
-    _ = try activateSystemGeneration(&fx.env.ctx, 2, .fast);
+    const activation_result = activateSystemGeneration(&fx.env.ctx, 2, .fast);
+    try std.testing.expectEqual(ActivationOutcome.committed, activation_result.outcome);
+    try std.testing.expectEqual(@as(?ActivationError, null), activation_result.failure);
     try std.testing.expectEqual(@as(?u32, 2), try fx.current());
     try std.testing.expectEqual(@as(usize, 0), PolicyHost.list_calls);
+}
+
+test "dinit backup repair preserves the backup when the replacement tree is absent" {
+    const th = @import("test_helpers.zig");
+    var test_env = try th.createTestEnv();
+    defer {
+        test_env.cleanup();
+        std.testing.allocator.destroy(test_env);
+    }
+
+    const allocator = test_env.ctx.allocator;
+    const generation_root = try std.fs.path.join(allocator, &.{ test_env.path, "mere", "profiles", "system", "gen-1" });
+    defer allocator.free(generation_root);
+    const service_root = try std.fs.path.join(allocator, &.{ generation_root, "usr", "share", "dinit.d" });
+    defer allocator.free(service_root);
+    const backup_root = try std.fmt.allocPrint(allocator, "{s}.mere-old", .{service_root});
+    defer allocator.free(backup_root);
+    try path_mod.ensureDirExists(backup_root);
+
+    try std.testing.expectError(
+        service_reconcile.ReconcileError.FileSystem,
+        service_reconcile.finalizeDinitBackup(allocator, generation_root),
+    );
+    try std.Io.Dir.accessAbsolute(path_mod.currentIo(), backup_root, .{});
 }
 
 test "activation realizes the target generation's service tree and its essential bundle" {
     var fx = try RollbackFixture.init(&.{}, &.{"worker"});
     defer fx.deinit();
+    defer setFailurePointForTest(null);
     PolicyHost.live = false;
 
-    _ = try activateSystemGeneration(&fx.env.ctx, 2, .fast);
+    const first = activateSystemGeneration(&fx.env.ctx, 2, .fast);
+    try std.testing.expectEqual(ActivationOutcome.committed, first.outcome);
     const tree = try std.fs.path.join(fx.arena.allocator(), &.{ fx.profile_dir, "gen-2", "usr", "share", "dinit.d" });
     const worker = try std.fs.path.join(fx.arena.allocator(), &.{ tree, "worker" });
     const bundle = try std.fs.path.join(fx.arena.allocator(), &.{ tree, "mere-essential" });
+    try std.Io.Dir.accessAbsolute(path_mod.currentIo(), worker, .{});
+    try std.Io.Dir.accessAbsolute(path_mod.currentIo(), bundle, .{});
+
+    // Repair also removes a retained backup from a previous successful
+    // pointer commit whose cleanup failed.
+    const retained_backup = try std.fmt.allocPrint(fx.arena.allocator(), "{s}.mere-old", .{tree});
+    try path_mod.ensureDirExists(retained_backup);
+    try repairSystemGeneration(&fx.env.ctx, .fast);
+    try std.testing.expectError(error.FileNotFound, std.Io.Dir.accessAbsolute(path_mod.currentIo(), retained_backup, .{}));
+
+    // Re-activating an already-current generation must restore its service
+    // tree if preparation fails after dinit publication.
+    setFailurePointForTest(.before_pointer_switch);
+    const retry = activateSystemGeneration(&fx.env.ctx, 2, .fast);
+    try std.testing.expectEqual(ActivationOutcome.not_committed, retry.outcome);
+    try std.testing.expectEqual(ActivationError.FileSystem, retry.failure.?);
     try std.Io.Dir.accessAbsolute(path_mod.currentIo(), worker, .{});
     try std.Io.Dir.accessAbsolute(path_mod.currentIo(), bundle, .{});
 }

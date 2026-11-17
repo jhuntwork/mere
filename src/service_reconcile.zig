@@ -24,42 +24,157 @@ pub const StagedDinit = struct {
     allocator: std.mem.Allocator,
     service_root: []const u8,
     stage_root: []const u8,
+    backup_root: ?[]const u8 = null,
+    had_old_tree: bool = false,
     committed: bool = false,
 
     pub fn commit(self: *StagedDinit) ReconcileError!void {
         const io = path.currentIo();
         const backup_root = std.fmt.allocPrint(self.allocator, "{s}.mere-old", .{self.service_root}) catch
             return error.OutOfMemory;
-        defer self.allocator.free(backup_root);
-        path.deleteTreeAbsolute(backup_root) catch |err| switch (err) {
+
+        // An unresolved backup belongs to an earlier failed publication. Do
+        // not delete it while retrying, because it may be the only copy of
+        // the previously active service tree.
+        if (std.Io.Dir.accessAbsolute(io, backup_root, .{})) |_| {
+            self.allocator.free(backup_root);
+            return error.FileSystem;
+        } else |err| switch (err) {
             error.FileNotFound => {},
-            else => return mapFsError(err),
-        };
+            else => {
+                self.allocator.free(backup_root);
+                return mapFsError(err);
+            },
+        }
 
         var old_exists = false;
         if (std.Io.Dir.accessAbsolute(io, self.service_root, .{})) |_| {
             old_exists = true;
         } else |_| {}
         if (old_exists) {
-            std.Io.Dir.renameAbsolute(self.service_root, backup_root, io) catch |err| return mapFsError(err);
+            std.Io.Dir.renameAbsolute(self.service_root, backup_root, io) catch |err| {
+                self.allocator.free(backup_root);
+                return mapFsError(err);
+            };
+            // Record ownership before attempting the second rename. If that
+            // rename fails and restoration also fails, discard must preserve
+            // this backup for a later repair or retry.
+            self.backup_root = backup_root;
+            self.had_old_tree = true;
+        } else {
+            self.allocator.free(backup_root);
         }
+
         std.Io.Dir.renameAbsolute(self.stage_root, self.service_root, io) catch |err| {
-            if (old_exists) std.Io.Dir.renameAbsolute(backup_root, self.service_root, io) catch {};
+            if (old_exists) {
+                if (std.Io.Dir.renameAbsolute(backup_root, self.service_root, io)) |_| {
+                    self.allocator.free(backup_root);
+                    self.backup_root = null;
+                    self.had_old_tree = false;
+                } else |_| {
+                    // Keep backup_root owned by this object. The caller's
+                    // cleanup path will preserve it if restoration failed.
+                }
+            }
             return mapFsError(err);
         };
-        if (old_exists) path.deleteTreeAbsolute(backup_root) catch {};
         self.committed = true;
     }
 
+    /// Restore the service tree that was visible before `commit`.
+    /// This is used only before the generation pointer commit point.
+    pub fn rollback(self: *StagedDinit) ReconcileError!void {
+        if (!self.committed) {
+            if (self.backup_root) |backup| {
+                path.deleteTreeAbsolute(self.service_root) catch |err| switch (err) {
+                    error.FileNotFound => {},
+                    else => return mapFsError(err),
+                };
+                std.Io.Dir.renameAbsolute(backup, self.service_root, path.currentIo()) catch |err| {
+                    return mapFsError(err);
+                };
+                self.allocator.free(backup);
+                self.backup_root = null;
+                self.had_old_tree = false;
+            }
+            return;
+        }
+        path.deleteTreeAbsolute(self.service_root) catch |err| switch (err) {
+            error.FileNotFound => {},
+            else => return mapFsError(err),
+        };
+        if (self.had_old_tree) {
+            const backup = self.backup_root orelse return error.FileSystem;
+            std.Io.Dir.renameAbsolute(backup, self.service_root, path.currentIo()) catch |err| {
+                return mapFsError(err);
+            };
+            self.allocator.free(backup);
+            self.backup_root = null;
+        }
+        self.committed = false;
+        self.had_old_tree = false;
+    }
+
+    /// Remove the retained old tree after the generation pointer commits.
+    /// A failure leaves the backup in place so repair can restore it later.
+    pub fn finalize(self: *StagedDinit) ReconcileError!void {
+        if (!self.committed) return;
+        if (self.backup_root) |backup| {
+            path.deleteTreeAbsolute(backup) catch |err| switch (err) {
+                error.FileNotFound => {},
+                else => return mapFsError(err),
+            };
+            self.allocator.free(backup);
+            self.backup_root = null;
+        }
+    }
+
     pub fn discard(self: *StagedDinit) void {
-        if (!self.committed) path.deleteTreeAbsolute(self.stage_root) catch {};
+        if (!self.committed) {
+            path.deleteTreeAbsolute(self.stage_root) catch {};
+            if (self.backup_root) |backup| {
+                // Preserve an unresolved backup on disk, but release its
+                // path allocation so a later repair can find the tree.
+                self.allocator.free(backup);
+            }
+        } else if (self.backup_root) |backup| {
+            // Preserve an unresolved backup on disk, but release its path
+            // allocation. A later repair can discover the retained tree.
+            self.allocator.free(backup);
+        }
         self.allocator.free(self.service_root);
         self.allocator.free(self.stage_root);
         self.* = undefined;
     }
 };
 
-/// Prepare dinit's package-owned service tree for a system profile.
+/// Remove a retained replacement backup after the generation pointer has
+/// selected this generation. Refuse to delete the backup if the replacement
+/// tree is absent, because the backup may be the only recoverable tree.
+pub fn finalizeDinitBackup(allocator: std.mem.Allocator, generation_root: []const u8) ReconcileError!void {
+    const service_root = std.fs.path.join(allocator, &.{ generation_root, "usr", "share", "dinit.d" }) catch {
+        return error.OutOfMemory;
+    };
+    defer allocator.free(service_root);
+    const backup_root = std.fmt.allocPrint(allocator, "{s}.mere-old", .{service_root}) catch {
+        return error.OutOfMemory;
+    };
+    defer allocator.free(backup_root);
+
+    if (std.Io.Dir.accessAbsolute(path.currentIo(), backup_root, .{})) |_| {
+        if (std.Io.Dir.accessAbsolute(path.currentIo(), service_root, .{})) |_| {} else |err| {
+            return mapFsError(err);
+        }
+        path.deleteTreeAbsolute(backup_root) catch |err| switch (err) {
+            error.FileNotFound => {},
+            else => return mapFsError(err),
+        };
+    } else |err| switch (err) {
+        error.FileNotFound => {},
+        else => return mapFsError(err),
+    }
+}
+
 ///
 /// Package-owned files live below `<generation>/usr/share/dinit.d` so the
 /// complete tree becomes visible with the generation switch. Administrator
@@ -114,6 +229,10 @@ pub fn reconcileDinit(
 ) ReconcileError!void {
     var staged = try stageDinit(ctx, ctx.root_path, packages, previous_packages);
     staged.commit() catch |err| {
+        staged.discard();
+        return err;
+    };
+    staged.finalize() catch |err| {
         staged.discard();
         return err;
     };

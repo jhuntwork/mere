@@ -329,6 +329,24 @@ fn extractProfileName(profile_dir: []const u8) []const u8 {
     return profile_dir;
 }
 
+/// Recreate only the current-generation GC root without inspecting store
+/// contents. Recovery uses this before validating a generation so the active
+/// pointer is protected from GC even when the store is damaged.
+pub fn ensureCurrentRootForProfile(
+    allocator: std.mem.Allocator,
+    gc_roots_dir: []const u8,
+    profile_dir: []const u8,
+) GCRootsError!void {
+    const profile_gc_dir = std.fs.path.join(allocator, &.{ gc_roots_dir, "profiles", extractProfileName(profile_dir) }) catch {
+        return GCRootsError.OutOfMemory;
+    };
+    defer allocator.free(profile_gc_dir);
+
+    var profile_gc_dir_handle = path_mod.makePathAndOpenDir(profile_gc_dir) catch |err| return mapGCRootFsError(err);
+    profile_gc_dir_handle.close(path_mod.currentIo());
+    try updateCurrentRoot(allocator, profile_gc_dir, profile_dir);
+}
+
 /// Update the current root symlink.
 /// Creates symlink at <profile_gc_dir>/current -> <profile_dir>/current
 fn updateCurrentRoot(
@@ -346,16 +364,24 @@ fn updateCurrentRoot(
     };
     defer allocator.free(target);
 
-    // Remove existing symlink if present
-    std.Io.Dir.deleteFileAbsolute(path_mod.currentIo(), root_path) catch |err| {
+    const temp_path = std.fs.path.join(allocator, &.{ profile_gc_dir, ".current-new" }) catch {
+        return GCRootsError.OutOfMemory;
+    };
+    defer allocator.free(temp_path);
+
+    // Publish through a temporary symlink and rename so recovery never has a
+    // window with no current root. Rename replaces the previous symlink.
+    std.Io.Dir.deleteFileAbsolute(path_mod.currentIo(), temp_path) catch |err| {
         switch (err) {
             error.FileNotFound => {},
             else => return mapGCRootFsError(err),
         }
     };
-
-    // Create new symlink
-    std.Io.Dir.symLinkAbsolute(path_mod.currentIo(), target, root_path, .{}) catch |err| {
+    std.Io.Dir.symLinkAbsolute(path_mod.currentIo(), target, temp_path, .{}) catch |err| {
+        return mapGCRootFsError(err);
+    };
+    errdefer std.Io.Dir.deleteFileAbsolute(path_mod.currentIo(), temp_path) catch {};
+    std.Io.Dir.renameAbsolute(temp_path, root_path, path_mod.currentIo()) catch |err| {
         return mapGCRootFsError(err);
     };
 }

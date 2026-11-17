@@ -24,6 +24,7 @@ const path_mod = @import("path.zig");
 const repodb = @import("repodb.zig");
 const repo_history = @import("repo_history.zig");
 const store = @import("store.zig");
+const activation_lock = @import("activation_lock.zig");
 
 /// GC error set
 const Std = errors.StandardErrors;
@@ -40,7 +41,14 @@ fn mapGcFsError(err: anyerror) GCError {
     };
 }
 
-/// Result of a GC operation
+fn mapGCRootError(err: gcroots.GCRootsError) GCError {
+    return switch (err) {
+        gcroots.GCRootsError.OutOfMemory => GCError.OutOfMemory,
+        gcroots.GCRootsError.PermissionDenied => GCError.PermissionDenied,
+        else => GCError.FileSystem,
+    };
+}
+
 pub const GCResult = struct {
     deleted_paths: std.ArrayList([]const u8),
     /// Abandoned store staging directories reclaimed under spec §4.3. Counted
@@ -88,6 +96,9 @@ pub fn collectGarbage(
     ctx: *mere.Context,
     options: GCOptions,
 ) GCError!GCResult {
+    activation_lock.mutex.lockUncancelable(path_mod.currentIo());
+    defer activation_lock.mutex.unlock(path_mod.currentIo());
+
     const allocator = ctx.allocator;
     const gc_roots_dir = std.fs.path.join(allocator, &.{ ctx.root_path, "mere", "gc-roots" }) catch {
         return ctx.fail(GCError.OutOfMemory, ctx.root_path, "out of memory building gc-roots path");
@@ -113,6 +124,23 @@ pub fn collectGarbage(
         return ctx.fail(GCError.OutOfMemory, ctx.root_path, "out of memory building repo root path");
     };
     defer allocator.free(repo_root_dir);
+
+    const system_profile_dir = std.fs.path.join(allocator, &.{ profiles_dir, "system" }) catch {
+        return ctx.fail(GCError.OutOfMemory, profiles_dir, "out of memory building system profile path");
+    };
+    defer allocator.free(system_profile_dir);
+
+    // Recreate the root selected by `current` before reachability collection.
+    // This closes the restart window after activation committed its pointer but
+    // before the previous process finished GC-root maintenance.
+    if (std.Io.Dir.accessAbsolute(path_mod.currentIo(), system_profile_dir, .{})) |_| {
+        gcroots.ensureCurrentRootForProfile(allocator, gc_roots_dir, system_profile_dir) catch |err| {
+            return ctx.fail(mapGCRootError(err), gc_roots_dir, "failed to repair the active GC root before collection");
+        };
+    } else |err| switch (err) {
+        error.FileNotFound => {},
+        else => return ctx.fail(mapGcFsError(err), system_profile_dir, "failed to inspect system profile for GC recovery"),
+    }
 
     return collectGarbageAtPathsWithPackagePool(ctx, gc_roots_dir, store_dir, profiles_dir, package_pool_dir, repo_root_dir, options);
 }
@@ -925,7 +953,51 @@ test "collectGarbage with no roots fails" {
     try std.testing.expectError(GCError.NoRoots, result);
 }
 
-// Spec #12: GC preserves reachable store paths (pin-based roots)
+test "public collectGarbage repairs a missing active current root" {
+    const th = @import("test_helpers.zig");
+    var test_env = try th.createTestEnv();
+    defer {
+        test_env.cleanup();
+        std.testing.allocator.destroy(test_env);
+    }
+
+    const allocator = test_env.ctx.allocator;
+    const store_dir = try std.fs.path.join(allocator, &.{ test_env.path, "mere", "store" });
+    defer allocator.free(store_dir);
+    const profile_dir = try std.fs.path.join(allocator, &.{ test_env.path, "mere", "profiles", "system" });
+    defer allocator.free(profile_dir);
+    const gen_dir = try std.fs.path.join(allocator, &.{ profile_dir, "gen-1" });
+    defer allocator.free(gen_dir);
+    try path_mod.ensureDirExists(store_dir);
+    try path_mod.ensureDirExists(gen_dir);
+
+    const hash = "abc1230000000000000000000000000000000000000000000000000000000000";
+    const kept = try std.fs.path.join(allocator, &.{ store_dir, hash ++ "-kept-1.0" });
+    defer allocator.free(kept);
+    const orphan = try std.fs.path.join(allocator, &.{ store_dir, "def4560000000000000000000000000000000000000000000000000000000000-orphan-1.0" });
+    defer allocator.free(orphan);
+    try path_mod.ensureDirExists(kept);
+    try path_mod.ensureDirExists(orphan);
+
+    var manifest = generation.GenerationManifest.init(allocator, 1);
+    defer manifest.deinit();
+    try manifest.addPackage("kept", "1.0", 1, "x86_64", kept, hash);
+    try generation.writeManifest(allocator, gen_dir, &manifest);
+
+    var profile_handle = try std.Io.Dir.openDirAbsolute(path_mod.currentIo(), profile_dir, .{});
+    defer profile_handle.close(path_mod.currentIo());
+    try profile_handle.symLink(path_mod.currentIo(), "gen-1", "current", .{});
+
+    var result = try collectGarbage(&test_env.ctx, .{ .dry_run = true });
+    defer result.deinit();
+    try std.testing.expectEqual(@as(usize, 1), result.deleted_paths.items.len);
+    try std.testing.expect(std.mem.endsWith(u8, result.deleted_paths.items[0], "orphan-1.0"));
+
+    const gc_current = try std.fs.path.join(allocator, &.{ test_env.path, "mere", "gc-roots", "profiles", "system", "current" });
+    defer allocator.free(gc_current);
+    try std.Io.Dir.accessAbsolute(path_mod.currentIo(), gc_current, .{});
+}
+
 test "collectGarbage keeps rooted store paths" {
     const th = @import("test_helpers.zig");
     var test_env = try th.createTestEnv();
