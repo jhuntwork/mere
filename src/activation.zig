@@ -97,6 +97,14 @@ fn checkFault(ctx: *mere.Context, checkpoint: fault_injection.Checkpoint, subjec
     };
 }
 
+fn mapStoreLockError(err: anyerror) ActivationError {
+    return switch (err) {
+        error.OutOfMemory => ActivationError.OutOfMemory,
+        error.PermissionDenied => ActivationError.PermissionDenied,
+        else => ActivationError.FileSystem,
+    };
+}
+
 /// Switch the active generation for a profile and update its GC roots.
 /// The pointer switch is the commit point; a post-switch maintenance failure
 /// is returned as `committed_needs_repair` rather than as an ambiguous error.
@@ -106,6 +114,12 @@ pub fn switchProfileGeneration(
     gen_num: u32,
     verification: VerificationMode,
 ) SystemActivationResult {
+    ctx.acquireStoreLockForMutation() catch |err| return .{
+        .outcome = .not_committed,
+        .failure = mapStoreLockError(err),
+    };
+    defer ctx.releaseStoreLock();
+
     return switchProfileGenerationInternal(ctx, profile_name, gen_num, verification) catch |err| .{
         .outcome = .not_committed,
         .failure = err,
@@ -157,7 +171,7 @@ fn switchProfileGenerationInternal(
         ctx.setDiagnosticContext(gc_roots_dir, "generation committed; GC roots need repair");
         return .{ .outcome = .committed_needs_repair, .failure = err };
     };
-    gcroots.updateRoots(ctx.allocator, store_root, gc_roots_dir, profile_dir, gcroots.DEFAULT_RETENTION_COUNT) catch |err| {
+    gcroots.updateRoots(ctx, store_root, gc_roots_dir, profile_dir, gcroots.DEFAULT_RETENTION_COUNT) catch |err| {
         const mapped = mapGCRootError(err);
         ctx.setDiagnosticContext(gc_roots_dir, "generation committed; GC roots need repair");
         return .{ .outcome = .committed_needs_repair, .failure = mapped };
@@ -193,6 +207,12 @@ pub fn activateSystemGeneration(
     gen_num: u32,
     verification: VerificationMode,
 ) SystemActivationResult {
+    ctx.acquireStoreLockForMutation() catch |err| return .{
+        .outcome = .not_committed,
+        .failure = mapStoreLockError(err),
+    };
+    defer ctx.releaseStoreLock();
+
     return activateSystemGenerationInternal(ctx, gen_num, verification) catch |err| .{
         .outcome = .not_committed,
         .failure = err,
@@ -375,7 +395,7 @@ fn activateSystemGenerationInternal(
         etc_result.deinit();
         return result;
     };
-    gcroots.updateRoots(ctx.allocator, store_root_b, gc_roots_dir, profile_dir, gcroots.DEFAULT_RETENTION_COUNT) catch |err| {
+    gcroots.updateRoots(ctx, store_root_b, gc_roots_dir, profile_dir, gcroots.DEFAULT_RETENTION_COUNT) catch |err| {
         const mapped = mapGCRootError(err);
         ctx.setDiagnosticContext(gc_roots_dir, "generation committed; GC roots need repair");
         const result = committedResult(.committed_needs_repair, mapped, etc_result.copied, etc_result.skipped, etc_result.differing, boot_artifacts_staged);
@@ -403,6 +423,9 @@ pub fn repairSystemGeneration(
     ctx: *mere.Context,
     verification: VerificationMode,
 ) ActivationError!void {
+    ctx.acquireStoreLockForMutation() catch |err| return mapStoreLockError(err);
+    defer ctx.releaseStoreLock();
+
     activation_lock.mutex.lockUncancelable(path_mod.currentIo());
     defer activation_lock.mutex.unlock(path_mod.currentIo());
 
@@ -437,7 +460,7 @@ pub fn repairSystemGeneration(
     // Protect the generation selected by `current` before validating any
     // store object. If validation reports corruption, GC still sees the active
     // generation and cannot collect its reachable objects.
-    gcroots.ensureCurrentRootForProfile(ctx.allocator, gc_roots_dir, profile_dir) catch |err| {
+    gcroots.ensureCurrentRootForProfile(ctx, gc_roots_dir, profile_dir) catch |err| {
         return ctx.fail(mapGCRootError(err), gc_roots_dir, "failed to protect the active generation during repair");
     };
     service_reconcile.finalizeDinitBackup(ctx.allocator, current_generation_path) catch |err| {
@@ -449,7 +472,7 @@ pub fn repairSystemGeneration(
 
     try failAt(.gc_root_update);
     try checkFault(ctx, .gc_roots_before_update, gc_roots_dir);
-    gcroots.updateRoots(ctx.allocator, store_root, gc_roots_dir, profile_dir, gcroots.DEFAULT_RETENTION_COUNT) catch |err| {
+    gcroots.updateRoots(ctx, store_root, gc_roots_dir, profile_dir, gcroots.DEFAULT_RETENTION_COUNT) catch |err| {
         return ctx.fail(mapGCRootError(err), gc_roots_dir, "failed to repair GC roots after activation");
     };
     try checkFault(ctx, .gc_roots_after_update, gc_roots_dir);
@@ -459,6 +482,9 @@ pub fn stageCurrentSystemBootArtifacts(
     ctx: *mere.Context,
     verification: VerificationMode,
 ) ActivationError!usize {
+    ctx.acquireStoreLockForMutation() catch |err| return mapStoreLockError(err);
+    defer ctx.releaseStoreLock();
+
     activation_lock.mutex.lockUncancelable(path_mod.currentIo());
     defer activation_lock.mutex.unlock(path_mod.currentIo());
 
@@ -1021,7 +1047,7 @@ test "switchProfileGeneration creates atomic symlink" {
     // Create a minimal manifest
     var manifest = generation.GenerationManifest.init(allocator, 1);
     defer manifest.deinit();
-    try generation.writeManifest(allocator, gen_path, &manifest);
+    try generation.writeManifest(&test_env.ctx, gen_path, &manifest);
 
     _ = switchProfileGeneration(&test_env.ctx, "system", 1, .fast);
 
@@ -1087,7 +1113,7 @@ test "switchProfileGeneration cleans up stale temp symlink" {
 
     var manifest = generation.GenerationManifest.init(allocator, 1);
     defer manifest.deinit();
-    try generation.writeManifest(allocator, gen_path, &manifest);
+    try generation.writeManifest(&test_env.ctx, gen_path, &manifest);
 
     _ = switchProfileGeneration(&test_env.ctx, "system", 1, .fast);
 
@@ -1126,7 +1152,7 @@ test "switchProfileGeneration can switch between generations" {
 
         var manifest = generation.GenerationManifest.init(allocator, n);
         defer manifest.deinit();
-        try generation.writeManifest(allocator, gen_path, &manifest);
+        try generation.writeManifest(&test_env.ctx, gen_path, &manifest);
     }
 
     _ = switchProfileGeneration(&test_env.ctx, "system", 1, .fast);
@@ -1172,7 +1198,7 @@ test "switchProfileGeneration creates GC roots" {
 
         var manifest = generation.GenerationManifest.init(allocator, n);
         defer manifest.deinit();
-        try generation.writeManifest(allocator, gen_path, &manifest);
+        try generation.writeManifest(&test_env.ctx, gen_path, &manifest);
     }
 
     _ = switchProfileGeneration(&test_env.ctx, "system", 3, .fast);
@@ -1239,7 +1265,7 @@ test "switchProfileGeneration rejects store path that shares prefix but escapes 
 
     // Write a valid KDL so readManifest succeeds, but then swap the manifest
     // with our crafted one for validation testing.
-    try generation.writeManifest(allocator, gen_path, &manifest);
+    try generation.writeManifest(&test_env.ctx, gen_path, &manifest);
 
     const result = switchProfileGeneration(&test_env.ctx, "system", 1, .fast);
     try std.testing.expectEqual(ActivationOutcome.not_committed, result.outcome);
@@ -1299,7 +1325,7 @@ test "applyEtcTemplatesForManifest preserves PermissionDenied from etc template 
         store_path,
         content_hash,
     );
-    try generation.writeManifest(allocator, gen_path, &manifest);
+    try generation.writeManifest(&test_env.ctx, gen_path, &manifest);
 
     const etc_dir = try std.fs.path.join(allocator, &.{ test_env.path, "etc" });
     defer allocator.free(etc_dir);
@@ -1353,7 +1379,7 @@ test "activateSystemGeneration rolls back created /etc files and does not switch
 
     var manifest1 = generation.GenerationManifest.init(allocator, 1);
     defer manifest1.deinit();
-    try generation.writeManifest(allocator, gen1_path, &manifest1);
+    try generation.writeManifest(&test_env.ctx, gen1_path, &manifest1);
 
     _ = switchProfileGeneration(&test_env.ctx, "system", 1, .fast);
 
@@ -1424,7 +1450,7 @@ test "activateSystemGeneration rolls back created /etc files and does not switch
         store_path,
         content_hash_2,
     );
-    try generation.writeManifest(allocator, gen2_path, &manifest2);
+    try generation.writeManifest(&test_env.ctx, gen2_path, &manifest2);
 
     const etc_dir = try std.fs.path.join(allocator, &.{ test_env.path, "etc" });
     defer allocator.free(etc_dir);
@@ -1506,7 +1532,7 @@ test "system profile activation rejects mismatched content hash without verify-s
     }
     var manifest1 = generation.GenerationManifest.init(allocator, 1);
     defer manifest1.deinit();
-    try generation.writeManifest(allocator, gen1_path, &manifest1);
+    try generation.writeManifest(&test_env.ctx, gen1_path, &manifest1);
     _ = switchProfileGeneration(&test_env.ctx, "system", 1, .fast);
 
     // Gen 2: references a store path with a WRONG content hash
@@ -1536,7 +1562,7 @@ test "system profile activation rejects mismatched content hash without verify-s
     var manifest2 = generation.GenerationManifest.init(allocator, 2);
     defer manifest2.deinit();
     try manifest2.addPackage("badpkg", "1.0.0", 1, "x86_64", store_path, fake_hash);
-    try generation.writeManifest(allocator, gen2_path, &manifest2);
+    try generation.writeManifest(&test_env.ctx, gen2_path, &manifest2);
 
     // Activate with .fast (no explicit verify-store) — should STILL fail
     // because system profile hash verification is now mandatory
@@ -1578,7 +1604,7 @@ test "system activation does not read the current generation when service policy
         dir.close(io);
         var manifest = generation.GenerationManifest.init(allocator, @intCast(n));
         defer manifest.deinit();
-        try generation.writeManifest(allocator, slot.*, &manifest);
+        try generation.writeManifest(&test_env.ctx, slot.*, &manifest);
     }
     defer for (gens) |g| allocator.free(g);
 
@@ -1713,13 +1739,13 @@ pub const RollbackFixture = struct {
             }
             try manifest.addPackage(service_name, "1.0", 1, "x86_64", final, digest);
         }
-        try generation.writeManifest(env.ctx.allocator, gen_dir, &manifest);
+        try generation.writeManifest(&env.ctx, gen_dir, &manifest);
         // A child generation reads its parent's realization, so a fixture
         // generation needs one. It owns no files.
         var realization = generation.RealizationData.init(env.ctx.allocator);
         defer realization.deinit();
         try realization.canonicalize();
-        try generation.writeRealization(env.ctx.allocator, gen_dir, &realization);
+        try generation.writeRealization(&env.ctx, gen_dir, &realization);
     }
 
     pub fn deinit(self: *RollbackFixture) void {
@@ -1857,7 +1883,7 @@ test "etc checkpoint failure rolls back files copied before the pointer switch" 
     defer allocator.free(content_hash);
     allocator.free(manifest.packages.items[0].content_hash);
     manifest.packages.items[0].content_hash = try allocator.dupe(u8, content_hash);
-    try generation.writeManifest(allocator, target_path, &manifest);
+    try generation.writeManifest(&fx.env.ctx, target_path, &manifest);
 
     fault_injection.setForTest(.etc_after_changes, .fail);
     const result = activateSystemGeneration(&fx.env.ctx, 2, .fast);
@@ -1898,7 +1924,7 @@ test "boot checkpoint failure rolls back staged artifacts before the pointer swi
     defer allocator.free(content_hash);
     allocator.free(manifest.packages.items[0].content_hash);
     manifest.packages.items[0].content_hash = try allocator.dupe(u8, content_hash);
-    try generation.writeManifest(allocator, target_path, &manifest);
+    try generation.writeManifest(&fx.env.ctx, target_path, &manifest);
 
     fault_injection.setForTest(.boot_after_staging, .fail);
     const result = activateSystemGeneration(&fx.env.ctx, 2, .fast);

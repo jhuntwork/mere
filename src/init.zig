@@ -265,6 +265,11 @@ pub fn initialize(ctx: *Context, options: InitOptions) !InitResult {
     var result = InitResult.init(ctx.allocator);
     errdefer result.deinit();
 
+    if (!options.dry_run) {
+        ctx.acquireStoreLockForMutation() catch |err| return mapInitFsError(err);
+        defer ctx.releaseStoreLock();
+    }
+
     // Get required directories
     const specs = try getRequiredDirectories(ctx.allocator, ctx.root_path);
     defer {

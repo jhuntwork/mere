@@ -188,6 +188,38 @@ fn optionalStringEqual(left: ?[]const u8, right: ?[]const u8) bool {
     return std.mem.eql(u8, left.?, right.?);
 }
 
+fn loadProfileState(ctx: *Context, profile_name: []const u8) !?generation.GenerationManifest {
+    const profile_dir = try getProfileDir(ctx, profile_name);
+    defer ctx.allocator.free(profile_dir);
+    return loadCurrentManifest(ctx, profile_name, profile_dir);
+}
+
+fn manifestsEqual(left: ?*const generation.GenerationManifest, right: ?*const generation.GenerationManifest) bool {
+    if (left == null or right == null) return left == null and right == null;
+    const a = left.?;
+    const b = right.?;
+    if (a.schema_version != b.schema_version or
+        a.generation != b.generation or
+        a.created_at != b.created_at or
+        a.parent_generation != b.parent_generation or
+        !optionalStringEqual(a.notes, b.notes) or
+        !optionalStringEqual(a.selected_profile, b.selected_profile) or
+        !optionalStringEqual(a.tool_version, b.tool_version) or
+        a.packages.items.len != b.packages.items.len) return false;
+
+    for (a.packages.items, b.packages.items) |left_pkg, right_pkg| {
+        if (!std.mem.eql(u8, left_pkg.name, right_pkg.name) or
+            !std.mem.eql(u8, left_pkg.version, right_pkg.version) or
+            left_pkg.release != right_pkg.release or
+            !std.mem.eql(u8, left_pkg.arch, right_pkg.arch) or
+            !std.mem.eql(u8, left_pkg.store_path, right_pkg.store_path) or
+            !std.mem.eql(u8, left_pkg.content_hash, right_pkg.content_hash) or
+            left_pkg.requested != right_pkg.requested or
+            !optionalStringEqual(left_pkg.constraint_expr, right_pkg.constraint_expr)) return false;
+    }
+    return true;
+}
+
 fn emitResolutionDiff(
     ctx: *Context,
     profile_name: []const u8,
@@ -431,6 +463,13 @@ pub fn installPackagesFromConfigWithPreview(
 
     const target_behavior = determineInstallTargetBehavior(profile_name, null, store.isPrivileged());
 
+    var initial_profile_state: ?generation.GenerationManifest = null;
+    defer if (initial_profile_state) |*state_manifest| state_manifest.deinit();
+    if (!dry_run and profile_name != null) {
+        initial_profile_state = try loadProfileState(ctx, profile_name.?);
+    }
+    const expected_profile_state = if (initial_profile_state) |*state_manifest| state_manifest else null;
+
     if (target_behavior == .activate_profile and profile_name != null) {
         requested_state = try buildRequestedRootsAfterAdd(ctx, profile_name.?, input_requirements.items);
         owned_resolver_requirements = try buildProfileResolverRequirements(
@@ -452,15 +491,8 @@ pub fn installPackagesFromConfigWithPreview(
     defer resolution.deinit();
     if (requested_state) |*state| resolution.setRequestedIntent(state.packages.items);
 
-    if (dry_run) {
-        emitResolutionDiff(ctx, profile_name.?, resolution.plan.sorted, .install);
-        emit.logLineSeverity(ctx, .install, .info, "dry run: no changes made");
-        emit.phaseEnd(ctx, .install, true);
-        return .completed;
-    }
-
     // Realize
-    const result_behavior = try realizeProfile(ctx, &resolution, client, reinstall, verify_store, profile_name, null, .install);
+    const result_behavior = try realizeProfile(ctx, &resolution, client, reinstall, verify_store, profile_name, null, .install, expected_profile_state);
 
     emit.phaseEnd(ctx, .install, true);
     return switch (result_behavior) {
@@ -520,6 +552,13 @@ pub fn installPackageSpecsFromConfig(
 
     const target_behavior = determineInstallTargetBehavior(profile_name, null, store.isPrivileged());
 
+    var initial_profile_state: ?generation.GenerationManifest = null;
+    defer if (initial_profile_state) |*state_manifest| state_manifest.deinit();
+    if (profile_name != null) {
+        initial_profile_state = try loadProfileState(ctx, profile_name.?);
+    }
+    const expected_profile_state = if (initial_profile_state) |*state_manifest| state_manifest else null;
+
     if (target_behavior == .activate_profile and profile_name != null) {
         requested_state = try buildRequestedRootsAfterAdd(ctx, profile_name.?, input_requirements.items);
         owned_resolver_requirements = try buildProfileResolverRequirements(
@@ -538,10 +577,7 @@ pub fn installPackageSpecsFromConfig(
     // Resolve
     var resolution = try resolveProfile(ctx, repocaches.items, resolver_requirements, preferred_selections, client, if (force_sync) .force else .automatic);
     defer resolution.deinit();
-    resolution.setRequirementIntent(input_requirements.items);
-
-    // Realize
-    const result_behavior = try realizeProfile(ctx, &resolution, client, reinstall, verify_store, profile_name, null, .install);
+    const result_behavior = try realizeProfile(ctx, &resolution, client, reinstall, verify_store, profile_name, null, .install, expected_profile_state);
 
     emit.phaseEnd(ctx, .install, true);
     return switch (result_behavior) {
@@ -565,6 +601,13 @@ pub fn upgradePackagesFromConfig(
     config.validate() catch {
         return ctx.fail(error.InvalidConfig, "configuration", "invalid repository configuration");
     };
+
+    var initial_profile_state: ?generation.GenerationManifest = null;
+    defer if (initial_profile_state) |*state_manifest| state_manifest.deinit();
+    if (!dry_run) {
+        initial_profile_state = try loadProfileState(ctx, profile_name);
+    }
+    const expected_profile_state = if (initial_profile_state) |*state_manifest| state_manifest else null;
 
     const phase_name: []const u8 = if (pkg_names.len == 0) profile_name else if (pkg_names.len == 1) pkg_names[0] else "multiple";
     emit.phaseStart(ctx, .install, .{ .name = phase_name });
@@ -627,7 +670,7 @@ pub fn upgradePackagesFromConfig(
         return .completed;
     }
 
-    const behavior = try realizeProfile(ctx, &resolution, client, false, verify_store, profile_name, null, .install);
+    const behavior = try realizeProfile(ctx, &resolution, client, false, verify_store, profile_name, null, .install, expected_profile_state);
     emit.phaseEnd(ctx, .install, true);
     return switch (behavior) {
         .store_only_system_deferred => .store_only_system_activation_deferred,
@@ -649,6 +692,13 @@ pub fn uninstallPackagesFromConfig(
 
     const config = ctx.configuration orelse return "No configuration loaded";
     config.validate() catch return "Invalid repository configuration";
+
+    var initial_profile_state: ?generation.GenerationManifest = null;
+    defer if (initial_profile_state) |*state_manifest| state_manifest.deinit();
+    if (!dry_run) {
+        initial_profile_state = try loadProfileState(ctx, profile_name);
+    }
+    const expected_profile_state = if (initial_profile_state) |*state_manifest| state_manifest else null;
 
     const phase_name: []const u8 = if (pkg_names.len == 1) pkg_names[0] else "multiple";
     emit.phaseStart(ctx, .uninstall, .{ .name = phase_name });
@@ -787,7 +837,7 @@ pub fn uninstallPackagesFromConfig(
                     emit.logLineSeverity(ctx, .uninstall, .info, "dry run: no changes made");
                 } else {
                     const empty: [0]generation.PackageEntry = .{};
-                    try applyProfileRealization(ctx, profile_name, &empty, verify_store, .uninstall);
+                    try applyProfileRealizationIfUnchanged(ctx, profile_name, &empty, verify_store, .uninstall, expected_profile_state);
                 }
                 emit.phaseEnd(ctx, .uninstall, true);
                 return null;
@@ -800,7 +850,7 @@ pub fn uninstallPackagesFromConfig(
             emitResolutionDiff(ctx, profile_name, resolution.plan.sorted, .uninstall);
             emit.logLineSeverity(ctx, .uninstall, .info, "dry run: no changes made");
         } else {
-            _ = try realizeProfile(ctx, &resolution, client, false, verify_store, profile_name, null, .uninstall);
+            _ = try realizeProfile(ctx, &resolution, client, false, verify_store, profile_name, null, .uninstall, expected_profile_state);
         }
     } else {
         // All roots removed
@@ -809,7 +859,7 @@ pub fn uninstallPackagesFromConfig(
             emit.logLineSeverity(ctx, .uninstall, .info, "dry run: no changes made");
         } else {
             const empty: [0]generation.PackageEntry = .{};
-            try applyProfileRealization(ctx, profile_name, &empty, verify_store, .uninstall);
+            try applyProfileRealizationIfUnchanged(ctx, profile_name, &empty, verify_store, .uninstall, expected_profile_state);
         }
     }
 
@@ -847,6 +897,13 @@ pub fn installPackagesToProfile(
 
     const target_behavior = determineInstallTargetBehavior(profile_name, target_profile_path, store.isPrivileged());
 
+    var initial_profile_state: ?generation.GenerationManifest = null;
+    defer if (initial_profile_state) |*state_manifest| state_manifest.deinit();
+    if (profile_name != null and target_profile_path == null) {
+        initial_profile_state = try loadProfileState(ctx, profile_name.?);
+    }
+    const expected_profile_state = if (initial_profile_state) |*state_manifest| state_manifest else null;
+
     if (target_behavior == .activate_profile and target_profile_path == null and profile_name != null) {
         requested_state = try buildRequestedRootsAfterAdd(ctx, profile_name.?, input_requirements.items);
         owned_resolver_requirements = try buildProfileResolverRequirements(
@@ -869,7 +926,7 @@ pub fn installPackagesToProfile(
     if (requested_state) |*state| resolution.setRequestedIntent(state.packages.items);
 
     // Realize
-    _ = try realizeProfile(ctx, &resolution, client, reinstall, verify_store, profile_name, target_profile_path, .install);
+    _ = try realizeProfile(ctx, &resolution, client, reinstall, verify_store, profile_name, target_profile_path, .install, expected_profile_state);
 }
 
 const RequestedRootsState = struct {
@@ -1491,7 +1548,9 @@ pub fn resolveProfile(
     };
 }
 
-/// Realize a resolved profile: admit packages to store, create generation, activate.
+/// Realize a resolved profile: download archives outside the store lock, then
+/// admit packages, create generations, and activate while the lock is held.
+/// The profile state is rechecked before publication.
 /// The phase parameter controls how UI output is labeled.
 pub fn realizeProfile(
     ctx: *Context,
@@ -1502,8 +1561,16 @@ pub fn realizeProfile(
     profile_name: ?[]const u8,
     target_profile_path: ?[]const u8,
     phase: ui.Phase,
+    expected_profile_state: ?*const generation.GenerationManifest,
 ) !InstallTargetBehavior {
     const target_behavior = determineInstallTargetBehavior(profile_name, target_profile_path, store.isPrivileged());
+
+    var owned_profile_state: ?generation.GenerationManifest = null;
+    defer if (owned_profile_state) |*state_manifest| state_manifest.deinit();
+    if (expected_profile_state == null and profile_name != null and target_profile_path == null) {
+        owned_profile_state = try loadProfileState(ctx, profile_name.?);
+    }
+    const profile_state = expected_profile_state orelse if (owned_profile_state) |*state_manifest| state_manifest else null;
 
     // Check if the resolved set matches the current profile — skip everything if unchanged
     if (!reinstall and target_profile_path == null) {
@@ -1526,7 +1593,47 @@ pub fn realizeProfile(
         }
     }
 
-    var installed_packages = try installResolvedPackages(ctx, resolution.plan.sorted, client, reinstall, resolution.loaded_keys.items);
+    var archive_cache_paths = try prefetchMissingPackageArchives(ctx, resolution.plan.sorted, client);
+    defer {
+        for (archive_cache_paths.items) |cache_path| ctx.allocator.free(cache_path);
+        archive_cache_paths.deinit(ctx.allocator);
+    }
+
+    ctx.acquireStoreLockForMutation() catch |err| return err;
+    defer ctx.releaseStoreLock();
+
+    // Resolution and archive downloads happen before locking. Re-read the
+    // profile after that work so a concurrent publisher cannot be overwritten
+    // by a stale realization. This applies to reinstalls too: the state token
+    // must remain unchanged even when publication is intentionally forced.
+    if (profile_name) |prof_name| {
+        if (target_profile_path == null) {
+            var current_profile_state = try loadProfileState(ctx, prof_name);
+            defer if (current_profile_state) |*state_manifest| state_manifest.deinit();
+            if (!manifestsEqual(
+                profile_state,
+                if (current_profile_state) |*current_manifest| current_manifest else null,
+            )) {
+                return ctx.fail(error.FileSystem, prof_name, "profile changed while packages were being prepared; retry the operation");
+            }
+        }
+    }
+
+    if (!reinstall and target_profile_path == null) {
+        if (profile_name) |prof_name| {
+            if (profileMatchesResolution(ctx, prof_name, resolution.plan.sorted)) {
+                return target_behavior;
+            }
+        }
+    }
+
+    var installed_packages = try installResolvedPackagesFromArchives(
+        ctx,
+        resolution.plan.sorted,
+        reinstall,
+        resolution.loaded_keys.items,
+        archive_cache_paths.items,
+    );
 
     defer {
         for (installed_packages.items) |*pkg_info| {
@@ -1621,20 +1728,13 @@ fn resolveInstallPlan(
     };
 }
 
-fn installResolvedPackages(
+fn installResolvedPackagesFromArchives(
     ctx: *Context,
     sorted_packages: []resolver.ResolvedPackage,
-    client: download.TransferClient,
     reinstall: bool,
     loaded_keys: []const sign.LoadedKey,
+    archive_cache_paths: []const []const u8,
 ) !std.ArrayList(generation.PackageEntry) {
-    var archive_cache_paths = try prefetchMissingPackageArchives(ctx, sorted_packages, client);
-    defer {
-        for (archive_cache_paths.items) |cache_path| ctx.allocator.free(cache_path);
-        archive_cache_paths.deinit(ctx.allocator);
-    }
-
-    // 2. Install each package to store in topological order
     // Collect installed package info for generation creation
     var installed_packages: std.ArrayList(generation.PackageEntry) = .empty;
     errdefer {
@@ -1644,7 +1744,7 @@ fn installResolvedPackages(
         installed_packages.deinit(ctx.allocator);
     }
 
-    for (sorted_packages, archive_cache_paths.items) |*resolved, cache_path| {
+    for (sorted_packages, archive_cache_paths) |*resolved, cache_path| {
         ctx.debug("installing: {s}-{s}-{d}", .{
             resolved.pkg.name.?,
             resolved.pkg.version.?,
@@ -1881,7 +1981,41 @@ fn discardUnactivatedGeneration(ctx: *Context, profile_dir: []const u8, gen_num:
 
 /// Apply installed packages to the requested profile target.
 /// System profiles create and activate generations; named profiles publish a single root.
-fn applyProfileRealization(ctx: *Context, prof_name: []const u8, installed_packages: []const generation.PackageEntry, verify_store: bool, phase: ui.Phase) !void {
+fn applyProfileRealizationIfUnchanged(
+    ctx: *Context,
+    prof_name: []const u8,
+    installed_packages: []const generation.PackageEntry,
+    verify_store: bool,
+    phase: ui.Phase,
+    expected_profile_state: ?*const generation.GenerationManifest,
+) !void {
+    ctx.acquireStoreLockForMutation() catch |err| return err;
+    defer ctx.releaseStoreLock();
+
+    var current_profile_state = try loadProfileState(ctx, prof_name);
+    defer if (current_profile_state) |*state_manifest| state_manifest.deinit();
+    if (!manifestsEqual(
+        expected_profile_state,
+        if (current_profile_state) |*current_manifest| current_manifest else null,
+    )) {
+        return ctx.fail(error.FileSystem, prof_name, "profile changed while packages were being prepared; retry the operation");
+    }
+    return applyProfileRealizationLocked(ctx, prof_name, installed_packages, verify_store, phase);
+}
+
+fn applyProfileRealization(
+    ctx: *Context,
+    prof_name: []const u8,
+    installed_packages: []const generation.PackageEntry,
+    verify_store: bool,
+    phase: ui.Phase,
+) !void {
+    ctx.acquireStoreLockForMutation() catch |err| return err;
+    defer ctx.releaseStoreLock();
+    return applyProfileRealizationLocked(ctx, prof_name, installed_packages, verify_store, phase);
+}
+
+fn applyProfileRealizationLocked(ctx: *Context, prof_name: []const u8, installed_packages: []const generation.PackageEntry, verify_store: bool, phase: ui.Phase) !void {
     const profile_dir = try std.fs.path.join(ctx.allocator, &.{ ctx.root_path, "mere", "profiles", prof_name });
     defer ctx.allocator.free(profile_dir);
 
@@ -4822,7 +4956,7 @@ test "integration: garbage collection removes unreferenced store paths" {
     // Step 1: Install pkgA (creates gen-1 with only A)
     const pkg_a_names = [_][]const u8{"pkgA"};
     try installPackagesToProfile(ctx, &repocaches, pkg_a_names[0..], client, false, false, false, profile_name, null);
-    try gcroots.updateRoots(ctx.allocator, store_dir, gc_roots_dir, profile_dir, 2);
+    try gcroots.updateRoots(ctx, store_dir, gc_roots_dir, profile_dir, 2);
 
     const store_path_a = try std.fmt.allocPrint(ctx.allocator, "{s}/{s}-pkgA-1.0.0", .{ store_dir, hash_a });
     defer ctx.allocator.free(store_path_a);
@@ -4833,7 +4967,7 @@ test "integration: garbage collection removes unreferenced store paths" {
     // Step 2: Install pkgB (additive: creates gen-2 with A + B)
     const pkg_b_names = [_][]const u8{"pkgB"};
     try installPackagesToProfile(ctx, &repocaches, pkg_b_names[0..], client, false, false, false, profile_name, null);
-    try gcroots.updateRoots(ctx.allocator, store_dir, gc_roots_dir, profile_dir, 2);
+    try gcroots.updateRoots(ctx, store_dir, gc_roots_dir, profile_dir, 2);
 
     const store_path_b = try std.fmt.allocPrint(ctx.allocator, "{s}/{s}-pkgB-1.0.0", .{ store_dir, hash_b });
     defer ctx.allocator.free(store_path_b);

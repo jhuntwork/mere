@@ -112,11 +112,27 @@ const TemplateSource = struct {
     package_name: []const u8,
 };
 
-/// Process all templates from a generation's packages.
-///
-/// Walks each package's store root looking for `etc-defaults/` subtrees and
-/// processes templates according to the activation rules.
+fn mapStoreLockError(err: anyerror) EtcError {
+    return switch (err) {
+        error.OutOfMemory => EtcError.OutOfMemory,
+        error.PermissionDenied => EtcError.PermissionDenied,
+        else => EtcError.FileSystem,
+    };
+}
+
+/// Process all templates from a generation's packages. The public operation
+/// owns the process-wide store lock; nested activation callers are reentrant.
 pub fn processTemplates(
+    ctx: *Context,
+    manifest: *const generation.GenerationManifest,
+    etc_dir: []const u8,
+) EtcError!TemplateResult {
+    ctx.acquireStoreLockForMutation() catch |err| return mapStoreLockError(err);
+    defer ctx.releaseStoreLock();
+    return processTemplatesLocked(ctx, manifest, etc_dir);
+}
+
+fn processTemplatesLocked(
     ctx: *Context,
     manifest: *const generation.GenerationManifest,
     etc_dir: []const u8,
@@ -124,7 +140,7 @@ pub fn processTemplates(
     const allocator = ctx.allocator;
     var result = TemplateResult.init(allocator);
     errdefer {
-        rollbackCreatedFiles(ctx, &result) catch {};
+        rollbackCreatedFilesLocked(ctx, &result) catch {};
         result.deinit();
     }
 
@@ -229,8 +245,15 @@ pub fn lookupActiveTemplate(ctx: *Context, raw_path: []const u8) ActiveLookupErr
     return error.TemplateNotFound;
 }
 
-/// Remove files created during template processing, in reverse order.
+/// Remove files created during template processing, in reverse order. The
+/// public operation owns the process-wide store lock.
 pub fn rollbackCreatedFiles(ctx: *Context, result: *const TemplateResult) EtcError!void {
+    ctx.acquireStoreLockForMutation() catch |err| return mapStoreLockError(err);
+    defer ctx.releaseStoreLock();
+    return rollbackCreatedFilesLocked(ctx, result);
+}
+
+fn rollbackCreatedFilesLocked(ctx: *Context, result: *const TemplateResult) EtcError!void {
     var idx = result.created_paths.items.len;
     while (idx > 0) {
         idx -= 1;
@@ -402,7 +425,15 @@ fn processTemplateFile(
     }) catch return EtcError.OutOfMemory;
 }
 
+/// Apply one active template. The public operation owns the process-wide
+/// store lock.
 pub fn applyTemplate(ctx: *Context, source_path: []const u8, dest_path: []const u8) EtcError!void {
+    ctx.acquireStoreLockForMutation() catch |err| return mapStoreLockError(err);
+    defer ctx.releaseStoreLock();
+    return applyTemplateLocked(ctx, source_path, dest_path);
+}
+
+fn applyTemplateLocked(ctx: *Context, source_path: []const u8, dest_path: []const u8) EtcError!void {
     const allocator = ctx.allocator;
     const old_path = std.fmt.allocPrint(allocator, "{s}.old", .{dest_path}) catch {
         return EtcError.OutOfMemory;

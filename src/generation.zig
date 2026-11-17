@@ -3,6 +3,7 @@ const builtin = @import("builtin");
 const kdl = @import("kdl.zig");
 const errors = @import("errors.zig");
 const path_mod = @import("path.zig");
+const mere = @import("mere.zig");
 
 const Std = errors.StandardErrors;
 pub const GenerationError = Std.OutOfMemory || Std.FileSystem || Std.PermissionDenied || Std.InvalidInput || error{
@@ -766,7 +767,7 @@ test "listGenerations ignores generation without profile.kdl" {
     gen1_dir.close(path_mod.currentIo());
     var manifest1 = GenerationManifest.init(allocator, 1);
     defer manifest1.deinit();
-    try writeManifest(allocator, gen1_path, &manifest1);
+    try writeManifest(&test_env.ctx, gen1_path, &manifest1);
 
     const gen2_path = try std.fs.path.join(allocator, &.{ profile_dir, "gen-2" });
     defer allocator.free(gen2_path);
@@ -779,7 +780,7 @@ test "listGenerations ignores generation without profile.kdl" {
     gen3_dir.close(path_mod.currentIo());
     var manifest3 = GenerationManifest.init(allocator, 3);
     defer manifest3.deinit();
-    try writeManifest(allocator, gen3_path, &manifest3);
+    try writeManifest(&test_env.ctx, gen3_path, &manifest3);
 
     const gens = try listGenerations(allocator, "/unused", profile_dir);
     defer allocator.free(gens);
@@ -811,7 +812,7 @@ test "listGenerations returns sorted list" {
 
         var manifest = GenerationManifest.init(allocator, n);
         defer manifest.deinit();
-        try writeManifest(allocator, gen_path, &manifest);
+        try writeManifest(&test_env.ctx, gen_path, &manifest);
     }
 
     const gens = try listGenerations(allocator, "/unused", profile_dir);
@@ -882,7 +883,7 @@ test "findPreviousGeneration returns previous generation" {
 
         var manifest = GenerationManifest.init(allocator, n);
         defer manifest.deinit();
-        try writeManifest(allocator, gen_path, &manifest);
+        try writeManifest(&test_env.ctx, gen_path, &manifest);
     }
 
     var current_handle = try std.Io.Dir.openDirAbsolute(path_mod.currentIo(), profile_dir, .{});
@@ -915,7 +916,7 @@ test "findPreviousGeneration fails when no previous generation" {
 
     var manifest = GenerationManifest.init(allocator, 1);
     defer manifest.deinit();
-    try writeManifest(allocator, gen_path, &manifest);
+    try writeManifest(&test_env.ctx, gen_path, &manifest);
 
     var current_handle = try std.Io.Dir.openDirAbsolute(path_mod.currentIo(), profile_dir, .{});
     defer current_handle.close(path_mod.currentIo());
@@ -1032,7 +1033,23 @@ fn writeMetadataFileAtomically(allocator: std.mem.Allocator, destination: []cons
     published = true;
 }
 
-pub fn writeManifest(allocator: std.mem.Allocator, generation_dir: []const u8, manifest: *const GenerationManifest) GenerationError!void {
+fn mapStoreLockError(err: anyerror) GenerationError {
+    return switch (err) {
+        error.OutOfMemory => GenerationError.OutOfMemory,
+        error.PermissionDenied => GenerationError.PermissionDenied,
+        else => GenerationError.FileSystem,
+    };
+}
+
+/// Write a generation manifest atomically. The public operation acquires the
+/// process-wide store lock before publishing generation metadata.
+pub fn writeManifest(ctx: *mere.Context, generation_dir: []const u8, manifest: *const GenerationManifest) GenerationError!void {
+    ctx.acquireStoreLockForMutation() catch |err| return mapStoreLockError(err);
+    defer ctx.releaseStoreLock();
+    return writeManifestLocked(ctx.allocator, generation_dir, manifest);
+}
+
+fn writeManifestLocked(allocator: std.mem.Allocator, generation_dir: []const u8, manifest: *const GenerationManifest) GenerationError!void {
     const manifest_path = std.fs.path.join(allocator, &.{ generation_dir, MANIFEST_FILENAME }) catch {
         return GenerationError.OutOfMemory;
     };
@@ -1085,7 +1102,19 @@ pub fn readRealization(allocator: std.mem.Allocator, generation_dir: []const u8)
     return RealizationData.decode(allocator, buffer);
 }
 
+/// Write realization metadata atomically. The public operation acquires the
+/// process-wide store lock before publishing generation metadata.
 pub fn writeRealization(
+    ctx: *mere.Context,
+    generation_dir: []const u8,
+    realization: *const RealizationData,
+) GenerationError!void {
+    ctx.acquireStoreLockForMutation() catch |err| return mapStoreLockError(err);
+    defer ctx.releaseStoreLock();
+    return writeRealizationLocked(ctx.allocator, generation_dir, realization);
+}
+
+fn writeRealizationLocked(
     allocator: std.mem.Allocator,
     generation_dir: []const u8,
     realization: *const RealizationData,
@@ -1381,7 +1410,7 @@ test "writeManifest and readManifest" {
         "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
     );
 
-    try writeManifest(allocator, gen_dir, &manifest);
+    try writeManifest(&test_env.ctx, gen_dir, &manifest);
 
     // Read it back
     const store_root = try std.fs.path.join(allocator, &.{ test_env.path, "mere", "store" });
@@ -1414,7 +1443,7 @@ test "writeRealization and readRealization" {
     try realization.addEntry("usr/lib/libhello.so", 1);
     try realization.canonicalize();
 
-    try writeRealization(allocator, gen_dir, &realization);
+    try writeRealization(&test_env.ctx, gen_dir, &realization);
 
     var read_realization = try readRealization(allocator, gen_dir);
     defer read_realization.deinit();

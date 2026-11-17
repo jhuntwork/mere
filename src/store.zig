@@ -243,6 +243,16 @@ fn clearImmutableFlag(fd: std.posix.fd_t) bool {
 /// 3. Recursively: chown root:root, chmod read-only, set FS_IMMUTABLE_FL
 /// 4. Validates all symlinks stay within the store path boundary
 pub fn harden(ctx: *Context, store_path: []const u8) StoreError!HardenResult {
+    ctx.acquireStoreLockForMutation() catch |err| return switch (err) {
+        error.OutOfMemory => StoreError.OutOfMemory,
+        error.PermissionDenied => StoreError.PermissionDenied,
+        else => StoreError.FileSystem,
+    };
+    defer ctx.releaseStoreLock();
+    return hardenLocked(ctx, store_path);
+}
+
+fn hardenLocked(ctx: *Context, store_path: []const u8) StoreError!HardenResult {
     if (std.c.getenv("MERE_NO_HARDEN")) |_| return .{};
 
     if (!isPrivileged()) {
@@ -377,8 +387,16 @@ fn hardenFile(io: std.Io, f: std.Io.File, result: *HardenResult) void {
 }
 
 /// Recursively clear filesystem immutable flags on a store path.
-/// Must be called before deletion (GC).
-pub fn clearImmutable(allocator: std.mem.Allocator, store_path: []const u8) HardenResult {
+/// Must be called before deletion (GC). The public operation acquires the
+/// process-wide store lock; the locked helper is used by tests and callers
+/// that already hold it.
+pub fn clearImmutable(ctx: *Context, store_path: []const u8) HardenResult {
+    ctx.acquireStoreLockForMutation() catch return .{};
+    defer ctx.releaseStoreLock();
+    return clearImmutableLocked(ctx.allocator, store_path);
+}
+
+fn clearImmutableLocked(allocator: std.mem.Allocator, store_path: []const u8) HardenResult {
     const io = path_mod.currentIo();
     var result = HardenResult{};
 
@@ -937,7 +955,7 @@ test "clearImmutable allows modification after clearing" {
         try f.writeStreamingAll(io, "content\n");
     }
 
-    _ = clearImmutable(allocator, store_path);
+    _ = clearImmutable(&test_env.ctx, store_path);
 
     {
         var f = try std.Io.Dir.openFileAbsolute(io, file_path, .{});
@@ -964,7 +982,7 @@ test "clearImmutable handles empty directory" {
         dir.close(io);
     }
 
-    const result = clearImmutable(allocator, store_path);
+    const result = clearImmutable(&test_env.ctx, store_path);
     try std.testing.expectEqual(@as(usize, 0), result.files_processed);
 }
 

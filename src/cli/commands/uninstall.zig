@@ -69,9 +69,6 @@ fn handleUninstall(ctx: *mere.Context, args: *const types.ParsedArgs) MereError!
         .withSubject(package_names[0]);
     ctx.withDiagnosticContext(diagnostic_ctx);
 
-    if (try command.acquireStoreLockOrResult(ctx)) |result| return result;
-    defer ctx.releaseStoreLock();
-
     const result = performUninstall(ctx, package_names, profile_name, verify_store, sync_policy, cascade, dry_run) catch |err| {
         return try command.errorResult(ctx, err, null);
     };

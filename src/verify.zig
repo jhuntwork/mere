@@ -853,7 +853,7 @@ test "verify profiles accepts valid named profile root manifest" {
     var manifest_data = generation.GenerationManifest.initRoot(ctx.allocator);
     defer manifest_data.deinit();
     try manifest_data.addPackage("demo", "1.0.0", 1, "x86_64", store_path, content_hash);
-    try generation.writeManifest(ctx.allocator, root_dir, &manifest_data);
+    try generation.writeManifest(ctx, root_dir, &manifest_data);
 
     var result = VerifyResult{};
     defer result.deinit(ctx.allocator);
@@ -891,7 +891,7 @@ test "verify profiles reports missing store path with profile context" {
     var manifest_data = generation.GenerationManifest.initRoot(ctx.allocator);
     defer manifest_data.deinit();
     try manifest_data.addPackage("demo", "1.0.0", 1, "x86_64", missing_store, content_hash);
-    try generation.writeManifest(ctx.allocator, root_dir, &manifest_data);
+    try generation.writeManifest(ctx, root_dir, &manifest_data);
 
     var result = VerifyResult{};
     defer result.deinit(ctx.allocator);
@@ -936,7 +936,7 @@ test "verify profiles reports profile manifest hash mismatch without full hash" 
     var manifest_data = generation.GenerationManifest.initRoot(ctx.allocator);
     defer manifest_data.deinit();
     try manifest_data.addPackage("demo", "1.0.0", 1, "x86_64", derived_store_path, content_hash);
-    try generation.writeManifest(ctx.allocator, root_dir, &manifest_data);
+    try generation.writeManifest(ctx, root_dir, &manifest_data);
 
     var result = VerifyResult{};
     defer result.deinit(ctx.allocator);

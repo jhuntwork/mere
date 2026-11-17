@@ -1,5 +1,6 @@
 const std = @import("std");
 const store = @import("store.zig");
+const mere = @import("mere.zig");
 const errors = @import("errors.zig");
 const path_mod = @import("path.zig");
 
@@ -46,7 +47,25 @@ pub const List = struct {
     }
 };
 
+/// Create a user pin. The public operation acquires the process-wide store
+/// lock before publishing the GC-root symlink.
 pub fn create(
+    ctx: *mere.Context,
+    gc_roots_dir: []const u8,
+    pin_name: []const u8,
+    store_path: []const u8,
+    note: ?[]const u8,
+) PinError!void {
+    ctx.acquireStoreLockForMutation() catch |err| return switch (err) {
+        error.OutOfMemory => PinError.OutOfMemory,
+        error.PermissionDenied => PinError.PermissionDenied,
+        else => PinError.FileSystem,
+    };
+    defer ctx.releaseStoreLock();
+    return createLocked(ctx.allocator, gc_roots_dir, pin_name, store_path, note);
+}
+
+fn createLocked(
     allocator: std.mem.Allocator,
     gc_roots_dir: []const u8,
     pin_name: []const u8,
@@ -137,7 +156,23 @@ pub fn create(
     }
 }
 
+/// Remove a user pin. The public operation acquires the process-wide store
+/// lock before removing the GC-root symlink.
 pub fn remove(
+    ctx: *mere.Context,
+    gc_roots_dir: []const u8,
+    pin_name: []const u8,
+) PinError!void {
+    ctx.acquireStoreLockForMutation() catch |err| return switch (err) {
+        error.OutOfMemory => PinError.OutOfMemory,
+        error.PermissionDenied => PinError.PermissionDenied,
+        else => PinError.FileSystem,
+    };
+    defer ctx.releaseStoreLock();
+    return removeLocked(ctx.allocator, gc_roots_dir, pin_name);
+}
+
+fn removeLocked(
     allocator: std.mem.Allocator,
     gc_roots_dir: []const u8,
     pin_name: []const u8,
@@ -364,7 +399,7 @@ test "create and remove work correctly" {
     try path_mod.ensureDirExists(store_path);
 
     // Create a pin
-    try create(allocator, gc_roots, "my-pin", store_path, "Test pin note");
+    try create(&test_env.ctx, gc_roots, "my-pin", store_path, "Test pin note");
 
     // Verify pin exists
     const pin_info = try get(allocator, gc_roots, "my-pin");
@@ -381,7 +416,7 @@ test "create and remove work correctly" {
     try std.testing.expectEqualStrings("Test pin note", pin_info.note.?);
 
     // Remove the pin
-    try remove(allocator, gc_roots, "my-pin");
+    try remove(&test_env.ctx, gc_roots, "my-pin");
 
     // Verify pin is gone
     try std.testing.expectError(PinError.PinNotFound, get(allocator, gc_roots, "my-pin"));
@@ -407,10 +442,10 @@ test "create rejects duplicate pins" {
     try path_mod.ensureDirExists(store_path);
 
     // Create first pin
-    try create(allocator, gc_roots, "foo", store_path, null);
+    try create(&test_env.ctx, gc_roots, "foo", store_path, null);
 
     // Try to create duplicate
-    try std.testing.expectError(PinError.PinExists, create(allocator, gc_roots, "foo", store_path, null));
+    try std.testing.expectError(PinError.PinExists, create(&test_env.ctx, gc_roots, "foo", store_path, null));
 }
 
 // Spec #22: Pin target must be a valid store path
@@ -428,13 +463,13 @@ test "createPin validates store path" {
     defer allocator.free(gc_roots);
 
     // Invalid store path format
-    try std.testing.expectError(PinError.InvalidStorePath, create(allocator, gc_roots, "bad", "/some/random/path", null));
+    try std.testing.expectError(PinError.InvalidStorePath, create(&test_env.ctx, gc_roots, "bad", "/some/random/path", null));
 
     // Valid format but doesn't exist
     const hash = "c" ** 64;
     const nonexistent = try std.fs.path.join(allocator, &.{ test_env.path, "mere", "store", hash ++ "-nonexistent-1.0" });
     defer allocator.free(nonexistent);
-    try std.testing.expectError(PinError.StorePathNotFound, create(allocator, gc_roots, "bad", nonexistent, null));
+    try std.testing.expectError(PinError.StorePathNotFound, create(&test_env.ctx, gc_roots, "bad", nonexistent, null));
 }
 
 // Spec #22: Pin name must be a valid filename
@@ -457,10 +492,10 @@ test "createPin validates pin name" {
     try path_mod.ensureDirExists(store_path);
 
     // Empty name
-    try std.testing.expectError(PinError.InvalidInput, create(allocator, gc_roots, "", store_path, null));
+    try std.testing.expectError(PinError.InvalidInput, create(&test_env.ctx, gc_roots, "", store_path, null));
 
     // Name with slash
-    try std.testing.expectError(PinError.InvalidInput, create(allocator, gc_roots, "bad/name", store_path, null));
+    try std.testing.expectError(PinError.InvalidInput, create(&test_env.ctx, gc_roots, "bad/name", store_path, null));
 }
 
 test "createPin rolls back symlink when note creation fails" {
@@ -488,7 +523,7 @@ test "createPin rolls back symlink when note creation fails" {
 
     try std.testing.expectError(
         PinError.FileSystem,
-        create(allocator, gc_roots, "rollback-pin", store_path, "note text"),
+        create(&test_env.ctx, gc_roots, "rollback-pin", store_path, "note text"),
     );
 
     // Pin symlink must not remain after note failure.
@@ -520,8 +555,8 @@ test "listPins returns all user pins" {
     defer allocator.free(store2);
     try path_mod.ensureDirExists(store2);
 
-    try create(allocator, gc_roots, "pin1", store1, null);
-    try create(allocator, gc_roots, "pin2", store2, "Note for pin2");
+    try create(&test_env.ctx, gc_roots, "pin1", store1, null);
+    try create(&test_env.ctx, gc_roots, "pin2", store2, "Note for pin2");
 
     // List pins
     var pins = try list(allocator, gc_roots);
@@ -567,7 +602,7 @@ test "listPins skips system roots" {
     defer allocator.free(store_path);
     try path_mod.ensureDirExists(store_path);
 
-    try create(allocator, gc_roots, "user-pin", store_path, null);
+    try create(&test_env.ctx, gc_roots, "user-pin", store_path, null);
 
     // List pins - should only see the user pin
     var pins = try list(allocator, gc_roots);
@@ -597,7 +632,7 @@ test "getPinForPackage finds pin by package name" {
     try path_mod.ensureDirExists(store_path);
 
     // Pin with custom name
-    try create(allocator, gc_roots, "stable-app", store_path, null);
+    try create(&test_env.ctx, gc_roots, "stable-app", store_path, null);
 
     // Find by package name (not pin name)
     const pinned_path = try forPackage(allocator, gc_roots, "my-app");

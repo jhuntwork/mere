@@ -73,7 +73,7 @@ pub const TestEnv = struct {
         self.ctx.resetDiagnostics();
         // Clear immutable flags before making writable (tests running as root
         // may have set chattr +i via store.harden)
-        _ = store.clearImmutable(allocator, self.path);
+        _ = store.clearImmutable(&self.ctx, self.path);
         self.ctx.deinit();
         makeWritable(self.path);
         self.tmp.cleanup();

@@ -109,7 +109,7 @@ pub fn handleAdd(ctx: *mere.Context, args: *const types.ParsedArgs) MereError!ty
     };
     defer ctx.allocator.free(gc_roots_dir);
 
-    pin.create(ctx.allocator, gc_roots_dir, pin_name, store_path, note) catch |err| {
+    pin.create(ctx, gc_roots_dir, pin_name, store_path, note) catch |err| {
         const user_message = switch (err) {
             pin.PinError.PinExists => "pin already exists (use 'pin remove' first)",
             pin.PinError.InvalidStorePath => "invalid store path format",
@@ -163,7 +163,7 @@ pub fn handleRemove(ctx: *mere.Context, args: *const types.ParsedArgs) MereError
     };
     defer ctx.allocator.free(gc_roots_dir);
 
-    pin.remove(ctx.allocator, gc_roots_dir, pin_name) catch |err| {
+    pin.remove(ctx, gc_roots_dir, pin_name) catch |err| {
         const user_message = switch (err) {
             pin.PinError.PinNotFound => "pin not found",
             pin.PinError.PermissionDenied => "permission denied",
