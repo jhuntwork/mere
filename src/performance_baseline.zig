@@ -218,7 +218,8 @@ test "install and activation performance baseline" {
     for (&fast_activation_times, 0..) |*sample, index| {
         const generation_number = generation_numbers[index % generation_numbers.len];
         const started_at = monotonicNs();
-        _ = try activation.activateSystemGeneration(ctx, generation_number, .fast);
+        const activation_result = activation.activateSystemGeneration(ctx, generation_number, .fast);
+        try std.testing.expectEqual(activation.ActivationOutcome.committed, activation_result.outcome);
         sample.* = elapsedNs(started_at);
     }
 
@@ -226,7 +227,8 @@ test "install and activation performance baseline" {
     for (&full_activation_times, 0..) |*sample, index| {
         const generation_number = generation_numbers[index % generation_numbers.len];
         const started_at = monotonicNs();
-        _ = try activation.activateSystemGeneration(ctx, generation_number, .full_store);
+        const activation_result = activation.activateSystemGeneration(ctx, generation_number, .full_store);
+        try std.testing.expectEqual(activation.ActivationOutcome.committed, activation_result.outcome);
         sample.* = elapsedNs(started_at);
     }
 

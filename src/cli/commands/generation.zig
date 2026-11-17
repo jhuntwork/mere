@@ -466,14 +466,26 @@ pub fn handleActivate(ctx: *mere.Context, args: *const types.ParsedArgs) MereErr
         ctx,
         gen_num,
         if (verify_store) .full_store else .fast,
-    ) catch |err| {
-        const msg = switch (err) {
+    );
+
+    if (result.outcome == .not_committed) {
+        const failure = result.failure orelse activation.ActivationError.FileSystem;
+        const msg = switch (failure) {
             activation.ActivationError.GenerationNotFound => "generation not found",
-            activation.ActivationError.FileSystem => "file system error",
-            else => "failed to activate generation",
+            activation.ActivationError.FileSystem => "activation did not commit",
+            else => "activation did not commit",
         };
-        return try command.errorResult(ctx, err, msg);
-    };
+        return try command.errorResult(ctx, failure, msg);
+    }
+
+    if (result.outcome == .committed_needs_repair) {
+        const failure = result.failure orelse activation.ActivationError.FileSystem;
+        const diagnostic = ctx.getDiagnosticContext();
+        if (diagnostic.details == null) {
+            ctx.setDiagnosticContext(profile_dir, "generation committed; post-commit maintenance is incomplete; rerun activation to repair");
+        }
+        return try command.errorResult(ctx, failure, "generation committed but needs post-commit repair");
+    }
 
     emitGenerationActivationStatus(ctx, gen_num, result.etc_copied, result.etc_skipped, result.etc_differing, result.boot_artifacts_staged);
     return types.CommandResult{ .success = true };

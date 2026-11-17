@@ -1920,11 +1920,23 @@ fn applyProfileRealization(ctx: *Context, prof_name: []const u8, installed_packa
             ctx,
             gen_num,
             if (verify_store) .full_store else .fast,
-        ) catch |err| {
-            ctx.debug("failed to activate generation: {}", .{err});
+        );
+
+        if (result.outcome == .not_committed) {
+            const failure = result.failure orelse activation.ActivationError.FileSystem;
+            ctx.debug("failed to activate generation before commit: {}", .{failure});
             discardUnactivatedGeneration(ctx, profile_dir, gen_num);
-            return mapActivationFailure(ctx, err, profile_dir, "failed to activate generation");
-        };
+            return mapActivationFailure(ctx, failure, profile_dir, "activation did not commit");
+        }
+
+        if (result.outcome == .committed_needs_repair) {
+            const failure = result.failure orelse activation.ActivationError.FileSystem;
+            const diagnostic = ctx.getDiagnosticContext();
+            if (diagnostic.details == null) {
+                ctx.setDiagnosticContext(profile_dir, "generation committed; post-commit maintenance is incomplete; rerun activation to repair");
+            }
+            return mapActivationFailure(ctx, failure, profile_dir, "generation committed but needs post-commit repair");
+        }
 
         var gen_buf: [32]u8 = undefined;
         var copied_buf: [32]u8 = undefined;
