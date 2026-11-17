@@ -21,6 +21,7 @@ test {
     _ = @import("etc.zig");
     _ = @import("extract.zig");
     _ = @import("filetype.zig");
+    _ = @import("fault_injection.zig");
     _ = @import("gc.zig");
     _ = @import("generation.zig");
     _ = @import("gcroots.zig");
