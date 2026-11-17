@@ -28,6 +28,14 @@ fn mapGenerationError(err: generation.GenerationError) GCRootsError {
     };
 }
 
+fn mapStoreLockError(err: anyerror) GCRootsError {
+    return switch (err) {
+        error.OutOfMemory => GCRootsError.OutOfMemory,
+        error.PermissionDenied => GCRootsError.PermissionDenied,
+        else => GCRootsError.FileSystem,
+    };
+}
+
 pub const DEFAULT_RETENTION_COUNT: u32 = 2;
 
 pub const KEEP_MARKER = ".keep";
@@ -58,8 +66,21 @@ pub fn isExplicitlyKept(
     return true;
 }
 
-/// Mark a generation as explicitly kept.
+/// Mark a generation as explicitly kept. The public operation owns the
+/// process-wide store lock; `keepGenerationLocked` is used after that lock is
+/// already held.
 pub fn keepGeneration(
+    ctx: *mere.Context,
+    profile_dir: []const u8,
+    gen_num: u32,
+    note: ?[]const u8,
+) GCRootsError!void {
+    ctx.acquireStoreLockForMutation() catch |err| return mapStoreLockError(err);
+    defer ctx.releaseStoreLock();
+    return keepGenerationLocked(ctx.allocator, profile_dir, gen_num, note);
+}
+
+fn keepGenerationLocked(
     allocator: std.mem.Allocator,
     profile_dir: []const u8,
     gen_num: u32,
@@ -103,6 +124,16 @@ pub fn keepGeneration(
 
 /// Remove explicit keep marker from a generation.
 pub fn unkeepGeneration(
+    ctx: *mere.Context,
+    profile_dir: []const u8,
+    gen_num: u32,
+) GCRootsError!void {
+    ctx.acquireStoreLockForMutation() catch |err| return mapStoreLockError(err);
+    defer ctx.releaseStoreLock();
+    return unkeepGenerationLocked(ctx.allocator, profile_dir, gen_num);
+}
+
+fn unkeepGenerationLocked(
     allocator: std.mem.Allocator,
     profile_dir: []const u8,
     gen_num: u32,
@@ -183,7 +214,21 @@ pub fn getKeptGenerations(
     };
 }
 
+/// Update profile GC roots. The public operation acquires the process-wide
+/// store lock; the locked implementation is used after that lock is held.
 pub fn updateRoots(
+    ctx: *mere.Context,
+    store_root: []const u8,
+    gc_roots_dir: []const u8,
+    profile_dir: []const u8,
+    retention_count: u32,
+) GCRootsError!void {
+    ctx.acquireStoreLockForMutation() catch |err| return mapStoreLockError(err);
+    defer ctx.releaseStoreLock();
+    return updateRootsLocked(ctx.allocator, store_root, gc_roots_dir, profile_dir, retention_count);
+}
+
+fn updateRootsLocked(
     allocator: std.mem.Allocator,
     store_root: []const u8,
     gc_roots_dir: []const u8,
@@ -207,7 +252,21 @@ pub fn updateRoots(
     try pruneObsoleteRoots(allocator, profile_gc_dir, state.all_gens, state.kept_gens);
 }
 
+/// Ensure all required roots for a profile exist. The public operation
+/// acquires the process-wide store lock.
 pub fn ensureRequiredRootsForProfile(
+    ctx: *mere.Context,
+    store_root: []const u8,
+    gc_roots_dir: []const u8,
+    profile_dir: []const u8,
+    retention_count: u32,
+) GCRootsError!void {
+    ctx.acquireStoreLockForMutation() catch |err| return mapStoreLockError(err);
+    defer ctx.releaseStoreLock();
+    return ensureRequiredRootsForProfileLocked(ctx.allocator, store_root, gc_roots_dir, profile_dir, retention_count);
+}
+
+fn ensureRequiredRootsForProfileLocked(
     allocator: std.mem.Allocator,
     store_root: []const u8,
     gc_roots_dir: []const u8,
@@ -229,7 +288,21 @@ pub fn ensureRequiredRootsForProfile(
     try ensureRequiredRoots(allocator, profile_gc_dir, profile_dir, state.kept_gens);
 }
 
+/// Remove obsolete roots for a profile. The public operation acquires the
+/// process-wide store lock.
 pub fn pruneObsoleteRootsForProfile(
+    ctx: *mere.Context,
+    store_root: []const u8,
+    gc_roots_dir: []const u8,
+    profile_dir: []const u8,
+    retention_count: u32,
+) GCRootsError!void {
+    ctx.acquireStoreLockForMutation() catch |err| return mapStoreLockError(err);
+    defer ctx.releaseStoreLock();
+    return pruneObsoleteRootsForProfileLocked(ctx.allocator, store_root, gc_roots_dir, profile_dir, retention_count);
+}
+
+fn pruneObsoleteRootsForProfileLocked(
     allocator: std.mem.Allocator,
     store_root: []const u8,
     gc_roots_dir: []const u8,
@@ -332,7 +405,19 @@ fn extractProfileName(profile_dir: []const u8) []const u8 {
 /// Recreate only the current-generation GC root without inspecting store
 /// contents. Recovery uses this before validating a generation so the active
 /// pointer is protected from GC even when the store is damaged.
+/// Recreate the current-generation root. The public operation acquires the
+/// process-wide store lock.
 pub fn ensureCurrentRootForProfile(
+    ctx: *mere.Context,
+    gc_roots_dir: []const u8,
+    profile_dir: []const u8,
+) GCRootsError!void {
+    ctx.acquireStoreLockForMutation() catch |err| return mapStoreLockError(err);
+    defer ctx.releaseStoreLock();
+    return ensureCurrentRootForProfileLocked(ctx.allocator, gc_roots_dir, profile_dir);
+}
+
+fn ensureCurrentRootForProfileLocked(
     allocator: std.mem.Allocator,
     gc_roots_dir: []const u8,
     profile_dir: []const u8,
@@ -470,7 +555,20 @@ fn removeGenerationRoot(
 /// Delete a generation and its root.
 ///
 /// Fails if trying to delete the active generation.
+/// Delete an inactive generation and its GC root. The public operation
+/// acquires the process-wide store lock.
 pub fn deleteGeneration(
+    ctx: *mere.Context,
+    gc_roots_dir: []const u8,
+    profile_dir: []const u8,
+    gen_num: u32,
+) GCRootsError!void {
+    ctx.acquireStoreLockForMutation() catch |err| return mapStoreLockError(err);
+    defer ctx.releaseStoreLock();
+    return deleteGenerationLocked(ctx, gc_roots_dir, profile_dir, gen_num);
+}
+
+fn deleteGenerationLocked(
     ctx: *mere.Context,
     gc_roots_dir: []const u8,
     profile_dir: []const u8,
@@ -605,7 +703,7 @@ test "isExplicitlyKept returns false when no marker" {
     gen_dir.close(path_mod.currentIo());
     var manifest = generation.GenerationManifest.init(allocator, 1);
     defer manifest.deinit();
-    try generation.writeManifest(allocator, gen_path, &manifest);
+    try generation.writeManifest(&test_env.ctx, gen_path, &manifest);
 
     const kept = try isExplicitlyKept(allocator, profile_dir, 1);
     try std.testing.expect(!kept);
@@ -631,7 +729,7 @@ test "keepGeneration creates marker" {
     gen_dir.close(path_mod.currentIo());
 
     // Keep with a note
-    try keepGeneration(allocator, profile_dir, 1, "Important release");
+    try keepGeneration(&test_env.ctx, profile_dir, 1, "Important release");
 
     // Verify marker exists
     try std.testing.expect(try isExplicitlyKept(allocator, profile_dir, 1));
@@ -663,10 +761,10 @@ test "unkeepGeneration removes marker" {
     var gen_dir = try path_mod.makePathAndOpenDir(gen_path);
     gen_dir.close(path_mod.currentIo());
 
-    try keepGeneration(allocator, profile_dir, 1, null);
+    try keepGeneration(&test_env.ctx, profile_dir, 1, null);
     try std.testing.expect(try isExplicitlyKept(allocator, profile_dir, 1));
 
-    try unkeepGeneration(allocator, profile_dir, 1);
+    try unkeepGeneration(&test_env.ctx, profile_dir, 1);
     try std.testing.expect(!try isExplicitlyKept(allocator, profile_dir, 1));
 }
 
@@ -694,7 +792,7 @@ test "getKeptGenerations returns last K generations" {
         gen_dir.close(path_mod.currentIo());
         var manifest = generation.GenerationManifest.init(allocator, n);
         defer manifest.deinit();
-        try generation.writeManifest(allocator, gen_path, &manifest);
+        try generation.writeManifest(&test_env.ctx, gen_path, &manifest);
     }
 
     // With retention_count=2, should keep 4 and 5
@@ -730,11 +828,11 @@ test "getKeptGenerations includes explicitly kept" {
         gen_dir.close(path_mod.currentIo());
         var manifest = generation.GenerationManifest.init(allocator, n);
         defer manifest.deinit();
-        try generation.writeManifest(allocator, gen_path, &manifest);
+        try generation.writeManifest(&test_env.ctx, gen_path, &manifest);
     }
 
     // Explicitly keep generation 1
-    try keepGeneration(allocator, profile_dir, 1, null);
+    try keepGeneration(&test_env.ctx, profile_dir, 1, null);
 
     // With retention_count=2, should keep 1 (explicit), 4, and 5 (recent)
     const kept = try getKeptGenerations(allocator, "/unused", profile_dir, 2);
@@ -770,7 +868,7 @@ test "updateRoots creates correct symlinks" {
         gen_dir.close(path_mod.currentIo());
         var manifest = generation.GenerationManifest.init(allocator, n);
         defer manifest.deinit();
-        try generation.writeManifest(allocator, gen_path, &manifest);
+        try generation.writeManifest(&test_env.ctx, gen_path, &manifest);
     }
 
     // Create current symlink in profile (simulating activation)
@@ -779,7 +877,7 @@ test "updateRoots creates correct symlinks" {
     profile_handle.symLink(path_mod.currentIo(), "gen-3", "current", .{}) catch {};
 
     // Update roots with retention_count=2
-    try updateRoots(allocator, "/unused", gc_roots_dir, profile_dir, 2);
+    try updateRoots(&test_env.ctx, "/unused", gc_roots_dir, profile_dir, 2);
 
     // Check roots exist in the nested structure (profiles/system/kept/)
     const profile_gc_dir = try std.fs.path.join(allocator, &.{ gc_roots_dir, "profiles", "system" });
@@ -828,7 +926,7 @@ test "deleteGeneration removes directory and root" {
         gen_dir.close(path_mod.currentIo());
         var manifest = generation.GenerationManifest.init(allocator, n);
         defer manifest.deinit();
-        try generation.writeManifest(allocator, gen_path, &manifest);
+        try generation.writeManifest(&test_env.ctx, gen_path, &manifest);
     }
 
     // Activate generation 2
@@ -882,7 +980,7 @@ test "deleteGeneration fails for active generation" {
     gen_dir.close(path_mod.currentIo());
     var manifest = generation.GenerationManifest.init(allocator, 1);
     defer manifest.deinit();
-    try generation.writeManifest(allocator, gen_path, &manifest);
+    try generation.writeManifest(&test_env.ctx, gen_path, &manifest);
 
     var profile_handle = try std.Io.Dir.openDirAbsolute(path_mod.currentIo(), profile_dir, .{});
     defer profile_handle.close(path_mod.currentIo());

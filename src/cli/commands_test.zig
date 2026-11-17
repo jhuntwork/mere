@@ -187,7 +187,7 @@ fn writeProfileManifest(
         defer ctx.allocator.free(store_path);
         try manifest.addPackage(pkg.name, pkg.version, pkg.release, "x86_64", store_path, "a" ** 64);
     }
-    try mere.generation.writeManifest(ctx.allocator, profile_path, &manifest);
+    try mere.generation.writeManifest(ctx, profile_path, &manifest);
 }
 
 test "profile packages lists the active system generation deterministically" {

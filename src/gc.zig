@@ -92,8 +92,23 @@ pub const GCOptions = struct {
 
 /// Perform garbage collection.
 ///
-/// Deletes store paths that are not reachable from any GC root.
+/// The public entry point owns the process-wide store lock. The locked helper
+/// keeps the activation mutex and filesystem work separate so callers already
+/// inside a locked operation can use it without taking a second lock path.
 pub fn collectGarbage(
+    ctx: *mere.Context,
+    options: GCOptions,
+) GCError!GCResult {
+    ctx.acquireStoreLockForMutation() catch |err| return switch (err) {
+        error.OutOfMemory => GCError.OutOfMemory,
+        error.PermissionDenied => GCError.PermissionDenied,
+        else => GCError.FileSystem,
+    };
+    defer ctx.releaseStoreLock();
+    return collectGarbageLocked(ctx, options);
+}
+
+fn collectGarbageLocked(
     ctx: *mere.Context,
     options: GCOptions,
 ) GCError!GCResult {
@@ -135,7 +150,7 @@ pub fn collectGarbage(
     // This closes the restart window after activation committed its pointer but
     // before the previous process finished GC-root maintenance.
     if (std.Io.Dir.accessAbsolute(path_mod.currentIo(), system_profile_dir, .{})) |_| {
-        gcroots.ensureCurrentRootForProfile(allocator, gc_roots_dir, system_profile_dir) catch |err| {
+        gcroots.ensureCurrentRootForProfile(ctx, gc_roots_dir, system_profile_dir) catch |err| {
             return ctx.fail(mapGCRootError(err), gc_roots_dir, "failed to repair the active GC root before collection");
         };
     } else |err| switch (err) {
@@ -240,7 +255,7 @@ fn collectGarbageAtPathsWithPackagePool(
 
             if (!options.dry_run) {
                 // Clear immutable flags before deletion (hardened store objects have chattr +i)
-                _ = store.clearImmutable(allocator, store_path);
+                _ = store.clearImmutable(ctx, store_path);
                 // Make directory writable before deletion (store paths are read-only)
                 makeWritable(store_path);
                 // Actually delete
@@ -991,7 +1006,7 @@ test "public collectGarbage repairs a missing active current root" {
     var manifest = generation.GenerationManifest.init(allocator, 1);
     defer manifest.deinit();
     try manifest.addPackage("kept", "1.0", 1, "x86_64", kept, hash);
-    try generation.writeManifest(allocator, gen_dir, &manifest);
+    try generation.writeManifest(&test_env.ctx, gen_dir, &manifest);
 
     var profile_handle = try std.Io.Dir.openDirAbsolute(path_mod.currentIo(), profile_dir, .{});
     defer profile_handle.close(path_mod.currentIo());
@@ -1122,7 +1137,7 @@ test "collectGarbage collects from generation manifest" {
         hash2,
     );
 
-    try generation.writeManifest(allocator, gen_dir, &manifest);
+    try generation.writeManifest(&test_env.ctx, gen_dir, &manifest);
 
     // Create gc-root pointing to generation
     var gc_roots_handle = try std.Io.Dir.openDirAbsolute(path_mod.currentIo(), gc_roots_dir, .{});
@@ -1246,7 +1261,7 @@ test "collectGarbage prunes unkept generations" {
             kept_obj,
             "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
         );
-        try generation.writeManifest(allocator, gen_dir, &manifest);
+        try generation.writeManifest(&test_env.ctx, gen_dir, &manifest);
     }
 
     // Point current to gen-1 so it stays kept even though it's not recent.
@@ -1314,7 +1329,7 @@ test "collectGarbage preserves store paths from an explicitly kept generation ou
         var manifest = generation.GenerationManifest.init(allocator, 1);
         defer manifest.deinit();
         try manifest.addPackage("old", "1.0", 1, "x86_64", old_obj, old_hash);
-        try generation.writeManifest(allocator, gen1_dir, &manifest);
+        try generation.writeManifest(&test_env.ctx, gen1_dir, &manifest);
     }
 
     // retention_count=2 (the default) means gen-1 falls outside the
@@ -1326,7 +1341,7 @@ test "collectGarbage preserves store paths from an explicitly kept generation ou
         var manifest = generation.GenerationManifest.init(allocator, gen);
         defer manifest.deinit();
         try manifest.addPackage("current", "1.0", 1, "x86_64", current_obj, current_hash);
-        try generation.writeManifest(allocator, gen_dir, &manifest);
+        try generation.writeManifest(&test_env.ctx, gen_dir, &manifest);
     }
 
     var profile_handle = try std.Io.Dir.openDirAbsolute(path_mod.currentIo(), profile_dir, .{});
@@ -1335,8 +1350,8 @@ test "collectGarbage preserves store paths from an explicitly kept generation ou
 
     // What `mere store generation keep 1` now does end-to-end: mark the
     // .keep file, then sync GC roots so the mark actually protects anything.
-    try gcroots.keepGeneration(allocator, profile_dir, 1, null);
-    try gcroots.updateRoots(allocator, store_dir, gc_roots_dir, profile_dir, gcroots.DEFAULT_RETENTION_COUNT);
+    try gcroots.keepGeneration(&test_env.ctx, profile_dir, 1, null);
+    try gcroots.updateRoots(&test_env.ctx, store_dir, gc_roots_dir, profile_dir, gcroots.DEFAULT_RETENTION_COUNT);
 
     var gc_result = try collectGarbageAtPaths(&test_env.ctx, gc_roots_dir, store_dir, profiles_dir, .{ .dry_run = true });
     defer gc_result.deinit();
@@ -1462,7 +1477,7 @@ test "collectGarbage preserves store paths from both pins and generation manifes
         gen_obj,
         gen_hash,
     );
-    try generation.writeManifest(allocator, gen_dir, &manifest);
+    try generation.writeManifest(&test_env.ctx, gen_dir, &manifest);
 
     // Create gc-root symlink pointing to the generation directory
     gc_roots_handle.symLink(path_mod.currentIo(), gen_dir, "gen-root", .{}) catch {};
@@ -1685,7 +1700,7 @@ test "collectGarbage preserves explicitly kept generations" {
             pkg_obj,
             "aaa1110000000000000000000000000000000000000000000000000000000000",
         );
-        try generation.writeManifest(allocator, gen_dir, &manifest);
+        try generation.writeManifest(&test_env.ctx, gen_dir, &manifest);
     }
 
     // Point current to gen-5
@@ -1694,7 +1709,7 @@ test "collectGarbage preserves explicitly kept generations" {
     profile_handle.symLink(path_mod.currentIo(), "gen-5", "current", .{}) catch {};
 
     // Explicitly keep gen-1 with a .keep marker
-    try gcroots.keepGeneration(allocator, profile_dir, 1, "important baseline");
+    try gcroots.keepGeneration(&test_env.ctx, profile_dir, 1, "important baseline");
 
     // Run GC in dry-run mode (DEFAULT_RETENTION_COUNT = 2, so keeps gen-4, gen-5 by recency)
     // gen-1 should also be kept due to .keep marker

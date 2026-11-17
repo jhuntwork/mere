@@ -230,6 +230,20 @@ pub const Context = struct {
         self.store_lock_depth = 1;
     }
 
+    /// Acquire the store lock for a public mutating library operation.
+    ///
+    /// The low-level lock API preserves the original `error.Locked` result
+    /// for CLI callers. Library operations expose the repository's standard
+    /// error vocabulary instead, so callers do not need to know about the
+    /// lock implementation or accidentally omit the lock altogether.
+    pub fn acquireStoreLockForMutation(self: *Context) error{ OutOfMemory, FileSystem, PermissionDenied }!void {
+        self.acquireStoreLock() catch |lock_err| return switch (lock_err) {
+            error.OutOfMemory => error.OutOfMemory,
+            error.AccessDenied, error.PermissionDenied, error.ReadOnlyFileSystem => error.PermissionDenied,
+            else => error.FileSystem,
+        };
+    }
+
     /// Release a previously acquired store lock. No-op if not held.
     pub fn releaseStoreLock(self: *Context) void {
         if (self.store_lock_depth == 0) return;
@@ -478,6 +492,23 @@ test "Context.acquireStoreLock is reentrant within the same Context" {
 
     // Releasing past zero is a no-op, not a crash.
     test_env.ctx.releaseStoreLock();
+}
+
+test "Context.acquireStoreLockForMutation is reentrant for library callers" {
+    const th = @import("test_helpers.zig");
+    var test_env = try th.createTestEnv();
+    defer {
+        test_env.cleanup();
+        std.testing.allocator.destroy(test_env);
+    }
+
+    try test_env.ctx.acquireStoreLockForMutation();
+    try test_env.ctx.acquireStoreLockForMutation();
+    try std.testing.expectEqual(@as(u32, 2), test_env.ctx.store_lock_depth);
+
+    test_env.ctx.releaseStoreLock();
+    test_env.ctx.releaseStoreLock();
+    try std.testing.expectEqual(@as(u32, 0), test_env.ctx.store_lock_depth);
 }
 
 test "Context.acquireStoreLock actually excludes a second independent lock holder" {

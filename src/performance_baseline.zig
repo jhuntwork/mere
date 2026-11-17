@@ -134,7 +134,7 @@ fn resetInstallState(allocator: std.mem.Allocator, fixture_root: []const u8) !vo
     for ([_][]const u8{ "store", "profiles", "cache", "gc-roots" }) |leaf| {
         const target = try std.fs.path.join(allocator, &.{ fixture_root, "mere", leaf });
         defer allocator.free(target);
-        _ = store.clearImmutable(allocator, target);
+        _ = store.clearImmutable(ctx, target);
         makeWritable(target);
         path.deleteTreeAbsolute(target) catch |err| {
             if (err != error.FileNotFound) return err;

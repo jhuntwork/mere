@@ -87,7 +87,7 @@ fn syncGCRoots(ctx: *mere.Context, profile_dir: []const u8) !?types.CommandResul
     };
     defer ctx.allocator.free(gc_roots_dir);
 
-    gcroots.updateRoots(ctx.allocator, store_root, gc_roots_dir, profile_dir, gcroots.DEFAULT_RETENTION_COUNT) catch |err| {
+    gcroots.updateRoots(ctx, store_root, gc_roots_dir, profile_dir, gcroots.DEFAULT_RETENTION_COUNT) catch |err| {
         const msg = switch (err) {
             gcroots.GCRootsError.PermissionDenied => "permission denied updating GC roots",
             else => "failed to update GC roots",
@@ -301,7 +301,7 @@ pub fn handleKeep(ctx: *mere.Context, args: *const types.ParsedArgs) MereError!t
     };
     defer ctx.allocator.free(profile_dir);
 
-    gcroots.keepGeneration(ctx.allocator, profile_dir, gen_num, note) catch |err| {
+    gcroots.keepGeneration(ctx, profile_dir, gen_num, note) catch |err| {
         const msg = switch (err) {
             gcroots.GCRootsError.GenerationNotFound => "generation not found",
             gcroots.GCRootsError.PermissionDenied => "permission denied",
@@ -346,7 +346,7 @@ pub fn handleUnkeep(ctx: *mere.Context, args: *const types.ParsedArgs) MereError
     };
     defer ctx.allocator.free(profile_dir);
 
-    gcroots.unkeepGeneration(ctx.allocator, profile_dir, gen_num) catch |err| {
+    gcroots.unkeepGeneration(ctx, profile_dir, gen_num) catch |err| {
         const msg = switch (err) {
             gcroots.GCRootsError.PermissionDenied => "permission denied",
             else => "failed to unkeep generation",

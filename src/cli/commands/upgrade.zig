@@ -59,9 +59,6 @@ fn handleUpgrade(ctx: *mere.Context, args: *const types.ParsedArgs) MereError!ty
         if (package_names.len > 0) package_names[0] else profile_name,
     ));
 
-    if (try command.acquireStoreLockOrResult(ctx)) |result| return result;
-    defer ctx.releaseStoreLock();
-
     _ = ctx.getConfig() catch |err| return try command.errorResult(ctx, err, null);
     var curl_client = download.CurlTransferClient.init(ctx, command.user_agent) catch |err| {
         return try command.errorResult(ctx, err, null);

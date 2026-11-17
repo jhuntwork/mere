@@ -320,7 +320,30 @@ fn canonicalizePackages(allocator: std.mem.Allocator, packages: []const generati
     return sorted;
 }
 
+fn mapStoreLockError(err: anyerror) ProfileError {
+    return switch (err) {
+        error.OutOfMemory => ProfileError.OutOfMemory,
+        error.PermissionDenied => ProfileError.PermissionDenied,
+        else => ProfileError.FileSystem,
+    };
+}
+
+/// Build and publish a profile projection. The public operation acquires the
+/// process-wide store lock; `buildProfileLocked` is used after that lock is
+/// already held.
 pub fn buildProfile(
+    allocator: std.mem.Allocator,
+    ctx: *Context,
+    profile_root: []const u8,
+    store_root: []const u8,
+    packages: []const generation.PackageEntry,
+) ProfileError!ProjectionResult {
+    ctx.acquireStoreLockForMutation() catch |err| return mapStoreLockError(err);
+    defer ctx.releaseStoreLock();
+    return buildProfileLocked(allocator, ctx, profile_root, store_root, packages);
+}
+
+fn buildProfileLocked(
     allocator: std.mem.Allocator,
     ctx: *Context,
     profile_root: []const u8,
@@ -1079,7 +1102,19 @@ fn buildProfileManifest(
     return manifest;
 }
 
+/// Publish a named profile root under the process-wide store lock.
 pub fn publishProfileRoot(
+    ctx: *Context,
+    profile_dir: []const u8,
+    store_root: []const u8,
+    packages: []const generation.PackageEntry,
+) ProfileError!ProjectionStats {
+    ctx.acquireStoreLockForMutation() catch |err| return mapStoreLockError(err);
+    defer ctx.releaseStoreLock();
+    return publishProfileRootLocked(ctx, profile_dir, store_root, packages);
+}
+
+fn publishProfileRootLocked(
     ctx: *Context,
     profile_dir: []const u8,
     store_root: []const u8,
@@ -1169,7 +1204,7 @@ pub fn publishProfileRoot(
     );
     defer manifest.deinit();
 
-    generation.writeRealization(ctx.allocator, stage_dir, &result.realization) catch |err| {
+    generation.writeRealization(ctx, stage_dir, &result.realization) catch |err| {
         return ctx.fail(switch (err) {
             generation.GenerationError.PermissionDenied => ProfileError.PermissionDenied,
             generation.GenerationError.OutOfMemory => ProfileError.OutOfMemory,
@@ -1178,7 +1213,7 @@ pub fn publishProfileRoot(
         }, stage_dir, "failed to write profile realization");
     };
 
-    generation.writeManifest(ctx.allocator, stage_dir, &manifest) catch |err| {
+    generation.writeManifest(ctx, stage_dir, &manifest) catch |err| {
         return ctx.fail(switch (err) {
             generation.GenerationError.PermissionDenied => ProfileError.PermissionDenied,
             generation.GenerationError.OutOfMemory => ProfileError.OutOfMemory,
@@ -1206,7 +1241,20 @@ pub fn publishProfileRoot(
     return result.stats;
 }
 
+/// Create a generation under the process-wide store lock.
 pub fn createGeneration(
+    ctx: *Context,
+    profile_dir: []const u8,
+    store_root: []const u8,
+    packages: []const generation.PackageEntry,
+    parent_generation: ?u32,
+) ProfileError!u32 {
+    ctx.acquireStoreLockForMutation() catch |err| return mapStoreLockError(err);
+    defer ctx.releaseStoreLock();
+    return createGenerationLocked(ctx, profile_dir, store_root, packages, parent_generation);
+}
+
+fn createGenerationLocked(
     ctx: *Context,
     profile_dir: []const u8,
     store_root: []const u8,
@@ -1315,7 +1363,7 @@ fn createGenerationWithRealizerRunner(
     );
     defer manifest.deinit();
 
-    generation.writeRealization(ctx.allocator, stage_path, &result.realization) catch |err| {
+    generation.writeRealization(ctx, stage_path, &result.realization) catch |err| {
         return ctx.fail(switch (err) {
             generation.GenerationError.PermissionDenied => ProfileError.PermissionDenied,
             generation.GenerationError.OutOfMemory => ProfileError.OutOfMemory,
@@ -1324,7 +1372,7 @@ fn createGenerationWithRealizerRunner(
         }, stage_path, "failed to write generation realization");
     };
 
-    generation.writeManifest(ctx.allocator, stage_path, &manifest) catch |err| {
+    generation.writeManifest(ctx, stage_path, &manifest) catch |err| {
         return ctx.fail(switch (err) {
             generation.GenerationError.PermissionDenied => ProfileError.PermissionDenied,
             generation.GenerationError.OutOfMemory => ProfileError.OutOfMemory,
@@ -1353,7 +1401,18 @@ fn createGenerationWithRealizerRunner(
     return gen_num;
 }
 
+/// Create a named profile under the process-wide store lock.
 pub fn createProfile(
+    ctx: *Context,
+    profiles_dir: []const u8,
+    profile_name: []const u8,
+) ProfileError![]const u8 {
+    ctx.acquireStoreLockForMutation() catch |err| return mapStoreLockError(err);
+    defer ctx.releaseStoreLock();
+    return createProfileLocked(ctx, profiles_dir, profile_name);
+}
+
+fn createProfileLocked(
     ctx: *Context,
     profiles_dir: []const u8,
     profile_name: []const u8,
