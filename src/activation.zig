@@ -30,6 +30,7 @@ const store = @import("store.zig");
 const service_policy = @import("service_policy.zig");
 const service_reconcile = @import("service_reconcile.zig");
 const activation_lock = @import("activation_lock.zig");
+const fault_injection = @import("fault_injection.zig");
 
 /// Activation error set
 const Std = errors.StandardErrors;
@@ -90,6 +91,12 @@ fn failAt(point: FailurePoint) ActivationError!void {
     }
 }
 
+fn checkFault(ctx: *mere.Context, checkpoint: fault_injection.Checkpoint, subject: []const u8) ActivationError!void {
+    fault_injection.hit(checkpoint) catch |err| switch (err) {
+        error.InjectedFailure => return ctx.fail(ActivationError.FileSystem, subject, "fault injection checkpoint failed"),
+    };
+}
+
 /// Switch the active generation for a profile and update its GC roots.
 /// The pointer switch is the commit point; a post-switch maintenance failure
 /// is returned as `committed_needs_repair` rather than as an ambiguous error.
@@ -130,6 +137,12 @@ fn switchProfileGenerationInternal(
     defer ctx.allocator.free(store_root);
 
     try switchProfileGenerationAtPath(ctx, profile_dir, gen_num);
+    fault_injection.hit(.current_after_replace) catch |err| switch (err) {
+        error.InjectedFailure => {
+            ctx.setDiagnosticContext(gc_roots_dir, "generation committed; GC roots need repair");
+            return .{ .outcome = .committed_needs_repair, .failure = ActivationError.FileSystem };
+        },
+    };
 
     failAt(.after_pointer_switch) catch |err| {
         ctx.setDiagnosticContext(gc_roots_dir, "generation committed; GC roots need repair");
@@ -140,10 +153,20 @@ fn switchProfileGenerationInternal(
         return .{ .outcome = .committed_needs_repair, .failure = err };
     };
 
+    checkFault(ctx, .gc_roots_before_update, gc_roots_dir) catch |err| {
+        ctx.setDiagnosticContext(gc_roots_dir, "generation committed; GC roots need repair");
+        return .{ .outcome = .committed_needs_repair, .failure = err };
+    };
     gcroots.updateRoots(ctx.allocator, store_root, gc_roots_dir, profile_dir, gcroots.DEFAULT_RETENTION_COUNT) catch |err| {
         const mapped = mapGCRootError(err);
         ctx.setDiagnosticContext(gc_roots_dir, "generation committed; GC roots need repair");
         return .{ .outcome = .committed_needs_repair, .failure = mapped };
+    };
+    fault_injection.hit(.gc_roots_after_update) catch |err| switch (err) {
+        error.InjectedFailure => {
+            ctx.setDiagnosticContext(gc_roots_dir, "generation committed; GC roots need repair");
+            return .{ .outcome = .committed_needs_repair, .failure = ActivationError.FileSystem };
+        },
     };
 
     return .{ .outcome = .committed };
@@ -249,17 +272,20 @@ fn activateSystemGenerationInternal(
     const etc_dir = try getEtcDir(ctx.allocator, ctx.root_path);
     defer ctx.allocator.free(etc_dir);
 
-    var etc_result = try applyEtcTemplatesForManifest(ctx, &manifest, etc_dir);
     var boot_artifacts_created: std.ArrayList([]const u8) = .empty;
     defer {
         for (boot_artifacts_created.items) |artifact| ctx.allocator.free(artifact);
         boot_artifacts_created.deinit(ctx.allocator);
     }
+
+    try checkFault(ctx, .etc_before_changes, etc_dir);
+    var etc_result = try applyEtcTemplatesForManifest(ctx, &manifest, etc_dir);
     errdefer if (!pointer_committed) {
         etc.rollbackCreatedFiles(ctx, &etc_result) catch {};
         rollbackBootArtifacts(&boot_artifacts_created);
         etc_result.deinit();
     };
+    try checkFault(ctx, .etc_after_changes, etc_dir);
 
     // Allocate every post-commit path before the pointer switch. After the
     // switch, only operations whose result can be represented as
@@ -274,11 +300,28 @@ fn activateSystemGenerationInternal(
     // Boot artifacts are staged under unique names before the generation
     // pointer changes. Newly published artifacts are tracked so an ordinary
     // pre-commit failure can remove them again.
+    try checkFault(ctx, .boot_before_staging, "boot");
     const boot_artifacts_staged = try stageBootArtifacts(ctx, &manifest, &boot_artifacts_created);
+    try checkFault(ctx, .boot_after_staging, "boot");
 
     try failAt(.before_pointer_switch);
     try switchProfileGenerationAtPath(ctx, profile_dir, gen_num);
     pointer_committed = true;
+    fault_injection.hit(.current_after_replace) catch |err| switch (err) {
+        error.InjectedFailure => {
+            ctx.setDiagnosticContext(gc_roots_dir, "generation committed; GC roots need repair");
+            const result: SystemActivationResult = .{
+                .outcome = .committed_needs_repair,
+                .failure = ActivationError.FileSystem,
+                .etc_copied = etc_result.copied,
+                .etc_skipped = etc_result.skipped,
+                .etc_differing = etc_result.differing,
+                .boot_artifacts_staged = boot_artifacts_staged,
+            };
+            etc_result.deinit();
+            return result;
+        },
+    };
 
     const committedResult = struct {
         fn make(
@@ -326,12 +369,26 @@ fn activateSystemGenerationInternal(
         return result;
     };
 
+    checkFault(ctx, .gc_roots_before_update, gc_roots_dir) catch |err| {
+        ctx.setDiagnosticContext(gc_roots_dir, "generation committed; GC roots need repair");
+        const result = committedResult(.committed_needs_repair, err, etc_result.copied, etc_result.skipped, etc_result.differing, boot_artifacts_staged);
+        etc_result.deinit();
+        return result;
+    };
     gcroots.updateRoots(ctx.allocator, store_root_b, gc_roots_dir, profile_dir, gcroots.DEFAULT_RETENTION_COUNT) catch |err| {
         const mapped = mapGCRootError(err);
         ctx.setDiagnosticContext(gc_roots_dir, "generation committed; GC roots need repair");
         const result = committedResult(.committed_needs_repair, mapped, etc_result.copied, etc_result.skipped, etc_result.differing, boot_artifacts_staged);
         etc_result.deinit();
         return result;
+    };
+    fault_injection.hit(.gc_roots_after_update) catch |err| switch (err) {
+        error.InjectedFailure => {
+            ctx.setDiagnosticContext(gc_roots_dir, "generation committed; GC roots need repair");
+            const result = committedResult(.committed_needs_repair, ActivationError.FileSystem, etc_result.copied, etc_result.skipped, etc_result.differing, boot_artifacts_staged);
+            etc_result.deinit();
+            return result;
+        },
     };
 
     const result = committedResult(.committed, null, etc_result.copied, etc_result.skipped, etc_result.differing, boot_artifacts_staged);
@@ -391,9 +448,11 @@ pub fn repairSystemGeneration(
     defer manifest.deinit();
 
     try failAt(.gc_root_update);
+    try checkFault(ctx, .gc_roots_before_update, gc_roots_dir);
     gcroots.updateRoots(ctx.allocator, store_root, gc_roots_dir, profile_dir, gcroots.DEFAULT_RETENTION_COUNT) catch |err| {
         return ctx.fail(mapGCRootError(err), gc_roots_dir, "failed to repair GC roots after activation");
     };
+    try checkFault(ctx, .gc_roots_after_update, gc_roots_dir);
 }
 
 pub fn stageCurrentSystemBootArtifacts(
@@ -457,6 +516,7 @@ fn switchProfileGenerationAtPath(
     };
 
     // Create the symlink target (relative path within profile_dir: gen-N)
+    try checkFault(ctx, .current_before_replace, profile_dir);
     const target = generation.formatGenerationName(ctx.allocator, gen_num) catch {
         return ctx.fail(ActivationError.OutOfMemory, profile_dir, "failed to allocate generation name");
     };
@@ -1673,6 +1733,188 @@ pub const RollbackFixture = struct {
         return generation.getCurrentGeneration(self.profile_dir);
     }
 };
+
+test "crash-boundary child activates a shared root" {
+    const child = std.c.getenv("MERE_CRASH_CHILD") orelse return;
+    _ = child;
+    const root = std.c.getenv("MERE_CRASH_ROOT") orelse return;
+    fault_injection.configureFromEnvironment();
+    var ctx = mere.Context.init(std.heap.page_allocator, std.mem.span(root));
+    defer ctx.deinit();
+    _ = activateSystemGeneration(&ctx, 2, .fast);
+}
+
+fn runCrashBoundaryChild(allocator: std.mem.Allocator, root: []const u8, checkpoint: []const u8) !u8 {
+    const executable = try std.process.executablePathAlloc(path_mod.currentIo(), allocator);
+    defer allocator.free(executable);
+
+    var env_map = std.process.Environ.Map.init(allocator);
+    defer env_map.deinit();
+    try env_map.put("MERE_CRASH_CHILD", "1");
+    try env_map.put("MERE_CRASH_ROOT", root);
+    try env_map.put("MERE_FAULT_CHECKPOINT", checkpoint);
+    try env_map.put("MERE_FAULT_ACTION", "terminate");
+
+    const result = try std.process.run(allocator, path_mod.currentIo(), .{
+        .argv = &.{executable},
+        .environ_map = &env_map,
+        .stdout_limit = .limited(1024 * 1024),
+        .stderr_limit = .limited(1024 * 1024),
+    });
+    defer allocator.free(result.stdout);
+    defer allocator.free(result.stderr);
+    return switch (result.term) {
+        .exited => |code| blk: {
+            if (code != 86) std.debug.print("crash child exited {d}: {s}{s}", .{ code, result.stdout, result.stderr });
+            break :blk code;
+        },
+        else => |term| blk: {
+            std.debug.print("crash child terminated: {any}: {s}{s}", .{ term, result.stdout, result.stderr });
+            break :blk 255;
+        },
+    };
+}
+
+test "subprocess termination at recoverable activation boundaries is repairable after restart" {
+    if (std.c.getenv("MERE_CRASH_CHILD") != null) return;
+    // `/etc` and boot staging are preparation mutations. Their durable
+    // rollback journal belongs to #102; this subprocess test covers the
+    // pointer and post-commit boundaries whose restart repair contract exists
+    // in this change. The preparation checkpoints still have fail-mode
+    // coverage through the normal activation rollback path.
+    const Case = struct { checkpoint: []const u8, current: ?u32 };
+    const cases = [_]Case{
+        .{ .checkpoint = "current_before_replace", .current = 1 },
+        .{ .checkpoint = "current_after_replace", .current = 2 },
+        .{ .checkpoint = "gc_roots_before_update", .current = 2 },
+        .{ .checkpoint = "gc_roots_after_update", .current = 2 },
+    };
+    for (cases) |case| {
+        var fx = try RollbackFixture.init(&.{}, &.{});
+        defer fx.deinit();
+        const code = try runCrashBoundaryChild(fx.env.ctx.allocator, fx.env.path, case.checkpoint);
+        try std.testing.expectEqual(@as(u8, 86), code);
+        try std.testing.expectEqual(case.current, try fx.current());
+
+        try repairSystemGeneration(&fx.env.ctx, .fast);
+        try std.testing.expectEqual(case.current, try fx.current());
+    }
+}
+
+test "in-process checkpoint after current preserves the committed outcome" {
+    var fx = try RollbackFixture.init(&.{}, &.{});
+    defer fx.deinit();
+    defer fault_injection.clearForTest();
+
+    fault_injection.setForTest(.current_after_replace, .fail);
+    const result = activateSystemGeneration(&fx.env.ctx, 2, .fast);
+    try std.testing.expectEqual(ActivationOutcome.committed_needs_repair, result.outcome);
+    try std.testing.expectEqual(ActivationError.FileSystem, result.failure.?);
+    try std.testing.expectEqual(@as(?u32, 2), try fx.current());
+
+    fault_injection.clearForTest();
+    try repairSystemGeneration(&fx.env.ctx, .fast);
+}
+
+test "in-process GC-root checkpoint preserves the committed outcome" {
+    var fx = try RollbackFixture.init(&.{}, &.{});
+    defer fx.deinit();
+    defer fault_injection.clearForTest();
+
+    fault_injection.setForTest(.gc_roots_before_update, .fail);
+    const result = activateSystemGeneration(&fx.env.ctx, 2, .fast);
+    try std.testing.expectEqual(ActivationOutcome.committed_needs_repair, result.outcome);
+    try std.testing.expectEqual(ActivationError.FileSystem, result.failure.?);
+    try std.testing.expectEqual(@as(?u32, 2), try fx.current());
+
+    fault_injection.clearForTest();
+    try repairSystemGeneration(&fx.env.ctx, .fast);
+}
+
+test "etc checkpoint failure rolls back files copied before the pointer switch" {
+    var fx = try RollbackFixture.init(&.{}, &.{"etc-test"});
+    defer fx.deinit();
+    defer fault_injection.clearForTest();
+
+    const allocator = fx.env.ctx.allocator;
+    const store_root = try std.fs.path.join(allocator, &.{ fx.env.path, "mere", "store" });
+    defer allocator.free(store_root);
+    const target_path = try generation.getGenerationPath(allocator, fx.profile_dir, 2);
+    defer allocator.free(target_path);
+    var manifest = try generation.readManifest(allocator, store_root, target_path);
+    defer manifest.deinit();
+    const package_path = manifest.packages.items[0].store_path;
+    const template_dir = try std.fs.path.join(allocator, &.{ package_path, "etc-defaults", "restart-test" });
+    defer allocator.free(template_dir);
+    try path_mod.ensureDirExists(template_dir);
+    const template_path = try std.fs.path.join(allocator, &.{ template_dir, "config" });
+    defer allocator.free(template_path);
+    var template = try std.Io.Dir.createFileAbsolute(path_mod.currentIo(), template_path, .{});
+    try template.writeStreamingAll(path_mod.currentIo(), "target\n");
+    template.close(path_mod.currentIo());
+
+    const content_hash = try hash.calculateStoreContentHash(allocator, package_path, null);
+    defer allocator.free(content_hash);
+    allocator.free(manifest.packages.items[0].content_hash);
+    manifest.packages.items[0].content_hash = try allocator.dupe(u8, content_hash);
+    try generation.writeManifest(allocator, target_path, &manifest);
+
+    fault_injection.setForTest(.etc_after_changes, .fail);
+    const result = activateSystemGeneration(&fx.env.ctx, 2, .fast);
+    try std.testing.expectEqual(ActivationOutcome.not_committed, result.outcome);
+    try std.testing.expectEqual(ActivationError.FileSystem, result.failure.?);
+    try std.testing.expectEqual(@as(?u32, 1), try fx.current());
+
+    const copied_path = try std.fs.path.join(allocator, &.{ fx.env.path, "etc", "restart-test", "config" });
+    defer allocator.free(copied_path);
+    try std.testing.expectError(error.FileNotFound, std.Io.Dir.accessAbsolute(path_mod.currentIo(), copied_path, .{}));
+}
+
+test "boot checkpoint failure rolls back staged artifacts before the pointer switch" {
+    var fx = try RollbackFixture.init(&.{}, &.{"linux"});
+    defer fx.deinit();
+    defer fault_injection.clearForTest();
+
+    const allocator = fx.env.ctx.allocator;
+    const store_root = try std.fs.path.join(allocator, &.{ fx.env.path, "mere", "store" });
+    defer allocator.free(store_root);
+    const target_path = try generation.getGenerationPath(allocator, fx.profile_dir, 2);
+    defer allocator.free(target_path);
+    var manifest = try generation.readManifest(allocator, store_root, target_path);
+    defer manifest.deinit();
+    const package_path = manifest.packages.items[0].store_path;
+    const boot_source = try std.fs.path.join(allocator, &.{ package_path, "boot" });
+    defer allocator.free(boot_source);
+    try path_mod.ensureDirExists(boot_source);
+    for ([_][]const u8{ "vmlinux", "config" }) |name| {
+        const source = try std.fs.path.join(allocator, &.{ boot_source, name });
+        defer allocator.free(source);
+        var file = try std.Io.Dir.createFileAbsolute(path_mod.currentIo(), source, .{});
+        try file.writeStreamingAll(path_mod.currentIo(), name);
+        file.close(path_mod.currentIo());
+    }
+
+    const content_hash = try hash.calculateStoreContentHash(allocator, package_path, null);
+    defer allocator.free(content_hash);
+    allocator.free(manifest.packages.items[0].content_hash);
+    manifest.packages.items[0].content_hash = try allocator.dupe(u8, content_hash);
+    try generation.writeManifest(allocator, target_path, &manifest);
+
+    fault_injection.setForTest(.boot_after_staging, .fail);
+    const result = activateSystemGeneration(&fx.env.ctx, 2, .fast);
+    try std.testing.expectEqual(ActivationOutcome.not_committed, result.outcome);
+    try std.testing.expectEqual(ActivationError.FileSystem, result.failure.?);
+    try std.testing.expectEqual(@as(?u32, 1), try fx.current());
+
+    const hash_prefix = content_hash[0..16];
+    for ([_][]const u8{ "vmlinux", "config" }) |name| {
+        const staged_name = try std.fmt.allocPrint(allocator, "{s}-1.0-{s}", .{ name, hash_prefix });
+        defer allocator.free(staged_name);
+        const staged_path = try std.fs.path.join(allocator, &.{ fx.env.path, "boot", staged_name });
+        defer allocator.free(staged_path);
+        try std.testing.expectError(error.FileNotFound, std.Io.Dir.accessAbsolute(path_mod.currentIo(), staged_path, .{}));
+    }
+}
 
 test "activation failure before the pointer switch is explicitly uncommitted" {
     var fx = try RollbackFixture.init(&.{}, &.{});

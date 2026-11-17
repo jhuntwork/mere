@@ -5,6 +5,7 @@ const repo_history = @import("repo_history.zig");
 const path = @import("path.zig");
 const sign = @import("sign.zig");
 const errors = @import("errors.zig");
+const fault_injection = @import("fault_injection.zig");
 
 const Std = errors.StandardErrors;
 pub const Error = Std.OutOfMemory || Std.FileSystem || Std.Network || Std.PermissionDenied || Std.InvalidInput || Std.CorruptData || Std.SignatureInvalid || error{
@@ -77,6 +78,7 @@ pub const Repository = struct {
             return Error.SignatureInvalid;
         }
 
+        try fault_injection.hit(.repository_before_signature_publish);
         _ = sign.writeSignatureFileWithResolver(self.ctx, db_path, sig_path, null, null) catch |err| {
             return switch (err) {
                 error.OutOfMemory => Error.OutOfMemory,
@@ -89,6 +91,7 @@ pub const Repository = struct {
                 => Error.SignatureInvalid,
             };
         };
+        try fault_injection.hit(.repository_after_signature_publish);
 
         self.ctx.debug("database signed successfully: sig_path={s}", .{sig_path});
     }
