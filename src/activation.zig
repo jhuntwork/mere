@@ -969,50 +969,20 @@ fn validateGenerationStorePaths(
 
         // For system profiles, hash verification is mandatory for unhardened objects.
         // Already-hardened objects were verified when first admitted.
-        const do_hash_verify = verify_store or (require_root_owned and !store.isHardened(pkg.store_path));
+        const do_hash_verify = verify_store or (require_root_owned and store.needsContentVerification(pkg.store_path));
 
         if (do_hash_verify) {
-            if (pkg.content_hash.len != 64) {
-                return ctx.fail(ActivationError.CorruptData, pkg.store_path, "invalid content hash length in manifest");
-            }
-
-            const format = package_manifest.detectFormat(ctx.allocator, pkg.store_path) catch |err| {
-                return ctx.fail(switch (err) {
-                    package_manifest.ManifestError.OutOfMemory => ActivationError.OutOfMemory,
-                    package_manifest.ManifestError.PermissionDenied => ActivationError.PermissionDenied,
-                    package_manifest.ManifestError.InvalidInput => ActivationError.CorruptData,
+            // store.verifyObjectContent owns the hash-compatibility policy and
+            // records the diagnostic; only the error vocabulary maps here.
+            _ = store.verifyObjectContent(ctx, pkg.store_path, pkg.content_hash) catch |err| {
+                return switch (err) {
+                    error.OutOfMemory => ActivationError.OutOfMemory,
+                    error.PermissionDenied => ActivationError.PermissionDenied,
+                    error.CorruptData => ActivationError.CorruptData,
+                    error.InvalidInput => ActivationError.InvalidInput,
                     else => ActivationError.FileSystem,
-                }, pkg.store_path, "failed to detect package manifest format");
+                };
             };
-            const computed = switch (format.storeHashFormat()) {
-                .v1 => hash.calculateStoreContentHash(ctx.allocator, pkg.store_path, null),
-                .v2 => hash.calculateStoreContentHashV2(ctx.allocator, pkg.store_path, null),
-                .v3 => hash.calculateStoreContentHashV3(ctx.allocator, pkg.store_path, null),
-                .v4 => hash.calculateStoreContentHashV4(ctx.allocator, pkg.store_path, null),
-            };
-            const computed_hash = computed catch |err| {
-                return ctx.fail(switch (err) {
-                    hash.HashError.OutOfMemory => ActivationError.OutOfMemory,
-                    hash.HashError.PermissionDenied => ActivationError.PermissionDenied,
-                    hash.HashError.InvalidInput => ActivationError.CorruptData,
-                    else => ActivationError.FileSystem,
-                }, pkg.store_path, "failed to compute store content hash");
-            };
-            defer ctx.allocator.free(computed_hash);
-
-            if (!std.mem.eql(u8, computed_hash, pkg.content_hash)) {
-                var accepted_transitional = false;
-                if (format == .v1) {
-                    const transitional = hash.calculateTransitionalMetadataContentHash(ctx.allocator, pkg.store_path, null) catch null;
-                    if (transitional) |transitional_hash| {
-                        accepted_transitional = std.mem.eql(u8, transitional_hash, pkg.content_hash);
-                        ctx.allocator.free(transitional_hash);
-                    }
-                }
-                if (!accepted_transitional) {
-                    return ctx.fail(ActivationError.CorruptData, pkg.store_path, "store content hash mismatch");
-                }
-            }
         }
     }
 }

@@ -2,6 +2,7 @@ const std = @import("std");
 const mere = @import("mere.zig");
 const path = @import("path.zig");
 const errors = @import("errors.zig");
+const StoreHashFormat = @import("manifest.zig").StoreHashFormat;
 
 const Std = errors.StandardErrors;
 pub const HashError = Std.OutOfMemory || Std.FileSystem || Std.PermissionDenied || Std.InvalidInput;
@@ -164,6 +165,53 @@ pub fn calculateStoreContentHashV4(
     diag: ?*HashDiag,
 ) HashError![]const u8 {
     return calculateTreeHashInternal(allocator, dir_path, diag, false, true, .canonical, "mere-store-content-v4\x00");
+}
+
+/// Compute the store identity a package's manifest format selects.
+pub fn calculateStoreContentHashFor(
+    allocator: std.mem.Allocator,
+    dir_path: []const u8,
+    format: StoreHashFormat,
+    diag: ?*HashDiag,
+) HashError![]const u8 {
+    return switch (format) {
+        .v1 => calculateStoreContentHash(allocator, dir_path, diag),
+        .v2 => calculateStoreContentHashV2(allocator, dir_path, diag),
+        .v3 => calculateStoreContentHashV3(allocator, dir_path, diag),
+        .v4 => calculateStoreContentHashV4(allocator, dir_path, diag),
+    };
+}
+
+pub const ContentVerification = enum {
+    /// The tree matches the expected identity for its format.
+    match,
+    /// A v1 tree matches only the transitional v0.18.0 identity, which is
+    /// accepted read-only for compatibility.
+    match_transitional,
+    mismatch,
+};
+
+/// The single hash-compatibility policy for store content: compute the
+/// identity selected by `format` and, for v1 only, fall back to the
+/// transitional metadata-aware identity. Admission, activation, and
+/// verification all decide content validity through this function.
+pub fn verifyStoreContent(
+    allocator: std.mem.Allocator,
+    dir_path: []const u8,
+    format: StoreHashFormat,
+    expected_hash: []const u8,
+    diag: ?*HashDiag,
+) HashError!ContentVerification {
+    const computed = try calculateStoreContentHashFor(allocator, dir_path, format, diag);
+    defer allocator.free(computed);
+    if (std.mem.eql(u8, computed, expected_hash)) return .match;
+
+    if (format == .v1) {
+        const transitional = try calculateTransitionalMetadataContentHash(allocator, dir_path, diag);
+        defer allocator.free(transitional);
+        if (std.mem.eql(u8, transitional, expected_hash)) return .match_transitional;
+    }
+    return .mismatch;
 }
 
 pub fn calculateBuildSnapshotHash(
@@ -1164,4 +1212,44 @@ test "calculateStoreContentHashV4 fixed protocol vector" {
     const actual = try calculateStoreContentHashV4(test_env.ctx.allocator, test_env.path, null);
     defer test_env.ctx.allocator.free(actual);
     try std.testing.expectEqualStrings("dc7d87316164e2afb509a4d42e7e95671577ad4bb6f670bcce67e1988ca0b114", actual);
+}
+
+test "verifyStoreContent applies the shared hash-compatibility policy" {
+    const th = @import("test_helpers.zig");
+    var test_env = try th.createTestEnv();
+    defer {
+        test_env.cleanup();
+        std.testing.allocator.destroy(test_env);
+    }
+    const allocator = test_env.ctx.allocator;
+    const io = path.currentIo();
+
+    const payload_path = try std.fs.path.join(allocator, &.{ test_env.path, "payload" });
+    defer allocator.free(payload_path);
+    var payload = try path.makePathAndOpenFile(payload_path);
+    try payload.writeStreamingAll(io, "package content");
+    payload.close(io);
+
+    const meta_path = try std.fs.path.join(allocator, &.{ test_env.path, ".mere", "meta.kdl" });
+    defer allocator.free(meta_path);
+    var metadata = try path.makePathAndOpenFile(meta_path);
+    try metadata.writeStreamingAll(io, "dependencies { }\n");
+    metadata.close(io);
+
+    const v1 = try calculateStoreContentHash(allocator, test_env.path, null);
+    defer allocator.free(v1);
+    const transitional = try calculateTransitionalMetadataContentHash(allocator, test_env.path, null);
+    defer allocator.free(transitional);
+    const v4 = try calculateStoreContentHashV4(allocator, test_env.path, null);
+    defer allocator.free(v4);
+
+    try std.testing.expectEqual(ContentVerification.match, try verifyStoreContent(allocator, test_env.path, .v1, v1, null));
+    try std.testing.expectEqual(ContentVerification.match, try verifyStoreContent(allocator, test_env.path, .v4, v4, null));
+
+    // The transitional identity is accepted only for v1 packages.
+    try std.testing.expectEqual(ContentVerification.match_transitional, try verifyStoreContent(allocator, test_env.path, .v1, transitional, null));
+    try std.testing.expectEqual(ContentVerification.mismatch, try verifyStoreContent(allocator, test_env.path, .v2, transitional, null));
+
+    try std.testing.expectEqual(ContentVerification.mismatch, try verifyStoreContent(allocator, test_env.path, .v1, "0" ** 64, null));
+    try std.testing.expectEqual(ContentVerification.mismatch, try verifyStoreContent(allocator, test_env.path, .v4, v1, null));
 }

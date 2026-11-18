@@ -1754,7 +1754,7 @@ fn installResolvedPackagesFromArchives(
         // If cache_path is empty, the package is already in the store — construct entry directly
         if (cache_path.len == 0) {
             const store_path = try store.constructStorePath(ctx, resolved.pkg.content_hash, resolved.pkg.name.?, resolved.pkg.version.?);
-            finalizeAdmittedStoreObject(ctx, store_path, true) catch |err| {
+            admitExistingStoreObject(ctx, store_path, resolved.pkg.content_hash) catch |err| {
                 ctx.allocator.free(store_path);
                 return err;
             };
@@ -2211,10 +2211,10 @@ fn installSinglePackageToStore(
     };
 
     if (preverify_exists and !reinstall) {
-        // Every existing object must be finalized before a profile can
-        // reference it. Privileged installs verify and harden it for system
-        // use; unprivileged installs repair or verify its read-only state.
-        try finalizeAdmittedStoreObject(ctx, preverify_install_dir, true);
+        // Every existing object must be content-verified and finalized
+        // before a profile can reference it. Privileged installs harden it
+        // for system use; unprivileged installs repair its read-only state.
+        try admitExistingStoreObject(ctx, preverify_install_dir, preverify.manifest_content_hash);
 
         keep_preverify_install_dir = true;
 
@@ -2239,7 +2239,7 @@ fn installSinglePackageToStore(
         ctx.debug("content already exists in store: {s}", .{staging.install_dir});
         path.deleteTreeAbsolute(staging.staging_dir) catch {};
 
-        try finalizeAdmittedStoreObject(ctx, staging.install_dir, true);
+        try admitExistingStoreObject(ctx, staging.install_dir, staging.content_hash);
 
         return generation.PackageEntry{
             .name = try ctx.allocator.dupe(u8, pkg.name.?),
@@ -2283,13 +2283,17 @@ fn installSinglePackageToStore(
     const install_z = try ctx.allocator.dupeZ(u8, staging.install_dir);
     defer ctx.allocator.free(install_z);
 
+    var target_preexisted = false;
     const rename_result = std.os.linux.rename(staging_z, install_z);
     if (rename_result != 0) {
         const errno: std.posix.E = @enumFromInt(rename_result);
         if (errno == .EXIST or errno == .NOTEMPTY) {
-            // Target already exists - another process beat us, treat as success
+            // Another process admitted the target first (or a reinstall
+            // could not remove it). The object is not ours, so it is
+            // admitted under the existing-object policy below.
             ctx.debug("target already exists (race), cleaning up staging dir", .{});
             path.deleteTreeAbsolute(staging.staging_dir) catch {};
+            target_preexisted = true;
         } else {
             ctx.debug("atomic rename failed with errno {d}", .{rename_result});
             path.deleteTreeAbsolute(staging.staging_dir) catch {};
@@ -2305,7 +2309,11 @@ fn installSinglePackageToStore(
     try fault_injection.hit(.store_after_admission);
     ctx.debug("package admitted to store: {s}", .{staging.install_dir});
 
-    try finalizeAdmittedStoreObject(ctx, staging.install_dir, false);
+    if (target_preexisted) {
+        try admitExistingStoreObject(ctx, staging.install_dir, staging.content_hash);
+    } else {
+        try finalizeAdmittedStoreObject(ctx, staging.install_dir, false);
+    }
 
     emit.installComplete(ctx, install_id, pkg_label);
 
@@ -2743,12 +2751,7 @@ fn stageAndValidatePayload(
     // Compute content hash from realized payload and canonical package metadata (spec #1/#4)
     var hash_diag: hash.HashDiag = .{};
     defer hash_diag.deinit(ctx.allocator);
-    var content_hash: []const u8 = switch (format.storeHashFormat()) {
-        .v1 => hash.calculateStoreContentHash(ctx.allocator, staging_dir, &hash_diag),
-        .v2 => hash.calculateStoreContentHashV2(ctx.allocator, staging_dir, &hash_diag),
-        .v3 => hash.calculateStoreContentHashV3(ctx.allocator, staging_dir, &hash_diag),
-        .v4 => hash.calculateStoreContentHashV4(ctx.allocator, staging_dir, &hash_diag),
-    } catch |err| {
+    const verification = hash.verifyStoreContent(ctx.allocator, staging_dir, format.storeHashFormat(), manifest_content_hash, &hash_diag) catch |err| {
         const action = hash_diag.action orelse "compute content hash";
         const path_label = hash_diag.path orelse staging_dir;
         const os_err = if (hash_diag.os_error) |oe| @errorName(oe) else "unknown";
@@ -2760,26 +2763,16 @@ fn stageAndValidatePayload(
             else => error.FileSystem,
         };
     };
+    switch (verification) {
+        .match, .match_transitional => {},
+        .mismatch => return ctx.fail(error.CorruptData, staging_dir, if (format == .v1)
+            "manifest content hash does not match payload"
+        else
+            "manifest content hash does not match payload and metadata"),
+    }
+    const content_hash = try ctx.allocator.dupe(u8, manifest_content_hash);
     errdefer ctx.allocator.free(content_hash);
     ctx.debug("content hash from payload and metadata: {s}", .{content_hash});
-
-    if (!std.mem.eql(u8, content_hash, manifest_content_hash)) {
-        if (format == .v1) {
-            const transitional_hash = hash.calculateTransitionalMetadataContentHash(ctx.allocator, staging_dir, null) catch {
-                ctx.allocator.free(content_hash);
-                return ctx.fail(error.FileSystem, staging_dir, "failed to compute transitional content hash");
-            };
-            if (std.mem.eql(u8, transitional_hash, manifest_content_hash)) {
-                ctx.allocator.free(content_hash);
-                content_hash = transitional_hash;
-            } else {
-                ctx.allocator.free(transitional_hash);
-                return ctx.fail(error.CorruptData, staging_dir, "manifest content hash does not match payload");
-            }
-        } else {
-            return ctx.fail(error.CorruptData, staging_dir, "manifest content hash does not match payload and metadata");
-        }
-    }
 
     const install_dir = store.constructStorePath(ctx, content_hash, pkg.name.?, pkg.version.?) catch |err| {
         ctx.setDiagnosticContext(staging_dir, "failed to construct store path");
@@ -3005,13 +2998,65 @@ fn fsyncTree(allocator: std.mem.Allocator, dir_path: []const u8) !void {
     _ = try fsyncTreeWithOptions(allocator, dir_path, .{});
 }
 
+/// Admit an object that is already present in the store. Presence is not
+/// identity: unless the object is already hardened (verified at first
+/// admission and changeable only by root), its content must match
+/// `expected_hash` before it is finalized and referenced by a profile.
+fn admitExistingStoreObject(
+    ctx: *Context,
+    install_dir: []const u8,
+    expected_hash: []const u8,
+) !void {
+    // The store lock is held across every step so no other mere mutation can
+    // interleave. The lock is reentrant, so the calls below re-acquire it.
+    try ctx.acquireStoreLockForMutation();
+    defer ctx.releaseStoreLock();
+
+    // Decide before any change: a hardened object is trusted as present, so
+    // only an unhardened object needs its content checked.
+    const must_verify = store.needsContentVerification(install_dir);
+
+    // Verify before touching the object. A tampered object is rejected here
+    // and is never hardened, so it never acquires the trusted state.
+    if (must_verify) try verifyExistingObject(ctx, install_dir, expected_hash);
+
+    try finalizeAdmittedStoreObject(ctx, install_dir, true);
+
+    // Verify again after hardening. A writer that changed the object between
+    // the two checks left it hardened with bad content, which later calls would
+    // trust, so the object is removed before the error is returned.
+    if (must_verify) {
+        verifyExistingObject(ctx, install_dir, expected_hash) catch |err| {
+            store.removeObject(ctx, install_dir) catch |remove_err| {
+                ctx.setDiagnosticContext(install_dir, "store object changed during admission and could not be removed; remove it manually before retrying");
+                return remove_err;
+            };
+            return err;
+        };
+    } else {
+        ctx.debug("existing store object already hardened: {s}", .{install_dir});
+    }
+}
+
+fn verifyExistingObject(ctx: *Context, install_dir: []const u8, expected_hash: []const u8) !void {
+    const outcome = store.verifyObjectContent(ctx, install_dir, expected_hash) catch |err| {
+        if (err == error.CorruptData) {
+            ctx.setDiagnosticContext(install_dir, "existing store object does not match its expected content hash; refusing to admit it");
+        }
+        return err;
+    };
+    ctx.debug("existing store object content verified ({s}): {s}", .{ @tagName(outcome), install_dir });
+}
+
 fn finalizeAdmittedStoreObject(
     ctx: *Context,
     install_dir: []const u8,
     existing_only: bool,
 ) !void {
     if (store.isPrivileged()) {
-        _ = store.harden(ctx, install_dir) catch |err| {
+        // Required hardening failures (ownership, permissions, traversal)
+        // are errors; the optional immutable flag is only reported.
+        const hardened = store.harden(ctx, install_dir) catch |err| {
             return switch (err) {
                 store.StoreError.OutOfMemory => error.OutOfMemory,
                 store.StoreError.PermissionDenied => error.PermissionDenied,
@@ -3020,7 +3065,16 @@ fn finalizeAdmittedStoreObject(
                 else => error.FileSystem,
             };
         };
-        ctx.debug("store object hardened (root ownership)", .{});
+        switch (hardened.immutable) {
+            .skipped => ctx.debug("store object hardening skipped by MERE_NO_HARDEN: {s}", .{install_dir}),
+            .applied => ctx.debug("store object hardened (root ownership, immutable)", .{}),
+            .unsupported => ctx.debug("store object hardened (root ownership, read-only; filesystem has no immutable flag)", .{}),
+            .failed => {
+                const msg = std.fmt.allocPrint(ctx.allocator, "store object is root-owned and read-only, but the immutable flag could not be set: {s}", .{install_dir}) catch return error.OutOfMemory;
+                defer ctx.allocator.free(msg);
+                emit.logLineSeverity(ctx, .install, .warn, msg);
+            },
+        }
     } else {
         setDirectoryReadOnly(ctx.allocator, install_dir) catch |err| {
             const detail = if (existing_only)
@@ -6041,4 +6095,67 @@ test "findTransitiveDependents never returns a smaller set when an allocation fa
             try std.testing.expectEqual(expected, mutable.count());
         } else |_| {}
     }
+}
+
+test "admitExistingStoreObject verifies content before admitting an existing object" {
+    const th = @import("test_helpers.zig");
+    var test_env = try th.createTestEnv();
+    defer {
+        test_env.cleanup();
+        std.testing.allocator.destroy(test_env);
+    }
+    const ctx = &test_env.ctx;
+    const io = path.currentIo();
+
+    // Writes a single-payload object at `install_dir` and returns its
+    // content identity, computed before any tampering.
+    const writeObject = struct {
+        fn run(test_ctx: *Context, dir_path: []const u8, body: []const u8) ![]const u8 {
+            const payload_path = try std.fs.path.join(test_ctx.allocator, &.{ dir_path, "payload" });
+            defer test_ctx.allocator.free(payload_path);
+            var payload = try path.makePathAndOpenFile(payload_path);
+            defer payload.close(path.currentIo());
+            try payload.writeStreamingAll(path.currentIo(), body);
+            return hash.calculateStoreContentHash(test_ctx.allocator, dir_path, null);
+        }
+    }.run;
+
+    // Tampered object: verification rejects it before admission hardens
+    // anything, so it is left untouched and never acquires the trusted state.
+    const tampered_dir = try std.fs.path.join(ctx.allocator, &.{ test_env.path, "mere", "store", ("7" ** 64) ++ "-pkg-1.0.0" });
+    defer ctx.allocator.free(tampered_dir);
+    const genuine_hash = try writeObject(ctx, tampered_dir, "original");
+    defer ctx.allocator.free(genuine_hash);
+    {
+        const payload_path = try std.fs.path.join(ctx.allocator, &.{ tampered_dir, "payload" });
+        defer ctx.allocator.free(payload_path);
+        try std.Io.Dir.deleteFileAbsolute(io, payload_path);
+        var payload = try path.makePathAndOpenFile(payload_path);
+        defer payload.close(io);
+        try payload.writeStreamingAll(io, "tampered");
+    }
+    // Rejected before hardening: the object is left exactly as it was, so it
+    // never acquires the trusted, hardened state.
+    try std.testing.expectError(error.CorruptData, admitExistingStoreObject(ctx, tampered_dir, genuine_hash));
+    {
+        var dir = try std.Io.Dir.openDirAbsolute(io, tampered_dir, .{});
+        defer dir.close(io);
+        const mode = (try dir.stat(io)).permissions.toMode();
+        try std.testing.expect(mode & 0o200 != 0);
+    }
+    // A second admission must reject it again. This is the regression the
+    // ordering prevents: a hardened object would be trusted without a check.
+    try std.testing.expectError(error.CorruptData, admitExistingStoreObject(ctx, tampered_dir, genuine_hash));
+
+    // Genuine object: verified and admitted, and finalized read-only.
+    const genuine_dir = try std.fs.path.join(ctx.allocator, &.{ test_env.path, "mere", "store", ("6" ** 64) ++ "-pkg-1.0.0" });
+    defer ctx.allocator.free(genuine_dir);
+    const admitted_hash = try writeObject(ctx, genuine_dir, "original");
+    defer ctx.allocator.free(admitted_hash);
+    try admitExistingStoreObject(ctx, genuine_dir, admitted_hash);
+    var dir = try std.Io.Dir.openDirAbsolute(io, genuine_dir, .{ .iterate = true });
+    defer dir.close(io);
+    const mode = (try dir.stat(io)).permissions.toMode();
+    try std.testing.expectEqual(@as(std.posix.mode_t, 0), mode & 0o222);
+    if (!store.isPrivileged()) try dir.setPermissions(io, .fromMode(mode | 0o200));
 }
