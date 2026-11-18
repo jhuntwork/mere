@@ -91,6 +91,9 @@ pub const TestEnv = struct {
 /// Returns a TestDir struct containing the directory and its absolute path.
 /// The caller is responsible for calling cleanup() on the returned struct.
 pub fn createTestEnv() !*TestEnv {
+    // Dispatch snapshot crash children before any other suite creates an env
+    // (and potentially launches its own crash-test subprocesses).
+    try @import("repo_snapshot.zig").runCrashChildForTest();
     // Allocate TestEnv on the heap using the global allocator
     const test_env = try std.testing.allocator.create(TestEnv);
 

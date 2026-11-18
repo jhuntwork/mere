@@ -139,7 +139,9 @@ pub const Repository = struct {
     /// instead of reopening dir_path's repo.db from disk. See
     /// RepoDB.initFromVerifiedBytes for why this matters.
     pub fn initFromVerifiedBytes(ctx: *mere.Context, dir_path: []const u8, bytes: []const u8) !Repository {
-        const active_paths = try resolveActiveRepoStatePaths(ctx, dir_path, true);
+        // These paths are diagnostic labels only. Verified bytes can outlive
+        // the selected snapshot's reader pin and its on-disk files.
+        const active_paths = try resolveActiveRepoStatePaths(ctx, dir_path, false);
         errdefer ctx.allocator.free(active_paths.db_path);
         errdefer ctx.allocator.free(active_paths.sig_path);
 

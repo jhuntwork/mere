@@ -145,8 +145,8 @@ column describes that sequence.
 | Package pool import (`import.zig`) | durable | `copyFile` | planned | no fsync |
 | Signing keys (`sign.zig`, `sign_io.zig`) | durable | `replaceFile` / no-replace | planned | no fsync |
 | Repository cache `last-sync` (`repocache.zig`) | atomic | `replaceFile`, `.atomic` | planned | fixed `.tmp` name |
-| Repository cache db/sig pair (`repocache.zig`) | atomic pair + durable | snapshot directory + pointer (#104) | #104 | two renames; a crash leaves a mismatched pair; no fsync |
-| Repository authoring db/sig pair (`repo_history.zig`) | atomic pair + durable | to be decided with #104 | #104 | same as above; clients fetch the flat file names |
+| Remote repository cache db/sig pair (`repocache.zig`, `repo_snapshot.zig`) | atomic pair + durable | verified snapshot directory + selecting pointer | migrated (#104) | reader leases protect collection; legacy flat caches remain readable until first snapshot refresh; see [repository-snapshots.md](repository-snapshots.md) |
+| Repository authoring db/sig pair (`repo_history.zig`) | atomic pair + durable | separate authoring/protocol follow-up | planned, outside remote-cache #104 | two renames; a crash leaves a mismatched pair; clients still fetch the flat file names |
 
 ### Out of scope
 
@@ -186,12 +186,14 @@ SQLite commits in `repodb.zig` follow SQLite's own durability settings.
   left by a terminated process. The names are unique and never collide with
   final names.
 
-## Guidance for repository snapshots (#104)
+## Repository snapshots (#104)
 
 Publish each snapshot directory with `publishDirectory` (`no_replace`,
 `.durable`), so both files and the directory entry are on disk before
 anything refers to them. Then switch the selecting pointer with
 `replaceSymlink`. If the pointer switch returns
 `error.PublishedNotDurable`, the new snapshot is selected, but the selection
-may not survive power loss; the previous snapshot must be kept until a later
-switch succeeds durably.
+may not survive power loss; the previous snapshot must be kept until the
+selection is known durable, through a successful switch or a later directory
+sync. Remote caches now implement this ordering and coordinate collection with
+reader leases; see [repository-snapshots.md](repository-snapshots.md).
