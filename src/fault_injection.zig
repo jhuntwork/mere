@@ -27,6 +27,12 @@ pub const Checkpoint = enum {
     gc_after_collection,
     install_before_activation,
     install_after_activation,
+    publish_file_before_rename,
+    publish_file_after_rename,
+    publish_directory_before_rename,
+    publish_directory_after_rename,
+    publish_symlink_before_rename,
+    publish_symlink_after_rename,
 };
 
 pub const Action = enum {

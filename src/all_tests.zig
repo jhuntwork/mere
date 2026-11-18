@@ -40,6 +40,7 @@ test {
     _ = @import("pin.zig");
     _ = @import("projection_index.zig");
     _ = @import("profile.zig");
+    _ = @import("publish.zig");
     _ = @import("recipe.zig");
     _ = @import("repodb.zig");
     _ = @import("repo_history.zig");
