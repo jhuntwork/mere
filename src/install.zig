@@ -2269,52 +2269,7 @@ fn installSinglePackageToStore(
     };
     defer parent_dir.close(path.currentIo());
 
-    // Ensure the staged payload is durable on disk before it becomes
-    // reachable under its final store path.
-    publish.syncTree(ctx.allocator, staging.staging_dir) catch |err| {
-        ctx.debug("fsync of staged content failed: {}", .{err});
-        path.deleteTreeAbsolute(staging.staging_dir) catch {};
-        return ctx.fail(error.FileSystem, staging.install_dir, "failed to sync staged package content to disk");
-    };
-
-    // === Step 4: Atomic rename to final path ===
-    try fault_injection.hit(.store_before_admission);
-    const staging_z = try ctx.allocator.dupeZ(u8, staging.staging_dir);
-    defer ctx.allocator.free(staging_z);
-    const install_z = try ctx.allocator.dupeZ(u8, staging.install_dir);
-    defer ctx.allocator.free(install_z);
-
-    var target_preexisted = false;
-    const rename_result = std.os.linux.rename(staging_z, install_z);
-    if (rename_result != 0) {
-        const errno: std.posix.E = @enumFromInt(rename_result);
-        if (errno == .EXIST or errno == .NOTEMPTY) {
-            // Another process admitted the target first (or a reinstall
-            // could not remove it). The object is not ours, so it is
-            // admitted under the existing-object policy below.
-            ctx.debug("target already exists (race), cleaning up staging dir", .{});
-            path.deleteTreeAbsolute(staging.staging_dir) catch {};
-            target_preexisted = true;
-        } else {
-            ctx.debug("atomic rename failed with errno {d}", .{rename_result});
-            path.deleteTreeAbsolute(staging.staging_dir) catch {};
-            return ctx.fail(error.FileSystem, staging.install_dir, "atomic rename to final path failed");
-        }
-    } else {
-        // Make the rename itself durable: fsync the directory that now
-        // contains the new entry.
-        fsyncFd(parent_dir.handle) catch |err| {
-            ctx.debug("fsync of store parent directory failed: {}", .{err});
-        };
-    }
-    try fault_injection.hit(.store_after_admission);
-    ctx.debug("package admitted to store: {s}", .{staging.install_dir});
-
-    if (target_preexisted) {
-        try admitExistingStoreObject(ctx, staging.install_dir, staging.content_hash);
-    } else {
-        try finalizeAdmittedStoreObject(ctx, staging.install_dir, false);
-    }
+    try publishStagedStoreObject(ctx, staging.staging_dir, staging.install_dir, staging.content_hash);
 
     emit.installComplete(ctx, install_id, pkg_label);
 
@@ -2327,6 +2282,34 @@ fn installSinglePackageToStore(
         .store_path = staging.install_dir,
         .content_hash = staging.content_hash,
     };
+}
+
+/// Admission boundary, called while holding the store mutation lock.
+fn publishStagedStoreObject(ctx: *Context, staging_dir: []const u8, install_dir: []const u8, content_hash: []const u8) !void {
+    // Sync the payload and both parents before reporting successful admission.
+    const outcome = publish.publishDirectory(ctx.allocator, staging_dir, install_dir, .{
+        .mode = .no_replace,
+        .checkpoints = .{ .before = .store_before_admission, .after = .store_after_admission },
+    }) catch |err| {
+        // The helper never removes staging; after publication it has moved.
+        // Cleanup is best-effort and must not mask the publication failure.
+        path.deleteTreeAbsolute(staging_dir) catch {};
+        return ctx.failFmt(switch (err) {
+            error.OutOfMemory => error.OutOfMemory,
+            error.AccessDenied => error.PermissionDenied,
+            else => error.FileSystem,
+        }, install_dir, "failed to publish store object: {s}", .{@errorName(err)});
+    };
+    if (outcome == .exists) {
+        // No-replace does not validate the existing object's identity.
+        path.deleteTreeAbsolute(staging_dir) catch |err| {
+            ctx.debug("failed to remove unused staging directory: {}", .{err});
+        };
+        try admitExistingStoreObject(ctx, install_dir, content_hash);
+    } else {
+        try finalizeAdmittedStoreObject(ctx, install_dir, false);
+    }
+    ctx.debug("package admitted to store: {s}", .{install_dir});
 }
 
 const ReadOnlyEntryKind = enum { file, directory };
@@ -2799,10 +2782,6 @@ fn stageAndValidatePayload(
         .content_exists = content_exists,
         .claim = staging_claim,
     };
-}
-
-fn fsyncFd(fd: std.posix.fd_t) !void {
-    if (std.os.linux.fsync(fd) != 0) return error.FileSystem;
 }
 
 /// Admit an object that is already present in the store. Presence is not
@@ -5067,6 +5046,73 @@ test "store admission uses atomic rename from staging directory to final store p
     var mbuf: [20]u8 = undefined;
     const mn = try mf.readPositionalAll(path.currentIo(), &mbuf, 0);
     try std.testing.expectEqualStrings("MEREMFST", mbuf[0..mn]);
+}
+
+test "store admission publication failures retain the boundary and retries verify existing targets" {
+    const th = @import("test_helpers.zig");
+    defer fault_injection.clearForTest();
+    var env = try th.createTestEnv();
+    defer {
+        env.cleanup();
+        std.testing.allocator.destroy(env);
+    }
+    const ctx = &env.ctx;
+    try ctx.acquireStoreLockForMutation();
+    defer ctx.releaseStoreLock();
+    const store_root = try std.fs.path.join(ctx.allocator, &.{ env.path, "mere", "store" });
+    defer ctx.allocator.free(store_root);
+    try path.ensureDirExists(store_root);
+
+    const writeObject = struct {
+        fn run(test_ctx: *Context, dir: []const u8, body: []const u8) ![]const u8 {
+            const payload_path = try std.fs.path.join(test_ctx.allocator, &.{ dir, "payload" });
+            defer test_ctx.allocator.free(payload_path);
+            var payload = try path.makePathAndOpenFile(payload_path);
+            defer payload.close(path.currentIo());
+            try payload.writeStreamingAll(path.currentIo(), body);
+            return hash.calculateStoreContentHash(test_ctx.allocator, dir, null);
+        }
+    }.run;
+
+    for (0..3) |case| {
+        const staged = try std.fmt.allocPrint(ctx.allocator, "{s}/.incoming/case-{d}", .{ store_root, case });
+        defer ctx.allocator.free(staged);
+        const final = try std.fmt.allocPrint(ctx.allocator, "{s}/{s}-case-{d}", .{ store_root, "a" ** 64, case });
+        defer ctx.allocator.free(final);
+        const expected_hash = try writeObject(ctx, staged, "original");
+        defer ctx.allocator.free(expected_hash);
+        switch (case) {
+            0 => fault_injection.setForTest(.store_before_admission, .fail),
+            1 => fault_injection.setForTest(.store_after_admission, .fail),
+            else => publish.failNextDirectorySyncForTest(),
+        }
+        try std.testing.expectError(error.FileSystem, publishStagedStoreObject(ctx, staged, final, expected_hash));
+        try std.testing.expect(!store.storePathExists(staged));
+        try std.testing.expectEqual(case != 0, store.storePathExists(final));
+
+        // For post-publication errors this retries through the .exists policy;
+        // for a pre-publication error this is a fresh admission.
+        const retry_hash = try writeObject(ctx, staged, "original");
+        defer ctx.allocator.free(retry_hash);
+        try publishStagedStoreObject(ctx, staged, final, expected_hash);
+        try std.testing.expect(!store.storePathExists(staged));
+        try std.testing.expect(store.storePathExists(final));
+        try store.removeObject(ctx, final);
+    }
+
+    // An existing, unhardened target is not trusted just because it exists.
+    const staged = try std.fs.path.join(ctx.allocator, &.{ store_root, ".incoming", "mismatch" });
+    defer ctx.allocator.free(staged);
+    const final = try std.fs.path.join(ctx.allocator, &.{ store_root, ("b" ** 64) ++ "-mismatch" });
+    defer ctx.allocator.free(final);
+    const expected_hash = try writeObject(ctx, staged, "original");
+    defer ctx.allocator.free(expected_hash);
+    const bad_hash = try writeObject(ctx, final, "tampered");
+    defer ctx.allocator.free(bad_hash);
+    try std.testing.expectError(error.CorruptData, publishStagedStoreObject(ctx, staged, final, expected_hash));
+    try std.testing.expect(!store.storePathExists(staged));
+    try std.testing.expect(store.storePathExists(final));
+    try std.testing.expectError(error.CorruptData, admitExistingStoreObject(ctx, final, expected_hash));
 }
 
 test "enforceRepoMetadataBinding rejects content hash mismatch" {

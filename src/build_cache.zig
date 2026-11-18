@@ -1806,7 +1806,7 @@ fn exchangePaths(allocator: std.mem.Allocator, left_path: []const u8, right_path
     const right_z = allocator.dupeZ(u8, right_path) catch return error.OutOfMemory;
     defer allocator.free(right_z);
 
-    switch (std.posix.errno(std.os.linux.renameat2(
+    switch (std.os.linux.errno(std.os.linux.renameat2(
         std.os.linux.AT.FDCWD,
         left_z,
         std.os.linux.AT.FDCWD,

@@ -4,6 +4,7 @@ const kdl = @import("kdl.zig");
 const errors = @import("errors.zig");
 const path_mod = @import("path.zig");
 const mere = @import("mere.zig");
+const publish = @import("publish.zig");
 
 const Std = errors.StandardErrors;
 pub const GenerationError = Std.OutOfMemory || Std.FileSystem || Std.PermissionDenied || Std.InvalidInput || error{
@@ -997,40 +998,48 @@ pub fn readManifest(allocator: std.mem.Allocator, store_root: []const u8, genera
     return GenerationManifest.parse(allocator, store_root, buffer);
 }
 
-fn writeMetadataFileAtomically(allocator: std.mem.Allocator, destination: []const u8, content: []const u8) GenerationError!void {
-    const temporary = std.fmt.allocPrint(allocator, "{s}.tmp", .{destination}) catch {
-        return GenerationError.OutOfMemory;
+fn mapPublicationError(err: publish.Error) GenerationError {
+    return switch (err) {
+        error.OutOfMemory => GenerationError.OutOfMemory,
+        error.AccessDenied => GenerationError.PermissionDenied,
+        else => GenerationError.FileSystem,
     };
-    defer allocator.free(temporary);
+}
 
-    var published = false;
-    defer if (!published) std.Io.Dir.deleteFileAbsolute(path_mod.currentIo(), temporary) catch {};
+fn writeMetadataFileAtomically(destination: []const u8, content: []const u8) GenerationError!void {
+    var parent = publish.openParent(destination) catch |err| return mapPublicationError(err);
+    defer parent.close();
+    _ = publish.replaceFile(parent.dir, parent.name, content, .{ .guarantee = .durable }) catch |err| return mapPublicationError(err);
+}
 
-    const io = path_mod.currentIo();
-    {
-        var file = std.Io.Dir.createFileAbsolute(io, temporary, .{ .truncate = true }) catch |err| {
-            return switch (err) {
-                error.AccessDenied => GenerationError.PermissionDenied,
-                else => GenerationError.FileSystem,
-            };
-        };
-        defer file.close(io);
+test "generation metadata publication failures preserve visibility and map sync errors" {
+    const faults = @import("fault_injection.zig");
+    defer faults.clearForTest();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const len = try tmp.dir.realPath(path_mod.currentIo(), &buffer);
+    const destination = try std.fs.path.join(std.testing.allocator, &.{ buffer[0..len], "metadata" });
+    defer std.testing.allocator.free(destination);
+    try writeMetadataFileAtomically(destination, "old");
 
-        file.writeStreamingAll(io, content) catch |err| {
-            return switch (err) {
-                error.AccessDenied => GenerationError.PermissionDenied,
-                else => GenerationError.FileSystem,
-            };
-        };
-    }
+    faults.setForTest(.publish_file_before_rename, .fail);
+    try std.testing.expectError(GenerationError.FileSystem, writeMetadataFileAtomically(destination, "before"));
+    const old = try tmp.dir.readFileAlloc(path_mod.currentIo(), "metadata", std.testing.allocator, .limited(32));
+    defer std.testing.allocator.free(old);
+    try std.testing.expectEqualStrings("old", old);
 
-    std.Io.Dir.renameAbsolute(temporary, destination, io) catch |err| {
-        return switch (err) {
-            error.AccessDenied => GenerationError.PermissionDenied,
-            else => GenerationError.FileSystem,
-        };
-    };
-    published = true;
+    faults.setForTest(.publish_file_after_rename, .fail);
+    try std.testing.expectError(GenerationError.FileSystem, writeMetadataFileAtomically(destination, "after"));
+    const after = try tmp.dir.readFileAlloc(path_mod.currentIo(), "metadata", std.testing.allocator, .limited(32));
+    defer std.testing.allocator.free(after);
+    try std.testing.expectEqualStrings("after", after);
+
+    publish.failNextDirectorySyncForTest();
+    try std.testing.expectError(GenerationError.FileSystem, writeMetadataFileAtomically(destination, "synced-file"));
+    const visible = try tmp.dir.readFileAlloc(path_mod.currentIo(), "metadata", std.testing.allocator, .limited(32));
+    defer std.testing.allocator.free(visible);
+    try std.testing.expectEqualStrings("synced-file", visible);
 }
 
 fn mapStoreLockError(err: anyerror) GenerationError {
@@ -1058,7 +1067,7 @@ fn writeManifestLocked(allocator: std.mem.Allocator, generation_dir: []const u8,
     const content = try manifest.encode(allocator);
     defer allocator.free(content);
 
-    try writeMetadataFileAtomically(allocator, manifest_path, content);
+    try writeMetadataFileAtomically(manifest_path, content);
 }
 
 pub fn readRealization(allocator: std.mem.Allocator, generation_dir: []const u8) GenerationError!RealizationData {
@@ -1127,7 +1136,7 @@ fn writeRealizationLocked(
     const content = try realization.encode(allocator);
     defer allocator.free(content);
 
-    try writeMetadataFileAtomically(allocator, realization_path, content);
+    try writeMetadataFileAtomically(realization_path, content);
 }
 
 // Tests

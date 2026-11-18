@@ -23,6 +23,7 @@ const path = @import("path.zig");
 const Context = @import("mere.zig").Context;
 const store = @import("store.zig");
 const errors = @import("errors.zig");
+const publish = @import("publish.zig");
 
 pub const ROOT_DIRNAME = "root";
 
@@ -728,7 +729,7 @@ fn applyRealization(
         };
         defer allocator.free(store_target);
 
-        try replaceSymlinkAtomically(allocator, ctx, profile_path, store_target);
+        try replaceSymlinkAtomically(ctx, profile_path, store_target);
         materialized_entries += 1;
     }
 
@@ -777,45 +778,16 @@ fn linkExistingEntry(ctx: *Context, source_path: []const u8, dest_path: []const 
 }
 
 fn replaceSymlinkAtomically(
-    allocator: std.mem.Allocator,
     ctx: *Context,
     profile_path: []const u8,
     store_target: []const u8,
 ) ProfileError!void {
-    const parent = std.fs.path.dirname(profile_path) orelse "/";
-    const basename = std.fs.path.basename(profile_path);
-
-    const io = path.currentIo();
-    var parent_dir = path.openExistingDir(parent) catch |err| {
-        return ctx.fail(switch (err) {
-            error.AccessDenied => ProfileError.PermissionDenied,
-            else => ProfileError.FileSystem,
-        }, parent, "failed to open parent directory for symlink replacement");
+    var parent = publish.openParent(profile_path) catch |err| {
+        return ctx.failFmt(mapPublicationError(err), profile_path, "failed to open symlink parent: {s}", .{@errorName(err)});
     };
-    defer parent_dir.close(io);
-
-    var random_bytes: [6]u8 = undefined;
-    io.random(&random_bytes);
-    const suffix = std.fmt.bytesToHex(random_bytes, .lower);
-
-    const tmp_name = std.fmt.allocPrint(allocator, ".{s}.tmp-{s}", .{ basename, suffix }) catch {
-        return ctx.fail(ProfileError.OutOfMemory, profile_path, "failed to allocate temp symlink name");
-    };
-    defer allocator.free(tmp_name);
-
-    parent_dir.symLink(io, store_target, tmp_name, .{}) catch |err| {
-        return ctx.fail(switch (err) {
-            error.AccessDenied => ProfileError.PermissionDenied,
-            else => ProfileError.FileSystem,
-        }, profile_path, "failed to create temporary symlink");
-    };
-    errdefer parent_dir.deleteFile(io, tmp_name) catch {};
-
-    parent_dir.rename(tmp_name, parent_dir, basename, io) catch |err| {
-        return ctx.fail(switch (err) {
-            error.AccessDenied => ProfileError.PermissionDenied,
-            else => ProfileError.FileSystem,
-        }, profile_path, "failed to atomically replace symlink");
+    defer parent.close();
+    publish.replaceSymlink(parent.dir, store_target, parent.name, .{ .guarantee = .atomic }) catch |err| {
+        return ctx.failFmt(mapPublicationError(err), profile_path, "failed to replace profile symlink: {s}", .{@errorName(err)});
     };
 }
 
@@ -860,25 +832,23 @@ fn loadParentRealizationState(
     };
 }
 
-fn exchangePaths(left_path: []const u8, right_path: []const u8) ProfileError!void {
-    const rename_exchange = std.os.linux.RENAME{ .EXCHANGE = true };
-    const left_z = std.heap.page_allocator.dupeZ(u8, left_path) catch return ProfileError.OutOfMemory;
-    defer std.heap.page_allocator.free(left_z);
-    const right_z = std.heap.page_allocator.dupeZ(u8, right_path) catch return ProfileError.OutOfMemory;
-    defer std.heap.page_allocator.free(right_z);
+fn mapPublicationError(err: publish.Error) ProfileError {
+    return switch (err) {
+        error.OutOfMemory => ProfileError.OutOfMemory,
+        error.AccessDenied => ProfileError.PermissionDenied,
+        error.InvalidInput => ProfileError.InvalidInput,
+        else => ProfileError.FileSystem,
+    };
+}
 
-    switch (std.posix.errno(std.os.linux.renameat2(
-        std.os.linux.AT.FDCWD,
-        left_z,
-        std.os.linux.AT.FDCWD,
-        right_z,
-        rename_exchange,
-    ))) {
-        .SUCCESS => {},
-        .ACCES => return ProfileError.PermissionDenied,
-        .INVAL => return ProfileError.InvalidInput,
-        else => return ProfileError.FileSystem,
-    }
+fn syncStoreRoot(ctx: *Context, store_root: []const u8) ProfileError!void {
+    var dir = path.openExistingDir(store_root) catch |err| {
+        return ctx.failFmt(ProfileError.FileSystem, store_root, "failed to open store root: {s}", .{@errorName(err)});
+    };
+    defer dir.close(path.currentIo());
+    publish.syncDir(dir) catch |err| {
+        return ctx.failFmt(mapPublicationError(err), store_root, "failed to persist store entries before publishing profile: {s}", .{@errorName(err)});
+    };
 }
 
 const RealizerRunner = struct {
@@ -1229,19 +1199,19 @@ fn publishProfileRootLocked(
         }, stage_dir, "failed to write profile manifest");
     };
 
+    try syncStoreRoot(ctx, store_root);
+    const outcome = publish.publishDirectory(ctx.allocator, stage_dir, root_path, .{
+        .mode = if (root_exists) .exchange else .no_replace,
+    }) catch |err| {
+        return ctx.failFmt(mapPublicationError(err), root_path, "failed to publish profile root: {s}", .{@errorName(err)});
+    };
+    if (outcome == .exists) {
+        return ctx.fail(ProfileError.FileSystem, root_path, "profile root appeared during publication");
+    }
     if (root_exists) {
-        exchangePaths(stage_dir, root_path) catch |err| {
-            return ctx.fail(err, root_path, "failed to atomically publish profile root");
-        };
+        // The exchanged old tree is no longer reachable from the profile.
         path.deleteTreeAbsolute(stage_dir) catch |err| {
             ctx.debug("failed to remove previous profile root after publish: {}", .{err});
-        };
-    } else {
-        std.Io.Dir.renameAbsolute(stage_dir, root_path, path.currentIo()) catch |err| {
-            return ctx.fail(switch (err) {
-                error.AccessDenied => ProfileError.PermissionDenied,
-                else => ProfileError.FileSystem,
-            }, root_path, "failed to publish profile root");
         };
     }
 
@@ -1387,12 +1357,13 @@ fn createGenerationWithRealizerRunner(
         }, stage_path, "failed to write generation manifest");
     };
 
-    std.Io.Dir.renameAbsolute(stage_path, gen_path, path.currentIo()) catch |err| {
-        return ctx.fail(switch (err) {
-            error.AccessDenied => ProfileError.PermissionDenied,
-            else => ProfileError.FileSystem,
-        }, gen_path, "failed to publish completed generation");
+    try syncStoreRoot(ctx, store_root);
+    const outcome = publish.publishDirectory(ctx.allocator, stage_path, gen_path, .{ .mode = .no_replace }) catch |err| {
+        return ctx.failFmt(mapPublicationError(err), gen_path, "failed to publish completed generation: {s}", .{@errorName(err)});
     };
+    if (outcome == .exists) {
+        return ctx.fail(ProfileError.FileSystem, gen_path, "generation appeared during publication");
+    }
 
     ctx.debug(
         "generation {d} built: entries={d} materialized={d} reused={d} duration_ms={d}",
@@ -1735,6 +1706,45 @@ test "buildProfile skips package metadata files" {
     } else |err| {
         try std.testing.expect(err == error.FileNotFound);
     }
+}
+
+test "profile directory publication failures preserve the visibility boundary" {
+    const th = @import("test_helpers.zig");
+    const faults = @import("fault_injection.zig");
+    defer faults.clearForTest();
+    var env = try th.createTestEnv();
+    defer {
+        env.cleanup();
+        std.testing.allocator.destroy(env);
+    }
+    const allocator = env.ctx.allocator;
+    const store_root = try std.fs.path.join(allocator, &.{ env.path, "mere", "store" });
+    defer allocator.free(store_root);
+    try path.ensureDirExists(store_root);
+    const profile_dir = try std.fs.path.join(allocator, &.{ env.path, "profiles", "dev" });
+    defer allocator.free(profile_dir);
+    try path.ensureDirExists(profile_dir);
+    const gen_path = try generation.getGenerationPath(allocator, profile_dir, 1);
+    defer allocator.free(gen_path);
+
+    faults.setForTest(.publish_directory_before_rename, .fail);
+    try std.testing.expectError(ProfileError.FileSystem, createGeneration(&env.ctx, profile_dir, store_root, &.{}, null));
+    try std.testing.expect(!path.fileExists(gen_path));
+    faults.setForTest(.publish_directory_after_rename, .fail);
+    try std.testing.expectError(ProfileError.FileSystem, createGeneration(&env.ctx, profile_dir, store_root, &.{}, null));
+    var manifest = try generation.readManifest(allocator, store_root, gen_path);
+    defer manifest.deinit();
+
+    const root_path = try getRootPath(allocator, profile_dir);
+    defer allocator.free(root_path);
+    faults.setForTest(.publish_directory_before_rename, .fail);
+    try std.testing.expectError(ProfileError.FileSystem, publishProfileRoot(&env.ctx, profile_dir, store_root, &.{}));
+    try std.testing.expect(!path.fileExists(root_path));
+    _ = try publishProfileRoot(&env.ctx, profile_dir, store_root, &.{});
+    faults.setForTest(.publish_directory_after_rename, .fail);
+    try std.testing.expectError(ProfileError.FileSystem, publishProfileRoot(&env.ctx, profile_dir, store_root, &.{}));
+    var root_manifest = try generation.readManifest(allocator, store_root, root_path);
+    defer root_manifest.deinit();
 }
 
 test "createGeneration creates full generation" {

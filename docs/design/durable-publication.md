@@ -7,7 +7,7 @@ the `current` pointer, GC roots, `/etc` files, boot artifacts, repository
 metadata and keys. Each publication must make two separate promises clear:
 
 - **Atomic visibility.** A reader sees the previous state or the complete new
-  state, never a partial one. A rename within one directory provides this.
+  state, never a partial one. A rename within one filesystem provides this.
 - **Durability.** Once the operation reports success, the new state survives
   power loss. This needs fsync calls in a specific order around the rename.
 
@@ -30,7 +30,7 @@ Every helper takes a `Guarantee`:
 | `replaceFile`, `copyFile` | the same, writing the given bytes or a copy of a source file | as above; `copyFile` keeps the source mode by default |
 | `replaceSymlink` | create a temporary symlink; rename over the destination; fsync the directory | always replaces; the name never disappears |
 | `createSymlink` | symlink(2) at the final name; fsync the directory | no-replace (returns `.exists`) |
-| `publishDirectory` | fsync every file in the staged tree, then every directory child-first; rename; fsync the parent | `no_replace` (returns `.exists`), or `exchange` (old tree ends up at the staged path) |
+| `publishDirectory` | fsync every file in the staged tree, then every directory child-first; rename; fsync the destination parent, then the source parent if different | `no_replace` (returns `.exists`), or `exchange` (old tree ends up at the staged path) |
 | `syncDir`, `syncTree` | fsync primitives for callers that publish by other means | — |
 
 With `.atomic`, the same sequences run without the fsync steps.
@@ -60,6 +60,10 @@ With `.durable` it still fsyncs the directory, because the existing entry may
 come from a process that stopped before its own fsync; if that fsync fails,
 the error is an ordinary one, not `PublishedNotDurable`.
 
+The `.exists` result does not verify or sync the existing target's contents.
+Callers must validate its identity and establish content durability separately
+before relying on it (in particular for existing pin notes and boot artifacts).
+
 No sync failure required by the chosen guarantee is ignored.
 
 ### Fault checkpoints
@@ -87,7 +91,9 @@ A pointer is only as durable as the state it points at. A caller that
 publishes a pointer durably must first publish its target durably:
 
 - a generation directory before `current` selects it;
-- a store object before a generation or GC root references it;
+- a store object before a generation or GC root references it; generation and
+  named-root publication also sync the store root before publishing their tree,
+  including when all referenced store objects already existed;
 - boot artifacts, `/etc` files and the service tree before `current` selects
   the generation that expects them;
 - a repository snapshot before the pointer that selects it (#104).
@@ -95,8 +101,9 @@ publishes a pointer durably must first publish its target durably:
 ## Platform assumptions
 
 - Linux only.
-- The temporary entry and its destination are in the same directory, so
-  rename(2) is atomic.
+- Temporary files and symlinks share their destination directory. Staged
+  directories may have different parents, but must be on the same filesystem
+  so rename(2) is atomic. Durable cross-parent publication syncs both parents.
 - fsync on a directory file descriptor persists that directory's entries.
   ext4, xfs and btrfs guarantee this. The helpers reopen a directory for
   reading before calling fsync, because fsync on an `O_PATH` descriptor fails
@@ -123,14 +130,14 @@ column describes that sequence.
 
 | Caller | Guarantee | Helper | Status | Gaps in the current sequence |
 | --- | --- | --- | --- | --- |
-| `current` pointer (`activation.zig`) | atomic + durable | `replaceSymlink` with the `current_*` checkpoints | planned | no directory fsync |
-| Generation directory (`profile.zig`, `createGeneration`) | atomic + durable | `publishDirectory`, `no_replace` | planned | no tree or parent fsync |
-| Generation manifest and realization (`generation.zig`) | atomic + durable | `replaceFile` | planned | no file or directory fsync; fixed `.tmp` name |
-| Named profile root (`profile.zig`, `publishProfileRoot`) | atomic + durable | `publishDirectory`, `exchange` for an existing root | planned | no tree or parent fsync; a failed exchange is reported as success |
-| Profile entry symlinks (`profile.zig`) | atomic, inside a staged tree | `replaceSymlink`, `.atomic` | planned | none once the enclosing tree is synced |
-| GC root `current` (`gcroots.zig`) | atomic + durable | `replaceSymlink` | planned | no directory fsync |
-| GC roots `kept/gen-N` (`gcroots.zig`) | atomic + durable | `replaceSymlink` | planned | deletes before recreating; no fsync |
-| Store admission (`install.zig`) | atomic + durable | `publishDirectory`, `no_replace` | `syncTree` in use; rename planned | a failed parent fsync is only logged; the existing-target errno is decoded incorrectly |
+| `current` pointer (`activation.zig`) | atomic + durable | `replaceSymlink` with the `current_*` checkpoints | migrated | visible sync failures return `committed_needs_repair`; repair syncs the profile directory |
+| Generation directory (`profile.zig`, `createGeneration`) | atomic + durable | `publishDirectory`, `no_replace` | migrated | syncs store root first; an existing generation is an error |
+| Generation manifest and realization (`generation.zig`) | atomic + durable | `replaceFile` | migrated | publication failures, including visible sync failures, map to `FileSystem` unless more specific |
+| Named profile root (`profile.zig`, `publishProfileRoot`) | atomic + durable | `publishDirectory`, `exchange` for an existing root | migrated | syncs store root first; visible sync failure reports an error without undoing publication |
+| Profile entry symlinks (`profile.zig`) | atomic, inside a staged tree | `replaceSymlink`, `.atomic` | migrated | none once the enclosing tree is synced |
+| GC root `current` (`gcroots.zig`) | atomic + durable within a persisted parent | `replaceSymlink` | migrated | visible sync failure is retryable by repair; newly created ancestor directories are not synced into their parents |
+| GC roots `kept/gen-N` (`gcroots.zig`) | atomic + durable within a persisted parent | `replaceSymlink` | migrated | no delete-before-create window; retries persist even already-correct links; newly created ancestor directories are not synced into their parents |
+| Store admission (`install.zig`) | atomic + durable | `publishDirectory`, `no_replace`, `store_*` checkpoints | migrated | cross-parent admission syncs both parents; `.exists` follows existing-object verification policy; visible sync failures are errors |
 | Boot artifacts (`activation.zig`) | durable before the pointer switch; never replaces | `copyFile`, no-replace | planned | no fsync |
 | `/etc` templates (`etc.zig`) | atomic + durable | hardlink the old file to `.old`, then `copyFile` | planned | the file is missing between the backup rename and the copy; no fsync |
 | dinit service tree (`service_reconcile.zig`) | durable before the pointer switch | `syncTree`, then the existing two renames, then `syncDir` | planned | no fsync; the two-rename window stays (see below) |
@@ -162,7 +169,13 @@ SQLite commits in `repodb.zig` follow SQLite's own durability settings.
   from #99, so there is a short window between the two renames with no live
   service tree. Replacing it with `RENAME_EXCHANGE` changes the
   `.mere-old` recovery states that rollback and repair rely on, and is left
-  to a separate issue.
+  to #118.
+- **New GC-root directories.** The symlink helpers persist entries within an
+  existing directory, but GC-root setup does not yet sync newly created
+  `gc_roots/profiles/<name>/kept` directories into each ancestor. On first use,
+  power loss can therefore remove the directory chain and its roots despite a
+  successful symlink publication. Full first-use durability requires syncing
+  these ancestor entries as well; the migrated symlinks alone do not promise it.
 - **Store hardening.** The ownership, mode and immutable-flag changes made
   after admission are not synced, so a power loss can undo some of them.
   Trust in a hardened object is decided by its top-level directory alone
