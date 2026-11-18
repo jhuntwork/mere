@@ -1390,6 +1390,39 @@ pub fn removeObject(ctx: *Context, store_path: []const u8) StoreError!void {
     };
 }
 
+/// Withdraw the trusted state from a hardened store object without deleting
+/// it. `isHardened` reads only the top-level directory, so clearing its
+/// immutable flag and restoring its owner write bit is enough for the next
+/// admission to verify the content again. Used when a verification after
+/// hardening could not finish for a reason other than a content mismatch,
+/// such as a read error: the content is unconfirmed, not known to be bad.
+pub fn revokeTrust(ctx: *Context, store_path: []const u8) StoreError!void {
+    ctx.acquireStoreLockForMutation() catch |err| return switch (err) {
+        error.OutOfMemory => StoreError.OutOfMemory,
+        error.PermissionDenied => StoreError.PermissionDenied,
+        else => StoreError.FileSystem,
+    };
+    defer ctx.releaseStoreLock();
+
+    const io = path_mod.currentIo();
+    {
+        var dir = std.Io.Dir.openDirAbsolute(io, store_path, .{}) catch {
+            return ctx.fail(StoreError.FileSystem, store_path, "failed to open store object to withdraw its trusted state");
+        };
+        defer dir.close(io);
+        _ = clearImmutableFlag(dir.handle);
+        const st = dir.stat(io) catch {
+            return ctx.fail(StoreError.FileSystem, store_path, "failed to stat store object to withdraw its trusted state");
+        };
+        dir.setPermissions(io, .fromMode(st.permissions.toMode() | 0o200)) catch {
+            return ctx.fail(StoreError.PermissionDenied, store_path, "failed to make store object writable to withdraw its trusted state");
+        };
+    }
+    if (isHardened(store_path)) {
+        return ctx.fail(StoreError.FileSystem, store_path, "store object is still hardened after withdrawing its trusted state");
+    }
+}
+
 fn restoreWriteBits(allocator: std.mem.Allocator, store_path: []const u8) void {
     const io = path_mod.currentIo();
     var dir = std.Io.Dir.openDirAbsolute(io, store_path, .{ .iterate = true }) catch return;
