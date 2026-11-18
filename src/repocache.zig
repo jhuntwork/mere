@@ -10,6 +10,8 @@ const kdl = @import("kdl.zig");
 const repo_history = @import("repo_history.zig");
 const ui = @import("ui/mod.zig");
 const hash = @import("hash.zig");
+const snapshots = @import("repo_snapshot.zig");
+const publish = @import("publish.zig");
 
 /// Repository cache operations error set
 ///
@@ -204,18 +206,15 @@ pub const RepoCache = struct {
         }
     }
 
-    /// Verify the repo.db currently sitting in cache_dir against
-    /// trusted_fingerprints. Shared by ensureRepository() (every repo,
+    /// Pin and verify one selected snapshot (or the legacy/local flat pair)
+    /// against trusted_fingerprints. Shared by ensureRepository() (every repo,
     /// every open) and syncLocal() (local repos specifically, so a bad
     /// signature is caught at sync time with a clear error rather than
     /// deferred to whenever the database is first opened).
     fn verifyCachedDb(self: *RepoCache, loaded_keys: []const sign.LoadedKey) RepoCacheError!sign.VerifyFileResult {
         const allocator = self.ctx.allocator;
-        const paths = try buildRepoPaths(self, allocator);
-        defer {
-            allocator.free(paths.db_path);
-            allocator.free(paths.sig_path);
-        }
+        var paths = try buildRepoPaths(self, allocator);
+        defer paths.deinit();
 
         if (self.trusted_fingerprints.len == 0) {
             self.ctx.setDiagnosticContext(self.name, "no trusted fingerprints configured for repository");
@@ -235,8 +234,7 @@ pub const RepoCache = struct {
 
     /// Deinitialize a RepoCache, cleaning up resources owned by this object.
     ///
-    /// NOTE: RepoCache borrows its name/url/fingerprint metadata and owns only
-    /// its cache_dir plus any initialized repository state.
+    /// Owns name, URL, fingerprints, cache_dir, and initialized repository state.
     pub fn deinit(self: *RepoCache) void {
         if (self.repository) |*repo| {
             repo.deinit();
@@ -247,7 +245,8 @@ pub const RepoCache = struct {
         self.ctx.allocator.free(self.url);
     }
 
-    /// Returns the path to the local cache directory: /mere/cache/[repo-name]
+    /// Returns the cache container: /mere/cache/repos/<trust-identity>, or the
+    /// source directory for a local repository. Not the selected snapshot.
     /// Ownership: Borrowed slice owned by RepoCache.
     pub fn cacheDir(self: RepoCache) []const u8 {
         return self.cache_dir;
@@ -313,6 +312,12 @@ pub const RepoCache = struct {
         // have completed the refresh while this caller was waiting.
         if (!options.force) {
             if (try shouldSkipSync(self, now, options.interval_seconds)) {
+                // A previous publisher may have failed after switching the
+                // pointer but before its fsync. A TTL hit must repair that
+                // barrier instead of silently treating it as durable.
+                var root = path.openExistingDir(cache_dir) catch |err| return mapFsAccessError(err);
+                defer root.close(path.currentIo());
+                publish.syncDir(root) catch |err| return self.ctx.failFmt(mapFsAccessError(err), cache_dir, "failed to persist cached repository selection: {s}", .{@errorName(err)});
                 return;
             }
         }
@@ -329,37 +334,21 @@ pub const RepoCache = struct {
         };
         defer allocator.free(sig_url);
 
-        // Build local paths
-        const db_path = std.fs.path.join(allocator, &.{ cache_dir, repo_history.REPO_DB_FILENAME }) catch {
-            return RepoCacheError.OutOfMemory;
-        };
-        defer allocator.free(db_path);
-
-        const sig_path = std.fs.path.join(allocator, &.{ cache_dir, repo_history.REPO_SIG_FILENAME }) catch {
-            return RepoCacheError.OutOfMemory;
-        };
-        defer allocator.free(sig_path);
-
-        // Download to temporary files first
-        const db_tmp = std.fs.path.join(allocator, &.{ cache_dir, ".repo.db.tmp" }) catch {
-            return RepoCacheError.OutOfMemory;
-        };
-        defer allocator.free(db_tmp);
-
-        const sig_tmp = std.fs.path.join(allocator, &.{ cache_dir, ".repo.db.sig.tmp" }) catch {
-            return RepoCacheError.OutOfMemory;
-        };
-        defer allocator.free(sig_tmp);
+        // A private, unique stage contains the entire candidate pair. Nothing
+        // under the legacy flat names is modified, even during migration.
+        var stage = snapshots.begin(self.ctx, cache_dir) catch |err| return mapFsAccessError(err);
+        defer stage.deinit();
+        var candidate = snapshots.flatSelection(self.ctx, stage.directory) catch |err| return mapFsAccessError(err);
+        defer candidate.deinit();
 
         const sync_result = syncDownloadAndVerify(
             self,
             client,
             db_url,
             sig_url,
-            db_tmp,
-            sig_tmp,
-            db_path,
-            sig_path,
+            &stage,
+            candidate.db_path,
+            candidate.sig_path,
             options.timeout_seconds,
             loaded_keys,
         );
@@ -369,9 +358,20 @@ pub const RepoCache = struct {
                 self.ctx.debug("failed to write last_sync.kdl for repo {s}: {s}", .{ self.name, @errorName(err) });
             };
 
+            // Publication is already durable. Collection is optional cache
+            // maintenance, under the same writer lock; pinned readers win.
+            _ = snapshots.collect(self.ctx, cache_dir) catch |err| blk: {
+                self.ctx.debug("repository snapshot cleanup incomplete for {s}: {s}", .{ self.name, @errorName(err) });
+                break :blk 0;
+            };
             ui.emit.logFmtSeverity(self.ctx, null, .info, "refreshed repository metadata for {s}", .{self.name});
             return;
         } else |err| {
+            if (err == error.PublishedNotDurable) {
+                // The selected snapshot is already live. Never disguise a
+                // failed durability barrier as a stale-cache fallback success.
+                return self.ctx.fail(RepoCacheError.FileSystem, self.cache_dir, "repository snapshot selected but not durable; retry sync to persist or replace the selection");
+            }
             if (options.allow_stale_fallback and try cacheUsable(self)) {
                 const hint = if (err == RepoCacheError.PermissionDenied)
                     " (permission denied — check ownership of cache directory)"
@@ -387,6 +387,22 @@ pub const RepoCache = struct {
             }
             return err;
         }
+    }
+
+    fn invalidateRepository(self: *RepoCache) void {
+        if (self.repository) |*repo| {
+            repo.deinit();
+            self.repository = null;
+        }
+    }
+
+    /// Explicit snapshot collection, also attempted after durable refreshes.
+    /// Failed publication never reaches collection and retains the old pair.
+    pub fn pruneSnapshots(self: *RepoCache) RepoCacheError!usize {
+        if (self.is_local) return 0;
+        const lock = try acquireSyncLock(self);
+        defer releaseSyncLock(lock);
+        return snapshots.collect(self.ctx, self.cache_dir) catch |err| return mapFsAccessError(err);
     }
 
     /// Sync a local (file://) repository.
@@ -559,6 +575,7 @@ fn mapFsAccessError(err: anyerror) RepoCacheError {
     return switch (err) {
         error.OutOfMemory => RepoCacheError.OutOfMemory,
         error.AccessDenied, error.PermissionDenied, error.ReadOnlyFileSystem => RepoCacheError.PermissionDenied,
+        error.CorruptData => RepoCacheError.CorruptData,
         else => RepoCacheError.FileSystem,
     };
 }
@@ -585,19 +602,10 @@ fn writeLastSync(self: *RepoCache, timestamp: u64) RepoCacheError!void {
     std.Io.Dir.renameAbsolute(tmp_path, path_buf, io) catch |err| return mapFsAccessError(err);
 }
 
-fn buildRepoPaths(self: *RepoCache, allocator: std.mem.Allocator) RepoCacheError!struct {
-    db_path: []const u8,
-    sig_path: []const u8,
-} {
-    const db_path = std.fs.path.join(allocator, &.{ self.cache_dir, repo_history.REPO_DB_FILENAME }) catch {
-        return RepoCacheError.OutOfMemory;
-    };
-    const sig_path = std.fs.path.join(allocator, &.{ self.cache_dir, repo_history.REPO_SIG_FILENAME }) catch {
-        allocator.free(db_path);
-        return RepoCacheError.OutOfMemory;
-    };
-
-    return .{ .db_path = db_path, .sig_path = sig_path };
+fn buildRepoPaths(self: *RepoCache, allocator: std.mem.Allocator) RepoCacheError!snapshots.Selection {
+    _ = allocator;
+    if (self.is_local) return snapshots.flatSelection(self.ctx, self.cache_dir) catch |err| return mapFsAccessError(err);
+    return snapshots.select(self.ctx, self.cache_dir) catch |err| return mapFsAccessError(err);
 }
 
 fn cacheUsable(self: *RepoCache) RepoCacheError!bool {
@@ -608,11 +616,13 @@ fn cacheUsable(self: *RepoCache) RepoCacheError!bool {
 }
 
 fn cacheFilesExist(self: *RepoCache) RepoCacheError!bool {
-    const paths = try buildRepoPaths(self, self.ctx.allocator);
-    defer {
-        self.ctx.allocator.free(paths.db_path);
-        self.ctx.allocator.free(paths.sig_path);
-    }
+    // A not-yet-created cache is simply unavailable, not a broken selection.
+    std.Io.Dir.accessAbsolute(path.currentIo(), self.cache_dir, .{}) catch |err| switch (err) {
+        error.FileNotFound => return false,
+        else => return mapFsAccessError(err),
+    };
+    var paths = try buildRepoPaths(self, self.ctx.allocator);
+    defer paths.deinit();
 
     const db_exists = pathExists(paths.db_path) catch |err| switch (err) {
         error.FileNotFound => return false,
@@ -703,13 +713,12 @@ fn syncDownloadAndVerify(
     client: download.TransferClient,
     db_url: []const u8,
     sig_url: []const u8,
+    stage: *snapshots.Stage,
     db_tmp: []const u8,
     sig_tmp: []const u8,
-    db_path: []const u8,
-    sig_path: []const u8,
     timeout_seconds: u32,
     loaded_keys: []const sign.LoadedKey,
-) RepoCacheError!void {
+) (RepoCacheError || error{PublishedNotDurable})!void {
     download.downloadFile(
         client,
         self.ctx,
@@ -751,61 +760,20 @@ fn syncDownloadAndVerify(
         std.Io.Dir.deleteFileAbsolute(path.currentIo(), sig_tmp) catch {};
         return RepoCacheError.SignatureInvalid;
     };
-    result.deinit(self.ctx.allocator);
-    self.ctx.debug("signature verification PASSED for DB: {s} with sig: {s}", .{ db_tmp, sig_tmp });
-
-    // Replace DB + signature as a coherent pair with rollback on partial failure.
-    try replaceCachedDbAndSigWithRollback(self.ctx.allocator, db_tmp, sig_tmp, db_path, sig_path);
-}
-
-fn replaceCachedDbAndSigWithRollback(
-    allocator: std.mem.Allocator,
-    new_db_tmp: []const u8,
-    new_sig_tmp: []const u8,
-    live_db_path: []const u8,
-    live_sig_path: []const u8,
-) RepoCacheError!void {
-    const db_backup = std.fmt.allocPrint(allocator, "{s}.bak", .{live_db_path}) catch return RepoCacheError.OutOfMemory;
-    defer allocator.free(db_backup);
-    const sig_backup = std.fmt.allocPrint(allocator, "{s}.bak", .{live_sig_path}) catch return RepoCacheError.OutOfMemory;
-    defer allocator.free(sig_backup);
-
-    std.Io.Dir.deleteFileAbsolute(path.currentIo(), db_backup) catch {};
-    std.Io.Dir.deleteFileAbsolute(path.currentIo(), sig_backup) catch {};
-
-    var moved_live_db = false;
-    var moved_live_sig = false;
-
-    std.Io.Dir.renameAbsolute(live_db_path, db_backup, path.currentIo()) catch |err| switch (err) {
-        error.FileNotFound => {},
-        else => return mapFsAccessError(err),
-    };
-    moved_live_db = pathExists(db_backup) catch false;
-
-    std.Io.Dir.renameAbsolute(live_sig_path, sig_backup, path.currentIo()) catch |err| switch (err) {
-        error.FileNotFound => {},
-        else => {
-            if (moved_live_db) std.Io.Dir.renameAbsolute(db_backup, live_db_path, path.currentIo()) catch {};
-            return mapFsAccessError(err);
-        },
-    };
-    moved_live_sig = pathExists(sig_backup) catch false;
-
-    std.Io.Dir.renameAbsolute(new_db_tmp, live_db_path, path.currentIo()) catch |err| {
-        if (moved_live_sig) std.Io.Dir.renameAbsolute(sig_backup, live_sig_path, path.currentIo()) catch {};
-        if (moved_live_db) std.Io.Dir.renameAbsolute(db_backup, live_db_path, path.currentIo()) catch {};
+    defer result.deinit(self.ctx.allocator);
+    // Persist exactly the database bytes just verified, not a later reread of
+    // the download path. The stage is private until both files are verified.
+    var parent = publish.openParent(db_tmp) catch |err| return mapFsAccessError(err);
+    defer parent.close();
+    _ = publish.replaceFile(parent.dir, parent.name, result.file_bytes, .{}) catch |err| return mapFsAccessError(err);
+    stage.commit() catch |err| {
+        if (err == error.PublishedNotDurable) {
+            self.invalidateRepository();
+            return error.PublishedNotDurable;
+        }
         return mapFsAccessError(err);
     };
-
-    std.Io.Dir.renameAbsolute(new_sig_tmp, live_sig_path, path.currentIo()) catch |err| {
-        std.Io.Dir.deleteFileAbsolute(path.currentIo(), live_db_path) catch {};
-        if (moved_live_db) std.Io.Dir.renameAbsolute(db_backup, live_db_path, path.currentIo()) catch {};
-        if (moved_live_sig) std.Io.Dir.renameAbsolute(sig_backup, live_sig_path, path.currentIo()) catch {};
-        return mapFsAccessError(err);
-    };
-
-    std.Io.Dir.deleteFileAbsolute(path.currentIo(), db_backup) catch {};
-    std.Io.Dir.deleteFileAbsolute(path.currentIo(), sig_backup) catch {};
+    self.invalidateRepository();
 }
 
 fn isLocalRepo(self: *const RepoCache) bool {
@@ -861,6 +829,111 @@ test "future last-sync timestamps do not suppress refresh" {
     try std.testing.expect(!try shouldSkipSync(&cache, 100, 900));
     try std.testing.expect(try shouldSkipSync(&cache, 200, 900));
     try std.testing.expect(try shouldSkipSync(&cache, 250, 900));
+}
+
+test "RepoCache remote snapshots migrate flat caches, verify pairs, repair committed errors and collect safely" {
+    const th = @import("test_helpers.zig");
+    const faults = @import("fault_injection.zig");
+    defer faults.clearForTest();
+    var env = try th.createTestEnv();
+    defer {
+        env.cleanup();
+        std.testing.allocator.destroy(env);
+    }
+    const ctx = &env.ctx;
+    const io = path.currentIo();
+    const keypair = try sign.generateKeyPair();
+    const fingerprint = try keypair.public_key.fingerprint(ctx.allocator);
+    defer ctx.allocator.free(fingerprint);
+    const keys = [_]sign.LoadedKey{.{ .public_key = keypair.public_key, .fingerprint = fingerprint, .path = "snapshot-fixture" }};
+    var cache = try RepoCache.init(ctx, "snapshot-test", "https://repo.example.com/snapshot-test", &.{fingerprint}, 100);
+    defer cache.deinit();
+    try path.ensureDirExists(cache.cache_dir);
+
+    const fixture_dir = try std.fs.path.join(ctx.allocator, &.{ env.path, "fixture" });
+    defer ctx.allocator.free(fixture_dir);
+    {
+        var repo = try Repository.init(ctx, fixture_dir, false);
+        repo.deinit();
+    }
+    var fixture = try path.openExistingDir(fixture_dir);
+    defer fixture.close(io);
+    const bytes = try fixture.readFileAlloc(io, repo_history.REPO_DB_FILENAME, ctx.allocator, .limited(16 * 1024 * 1024));
+    defer ctx.allocator.free(bytes);
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.Blake3.hash(bytes, &digest, .{});
+    const signature = try sign.signBytes(&keypair.secret_key.key, &digest);
+
+    // Preserve and verify the legacy pair until a snapshot is selected.
+    var legacy = try snapshots.flatSelection(ctx, cache.cache_dir);
+    defer legacy.deinit();
+    var root = try path.openExistingDir(cache.cache_dir);
+    defer root.close(io);
+    _ = try publish.replaceFile(root, repo_history.REPO_DB_FILENAME, bytes, .{});
+    _ = try publish.replaceFile(root, repo_history.REPO_SIG_FILENAME, &signature, .{});
+    try cache.ensureRepository(&keys);
+    var dummy = th.DummyClient.init(ctx.allocator);
+    defer dummy.deinit();
+    const db_url = "https://repo.example.com/snapshot-test/repo.db";
+    const sig_url = "https://repo.example.com/snapshot-test/repo.db.sig";
+    try dummy.set(db_url, bytes);
+    try dummy.set(sig_url, &signature);
+    var vtable = download.TransferClient.VTable{ .download_file = th.dummy_download_file };
+    const client = download.TransferClient{ .ptr = &dummy, .vtable = &vtable };
+    try cache.sync(client, .{ .force = true, .now = 10, .allow_stale_fallback = false }, &keys);
+    try std.testing.expect(cache.repository == null);
+    var reader = try buildRepoPaths(&cache, ctx.allocator);
+    var pinned = true;
+    defer if (pinned) reader.deinit();
+    try std.testing.expect(reader.lease != null);
+    // Flat files were not replaced by publication; neither is required by a
+    // snapshot-backed reader (verified bytes are SQLite's only input).
+    const legacy_bytes = try root.readFileAlloc(io, repo_history.REPO_DB_FILENAME, ctx.allocator, .limited(16 * 1024 * 1024));
+    defer ctx.allocator.free(legacy_bytes);
+    try std.testing.expectEqualSlices(u8, bytes, legacy_bytes);
+    try root.deleteFile(io, repo_history.REPO_DB_FILENAME);
+    try root.deleteFile(io, repo_history.REPO_SIG_FILENAME);
+    try cache.ensureRepository(&keys);
+    var names = try cache.repository.?.db.getDistinctPackageNameArch(ctx.allocator);
+    defer names.deinit(ctx.allocator);
+    try std.testing.expectEqual(@as(usize, 0), names.items.len);
+
+    // SQLite's application-owned user_version field makes a different, still
+    // valid database revision without changing the repository schema.
+    std.mem.writeInt(u32, bytes[60..64], 1, .big);
+    std.crypto.hash.Blake3.hash(bytes, &digest, .{});
+    const next_signature = try sign.signBytes(&keypair.secret_key.key, &digest);
+    try dummy.set(db_url, bytes);
+    try dummy.set(sig_url, &next_signature);
+    faults.setForTest(.repository_snapshot_after_select, .fail);
+    // allow_stale_fallback must not hide a committed durability error.
+    try std.testing.expectError(RepoCacheError.FileSystem, cache.sync(client, .{ .force = true, .now = 11 }, &keys));
+    try std.testing.expect(cache.repository == null);
+    var verified = try cache.verifyCachedDb(&keys);
+    defer verified.deinit(ctx.allocator);
+    try std.testing.expectEqualSlices(u8, bytes, verified.file_bytes);
+    var old_verified = try sign.verifyWithTrustedFingerprints(ctx, reader.db_path, reader.sig_path, &.{fingerprint}, &keys);
+    defer old_verified.deinit(ctx.allocator);
+    try std.testing.expect(!std.mem.eql(u8, bytes, old_verified.file_bytes));
+    try std.testing.expectEqual(@as(usize, 0), try cache.pruneSnapshots());
+    reader.deinit();
+    pinned = false;
+    try std.testing.expectEqual(@as(usize, 1), try cache.pruneSnapshots());
+
+    // A TTL hit repairs the pointer sync even though its timestamp is from
+    // the previous revision; it must not download this deliberately bad pair.
+    try dummy.set(db_url, "do-not-download");
+    try dummy.set(sig_url, "bad-signature");
+    publish.failNextDirectorySyncForTest();
+    try std.testing.expectError(RepoCacheError.FileSystem, cache.sync(client, .{ .now = 12, .interval_seconds = 900 }, &keys));
+    try cache.sync(client, .{ .now = 12, .interval_seconds = 900 }, &keys);
+    var current = try buildRepoPaths(&cache, ctx.allocator);
+    defer current.deinit();
+    try std.testing.expectError(RepoCacheError.SignatureInvalid, cache.sync(client, .{ .force = true, .allow_stale_fallback = false }, &keys));
+    var after_bad = try buildRepoPaths(&cache, ctx.allocator);
+    defer after_bad.deinit();
+    try std.testing.expectEqualStrings(current.directory, after_bad.directory);
+    try cache.ensureRepository(&keys);
 }
 
 test "RepoCache.sync downloads and verifies DB and signature" {
@@ -1252,66 +1325,6 @@ test "sync still fails when the lock cannot be taken and there is no usable cach
         RepoCacheError.PermissionDenied,
         cache.sync(client, .{ .interval_seconds = 0 }, loaded_keys.items),
     );
-}
-
-test "replaceCachedDbAndSigWithRollback restores live pair when sig swap fails" {
-    const th = @import("test_helpers.zig");
-    var test_env = try th.createTestEnv();
-    defer {
-        test_env.cleanup();
-        std.testing.allocator.destroy(test_env);
-    }
-    const allocator = test_env.ctx.allocator;
-
-    const cache_dir = try std.fs.path.join(allocator, &.{ test_env.path, "swap-rollback" });
-    defer allocator.free(cache_dir);
-    try path.ensureDirExists(cache_dir);
-
-    const live_db = try std.fs.path.join(allocator, &.{ cache_dir, repo_history.REPO_DB_FILENAME });
-    defer allocator.free(live_db);
-    const live_sig = try std.fs.path.join(allocator, &.{ cache_dir, repo_history.REPO_SIG_FILENAME });
-    defer allocator.free(live_sig);
-    const new_db_tmp = try std.fs.path.join(allocator, &.{ cache_dir, ".repo.db.tmp" });
-    defer allocator.free(new_db_tmp);
-    const missing_sig_tmp = try std.fs.path.join(allocator, &.{ cache_dir, ".repo.db.sig.tmp" });
-    defer allocator.free(missing_sig_tmp);
-
-    {
-        const f = try std.Io.Dir.createFileAbsolute(path.currentIo(), live_db, .{});
-        defer f.close(path.currentIo());
-        try f.writeStreamingAll(path.currentIo(), "old-db");
-    }
-    {
-        const f = try std.Io.Dir.createFileAbsolute(path.currentIo(), live_sig, .{});
-        defer f.close(path.currentIo());
-        try f.writeStreamingAll(path.currentIo(), "old-sig");
-    }
-    {
-        const f = try std.Io.Dir.createFileAbsolute(path.currentIo(), new_db_tmp, .{});
-        defer f.close(path.currentIo());
-        try f.writeStreamingAll(path.currentIo(), "new-db");
-    }
-    // Intentionally do not create missing_sig_tmp so second rename fails.
-
-    try std.testing.expectError(
-        RepoCacheError.FileSystem,
-        replaceCachedDbAndSigWithRollback(allocator, new_db_tmp, missing_sig_tmp, live_db, live_sig),
-    );
-
-    {
-        const f = try std.Io.Dir.openFileAbsolute(path.currentIo(), live_db, .{});
-        defer f.close(path.currentIo());
-        var buf: [64]u8 = undefined;
-        const n = try f.readPositionalAll(path.currentIo(), &buf, 0);
-        try std.testing.expectEqualStrings("old-db", buf[0..n]);
-    }
-    {
-        const f = try std.Io.Dir.openFileAbsolute(path.currentIo(), live_sig, .{});
-        defer f.close(path.currentIo());
-        var buf: [64]u8 = undefined;
-        const n = try f.readPositionalAll(path.currentIo(), &buf, 0);
-        try std.testing.expectEqualStrings("old-sig", buf[0..n]);
-    }
 }
 
 test "ensurePackageArchiveCached uses dummy HTTP client" {
