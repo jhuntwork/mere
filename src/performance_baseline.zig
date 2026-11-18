@@ -17,9 +17,11 @@ const test_helpers = @import("test_helpers.zig");
 
 const package_count = 8;
 const files_per_package = 24;
-const bytes_per_file = 1024;
+const default_bytes_per_file = 1024;
+const max_bytes_per_file = 64 * 1024 * 1024;
 const cold_install_samples = 5;
 const warm_install_samples = 9;
+const existing_object_samples = 5;
 const generation_samples = 7;
 const activation_samples = 11;
 
@@ -36,12 +38,21 @@ fn median(values: []u64) u64 {
     return values[values.len / 2];
 }
 
+/// Payload bytes per fixture file. MERE_BENCH_BYTES_PER_FILE overrides the
+/// default so content-hashing cost can be measured at realistic package sizes.
+fn bytesPerFile() !usize {
+    const raw = std.c.getenv("MERE_BENCH_BYTES_PER_FILE") orelse return default_bytes_per_file;
+    const value = try std.fmt.parseInt(usize, std.mem.span(raw), 10);
+    if (value == 0 or value > max_bytes_per_file) return error.InvalidBenchmarkPayloadSize;
+    return value;
+}
+
 fn printResult(name: []const u8, samples: []u64) void {
     const value_ns = median(samples);
     std.debug.print("{s}\t{d}\t{d}\n", .{ name, samples.len, value_ns / std.time.ns_per_us });
 }
 
-fn createBenchmarkPackage(ctx: anytype, fixture_root: []const u8, package_index: usize) ![]const u8 {
+fn createBenchmarkPackage(ctx: anytype, fixture_root: []const u8, package_index: usize, bytes_per_file: usize) ![]const u8 {
     const name = try std.fmt.allocPrint(ctx.allocator, "bench-{d:0>2}", .{package_index});
     errdefer ctx.allocator.free(name);
 
@@ -53,13 +64,14 @@ fn createBenchmarkPackage(ctx: anytype, fixture_root: []const u8, package_index:
     defer ctx.allocator.free(payload_dir);
     try path.ensureDirExists(payload_dir);
 
-    var payload: [bytes_per_file]u8 = undefined;
-    @memset(&payload, @intCast('a' + package_index % 26));
+    const payload = try ctx.allocator.alloc(u8, bytes_per_file);
+    defer ctx.allocator.free(payload);
+    @memset(payload, @intCast('a' + package_index % 26));
     for (0..files_per_package) |file_index| {
         const file_path = try std.fmt.allocPrint(ctx.allocator, "{s}/file-{d:0>3}", .{ payload_dir, file_index });
         defer ctx.allocator.free(file_path);
         var file = try path.makePathAndOpenFile(file_path);
-        try file.writeStreamingAll(path.currentIo(), &payload);
+        try file.writeStreamingAll(path.currentIo(), payload);
         file.close(path.currentIo());
     }
 
@@ -130,8 +142,20 @@ fn makeWritable(target: []const u8) void {
     dir.setPermissions(io, .fromMode(stat.permissions.toMode() | 0o200)) catch {};
 }
 
-fn resetInstallState(allocator: std.mem.Allocator, fixture_root: []const u8) !void {
-    for ([_][]const u8{ "store", "profiles", "cache", "gc-roots" }) |leaf| {
+fn resetInstallState(ctx: anytype, fixture_root: []const u8) !void {
+    try resetLeaves(ctx, fixture_root, &.{ "store", "profiles", "cache", "gc-roots" });
+}
+
+/// Remove profile and GC-root state but keep the store and archive cache, so
+/// the next install finds every store object already present and must admit
+/// it as an existing object.
+fn resetProfileState(ctx: anytype, fixture_root: []const u8) !void {
+    try resetLeaves(ctx, fixture_root, &.{ "profiles", "gc-roots" });
+}
+
+fn resetLeaves(ctx: anytype, fixture_root: []const u8, leaves: []const []const u8) !void {
+    const allocator = ctx.allocator;
+    for (leaves) |leaf| {
         const target = try std.fs.path.join(allocator, &.{ fixture_root, "mere", leaf });
         defer allocator.free(target);
         _ = store.clearImmutable(ctx, target);
@@ -150,9 +174,10 @@ test "install and activation performance baseline" {
     }
     const ctx = &test_env.ctx;
 
+    const bytes_per_file = try bytesPerFile();
     var package_names: [package_count][]const u8 = undefined;
     for (0..package_count) |index| {
-        package_names[index] = try createBenchmarkPackage(ctx, test_env.path, index);
+        package_names[index] = try createBenchmarkPackage(ctx, test_env.path, index, bytes_per_file);
     }
     defer for (package_names) |name| ctx.allocator.free(name);
 
@@ -168,7 +193,7 @@ test "install and activation performance baseline" {
 
     var cold_times: [cold_install_samples]u64 = undefined;
     for (&cold_times) |*sample| {
-        try resetInstallState(ctx.allocator, test_env.path);
+        try resetInstallState(ctx, test_env.path);
         ctx.resetDiagnostics();
         const started_at = monotonicNs();
         _ = try install.installPackagesFromConfig(ctx, &package_names, client, false, false, false, "benchmark");
@@ -177,6 +202,18 @@ test "install and activation performance baseline" {
 
     var warm_times: [warm_install_samples]u64 = undefined;
     for (&warm_times) |*sample| {
+        ctx.resetDiagnostics();
+        const started_at = monotonicNs();
+        _ = try install.installPackagesFromConfig(ctx, &package_names, client, false, false, false, "benchmark");
+        sample.* = elapsedNs(started_at);
+    }
+
+    // Existing-object admission: the store and archive cache are intact but no
+    // profile references the objects, so each one goes through existing-object
+    // admission (content verification, and hardening when privileged).
+    var existing_object_times: [existing_object_samples]u64 = undefined;
+    for (&existing_object_times) |*sample| {
+        try resetProfileState(ctx, test_env.path);
         ctx.resetDiagnostics();
         const started_at = monotonicNs();
         _ = try install.installPackagesFromConfig(ctx, &package_names, client, false, false, false, "benchmark");
@@ -234,12 +271,13 @@ test "install and activation performance baseline" {
 
     std.debug.print(
         "\nMere install/activation performance baseline\n" ++
-            "fixture\tpackages={d}\tfiles_per_package={d}\tbytes_per_file={d}\n" ++
+            "fixture\tpackages={d}\tfiles_per_package={d}\tbytes_per_file={d}\tprivileged={}\n" ++
             "scenario\tsamples\tmedian_us\n",
-        .{ package_count, files_per_package, bytes_per_file },
+        .{ package_count, files_per_package, bytes_per_file, store.isPrivileged() },
     );
     printResult("cold_local_install", &cold_times);
     printResult("warm_noop_install", &warm_times);
+    printResult("existing_object_install", &existing_object_times);
     printResult("incremental_generation", &generation_times);
     printResult("fast_activation", &fast_activation_times);
     printResult("full_store_activation", &full_activation_times);
