@@ -3024,11 +3024,22 @@ fn admitExistingStoreObject(
 
     // Verify again after hardening. A writer that changed the object between
     // the two checks left it hardened with bad content, which later calls would
-    // trust, so the object is removed before the error is returned.
+    // trust, so a mismatched object is removed before the error is returned.
+    // Any other failure (a read error, for example) leaves the content
+    // unconfirmed rather than known bad: the object is kept, but its trusted
+    // state is withdrawn so the next admission verifies it again.
     if (must_verify) {
-        verifyExistingObject(ctx, install_dir, expected_hash) catch |err| {
+        reverifyHardenedObject(ctx, install_dir, expected_hash) catch |err| {
+            if (err != error.CorruptData) {
+                if (store.revokeTrust(ctx, install_dir)) |_| {
+                    return err;
+                } else |_| {
+                    // The object could not be returned to the untrusted
+                    // state, so it must not survive as trusted.
+                }
+            }
             store.removeObject(ctx, install_dir) catch |remove_err| {
-                ctx.setDiagnosticContext(install_dir, "store object changed during admission and could not be removed; remove it manually before retrying");
+                ctx.setDiagnosticContext(install_dir, "store object failed verification after hardening and could not be removed; remove it manually before retrying");
                 return remove_err;
             };
             return err;
@@ -3036,6 +3047,13 @@ fn admitExistingStoreObject(
     } else {
         ctx.debug("existing store object already hardened: {s}", .{install_dir});
     }
+}
+
+fn reverifyHardenedObject(ctx: *Context, install_dir: []const u8, expected_hash: []const u8) !void {
+    fault_injection.hit(.store_reverify_after_harden) catch {
+        return ctx.fail(error.FileSystem, install_dir, "injected read failure during verification after hardening");
+    };
+    try verifyExistingObject(ctx, install_dir, expected_hash);
 }
 
 fn verifyExistingObject(ctx: *Context, install_dir: []const u8, expected_hash: []const u8) !void {
@@ -6158,4 +6176,44 @@ test "admitExistingStoreObject verifies content before admitting an existing obj
     const mode = (try dir.stat(io)).permissions.toMode();
     try std.testing.expectEqual(@as(std.posix.mode_t, 0), mode & 0o222);
     if (!store.isPrivileged()) try dir.setPermissions(io, .fromMode(mode | 0o200));
+}
+
+test "admitExistingStoreObject keeps an object whose verification after hardening fails without a mismatch" {
+    const th = @import("test_helpers.zig");
+    var test_env = try th.createTestEnv();
+    defer {
+        test_env.cleanup();
+        std.testing.allocator.destroy(test_env);
+    }
+    defer fault_injection.clearForTest();
+    const ctx = &test_env.ctx;
+    const io = path.currentIo();
+
+    const object_dir = try std.fs.path.join(ctx.allocator, &.{ test_env.path, "mere", "store", ("5" ** 64) ++ "-pkg-1.0.0" });
+    defer ctx.allocator.free(object_dir);
+    const payload_path = try std.fs.path.join(ctx.allocator, &.{ object_dir, "payload" });
+    defer ctx.allocator.free(payload_path);
+    {
+        var payload = try path.makePathAndOpenFile(payload_path);
+        defer payload.close(io);
+        try payload.writeStreamingAll(io, "original");
+    }
+    const object_hash = try hash.calculateStoreContentHash(ctx.allocator, object_dir, null);
+    defer ctx.allocator.free(object_hash);
+
+    // A read failure in the second check is not a content mismatch: the
+    // object is kept, and it is left untrusted so it is verified again.
+    fault_injection.setForTest(.store_reverify_after_harden, .fail);
+    try std.testing.expectError(error.FileSystem, admitExistingStoreObject(ctx, object_dir, object_hash));
+    try std.Io.Dir.accessAbsolute(io, payload_path, .{});
+    try std.testing.expect(store.needsContentVerification(object_dir));
+
+    // The checkpoint is consumed, so the retry verifies and admits it.
+    try admitExistingStoreObject(ctx, object_dir, object_hash);
+    var dir = try std.Io.Dir.openDirAbsolute(io, object_dir, .{ .iterate = true });
+    defer dir.close(io);
+    const mode = (try dir.stat(io)).permissions.toMode();
+    try std.testing.expectEqual(@as(std.posix.mode_t, 0), mode & 0o222);
+    if (store.isPrivileged()) _ = store.clearImmutable(ctx, object_dir);
+    try dir.setPermissions(io, .fromMode(mode | 0o200));
 }

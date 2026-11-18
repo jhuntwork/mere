@@ -22,6 +22,7 @@ pub const Checkpoint = enum {
     store_harden_chown,
     store_harden_chmod,
     store_harden_immutable,
+    store_reverify_after_harden,
     gc_before_collection,
     gc_after_collection,
     install_before_activation,
