@@ -3,6 +3,7 @@ const generation = @import("generation.zig");
 const mere = @import("mere.zig");
 const errors = @import("errors.zig");
 const path_mod = @import("path.zig");
+const publish = @import("publish.zig");
 
 const Std = errors.StandardErrors;
 pub const GCRootsError = Std.OutOfMemory || Std.FileSystem || Std.PermissionDenied || Std.InvalidInput || error{
@@ -449,26 +450,9 @@ fn updateCurrentRoot(
     };
     defer allocator.free(target);
 
-    const temp_path = std.fs.path.join(allocator, &.{ profile_gc_dir, ".current-new" }) catch {
-        return GCRootsError.OutOfMemory;
-    };
-    defer allocator.free(temp_path);
-
-    // Publish through a temporary symlink and rename so recovery never has a
-    // window with no current root. Rename replaces the previous symlink.
-    std.Io.Dir.deleteFileAbsolute(path_mod.currentIo(), temp_path) catch |err| {
-        switch (err) {
-            error.FileNotFound => {},
-            else => return mapGCRootFsError(err),
-        }
-    };
-    std.Io.Dir.symLinkAbsolute(path_mod.currentIo(), target, temp_path, .{}) catch |err| {
-        return mapGCRootFsError(err);
-    };
-    errdefer std.Io.Dir.deleteFileAbsolute(path_mod.currentIo(), temp_path) catch {};
-    std.Io.Dir.renameAbsolute(temp_path, root_path, path_mod.currentIo()) catch |err| {
-        return mapGCRootFsError(err);
-    };
+    var parent = publish.openParent(root_path) catch |err| return mapGCRootFsError(err);
+    defer parent.close();
+    publish.replaceSymlink(parent.dir, target, parent.name, .{}) catch |err| return mapGCRootFsError(err);
 }
 
 /// Ensure a generation has a root symlink.
@@ -486,40 +470,82 @@ fn ensureGenerationRoot(
     defer allocator.free(kept_dir);
 
     var kept_dir_handle = path_mod.makePathAndOpenDir(kept_dir) catch |err| return mapGCRootFsError(err);
-    kept_dir_handle.close(path_mod.currentIo());
+    defer kept_dir_handle.close(path_mod.currentIo());
 
     const root_name = generation.formatGenerationName(allocator, gen_num) catch {
         return GCRootsError.OutOfMemory;
     };
     defer allocator.free(root_name);
 
-    const root_path = std.fs.path.join(allocator, &.{ kept_dir, root_name }) catch {
-        return GCRootsError.OutOfMemory;
-    };
-    defer allocator.free(root_path);
-
     const target = generation.getGenerationPath(allocator, profile_dir, gen_num) catch {
         return GCRootsError.OutOfMemory;
     };
     defer allocator.free(target);
 
-    // Check if root already exists and points to correct target
-    var link_buf: [std.fs.max_path_bytes]u8 = undefined;
-    if (std.Io.Dir.readLinkAbsolute(path_mod.currentIo(), root_path, &link_buf)) |target_len| {
-        const existing_target = link_buf[0..target_len];
-        if (std.mem.eql(u8, existing_target, target)) {
-            return; // Already correct
-        }
-        // Remove incorrect symlink
-        std.Io.Dir.deleteFileAbsolute(path_mod.currentIo(), root_path) catch {};
-    } else |_| {
-        // Doesn't exist, will create
-    }
+    // Replace even an already-correct link so a retry also persists it.
+    publish.replaceSymlink(kept_dir_handle, target, root_name, .{}) catch |err| return mapGCRootFsError(err);
+}
 
-    // Create symlink
-    std.Io.Dir.symLinkAbsolute(path_mod.currentIo(), target, root_path, .{}) catch |err| {
-        return mapGCRootFsError(err);
-    };
+test "gcroots publication failures retain visible links and retries sync correct targets" {
+    const faults = @import("fault_injection.zig");
+    defer faults.clearForTest();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const len = try tmp.dir.realPath(path_mod.currentIo(), &buffer);
+    const base = buffer[0..len];
+    const allocator = std.testing.allocator;
+    const old_profile = try std.fs.path.join(allocator, &.{ base, "old" });
+    defer allocator.free(old_profile);
+    const new_profile = try std.fs.path.join(allocator, &.{ base, "new" });
+    defer allocator.free(new_profile);
+    const current = try std.fs.path.join(allocator, &.{ base, "current" });
+    defer allocator.free(current);
+    const kept = try std.fs.path.join(allocator, &.{ base, "kept", "gen-1" });
+    defer allocator.free(kept);
+
+    for ([_]bool{ false, true }) |is_kept| {
+        if (is_kept) {
+            try ensureGenerationRoot(allocator, base, old_profile, 1);
+        } else {
+            try updateCurrentRoot(allocator, base, old_profile);
+        }
+        const root = if (is_kept) kept else current;
+        const old_target = try std.fs.path.join(allocator, &.{ old_profile, if (is_kept) "gen-1" else "current" });
+        defer allocator.free(old_target);
+        const new_target = try std.fs.path.join(allocator, &.{ new_profile, if (is_kept) "gen-1" else "current" });
+        defer allocator.free(new_target);
+
+        faults.setForTest(.publish_symlink_before_rename, .fail);
+        try std.testing.expectError(GCRootsError.FileSystem, if (is_kept)
+            ensureGenerationRoot(allocator, base, new_profile, 1)
+        else
+            updateCurrentRoot(allocator, base, new_profile));
+        var link_buffer: [std.fs.max_path_bytes]u8 = undefined;
+        const old_len = try std.Io.Dir.readLinkAbsolute(path_mod.currentIo(), root, &link_buffer);
+        try std.testing.expectEqualStrings(old_target, link_buffer[0..old_len]);
+
+        faults.setForTest(.publish_symlink_after_rename, .fail);
+        try std.testing.expectError(GCRootsError.FileSystem, if (is_kept)
+            ensureGenerationRoot(allocator, base, new_profile, 1)
+        else
+            updateCurrentRoot(allocator, base, new_profile));
+        const new_len = try std.Io.Dir.readLinkAbsolute(path_mod.currentIo(), root, &link_buffer);
+        try std.testing.expectEqualStrings(new_target, link_buffer[0..new_len]);
+
+        publish.failNextDirectorySyncForTest();
+        try std.testing.expectError(GCRootsError.FileSystem, if (is_kept)
+            ensureGenerationRoot(allocator, base, new_profile, 1)
+        else
+            updateCurrentRoot(allocator, base, new_profile));
+        if (is_kept) {
+            try ensureGenerationRoot(allocator, base, new_profile, 1);
+        } else {
+            try updateCurrentRoot(allocator, base, new_profile);
+        }
+        const retried_len = try std.Io.Dir.readLinkAbsolute(path_mod.currentIo(), root, &link_buffer);
+        try std.testing.expectEqualStrings(new_target, link_buffer[0..retried_len]);
+    }
 }
 
 /// Remove a generation root symlink (if it exists).

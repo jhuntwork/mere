@@ -23,8 +23,9 @@
 //! but nothing new became visible, so that fsync failing is an ordinary error.
 //!
 //! Platform assumptions (Linux only):
-//!   - the temporary entry and its destination are in the same directory, and
-//!     rename(2) within one filesystem is atomic;
+//!   - temporary files and symlinks share their destination directory;
+//!     staged directories may have different parents on the same filesystem,
+//!     where rename(2) is atomic;
 //!   - fsync on a directory file descriptor persists that directory's
 //!     entries (ext4, xfs and btrfs guarantee this). A new symlink is made
 //!     durable through its parent's fsync alone; older btrfs kernels had bugs
@@ -325,9 +326,12 @@ pub const DirectoryOptions = struct {
 };
 
 /// Publish the fully written tree at `staged_path` as `final_path`. Both
-/// paths are absolute and share a parent directory. The staged tree is
-/// never removed by this function; on `.exists` or an error the caller
-/// still owns it.
+/// paths are absolute and on the same filesystem; they may have different
+/// parent directories. Under `.durable` the destination parent is fsynced
+/// after the rename, and so is the source parent when it differs, so the
+/// staged name cannot reappear after power loss. The staged tree is never
+/// removed by this function; on `.exists` or an error the caller still owns
+/// it.
 pub fn publishDirectory(
     allocator: std.mem.Allocator,
     staged_path: []const u8,
@@ -337,7 +341,7 @@ pub fn publishDirectory(
     if (!std.fs.path.isAbsolute(staged_path) or !std.fs.path.isAbsolute(final_path)) return error.InvalidInput;
     const staged_parent = std.fs.path.dirname(staged_path) orelse return error.InvalidInput;
     const final_parent = std.fs.path.dirname(final_path) orelse return error.InvalidInput;
-    if (!std.mem.eql(u8, staged_parent, final_parent)) return error.InvalidInput;
+    const same_parent = std.mem.eql(u8, staged_parent, final_parent);
     const staged_name = std.fs.path.basename(staged_path);
     const final_name = std.fs.path.basename(final_path);
     try validateName(staged_name);
@@ -346,21 +350,30 @@ pub fn publishDirectory(
     if (options.guarantee == .durable) try syncTree(allocator, staged_path);
 
     const io = path_mod.currentIo();
-    var parent = path_mod.openExistingDir(staged_parent) catch |err| return mapError(err);
-    defer parent.close(io);
+    var source_dir = path_mod.openExistingDir(staged_parent) catch |err| return mapError(err);
+    defer source_dir.close(io);
+    var target_dir = if (same_parent)
+        source_dir
+    else
+        path_mod.openExistingDir(final_parent) catch |err| return mapError(err);
+    defer if (!same_parent) target_dir.close(io);
 
     fault_injection.hit(options.checkpoints.before) catch return error.InjectedFailure;
 
     var outcome: Outcome = .published;
     switch (options.mode) {
         .no_replace => {
-            if (!try renameDirNoReplace(parent, staged_name, final_name)) outcome = .exists;
+            if (!try renameDirNoReplace(source_dir, staged_name, target_dir, final_name)) outcome = .exists;
         },
-        .exchange => renameEntry(parent, staged_name, final_name, .{ .EXCHANGE = true }) catch |err| {
+        .exchange => renameBetween(source_dir, staged_name, target_dir, final_name, .{ .EXCHANGE = true }) catch |err| {
             return if (err == error.InvalidInput) error.Unsupported else err;
         },
     }
-    return finishPublication(parent, outcome, options.checkpoints, options.guarantee);
+    outcome = try finishPublication(target_dir, outcome, options.checkpoints, options.guarantee);
+    if (outcome == .published and !same_parent and options.guarantee == .durable) {
+        syncDir(source_dir) catch return error.PublishedNotDurable;
+    }
+    return outcome;
 }
 
 // ---------------------------------------------------------------------------
@@ -648,9 +661,13 @@ fn formatTempName(buf: *[name_max]u8, name: []const u8) []const u8 {
 }
 
 fn renameEntry(dir: std.Io.Dir, old_name: []const u8, new_name: []const u8, flags: linux.RENAME) Error!void {
+    return renameBetween(dir, old_name, dir, new_name, flags);
+}
+
+fn renameBetween(old_dir: std.Io.Dir, old_name: []const u8, new_dir: std.Io.Dir, new_name: []const u8, flags: linux.RENAME) Error!void {
     const old_z = NameZ.init(old_name);
     const new_z = NameZ.init(new_name);
-    switch (linux.errno(linux.renameat2(dir.handle, old_z.ptr(), dir.handle, new_z.ptr(), flags))) {
+    switch (linux.errno(linux.renameat2(old_dir.handle, old_z.ptr(), new_dir.handle, new_z.ptr(), flags))) {
         .SUCCESS => {},
         else => |e| return errnoError(e),
     }
@@ -673,16 +690,16 @@ fn finishPublication(dir: std.Io.Dir, outcome: Outcome, checkpoints: Checkpoints
     return outcome;
 }
 
-fn renameNoReplaceErrno(dir: std.Io.Dir, old_z: *const NameZ, new_z: *const NameZ) linux.E {
+fn renameNoReplaceErrno(old_dir: std.Io.Dir, old_z: *const NameZ, new_dir: std.Io.Dir, new_z: *const NameZ) linux.E {
     if (builtin.is_test and noreplace_unsupported_for_test) return .INVAL;
-    return linux.errno(linux.renameat2(dir.handle, old_z.ptr(), dir.handle, new_z.ptr(), .{ .NOREPLACE = true }));
+    return linux.errno(linux.renameat2(old_dir.handle, old_z.ptr(), new_dir.handle, new_z.ptr(), .{ .NOREPLACE = true }));
 }
 
 /// Publish `temp_name` as `new_name` unless `new_name` already exists.
 fn linkFileNoReplace(dir: std.Io.Dir, temp_name: []const u8, new_name: []const u8) Error!Outcome {
     const temp_z = NameZ.init(temp_name);
     const new_z = NameZ.init(new_name);
-    switch (renameNoReplaceErrno(dir, &temp_z, &new_z)) {
+    switch (renameNoReplaceErrno(dir, &temp_z, dir, &new_z)) {
         .SUCCESS => return .published,
         .EXIST => return .exists,
         // The filesystem does not support RENAME_NOREPLACE. link(2) also
@@ -699,10 +716,10 @@ fn linkFileNoReplace(dir: std.Io.Dir, temp_name: []const u8, new_name: []const u
 }
 
 /// Returns false when `new_name` already exists.
-fn renameDirNoReplace(dir: std.Io.Dir, old_name: []const u8, new_name: []const u8) Error!bool {
+fn renameDirNoReplace(old_dir: std.Io.Dir, old_name: []const u8, new_dir: std.Io.Dir, new_name: []const u8) Error!bool {
     const old_z = NameZ.init(old_name);
     const new_z = NameZ.init(new_name);
-    switch (renameNoReplaceErrno(dir, &old_z, &new_z)) {
+    switch (renameNoReplaceErrno(old_dir, &old_z, new_dir, &new_z)) {
         .SUCCESS => return true,
         .EXIST, .NOTEMPTY => return false,
         .INVAL => {},
@@ -711,13 +728,13 @@ fn renameDirNoReplace(dir: std.Io.Dir, old_name: []const u8, new_name: []const u
     // RENAME_NOREPLACE is unsupported here. A plain rename(2) replaces an
     // empty directory, so refuse any existing entry first. Only an entry
     // created between this check and the rename can still be replaced.
-    if (dir.statFile(path_mod.currentIo(), new_name, .{ .follow_symlinks = false })) |_| {
+    if (new_dir.statFile(path_mod.currentIo(), new_name, .{ .follow_symlinks = false })) |_| {
         return false;
     } else |err| switch (err) {
         error.FileNotFound => {},
         else => return mapError(err),
     }
-    switch (linux.errno(linux.renameat2(dir.handle, old_z.ptr(), dir.handle, new_z.ptr(), .{}))) {
+    switch (linux.errno(linux.renameat2(old_dir.handle, old_z.ptr(), new_dir.handle, new_z.ptr(), .{}))) {
         .SUCCESS => return true,
         .EXIST, .NOTEMPTY => return false,
         else => |e| return errnoError(e),
@@ -761,6 +778,11 @@ fn mapError(err: anyerror) Error {
 // cover because they fire only around the rename.
 const SyncTarget = enum { file, directory, tree };
 var injected_sync_failure: ?SyncTarget = null;
+var injected_sync_skip: usize = 0;
+
+pub fn failNextDirectorySyncForTest() void {
+    if (builtin.is_test) injected_sync_failure = .directory;
+}
 
 // Test-only: behave as if the filesystem rejects RENAME_NOREPLACE, so the
 // link(2) and rename(2) fallbacks run on filesystems that support it.
@@ -769,6 +791,10 @@ var noreplace_unsupported_for_test = false;
 fn checkInjectedSync(target: SyncTarget) Error!void {
     if (!builtin.is_test) return;
     if (injected_sync_failure == target) {
+        if (injected_sync_skip > 0) {
+            injected_sync_skip -= 1;
+            return;
+        }
         injected_sync_failure = null;
         return error.FileSystem;
     }
@@ -818,6 +844,7 @@ fn tmpPath(tmp: *testing.TmpDir, buf: []u8) ![]const u8 {
 fn resetTestFaults() void {
     fault_injection.clearForTest();
     injected_sync_failure = null;
+    injected_sync_skip = 0;
     noreplace_unsupported_for_test = false;
 }
 
@@ -1157,9 +1184,58 @@ test "directory publication: tree fsync failure publishes nothing" {
     try expectTreeMarker(final, "new");
 }
 
-test "publishDirectory requires absolute paths in one parent" {
+test "publishDirectory requires absolute paths" {
     try testing.expectError(error.InvalidInput, publishDirectory(testing.allocator, "rel/a", "rel/b", .{}));
-    try testing.expectError(error.InvalidInput, publishDirectory(testing.allocator, "/x/a", "/y/b", .{}));
+    try testing.expectError(error.InvalidInput, publishDirectory(testing.allocator, "/x/a", "rel/b", .{}));
+}
+
+test "publishDirectory publishes across parent directories and syncs both" {
+    defer resetTestFaults();
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const base = try tmpPath(&tmp, &buf);
+
+    const incoming = try std.fs.path.join(testing.allocator, &.{ base, ".incoming" });
+    defer testing.allocator.free(incoming);
+    try path_mod.ensureDirExists(incoming);
+    const staged = try makeStagedTree(incoming, "abc123", "new");
+    defer testing.allocator.free(staged);
+    const final = try std.fs.path.join(testing.allocator, &.{ base, "object" });
+    defer testing.allocator.free(final);
+
+    try testing.expectEqual(Outcome.published, try publishDirectory(testing.allocator, staged, final, .{}));
+    try expectTreeMarker(final, "new");
+    try testing.expectError(error.FileNotFound, std.Io.Dir.accessAbsolute(testIo(), staged, .{}));
+
+    // A failed parent fsync after a cross-directory rename is reported as a
+    // visible, non-durable publication.
+    const second = try makeStagedTree(incoming, "def456", "second");
+    defer testing.allocator.free(second);
+    const second_final = try std.fs.path.join(testing.allocator, &.{ base, "object-2" });
+    defer testing.allocator.free(second_final);
+    injected_sync_failure = .directory;
+    try testing.expectError(error.PublishedNotDurable, publishDirectory(testing.allocator, second, second_final, .{}));
+    try expectTreeMarker(second_final, "second");
+
+    // Fail the source-parent syncDir specifically, after the destination
+    // parent succeeds. Tree syncing uses its own direct fsync path.
+    const source_fail = try makeStagedTree(incoming, "source-fail", "source-fail");
+    defer testing.allocator.free(source_fail);
+    const source_final = try std.fs.path.join(testing.allocator, &.{ base, "source-final" });
+    defer testing.allocator.free(source_final);
+    injected_sync_failure = .directory;
+    injected_sync_skip = 1;
+    try testing.expectError(error.PublishedNotDurable, publishDirectory(testing.allocator, source_fail, source_final, .{}));
+    try expectTreeMarker(source_final, "source-fail");
+    try testing.expectEqual(@as(?SyncTarget, null), injected_sync_failure);
+
+    // An existing destination in another parent is left alone.
+    const third = try makeStagedTree(incoming, "ghi789", "third");
+    defer testing.allocator.free(third);
+    try testing.expectEqual(Outcome.exists, try publishDirectory(testing.allocator, third, final, .{}));
+    try expectTreeMarker(final, "new");
+    try expectTreeMarker(third, "third");
 }
 
 test "openParent splits an absolute path" {

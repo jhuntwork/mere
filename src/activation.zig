@@ -31,6 +31,7 @@ const service_policy = @import("service_policy.zig");
 const service_reconcile = @import("service_reconcile.zig");
 const activation_lock = @import("activation_lock.zig");
 const fault_injection = @import("fault_injection.zig");
+const publish = @import("publish.zig");
 
 /// Activation error set
 const Std = errors.StandardErrors;
@@ -150,13 +151,9 @@ fn switchProfileGenerationInternal(
     };
     defer ctx.allocator.free(store_root);
 
-    try switchProfileGenerationAtPath(ctx, profile_dir, gen_num);
-    fault_injection.hit(.current_after_replace) catch |err| switch (err) {
-        error.InjectedFailure => {
-            ctx.setDiagnosticContext(gc_roots_dir, "generation committed; GC roots need repair");
-            return .{ .outcome = .committed_needs_repair, .failure = ActivationError.FileSystem };
-        },
-    };
+    if (try switchProfileGenerationAtPath(ctx, profile_dir, gen_num) == .needs_repair) {
+        return .{ .outcome = .committed_needs_repair, .failure = ActivationError.FileSystem };
+    }
 
     failAt(.after_pointer_switch) catch |err| {
         ctx.setDiagnosticContext(gc_roots_dir, "generation committed; GC roots need repair");
@@ -325,23 +322,20 @@ fn activateSystemGenerationInternal(
     try checkFault(ctx, .boot_after_staging, "boot");
 
     try failAt(.before_pointer_switch);
-    try switchProfileGenerationAtPath(ctx, profile_dir, gen_num);
+    const pointer_status = try switchProfileGenerationAtPath(ctx, profile_dir, gen_num);
     pointer_committed = true;
-    fault_injection.hit(.current_after_replace) catch |err| switch (err) {
-        error.InjectedFailure => {
-            ctx.setDiagnosticContext(gc_roots_dir, "generation committed; GC roots need repair");
-            const result: SystemActivationResult = .{
-                .outcome = .committed_needs_repair,
-                .failure = ActivationError.FileSystem,
-                .etc_copied = etc_result.copied,
-                .etc_skipped = etc_result.skipped,
-                .etc_differing = etc_result.differing,
-                .boot_artifacts_staged = boot_artifacts_staged,
-            };
-            etc_result.deinit();
-            return result;
-        },
-    };
+    if (pointer_status == .needs_repair) {
+        const result: SystemActivationResult = .{
+            .outcome = .committed_needs_repair,
+            .failure = ActivationError.FileSystem,
+            .etc_copied = etc_result.copied,
+            .etc_skipped = etc_result.skipped,
+            .etc_differing = etc_result.differing,
+            .boot_artifacts_staged = boot_artifacts_staged,
+        };
+        etc_result.deinit();
+        return result;
+    }
 
     const committedResult = struct {
         fn make(
@@ -441,6 +435,14 @@ pub fn repairSystemGeneration(
         };
     } orelse return ActivationError.GenerationNotFound;
 
+    var profile_handle = path_mod.openExistingDir(profile_dir) catch |err| {
+        return ctx.failFmt(ActivationError.FileSystem, profile_dir, "failed to open profile during repair: {s}", .{@errorName(err)});
+    };
+    defer profile_handle.close(path_mod.currentIo());
+    publish.syncDir(profile_handle) catch |err| {
+        return ctx.failFmt(ActivationError.FileSystem, profile_dir, "failed to persist current pointer during repair: {s}", .{@errorName(err)});
+    };
+
     const current_generation_path = generation.getGenerationPath(ctx.allocator, profile_dir, gen_num) catch |err| {
         return switch (err) {
             generation.GenerationError.OutOfMemory => ActivationError.OutOfMemory,
@@ -515,16 +517,13 @@ pub fn stageCurrentSystemBootArtifacts(
     return staged;
 }
 
-/// Activate a specific generation atomically.
-/// 1. Validate the target generation exists and has a readable manifest
-/// 2. Remove any stale temp symlink (idempotent)
-/// 3. Create temp symlink: .current-new -> gen-<N>
-/// 4. Atomic rename: .current-new -> current
+/// Durably switch current; a visible but unsynced pointer requires repair.
+const PointerStatus = enum { durable, needs_repair };
 fn switchProfileGenerationAtPath(
     ctx: *mere.Context,
     profile_dir: []const u8,
     gen_num: u32,
-) ActivationError!void {
+) ActivationError!PointerStatus {
     // Open profile directory for symlink operations
     var profile_dir_handle = std.Io.Dir.openDirAbsolute(path_mod.currentIo(), profile_dir, .{}) catch {
         return ctx.fail(ActivationError.FileSystem, profile_dir, "failed to open profile directory for activation");
@@ -542,34 +541,28 @@ fn switchProfileGenerationAtPath(
     };
 
     // Create the symlink target (relative path within profile_dir: gen-N)
-    try checkFault(ctx, .current_before_replace, profile_dir);
     const target = generation.formatGenerationName(ctx.allocator, gen_num) catch {
         return ctx.fail(ActivationError.OutOfMemory, profile_dir, "failed to allocate generation name");
     };
     defer ctx.allocator.free(target);
 
-    // Create temp symlink: .current-new -> gen-<N>
-    profile_dir_handle.symLink(path_mod.currentIo(), target, CURRENT_SYMLINK_TEMP, .{}) catch {
-        return ctx.fail(ActivationError.FileSystem, profile_dir, "failed to create temporary symlink .current-new");
+    publish.replaceSymlink(profile_dir_handle, target, CURRENT_SYMLINK, .{
+        .guarantee = .durable,
+        .checkpoints = .{ .before = .current_before_replace, .after = .current_after_replace },
+    }) catch |err| {
+        const mapped: ActivationError = switch (err) {
+            error.OutOfMemory => ActivationError.OutOfMemory,
+            error.AccessDenied => ActivationError.PermissionDenied,
+            else => ActivationError.FileSystem,
+        };
+        if (err == error.PublishedNotDurable) {
+            ctx.setDiagnosticContext(profile_dir, "generation committed; rerun activation to persist the current pointer and repair maintenance");
+            return .needs_repair;
+        }
+        ctx.setDiagnosticContextFmt(profile_dir, "failed to publish current pointer: {s}", .{@errorName(err)});
+        return mapped;
     };
-
-    const current_temp_path = std.fs.path.join(ctx.allocator, &.{ profile_dir, CURRENT_SYMLINK_TEMP }) catch {
-        return ctx.fail(ActivationError.OutOfMemory, profile_dir, "failed to construct temporary symlink path");
-    };
-    defer ctx.allocator.free(current_temp_path);
-    const current_path = std.fs.path.join(ctx.allocator, &.{ profile_dir, CURRENT_SYMLINK }) catch {
-        return ctx.fail(ActivationError.OutOfMemory, profile_dir, "failed to construct current symlink path");
-    };
-    defer ctx.allocator.free(current_path);
-
-    // Atomic rename: .current-new -> current
-    // This is the atomic operation that makes the switch visible
-    std.Io.Dir.renameAbsolute(current_temp_path, current_path, path_mod.currentIo()) catch {
-        // Record diagnostic context and clean up temp symlink on failure
-        const err = ctx.fail(ActivationError.FileSystem, profile_dir, "failed to atomically rename .current-new -> current");
-        profile_dir_handle.deleteFile(path_mod.currentIo(), CURRENT_SYMLINK_TEMP) catch {};
-        return err;
-    };
+    return .durable;
 }
 
 fn loadValidatedTargetManifest(
@@ -1809,6 +1802,33 @@ test "in-process checkpoint after current preserves the committed outcome" {
     try std.testing.expectEqual(@as(?u32, 2), try fx.current());
 
     fault_injection.clearForTest();
+    try repairSystemGeneration(&fx.env.ctx, .fast);
+}
+
+test "activation pointer fsync failure commits and repair retries its durability" {
+    var fx = try RollbackFixture.init(&.{}, &.{});
+    defer fx.deinit();
+
+    publish.failNextDirectorySyncForTest();
+    const result = activateSystemGeneration(&fx.env.ctx, 2, .fast);
+    try std.testing.expectEqual(ActivationOutcome.committed_needs_repair, result.outcome);
+    try std.testing.expectEqual(ActivationError.FileSystem, result.failure.?);
+    try std.testing.expectEqual(@as(?u32, 2), try fx.current());
+
+    publish.failNextDirectorySyncForTest();
+    try std.testing.expectError(ActivationError.FileSystem, repairSystemGeneration(&fx.env.ctx, .fast));
+    try repairSystemGeneration(&fx.env.ctx, .fast);
+    try std.testing.expectEqual(@as(?u32, 2), try fx.current());
+}
+
+test "activation profile switch pointer fsync failure preserves commit status" {
+    var fx = try RollbackFixture.init(&.{}, &.{});
+    defer fx.deinit();
+
+    publish.failNextDirectorySyncForTest();
+    const result = switchProfileGeneration(&fx.env.ctx, "system", 2, .fast);
+    try std.testing.expectEqual(ActivationOutcome.committed_needs_repair, result.outcome);
+    try std.testing.expectEqual(@as(?u32, 2), try fx.current());
     try repairSystemGeneration(&fx.env.ctx, .fast);
 }
 
