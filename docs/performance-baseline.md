@@ -8,16 +8,25 @@ Run it with an optimized build:
 zig build test-performance_baseline -Doptimize=ReleaseFast --summary all
 ```
 
-The benchmark constructs a signed local development repository and a fixed package set inside a temporary root. Fixture construction is not timed. It prints the fixture scale, sample count, and median elapsed microseconds for:
+The benchmark constructs a signed local development repository and a fixed package set inside a temporary root. Fixture construction is not timed. It prints the fixture scale, whether the process is privileged, the sample count, and median elapsed microseconds for:
 
 - `cold_local_install`: dependency resolution, local archive transfer, verification, store admission, and named-profile publication after removing the prior store, profile, cache, and GC-root state.
 - `warm_noop_install`: resolution and the already-current profile fast path with the store and profile intact.
+- `existing_object_install`: installation after removing profile and GC-root state while keeping the store and archive cache, so every store object goes through existing-object admission. Unhardened objects are content-verified before and after finalization; when privileged, they are also hardened.
 - `incremental_generation`: system generation construction using the preceding generated state as its parent.
 - `fast_activation`: manifest validation, `/etc` and boot policy processing, the atomic generation switch, and GC-root maintenance without recomputing store content hashes.
 - `full_store_activation`: the same activation path with store content hashes recomputed.
 
+Each fixture file holds 1024 bytes by default. Set `MERE_BENCH_BYTES_PER_FILE` to a larger value, up to 64 MiB, to measure content-hashing cost at realistic package sizes:
+
+```sh
+MERE_BENCH_BYTES_PER_FILE=1048576 zig build test-performance_baseline -Doptimize=ReleaseFast --summary all
+```
+
+Store hardening runs only when the benchmark runs as root. An unprivileged run never hardens objects, so it measures content verification without ownership, permission, or immutable-flag changes. The `privileged` field in the fixture line records which case a result describes.
+
 ## Interpretation
 
-Compare results only when the Mere commit, optimization mode, fixture constants, filesystem, and machine are recorded. The benchmark reports medians to reduce incidental scheduler and cache noise, but it is not a substitute for measuring a real MereLinux workload.
+Compare results only when the Mere commit, optimization mode, fixture constants, payload size, privilege, filesystem, and machine are recorded. The benchmark reports medians to reduce incidental scheduler and cache noise, but it is not a substitute for measuring a real MereLinux workload.
 
 The benchmark intentionally excludes remote repository latency, production package sizes, service-manager effects, and host-specific `/etc` or boot artifacts. Its purpose is to identify whether Mere's local store/profile/activation work is large enough to justify a focused optimization. A later optimization should name the scenario it improves and preserve the other scenarios as regression evidence.
