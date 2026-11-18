@@ -301,8 +301,15 @@ pub fn getRootPath(allocator: std.mem.Allocator, profile_dir: []const u8) Profil
 fn ensureRootOwnedPackages(ctx: *Context, packages: []const generation.PackageEntry) ProfileError!void {
     for (packages) |pkg| {
         if (store.isHardened(pkg.store_path)) continue;
-        _ = store.harden(ctx, pkg.store_path) catch {
-            return ctx.fail(ProfileError.PermissionDenied, pkg.store_path, "failed to harden store path");
+        // store.harden records which entry and step failed; keep that
+        // diagnostic rather than replacing it with a generic one.
+        _ = store.harden(ctx, pkg.store_path) catch |err| {
+            return switch (err) {
+                error.OutOfMemory => ProfileError.OutOfMemory,
+                error.FileSystem => ProfileError.FileSystem,
+                error.InvalidInput => ProfileError.InvalidInput,
+                else => ProfileError.PermissionDenied,
+            };
         };
     }
 }

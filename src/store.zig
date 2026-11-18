@@ -3,10 +3,63 @@ const Context = @import("mere.zig").Context;
 const errors = @import("errors.zig");
 const path_mod = @import("path.zig");
 const path_safety = @import("path_safety.zig");
+const hash_mod = @import("hash.zig");
+const manifest = @import("manifest.zig");
+const fault_injection = @import("fault_injection.zig");
 
 /// Store operations error set
 const Std = errors.StandardErrors;
 pub const StoreError = Std.OutOfMemory || Std.FileSystem || Std.PermissionDenied || Std.InvalidInput || error{SymlinkEscapesBoundary};
+pub const ContentError = StoreError || Std.CorruptData;
+
+/// Verify that an object already present in the store has the content
+/// identity `expected_hash`, using the shared hash-compatibility policy.
+/// Presence alone never establishes identity: an object that does not match
+/// returns CorruptData and must not be admitted to a profile.
+pub fn verifyObjectContent(
+    ctx: *Context,
+    store_path: []const u8,
+    expected_hash: []const u8,
+) ContentError!hash_mod.ContentVerification {
+    if (expected_hash.len != 64) {
+        return ctx.fail(error.CorruptData, store_path, "invalid expected content hash length");
+    }
+
+    const format = manifest.detectFormat(ctx.allocator, store_path) catch |err| {
+        return ctx.fail(switch (err) {
+            error.OutOfMemory => error.OutOfMemory,
+            error.PermissionDenied => error.PermissionDenied,
+            error.InvalidInput => error.CorruptData,
+            else => error.FileSystem,
+        }, store_path, "failed to detect package manifest format");
+    };
+
+    var diag: hash_mod.HashDiag = .{};
+    defer diag.deinit(ctx.allocator);
+    const outcome = hash_mod.verifyStoreContent(ctx.allocator, store_path, format.storeHashFormat(), expected_hash, &diag) catch |err| {
+        return ctx.failFmt(switch (err) {
+            error.OutOfMemory => error.OutOfMemory,
+            error.PermissionDenied => error.PermissionDenied,
+            error.InvalidInput => error.CorruptData,
+            else => error.FileSystem,
+        }, store_path, "failed to compute store content hash: {s}: {s}", .{
+            diag.action orelse "hash tree",
+            diag.path orelse store_path,
+        });
+    };
+    if (outcome == .mismatch) {
+        return ctx.fail(error.CorruptData, store_path, "store content hash mismatch");
+    }
+    return outcome;
+}
+
+/// Whether an existing object must be content-verified before admission.
+/// A hardened object (root-owned and immutable, or root-owned and read-only
+/// where immutable flags are unsupported) was verified when first admitted
+/// and can only be changed by root, so it is trusted as present.
+pub fn needsContentVerification(store_path: []const u8) bool {
+    return !isHardened(store_path);
+}
 
 /// Construct a content-addressed store path from components.
 ///
@@ -217,16 +270,56 @@ const FS_IOC_GETFLAGS = ior('f', 1, c_long);
 const FS_IOC_SETFLAGS = iow('f', 2, c_long);
 const FS_IMMUTABLE_FL: u64 = 0x00000010;
 
-pub const HardenResult = struct {
-    files_processed: usize = 0,
-    immutable_supported: bool = true,
+/// Outcome of the optional immutable-flag step. Root ownership and removal
+/// of write bits are the required read-only protection; the immutable flag
+/// is defense in depth, so its absence is reported, never fatal.
+pub const ImmutableOutcome = enum {
+    /// The flag was set on every entry.
+    applied,
+    /// The filesystem does not implement inode flags.
+    unsupported,
+    /// The filesystem supports flags but setting one failed, for example
+    /// without CAP_LINUX_IMMUTABLE in a user namespace.
+    failed,
+    /// Hardening was disabled by MERE_NO_HARDEN, so no step ran at all.
+    skipped,
+
+    /// Combine per-entry outcomes; the most severe one wins. `skipped` is
+    /// never produced per entry, so it does not take part in the ordering.
+    fn merge(self: ImmutableOutcome, other: ImmutableOutcome) ImmutableOutcome {
+        return if (@intFromEnum(other) > @intFromEnum(self)) other else self;
+    }
 };
 
-fn setImmutable(fd: std.posix.fd_t) bool {
+pub const HardenResult = struct {
+    files_processed: usize = 0,
+    immutable: ImmutableOutcome = .applied,
+    /// True unless the filesystem lacks inode-flag support. Retained for
+    /// callers that only distinguish supported from unsupported.
+    immutable_supported: bool = true,
+
+    fn recordImmutable(self: *HardenResult, outcome: ImmutableOutcome) void {
+        self.immutable = self.immutable.merge(outcome);
+        if (outcome == .unsupported) self.immutable_supported = false;
+    }
+};
+
+fn classifyFlagsErrno(e: std.os.linux.E) ImmutableOutcome {
+    return switch (e) {
+        .SUCCESS => .applied,
+        // No inode-flag support on this filesystem or file type.
+        .NOTTY, .OPNOTSUPP, .INVAL, .NOSYS => .unsupported,
+        else => .failed,
+    };
+}
+
+fn setImmutable(fd: std.posix.fd_t) ImmutableOutcome {
+    fault_injection.hit(.store_harden_immutable) catch return .failed;
     var flags: u64 = 0;
-    if (std.os.linux.errno(std.os.linux.ioctl(fd, FS_IOC_GETFLAGS, @intFromPtr(&flags))) != .SUCCESS) return false;
+    const get = std.os.linux.errno(std.os.linux.ioctl(fd, FS_IOC_GETFLAGS, @intFromPtr(&flags)));
+    if (get != .SUCCESS) return classifyFlagsErrno(get);
     flags |= FS_IMMUTABLE_FL;
-    return std.os.linux.errno(std.os.linux.ioctl(fd, FS_IOC_SETFLAGS, @intFromPtr(&flags))) == .SUCCESS;
+    return classifyFlagsErrno(std.os.linux.errno(std.os.linux.ioctl(fd, FS_IOC_SETFLAGS, @intFromPtr(&flags))));
 }
 
 fn clearImmutableFlag(fd: std.posix.fd_t) bool {
@@ -253,7 +346,7 @@ pub fn harden(ctx: *Context, store_path: []const u8) StoreError!HardenResult {
 }
 
 fn hardenLocked(ctx: *Context, store_path: []const u8) StoreError!HardenResult {
-    if (std.c.getenv("MERE_NO_HARDEN")) |_| return .{};
+    if (std.c.getenv("MERE_NO_HARDEN")) |_| return .{ .immutable = .skipped };
 
     if (!isPrivileged()) {
         return ctx.fail(StoreError.PermissionDenied, store_path, "not running as root");
@@ -303,7 +396,7 @@ fn hardenLocked(ctx: *Context, store_path: []const u8) StoreError!HardenResult {
                     return ctx.fail(StoreError.FileSystem, p, "failed to open subdirectory");
                 };
                 defer subdir.close(io);
-                hardenDir(io, subdir, &result);
+                try hardenEntryOrFail(ctx, subdir.handle, store_path, entry.path, &result);
             },
             .file => {
                 var file = dir.openFile(io, entry.path, .{}) catch {
@@ -313,7 +406,7 @@ fn hardenLocked(ctx: *Context, store_path: []const u8) StoreError!HardenResult {
                     return ctx.fail(StoreError.FileSystem, p, "failed to open file");
                 };
                 defer file.close(io);
-                hardenFile(io, file, &result);
+                try hardenEntryOrFail(ctx, file.handle, store_path, entry.path, &result);
             },
             .sym_link => {
                 const entry_path = std.fs.path.join(ctx.allocator, &.{ store_path, entry.path }) catch {
@@ -344,46 +437,113 @@ fn hardenLocked(ctx: *Context, store_path: []const u8) StoreError!HardenResult {
                 };
                 ctx.allocator.free(symlink_result.path);
 
-                const path_z = std.posix.toPosixPath(entry.path) catch continue;
-                _ = std.os.linux.fchownat(dir.handle, &path_z, 0, 0, std.os.linux.AT.SYMLINK_NOFOLLOW);
+                const path_z = std.posix.toPosixPath(entry.path) catch {
+                    return ctx.fail(StoreError.InvalidInput, entry_path, "symlink path too long");
+                };
+                var failure: HardenFailure = undefined;
+                lchownRoot(dir.handle, &path_z, &failure) catch {
+                    return failHardenStep(ctx, entry_path, failure);
+                };
             },
             else => {},
         }
     }
 
-    hardenDir(io, dir, &result);
+    try hardenEntryOrFail(ctx, dir.handle, store_path, "", &result);
     return result;
 }
 
-fn stripWriteBits(io: std.Io, handle: anytype) void {
-    if (handle.stat(io)) |st| {
-        const new_mode = st.permissions.toMode() & ~@as(std.posix.mode_t, 0o222);
-        handle.setPermissions(io, .fromMode(new_mode)) catch {};
-    } else |_| {}
-}
+/// Required hardening steps. A failure of any of these leaves the object
+/// without read-only protection and is returned to the caller.
+const HardenStep = enum { stat, chown, chmod, lchown };
 
-fn hardenDir(io: std.Io, d: std.Io.Dir, result: *HardenResult) void {
-    // Capture mode before fchown — chown clears setgid bits on directories.
-    const mode = if (d.stat(io)) |st| st.permissions.toMode() else |_| {
-        result.files_processed += 1;
-        return;
+const HardenFailure = struct {
+    step: HardenStep,
+    errno: std.os.linux.E,
+};
+
+fn hardenStepCheckpoint(step: HardenStep) ?fault_injection.Checkpoint {
+    return switch (step) {
+        .stat => null,
+        .chown, .lchown => .store_harden_chown,
+        .chmod => .store_harden_chmod,
     };
-    _ = std.os.linux.fchown(d.handle, 0, 0);
-    d.setPermissions(io, .fromMode(mode & ~@as(std.posix.mode_t, 0o222))) catch {};
-    if (!setImmutable(d.handle)) result.immutable_supported = false;
-    result.files_processed += 1;
 }
 
-fn hardenFile(io: std.Io, f: std.Io.File, result: *HardenResult) void {
+fn runStep(step: HardenStep, rc: usize, failure: *HardenFailure) error{HardenFailed}!void {
+    if (hardenStepCheckpoint(step)) |checkpoint| {
+        fault_injection.hit(checkpoint) catch {
+            failure.* = .{ .step = step, .errno = .PERM };
+            return error.HardenFailed;
+        };
+    }
+    const e = std.os.linux.errno(rc);
+    if (e != .SUCCESS) {
+        failure.* = .{ .step = step, .errno = e };
+        return error.HardenFailed;
+    }
+}
+
+fn lchownRoot(dir_fd: std.posix.fd_t, path_z: [*:0]const u8, failure: *HardenFailure) error{HardenFailed}!void {
+    try runStep(.lchown, std.os.linux.fchownat(dir_fd, path_z, 0, 0, std.os.linux.AT.SYMLINK_NOFOLLOW), failure);
+}
+
+/// Harden one directory or regular file: root ownership and no write bits
+/// (required), then the immutable flag (optional, recorded in `result`).
+/// An entry that is already immutable, root-owned, and read-only is left
+/// alone; chown and chmod on an immutable inode would fail with EPERM.
+fn hardenEntry(fd: std.posix.fd_t, result: *HardenResult, failure: *HardenFailure) error{HardenFailed}!void {
     // Capture mode before fchown — chown clears setuid/setgid bits.
-    const mode = if (f.stat(io)) |st| st.permissions.toMode() else |_| {
-        result.files_processed += 1;
-        return;
-    };
-    _ = std.os.linux.fchown(f.handle, 0, 0);
-    f.setPermissions(io, .fromMode(mode & ~@as(std.posix.mode_t, 0o222))) catch {};
-    if (!setImmutable(f.handle)) result.immutable_supported = false;
+    var sx = std.mem.zeroes(std.os.linux.Statx);
+    try runStep(.stat, std.os.linux.statx(fd, "", std.os.linux.AT.EMPTY_PATH, .{ .UID = true, .MODE = true }, &sx), failure);
+    const mode: u32 = @as(u32, sx.mode) & 0o7777;
+
+    var flags: u64 = 0;
+    const flags_known = std.os.linux.errno(std.os.linux.ioctl(fd, FS_IOC_GETFLAGS, @intFromPtr(&flags))) == .SUCCESS;
+    if (flags_known and (flags & FS_IMMUTABLE_FL) != 0) {
+        if (sx.uid == 0 and (mode & 0o222) == 0) {
+            result.recordImmutable(.applied);
+            result.files_processed += 1;
+            return;
+        }
+        // Immutable but not read-only protected: chown/chmod cannot repair it.
+        failure.* = .{ .step = .chown, .errno = .PERM };
+        return error.HardenFailed;
+    }
+
+    try runStep(.chown, std.os.linux.fchown(fd, 0, 0), failure);
+    try runStep(.chmod, std.os.linux.fchmod(fd, mode & ~@as(u32, 0o222)), failure);
+    result.recordImmutable(setImmutable(fd));
     result.files_processed += 1;
+}
+
+fn failHardenStep(ctx: *Context, subject: []const u8, failure: HardenFailure) StoreError {
+    const err: StoreError = switch (failure.errno) {
+        .PERM, .ACCES, .ROFS => StoreError.PermissionDenied,
+        else => StoreError.FileSystem,
+    };
+    return ctx.failFmt(err, subject, "required store hardening step '{s}' failed: {s}", .{
+        @tagName(failure.step),
+        @tagName(failure.errno),
+    });
+}
+
+fn hardenEntryOrFail(
+    ctx: *Context,
+    fd: std.posix.fd_t,
+    store_path: []const u8,
+    rel_path: []const u8,
+    result: *HardenResult,
+) StoreError!void {
+    var failure: HardenFailure = undefined;
+    hardenEntry(fd, result, &failure) catch {
+        const subject = if (rel_path.len == 0)
+            ctx.allocator.dupe(u8, store_path) catch return StoreError.OutOfMemory
+        else
+            std.fs.path.join(ctx.allocator, &.{ store_path, rel_path }) catch return StoreError.OutOfMemory;
+        defer ctx.allocator.free(subject);
+        return failHardenStep(ctx, subject, failure);
+    };
 }
 
 /// Recursively clear filesystem immutable flags on a store path.
@@ -899,7 +1059,8 @@ test "harden preserves directory setgid and sticky bits" {
     try dir.setPermissions(io, .fromMode(0o3777));
 
     var result = HardenResult{};
-    hardenDir(io, dir, &result);
+    var failure: HardenFailure = undefined;
+    try hardenEntry(dir.handle, &result, &failure);
     defer _ = clearImmutableFlag(dir.handle);
 
     const mode = (try dir.stat(io)).permissions.toMode() & 0o7777;
@@ -1012,4 +1173,247 @@ test "isHardened returns false for user-owned store path" {
 
 test "isHardened returns false for nonexistent path" {
     try std.testing.expect(!isHardened("/mere/store/nonexistent-pkg-1.0"));
+}
+
+fn writeTestStoreFile(dir_path: []const u8, rel_path: []const u8, bytes: []const u8) !void {
+    const io = path_mod.currentIo();
+    const full = try std.fs.path.join(std.testing.allocator, &.{ dir_path, rel_path });
+    defer std.testing.allocator.free(full);
+    std.Io.Dir.deleteFileAbsolute(io, full) catch {};
+    var file = try path_mod.makePathAndOpenFile(full);
+    defer file.close(io);
+    try file.writeStreamingAll(io, bytes);
+}
+
+test "verifyObjectContent rejects a tampered existing object" {
+    const th = @import("test_helpers.zig");
+    var test_env = try th.createTestEnv();
+    defer {
+        test_env.cleanup();
+        std.testing.allocator.destroy(test_env);
+    }
+    const ctx = &test_env.ctx;
+
+    const object = try std.fs.path.join(ctx.allocator, &.{ test_env.path, "mere", "store", ("e" ** 64) ++ "-pkg-1.0" });
+    defer ctx.allocator.free(object);
+    try writeTestStoreFile(object, "bin/tool", "original");
+
+    const expected = try hash_mod.calculateStoreContentHash(ctx.allocator, object, null);
+    defer ctx.allocator.free(expected);
+    try std.testing.expectEqual(hash_mod.ContentVerification.match, try verifyObjectContent(ctx, object, expected));
+
+    // Present at the right path is not the same as having the right content.
+    try writeTestStoreFile(object, "bin/tool", "tampered");
+    try std.testing.expectError(error.CorruptData, verifyObjectContent(ctx, object, expected));
+    try std.testing.expectError(error.CorruptData, verifyObjectContent(ctx, object, "abc"));
+}
+
+test "immutable flag outcomes separate unsupported filesystems from failures" {
+    try std.testing.expectEqual(ImmutableOutcome.applied, classifyFlagsErrno(.SUCCESS));
+    try std.testing.expectEqual(ImmutableOutcome.unsupported, classifyFlagsErrno(.NOTTY));
+    try std.testing.expectEqual(ImmutableOutcome.unsupported, classifyFlagsErrno(.OPNOTSUPP));
+    try std.testing.expectEqual(ImmutableOutcome.failed, classifyFlagsErrno(.PERM));
+    try std.testing.expectEqual(ImmutableOutcome.failed, classifyFlagsErrno(.IO));
+
+    var result = HardenResult{};
+    result.recordImmutable(.applied);
+    try std.testing.expectEqual(ImmutableOutcome.applied, result.immutable);
+    result.recordImmutable(.unsupported);
+    try std.testing.expectEqual(ImmutableOutcome.unsupported, result.immutable);
+    try std.testing.expect(!result.immutable_supported);
+    result.recordImmutable(.failed);
+    result.recordImmutable(.applied);
+    try std.testing.expectEqual(ImmutableOutcome.failed, result.immutable);
+}
+
+test "hardenEntry returns an injected chown failure to the caller" {
+    const th = @import("test_helpers.zig");
+    var test_env = try th.createTestEnv();
+    defer {
+        test_env.cleanup();
+        std.testing.allocator.destroy(test_env);
+    }
+    const io = path_mod.currentIo();
+    try writeTestStoreFile(test_env.path, "entry", "x");
+    const entry_path = try std.fs.path.join(std.testing.allocator, &.{ test_env.path, "entry" });
+    defer std.testing.allocator.free(entry_path);
+    var file = try std.Io.Dir.openFileAbsolute(io, entry_path, .{});
+    defer file.close(io);
+
+    fault_injection.setForTest(.store_harden_chown, .fail);
+    defer fault_injection.clearForTest();
+
+    var result = HardenResult{};
+    var failure: HardenFailure = undefined;
+    try std.testing.expectError(error.HardenFailed, hardenEntry(file.handle, &result, &failure));
+    try std.testing.expectEqual(HardenStep.chown, failure.step);
+    try std.testing.expectEqual(@as(usize, 0), result.files_processed);
+}
+
+test "hardenEntry surfaces a real chown failure without privilege" {
+    if (isPrivileged()) return error.SkipZigTest;
+    const th = @import("test_helpers.zig");
+    var test_env = try th.createTestEnv();
+    defer {
+        test_env.cleanup();
+        std.testing.allocator.destroy(test_env);
+    }
+    const io = path_mod.currentIo();
+    try writeTestStoreFile(test_env.path, "entry", "x");
+    const entry_path = try std.fs.path.join(std.testing.allocator, &.{ test_env.path, "entry" });
+    defer std.testing.allocator.free(entry_path);
+    var file = try std.Io.Dir.openFileAbsolute(io, entry_path, .{});
+    defer file.close(io);
+
+    var result = HardenResult{};
+    var failure: HardenFailure = undefined;
+    try std.testing.expectError(error.HardenFailed, hardenEntry(file.handle, &result, &failure));
+    try std.testing.expectEqual(HardenStep.chown, failure.step);
+    // EPERM normally; EINVAL in a user namespace where uid 0 is unmapped.
+    try std.testing.expect(failure.errno != .SUCCESS);
+}
+
+test "harden returns an injected chmod failure instead of reporting success" {
+    const th = @import("test_helpers.zig");
+    var test_env = try th.createTestEnv();
+    defer {
+        test_env.cleanup();
+        std.testing.allocator.destroy(test_env);
+    }
+    const ctx = &test_env.ctx;
+    if (!isPrivileged()) return error.SkipZigTest;
+
+    const object = try std.fs.path.join(ctx.allocator, &.{ test_env.path, "mere", "store", ("f" ** 64) ++ "-chmod-1.0" });
+    defer ctx.allocator.free(object);
+    try writeTestStoreFile(object, "payload", "x");
+
+    fault_injection.setForTest(.store_harden_chmod, .fail);
+    defer fault_injection.clearForTest();
+    try std.testing.expectError(StoreError.PermissionDenied, harden(ctx, object));
+}
+
+test "harden reports an immutable-flag failure without failing required hardening" {
+    const th = @import("test_helpers.zig");
+    var test_env = try th.createTestEnv();
+    defer {
+        test_env.cleanup();
+        std.testing.allocator.destroy(test_env);
+    }
+    const ctx = &test_env.ctx;
+    if (!isPrivileged()) return error.SkipZigTest;
+
+    const object = try std.fs.path.join(ctx.allocator, &.{ test_env.path, "mere", "store", ("9" ** 64) ++ "-immutable-1.0" });
+    defer ctx.allocator.free(object);
+    try writeTestStoreFile(object, "payload", "x");
+
+    fault_injection.setForTest(.store_harden_immutable, .fail);
+    defer fault_injection.clearForTest();
+    const result = try harden(ctx, object);
+    try std.testing.expectEqual(ImmutableOutcome.failed, result.immutable);
+
+    // Required read-only protection was still applied.
+    const io = path_mod.currentIo();
+    const payload_path = try std.fs.path.join(ctx.allocator, &.{ object, "payload" });
+    defer ctx.allocator.free(payload_path);
+    var payload = try std.Io.Dir.openFileAbsolute(io, payload_path, .{});
+    defer payload.close(io);
+    try std.testing.expectEqual(@as(std.posix.mode_t, 0), (try payload.stat(io)).permissions.toMode() & 0o222);
+}
+
+test "harden is idempotent on an already-hardened object" {
+    const th = @import("test_helpers.zig");
+    var test_env = try th.createTestEnv();
+    defer {
+        test_env.cleanup();
+        std.testing.allocator.destroy(test_env);
+    }
+    const ctx = &test_env.ctx;
+    if (!isPrivileged()) return error.SkipZigTest;
+
+    const object = try std.fs.path.join(ctx.allocator, &.{ test_env.path, "mere", "store", ("8" ** 64) ++ "-again-1.0" });
+    defer ctx.allocator.free(object);
+    try writeTestStoreFile(object, "payload", "x");
+
+    _ = try harden(ctx, object);
+    // Re-admitting an existing object re-runs hardening; immutable entries
+    // must not turn into chown/chmod EPERM failures.
+    _ = try harden(ctx, object);
+}
+
+test "harden reports skipped hardening when MERE_NO_HARDEN is set" {
+    const th = @import("test_helpers.zig");
+    var test_env = try th.createTestEnv();
+    defer {
+        test_env.cleanup();
+        std.testing.allocator.destroy(test_env);
+    }
+    const ctx = &test_env.ctx;
+
+    const object = try std.fs.path.join(ctx.allocator, &.{ test_env.path, "mere", "store", ("5" ** 64) ++ "-skipped-1.0" });
+    defer ctx.allocator.free(object);
+    try writeTestStoreFile(object, "payload", "x");
+
+    try std.testing.expectEqual(@as(c_int, 0), c_setenv("MERE_NO_HARDEN", "1", 1));
+    defer _ = c_unsetenv("MERE_NO_HARDEN");
+
+    const result = try harden(ctx, object);
+    try std.testing.expectEqual(ImmutableOutcome.skipped, result.immutable);
+    try std.testing.expectEqual(@as(usize, 0), result.files_processed);
+}
+
+// Test-only libc environment control. std.c exposes getenv but not setenv
+// in this Zig version; the store already links libc.
+extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
+extern "c" fn unsetenv(name: [*:0]const u8) c_int;
+const c_setenv = setenv;
+const c_unsetenv = unsetenv;
+
+/// Remove a store object that failed verification after it was hardened.
+/// Hardened state is what later calls trust, so the object must not survive.
+/// Removal follows garbage collection: clear immutable flags, restore owner
+/// write bits so the tree can be unlinked, then delete it.
+pub fn removeObject(ctx: *Context, store_path: []const u8) StoreError!void {
+    ctx.acquireStoreLockForMutation() catch |err| return switch (err) {
+        error.OutOfMemory => StoreError.OutOfMemory,
+        error.PermissionDenied => StoreError.PermissionDenied,
+        else => StoreError.FileSystem,
+    };
+    defer ctx.releaseStoreLock();
+
+    _ = clearImmutableLocked(ctx.allocator, store_path);
+    restoreWriteBits(ctx.allocator, store_path);
+    path_mod.deleteTreeAbsolute(store_path) catch |err| {
+        return ctx.failFmt(switch (err) {
+            error.AccessDenied => StoreError.PermissionDenied,
+            else => StoreError.FileSystem,
+        }, store_path, "failed to remove store object that failed verification: {s}", .{@errorName(err)});
+    };
+}
+
+fn restoreWriteBits(allocator: std.mem.Allocator, store_path: []const u8) void {
+    const io = path_mod.currentIo();
+    var dir = std.Io.Dir.openDirAbsolute(io, store_path, .{ .iterate = true }) catch return;
+    defer dir.close(io);
+    const top = dir.stat(io) catch return;
+    dir.setPermissions(io, .fromMode(top.permissions.toMode() | 0o200)) catch {};
+
+    var walker = dir.walk(allocator) catch return;
+    defer walker.deinit();
+    while (walker.next(io) catch null) |entry| {
+        switch (entry.kind) {
+            .directory => {
+                var subdir = dir.openDir(io, entry.path, .{ .iterate = true }) catch continue;
+                defer subdir.close(io);
+                const st = subdir.stat(io) catch continue;
+                subdir.setPermissions(io, .fromMode(st.permissions.toMode() | 0o200)) catch {};
+            },
+            .file => {
+                var file = dir.openFile(io, entry.path, .{}) catch continue;
+                defer file.close(io);
+                const st = file.stat(io) catch continue;
+                file.setPermissions(io, .fromMode(st.permissions.toMode() | 0o200)) catch {};
+            },
+            else => {},
+        }
+    }
 }

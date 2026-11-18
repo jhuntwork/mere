@@ -317,32 +317,14 @@ fn verifyStore(
         };
 
         if (full_hash) {
-            const computed = switch (format.storeHashFormat()) {
-                .v1 => hash.calculateStoreContentHash(ctx.allocator, entry_path, null),
-                .v2 => hash.calculateStoreContentHashV2(ctx.allocator, entry_path, null),
-                .v3 => hash.calculateStoreContentHashV3(ctx.allocator, entry_path, null),
-                .v4 => hash.calculateStoreContentHashV4(ctx.allocator, entry_path, null),
-            };
-            const computed_hash = computed catch {
+            const outcome = hash.verifyStoreContent(ctx.allocator, entry_path, format.storeHashFormat(), manifest_hash, null) catch {
                 result.store_issues += 1;
                 try addIssue(ctx, result, .store, entry_path, "failed to compute store content hash");
                 continue;
             };
-            defer ctx.allocator.free(computed_hash);
-
-            if (!std.mem.eql(u8, computed_hash, manifest_hash)) {
-                var accepted_transitional = false;
-                if (format == .v1) {
-                    const transitional = hash.calculateTransitionalMetadataContentHash(ctx.allocator, entry_path, null) catch null;
-                    if (transitional) |transitional_hash| {
-                        accepted_transitional = std.mem.eql(u8, transitional_hash, manifest_hash);
-                        ctx.allocator.free(transitional_hash);
-                    }
-                }
-                if (!accepted_transitional) {
-                    result.store_issues += 1;
-                    try addIssue(ctx, result, .store, entry_path, "computed store hash does not match manifest content hash");
-                }
+            if (outcome == .mismatch) {
+                result.store_issues += 1;
+                try addIssue(ctx, result, .store, entry_path, "computed store hash does not match manifest content hash");
             }
         }
     }
@@ -517,32 +499,14 @@ fn verifyProfileManifestPackages(
                 try addProfileIssue(ctx, result, pkg.store_path, profile_name, realization_name, "failed to detect manifest format");
                 continue;
             };
-            const computed = switch (format.storeHashFormat()) {
-                .v1 => hash.calculateStoreContentHash(ctx.allocator, pkg.store_path, null),
-                .v2 => hash.calculateStoreContentHashV2(ctx.allocator, pkg.store_path, null),
-                .v3 => hash.calculateStoreContentHashV3(ctx.allocator, pkg.store_path, null),
-                .v4 => hash.calculateStoreContentHashV4(ctx.allocator, pkg.store_path, null),
-            };
-            const computed_hash = computed catch {
+            const outcome = hash.verifyStoreContent(ctx.allocator, pkg.store_path, format.storeHashFormat(), pkg.content_hash, null) catch {
                 result.profile_issues += 1;
                 try addProfileIssue(ctx, result, pkg.store_path, profile_name, realization_name, "failed to compute store content hash");
                 continue;
             };
-            defer ctx.allocator.free(computed_hash);
-
-            if (!std.mem.eql(u8, computed_hash, pkg.content_hash)) {
-                var accepted_transitional = false;
-                if (format == .v1) {
-                    const transitional = hash.calculateTransitionalMetadataContentHash(ctx.allocator, pkg.store_path, null) catch null;
-                    if (transitional) |transitional_hash| {
-                        accepted_transitional = std.mem.eql(u8, transitional_hash, pkg.content_hash);
-                        ctx.allocator.free(transitional_hash);
-                    }
-                }
-                if (!accepted_transitional) {
-                    result.profile_issues += 1;
-                    try addProfileIssue(ctx, result, pkg.store_path, profile_name, realization_name, "computed store hash does not match profile manifest");
-                }
+            if (outcome == .mismatch) {
+                result.profile_issues += 1;
+                try addProfileIssue(ctx, result, pkg.store_path, profile_name, realization_name, "computed store hash does not match profile manifest");
             }
         }
 
