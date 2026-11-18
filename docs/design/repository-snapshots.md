@@ -64,8 +64,10 @@ same snapshot name. Names must match the generated single-component format;
 absolute paths and traversal are rejected. A malformed or dangling pointer
 never falls back to legacy metadata.
 
-The reader opens `.lease` and holds a shared `flock` through signature
-verification. A collector may win before that lock is acquired: the reader
+The reader opens `.lease` with `O_NOFOLLOW | O_NONBLOCK`, requires a regular
+file, and holds a shared `flock` through signature verification. Selected
+snapshot directories are opened without following symlinks. This prevents a
+planted FIFO or symlink from blocking lease opening in a shared cache. A collector may win before that lock is acquired: the reader
 checks that the leased directory still exists and retries selection if it was
 removed. No retry combines paths from different selections. Writers never
 modify a published snapshot.
@@ -84,8 +86,10 @@ collection, acquiring that lock itself. Before deleting anything, collection
 persists the actual `current` selection (including a previously failed pointer
 sync) and its ancestor entries. It never deletes current.
 
-For each unselected snapshot, collection attempts a nonblocking exclusive lock
-on that snapshot's lease. An active verifier's shared lock prevents deletion;
+Collection only considers directories owned by its effective uid, opens them
+without following symlinks, and skips malformed or inaccessible entries. For
+each unselected snapshot, it safely opens the regular lease file as described
+above and attempts a nonblocking exclusive lock on that snapshot's lease. An active verifier's shared lock prevents deletion;
 that snapshot can be collected on a later pass. An already initialized SQLite
 repository needs no on-disk retention because it owns its verified bytes.
 Collection syncs the cache directory after deletion. Optional collection errors
@@ -98,14 +102,20 @@ collected automatically. Older Mere binaries do not understand `current`; they
 may read stale flat metadata or fail on caches created by a newer version.
 Downgrading or running older cache writers concurrently is not supported.
 
-Unrecognized names and private staging trees left by process termination are
-not collected. Their ownership/cleanup policy is separate from snapshot GC.
+While holding the exclusive sync lock, collection also removes recognized,
+current-uid-owned staging directories abandoned by terminated publishers,
+including before the first successful snapshot publication. No active publisher
+can be using a stage during such collection: the same lock covers its entire
+staging lifetime. Unrecognized names, malformed snapshots, foreign-owned
+directories, and legacy flat files are left untouched. Cross-user cleanup remains
+part of the separate ownership-policy work.
 
 ## Tests and platform assumptions
 
 The snapshot tests cover reader pins across refresh/collection, legacy reads,
 malformed/dangling pointers, pre/post-publication failures, a required directory
-sync failure, and real subprocess termination/restart at all four publication
+sync failure, abandoned-stage cleanup, nonblocking FIFO/symlink rejection,
+and real subprocess termination/restart at all four publication
 checkpoints. Signed remote-cache integration tests cover migration, exact
 verified SQLite bytes, invalid signatures, committed error reporting, TTL
 repair, invalidation of an initialized repository, and collection with readers.

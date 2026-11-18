@@ -7,6 +7,7 @@ const path = @import("path.zig");
 const publish = @import("publish.zig");
 const history = @import("repo_history.zig");
 const errors = @import("errors.zig");
+const linux = std.os.linux;
 
 const Std = errors.StandardErrors;
 pub const Error = Std.OutOfMemory || Std.FileSystem || Std.PermissionDenied || Std.CorruptData || error{PublishedNotDurable};
@@ -28,6 +29,41 @@ fn validName(name: []const u8) bool {
         if (!std.ascii.isDigit(byte) and !(byte >= 'a' and byte <= 'f')) return false;
     }
     return true;
+}
+
+fn validStageName(name: []const u8) bool {
+    const suffix = ".staging";
+    return name.len == 1 + prefix.len + 32 + suffix.len and name[0] == '.' and
+        std.mem.endsWith(u8, name, suffix) and validName(name[1 .. name.len - suffix.len]);
+}
+
+/// Cache entries are untrusted (the container may be shared and sticky).
+/// O_NONBLOCK prevents FIFO opens from hanging; O_NOFOLLOW rejects symlinks.
+fn openLease(ctx: *mere.Context, dir: std.Io.Dir, label: []const u8) Error!?std.Io.File {
+    const result = linux.openat(dir.handle, lease_name, .{ .ACCMODE = .RDONLY, .NONBLOCK = true, .NOFOLLOW = true, .CLOEXEC = true }, 0);
+    switch (linux.errno(result)) {
+        .SUCCESS => {},
+        .NOENT, .LOOP, .ACCES, .PERM, .NOTDIR, .NXIO, .NODEV => return null,
+        else => |err| return ctx.failFmt(Error.FileSystem, label, "open snapshot lease: {s}", .{@tagName(err)}),
+    }
+    const file = std.Io.File{ .handle = @intCast(result), .flags = .{ .nonblocking = true } };
+    const stat = file.stat(path.currentIo()) catch |err| {
+        file.close(path.currentIo());
+        return fail(ctx, label, "inspect snapshot lease", err);
+    };
+    if (stat.kind != .file) {
+        file.close(path.currentIo());
+        return null;
+    }
+    return file;
+}
+
+fn ownedByCollector(ctx: *mere.Context, dir: std.Io.Dir, label: []const u8) Error!bool {
+    var stat: linux.Statx = undefined;
+    switch (linux.errno(linux.statx(dir.handle, "", linux.AT.EMPTY_PATH, .{ .UID = true }, &stat))) {
+        .SUCCESS => return stat.uid == linux.geteuid(),
+        else => |err| return ctx.failFmt(Error.FileSystem, label, "inspect snapshot directory owner: {s}", .{@tagName(err)}),
+    }
 }
 
 pub const Selection = struct {
@@ -70,18 +106,15 @@ pub fn select(ctx: *mere.Context, cache_dir: []const u8) Error!Selection {
             else => return fail(ctx, cache_dir, "read snapshot selection", err),
         };
         const name = buffer[0..len];
-        if (!validName(name)) return ctx.fail(Error.CorruptData, cache_dir, "invalid repository snapshot selection");
+        if (!validName(name)) return ctx.fail(Error.CorruptData, cache_dir, "invalid repository snapshot selection; run mere sync to refresh it");
         const directory = std.fs.path.join(ctx.allocator, &.{ cache_dir, name }) catch |err| return fail(ctx, cache_dir, "allocate snapshot path", err);
         defer ctx.allocator.free(directory);
-        var dir = path.openExistingDir(directory) catch |err| switch (err) {
+        var dir = root.openDir(io, name, .{ .follow_symlinks = false }) catch |err| switch (err) {
             error.FileNotFound => continue,
-            else => return fail(ctx, directory, "open selected snapshot", err),
+            else => return fail(ctx, directory, "open selected snapshot (run mere sync to refresh)", err),
         };
         defer dir.close(io);
-        const lease = dir.openFile(io, lease_name, .{}) catch |err| switch (err) {
-            error.FileNotFound => continue,
-            else => return fail(ctx, directory, "open snapshot lease", err),
-        };
+        const lease = (try openLease(ctx, dir, directory)) orelse continue;
         var pinned = false;
         defer if (!pinned) lease.close(io);
         if (std.posix.errno(std.c.flock(lease.handle, std.c.LOCK.SH)) != .SUCCESS)
@@ -97,7 +130,7 @@ pub fn select(ctx: *mere.Context, cache_dir: []const u8) Error!Selection {
         pinned = true;
         return result;
     }
-    return ctx.fail(Error.FileSystem, cache_dir, "selected repository snapshot disappeared or is incomplete");
+    return ctx.fail(Error.FileSystem, cache_dir, "selected repository snapshot disappeared or is incomplete; run mere sync to refresh it");
 }
 
 pub const Stage = struct {
@@ -178,13 +211,13 @@ fn syncAncestors(ctx: *mere.Context, directory: []const u8) Error!void {
 }
 
 /// Caller holds the exclusive cache sync lock. Retain current and any reader-
-/// pinned snapshots. This operation never removes legacy flat files,
-/// unrecognized entries, or staging trees left by interrupted publishers.
+/// pinned snapshots. Abandoned stages are safe to remove under that lock,
+/// including before the first publication. Never remove legacy flat files,
+/// unrecognized entries, or directories owned by a different uid.
 pub fn collect(ctx: *mere.Context, cache_dir: []const u8) Error!usize {
     const io = path.currentIo();
     var selected = try select(ctx, cache_dir);
     defer selected.deinit();
-    if (selected.lease == null) return 0; // No authoritative snapshot pointer yet.
     var root = std.Io.Dir.openDirAbsolute(io, cache_dir, .{ .iterate = true }) catch |err| return fail(ctx, cache_dir, "open snapshot collection directory", err);
     defer root.close(io);
     // A prior switch may have reported PublishedNotDurable. Persist its
@@ -194,11 +227,27 @@ pub fn collect(ctx: *mere.Context, cache_dir: []const u8) Error!usize {
     var count: usize = 0;
     var iterator = root.iterate();
     while (iterator.next(io) catch |err| return fail(ctx, cache_dir, "list repository snapshots", err)) |entry| {
-        if (entry.kind != .directory or !validName(entry.name)) continue;
-        if (std.mem.eql(u8, entry.name, std.fs.path.basename(selected.directory))) continue;
-        var dir = root.openDir(io, entry.name, .{}) catch |err| return fail(ctx, entry.name, "open old snapshot", err);
+        const abandoned_stage = validStageName(entry.name);
+        if (entry.kind != .directory or (!abandoned_stage and !validName(entry.name))) continue;
+        if (selected.lease != null and std.mem.eql(u8, entry.name, std.fs.path.basename(selected.directory))) continue;
+        var dir = root.openDir(io, entry.name, .{ .follow_symlinks = false }) catch |err| {
+            // A foreign/malformed cache entry must not stop collection.
+            ctx.debug("skipping inaccessible snapshot entry {s}: {s}", .{ entry.name, @errorName(err) });
+            continue;
+        };
         defer dir.close(io);
-        const lease = dir.openFile(io, lease_name, .{}) catch |err| return fail(ctx, entry.name, "open old snapshot lease", err);
+        if (!try ownedByCollector(ctx, dir, entry.name)) continue;
+        if (abandoned_stage) {
+            // No active publisher can own this stage: the caller holds the
+            // same exclusive sync lock used for the entire staging lifetime.
+            root.deleteTree(io, entry.name) catch |err| return fail(ctx, entry.name, "remove abandoned repository stage", err);
+            count += 1;
+            continue;
+        }
+        const lease = (try openLease(ctx, dir, entry.name)) orelse {
+            ctx.debug("skipping snapshot with missing or invalid lease: {s}", .{entry.name});
+            continue;
+        };
         defer lease.close(io);
         switch (std.posix.errno(std.c.flock(lease.handle, std.c.LOCK.EX | std.c.LOCK.NB))) {
             .SUCCESS => {},
@@ -284,6 +333,65 @@ test "repository snapshot migration never falls back from an invalid selection" 
     try publish.replaceSymlink(dir, "snapshot-" ++ "a" ** 32, "current", .{});
     try std.testing.expectError(Error.FileSystem, select(ctx, env.path));
     try expectPairForTest(&legacy, "legacy-db", "legacy-sig");
+}
+
+test "repository snapshot collection reclaims abandoned stages before first publication" {
+    const th = @import("test_helpers.zig");
+    var env = try th.createTestEnv();
+    defer {
+        env.cleanup();
+        std.testing.allocator.destroy(env);
+    }
+    var abandoned = try begin(&env.ctx, env.path);
+    defer abandoned.deinit();
+    var dir = try path.openExistingDir(abandoned.directory);
+    defer dir.close(path.currentIo());
+    _ = try publish.replaceFile(dir, history.REPO_DB_FILENAME, "partial-download", .{});
+    try std.testing.expectEqual(@as(usize, 1), try collect(&env.ctx, env.path));
+    try std.testing.expectError(error.FileNotFound, std.Io.Dir.accessAbsolute(path.currentIo(), abandoned.directory, .{}));
+}
+
+test "repository snapshot leases reject FIFOs and symlinks and collection skips malformed entries" {
+    const th = @import("test_helpers.zig");
+    var env = try th.createTestEnv();
+    defer {
+        env.cleanup();
+        std.testing.allocator.destroy(env);
+    }
+    const ctx = &env.ctx;
+    const io = path.currentIo();
+    var old = try begin(ctx, env.path);
+    defer old.deinit();
+    try writePairForTest(ctx, old.directory, "old", "old");
+    try old.commit();
+    var current = try begin(ctx, env.path);
+    defer current.deinit();
+    try writePairForTest(ctx, current.directory, "current", "current");
+    try current.commit();
+    var root = try path.openExistingDir(env.path);
+    defer root.close(io);
+    const fifo_name = "snapshot-" ++ "a" ** 32;
+    const link_name = "snapshot-" ++ "b" ** 32;
+    const missing_name = "snapshot-" ++ "c" ** 32;
+    for ([_][]const u8{ fifo_name, link_name, missing_name }) |name| try root.createDir(io, name, .default_dir);
+    var fifo_dir = try root.openDir(io, fifo_name, .{});
+    defer fifo_dir.close(io);
+    try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.mknodat(fifo_dir.handle, lease_name, std.posix.S.IFIFO | 0o644, 0)));
+    var link_dir = try root.openDir(io, link_name, .{});
+    defer link_dir.close(io);
+    try link_dir.symLink(io, "../" ++ fifo_name ++ "/.lease", lease_name, .{});
+    // This must neither block opening the FIFO nor abort at the missing lease.
+    try std.testing.expectEqual(@as(usize, 1), try collect(ctx, env.path));
+    try std.testing.expectError(error.FileNotFound, std.Io.Dir.accessAbsolute(io, old.final_path, .{}));
+    for ([_][]const u8{ fifo_name, link_name, missing_name }) |name| try root.access(io, name, .{});
+    for ([_][]const u8{ fifo_name, link_name, missing_name }) |name| {
+        try publish.replaceSymlink(root, name, "current", .{});
+        try std.testing.expectError(Error.FileSystem, select(ctx, env.path));
+    }
+    try publish.replaceSymlink(root, current.name, "current", .{});
+    var selected = try select(ctx, env.path);
+    defer selected.deinit();
+    try expectPairForTest(&selected, "current", "current");
 }
 
 test "repository snapshot faults retain the previous selection until pointer commit" {
@@ -385,5 +493,12 @@ test "repository snapshot subprocess restart preserves a coherent selected pair"
         const committed = std.mem.eql(u8, checkpoint, "repository_snapshot_after_select");
         try expectPairForTest(&current, if (committed) "new-db" else "old-db", if (committed) "new-sig" else "old-sig");
         try std.Io.Dir.accessAbsolute(path.currentIo(), old.final_path, .{});
+        // Collection holds the writer lock in production, so a subsequent
+        // pass can reclaim a stage abandoned by a terminated publisher.
+        _ = try collect(ctx, env.path);
+        var dir = try std.Io.Dir.openDirAbsolute(path.currentIo(), env.path, .{ .iterate = true });
+        defer dir.close(path.currentIo());
+        var entries = dir.iterate();
+        while (try entries.next(path.currentIo())) |entry| try std.testing.expect(!validStageName(entry.name));
     }
 }

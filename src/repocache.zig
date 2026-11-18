@@ -924,6 +924,8 @@ test "RepoCache remote snapshots migrate flat caches, verify pairs, repair commi
     // the previous revision; it must not download this deliberately bad pair.
     try dummy.set(db_url, "do-not-download");
     try dummy.set(sig_url, "bad-signature");
+    publish.failNextDirectorySyncForTest();
+    try std.testing.expectError(RepoCacheError.FileSystem, cache.sync(client, .{ .now = 12, .interval_seconds = 900 }, &keys));
     try cache.sync(client, .{ .now = 12, .interval_seconds = 900 }, &keys);
     var current = try buildRepoPaths(&cache, ctx.allocator);
     defer current.deinit();
