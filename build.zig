@@ -320,9 +320,14 @@ pub fn build(b: *std.Build) void {
     const all_tests_run = createTestStep(b, .{ .name = "all", .path = "src/all_tests.zig" }, target, optimize, sqlite_lib, ckdl_lib, vendored, mere_module, zon_module);
     test_step.dependOn(&all_tests_run.step);
 
-    // Individual test steps for running specific module tests
+    // Individual test steps for running specific module tests. Files under
+    // src/cli/ import the library as the "mere" module, so all_tests.zig
+    // cannot reach them; the main step runs those roots separately.
     for (test_modules) |test_module| {
-        _ = createTestStep(b, test_module, target, optimize, sqlite_lib, ckdl_lib, vendored, mere_module, zon_module);
+        const run_test = createTestStep(b, test_module, target, optimize, sqlite_lib, ckdl_lib, vendored, mere_module, zon_module);
+        if (std.mem.startsWith(u8, test_module.path, "src/cli/")) {
+            test_step.dependOn(&run_test.step);
+        }
     }
 }
 

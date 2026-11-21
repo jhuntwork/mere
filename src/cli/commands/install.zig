@@ -43,14 +43,14 @@ const install_meta = command.CommandMeta{
         },
         .{
             .name = "dry-run",
-            .description = "Show changes without creating or activating a generation",
+            .description = "Preview changes without downloading packages or changing the store, profiles, or GC roots; repository metadata follows the sync options",
             .flag_type = .bool,
         },
     },
 };
 
 /// Install command handler
-fn handleInstall(ctx: *mere.Context, args: *const types.ParsedArgs) MereError!types.CommandResult {
+pub fn handleInstall(ctx: *mere.Context, args: *const types.ParsedArgs) MereError!types.CommandResult {
     if (args.positional.len == 0) {
         return MereError.MissingArgument;
     }
@@ -97,7 +97,11 @@ fn performInstallation(
     const client = curl_client.client();
 
     // Perform installation (no logging - errors propagate)
-    const outcome = try mere.install.installPackagesFromConfigWithPreview(ctx, package_names, client, false, verify_store, sync_policy, profile_name, dry_run);
+    const outcome = try mere.install.installPackagesFromConfig(ctx, package_names, client, profile_name, .{
+        .verify_store = verify_store,
+        .sync_policy = sync_policy,
+        .dry_run = dry_run,
+    });
     return switch (outcome) {
         .completed => null,
         .store_only_system_activation_deferred => null,
