@@ -32,7 +32,7 @@ const uninstall_meta = command.CommandMeta{
         },
         .{
             .name = "dry-run",
-            .description = "Show what would be removed without making changes",
+            .description = "Preview removals without changing the store, profiles, or GC roots; repository metadata follows the sync options",
             .flag_type = .bool,
         },
         .{
@@ -53,7 +53,7 @@ const uninstall_meta = command.CommandMeta{
     },
 };
 
-fn handleUninstall(ctx: *mere.Context, args: *const types.ParsedArgs) MereError!types.CommandResult {
+pub fn handleUninstall(ctx: *mere.Context, args: *const types.ParsedArgs) MereError!types.CommandResult {
     if (args.positional.len == 0) {
         return MereError.MissingArgument;
     }

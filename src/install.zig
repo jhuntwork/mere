@@ -393,37 +393,28 @@ fn emitNamedDiffLine(ctx: *Context, phase: ui.Phase, label: []const u8, kind: me
     emit.logSegmentsSeverity(ctx, phase, .info, &segments);
 }
 
+pub const InstallOptions = struct {
+    reinstall: bool = false,
+    verify_store: bool = false,
+    sync_policy: SyncPolicy = .automatic,
+    /// Resolve and report the transaction without realizing it: no archive
+    /// downloads, store admission, profile or generation publication, or GC
+    /// root changes. Repository metadata still follows `sync_policy`.
+    dry_run: bool = false,
+};
+
 pub fn installPackagesFromConfig(
     ctx: *Context,
     pkg_names: []const []const u8,
     client: download.TransferClient,
-    reinstall: bool,
-    verify_store: bool,
-    force_sync: bool,
     profile_name: ?[]const u8,
+    options: InstallOptions,
 ) !InstallCommandOutcome {
-    return installPackagesFromConfigWithPreview(
-        ctx,
-        pkg_names,
-        client,
-        reinstall,
-        verify_store,
-        if (force_sync) SyncPolicy.force else .automatic,
-        profile_name,
-        false,
-    );
-}
+    const reinstall = options.reinstall;
+    const verify_store = options.verify_store;
+    const sync_policy = options.sync_policy;
+    const dry_run = options.dry_run;
 
-pub fn installPackagesFromConfigWithPreview(
-    ctx: *Context,
-    pkg_names: []const []const u8,
-    client: download.TransferClient,
-    reinstall: bool,
-    verify_store: bool,
-    sync_policy: SyncPolicy,
-    profile_name: ?[]const u8,
-    dry_run: bool,
-) !InstallCommandOutcome {
     if (pkg_names.len == 0) {
         return ctx.fail(error.InvalidInput, "package", "no package names provided");
     }
@@ -492,14 +483,83 @@ pub fn installPackagesFromConfigWithPreview(
     defer resolution.deinit();
     if (requested_state) |*state| resolution.setRequestedIntent(state.packages.items);
 
+    if (dry_run) {
+        emitInstallPreview(ctx, target_behavior, profile_name, resolution.plan.sorted);
+        emit.logLineSeverity(ctx, .install, .info, "dry run: no changes made");
+        emit.phaseEnd(ctx, .install, true);
+        return commandOutcome(target_behavior);
+    }
+
     // Realize
     const result_behavior = try realizeProfile(ctx, &resolution, client, reinstall, verify_store, profile_name, null, .install, expected_profile_state);
 
     emit.phaseEnd(ctx, .install, true);
-    return switch (result_behavior) {
+    return commandOutcome(result_behavior);
+}
+
+fn commandOutcome(behavior: InstallTargetBehavior) InstallCommandOutcome {
+    return switch (behavior) {
         .store_only_system_deferred => .store_only_system_activation_deferred,
         .store_only_requested, .activate_profile => .completed,
     };
+}
+
+/// Report what a real install with the same resolution would change, using
+/// only reads. Profile targets get the same diff a real install reports.
+/// Store-only targets resolve just the requested packages, so a profile diff
+/// would misreport the rest of the profile as removed; they instead report
+/// which store objects would be admitted.
+fn emitInstallPreview(
+    ctx: *Context,
+    target_behavior: InstallTargetBehavior,
+    profile_name: ?[]const u8,
+    sorted: []const resolver.ResolvedPackage,
+) void {
+    switch (target_behavior) {
+        .activate_profile => if (profile_name) |prof_name| {
+            emitResolutionDiff(ctx, prof_name, sorted, .install);
+        },
+        .store_only_requested, .store_only_system_deferred => {
+            emitStoreAdmissionPreview(ctx, sorted);
+            if (target_behavior == .store_only_system_deferred) {
+                emit.logLineSeverity(ctx, .install, .warn, "system activation would be deferred: packages would be installed to the store only; rerun as root to activate");
+            }
+        },
+    }
+}
+
+fn emitStoreAdmissionPreview(ctx: *Context, sorted: []const resolver.ResolvedPackage) void {
+    var missing: std.ArrayList([]const u8) = .empty;
+    defer missing.deinit(ctx.allocator);
+    var present: usize = 0;
+    for (sorted) |*resolved| {
+        const name = resolved.pkg.name orelse continue;
+        if (isResolvedPackageInStore(ctx, resolved)) {
+            present += 1;
+        } else {
+            missing.append(ctx.allocator, name) catch return;
+        }
+    }
+    if (missing.items.len > 0) {
+        emitNamedDiffLine(ctx, .install, "store additions: ", .success, missing.items);
+    }
+    if (present > 0) {
+        var buf: [48]u8 = undefined;
+        const text = std.fmt.bufPrint(&buf, "{d} already in store", .{present}) catch return;
+        const segments = [_]mere.ui.Segment{
+            .{ .text = text, .kind = .normal },
+        };
+        emit.logSegmentsSeverity(ctx, .install, .info, &segments);
+    }
+}
+
+fn isResolvedPackageInStore(ctx: *Context, resolved: *const resolver.ResolvedPackage) bool {
+    const name = resolved.pkg.name orelse return false;
+    const version = resolved.pkg.version orelse return false;
+    const store_path = store.constructStorePath(ctx, resolved.pkg.content_hash, name, version) catch return false;
+    defer ctx.allocator.free(store_path);
+    std.Io.Dir.accessAbsolute(path.currentIo(), store_path, .{}) catch return false;
+    return true;
 }
 
 /// Install packages from PackageSpec entries (from profile.kdl input).
@@ -1016,16 +1076,10 @@ fn getProfileDir(ctx: *Context, profile_name: []const u8) ![]const u8 {
 }
 
 fn loadRequestedRootsState(ctx: *Context, profile_name: []const u8) !RequestedRootsState {
+    // Read-only: dry runs rely on this. A missing profile has no requested
+    // roots, and publication creates the profile directory when it commits.
     const profile_dir = try getProfileDir(ctx, profile_name);
     defer ctx.allocator.free(profile_dir);
-
-    path.ensureDirExists(profile_dir) catch |err| {
-        ctx.setDiagnosticContext(profile_dir, "failed to create profile directory");
-        return switch (err) {
-            error.AccessDenied => error.PermissionDenied,
-            else => error.FileSystem,
-        };
-    };
 
     // Read package names from the current generation's profile.kdl
     var packages: std.ArrayList(RequestedPackage) = .empty;
@@ -1839,19 +1893,7 @@ fn prefetchMissingPackageArchives(
         }
 
         // Not in cache — check if already in store before downloading
-        const in_store = blk: {
-            if (resolved.pkg.name) |name| {
-                if (resolved.pkg.version) |version| {
-                    const store_path = store.constructStorePath(ctx, resolved.pkg.content_hash, name, version) catch break :blk false;
-                    defer ctx.allocator.free(store_path);
-                    std.Io.Dir.accessAbsolute(path.currentIo(), store_path, .{}) catch break :blk false;
-                    break :blk true;
-                }
-            }
-            break :blk false;
-        };
-
-        if (in_store) {
+        if (isResolvedPackageInStore(ctx, resolved)) {
             ctx.allocator.free(cache_path);
             const empty = try ctx.allocator.dupe(u8, "");
             try cache_paths.append(ctx.allocator, empty);
@@ -5367,19 +5409,22 @@ fn createSignedTestPackage(
     pkg.release = 1;
     pkg.arch = try ctx.allocator.dupe(u8, th.host_arch);
 
-    const staging = try std.fs.path.join(ctx.allocator, &.{ staging_root, name });
+    const staging_name = try std.fmt.allocPrint(ctx.allocator, "{s}-{s}", .{ name, version });
+    defer ctx.allocator.free(staging_name);
+    const staging = try std.fs.path.join(ctx.allocator, &.{ staging_root, staging_name });
     defer ctx.allocator.free(staging);
     try path.ensureDirExists(staging);
 
     // Filename includes the package name - these packages may all end up
     // merged into the same profile, and identical paths across packages
-    // would collide when publishing the symlink tree.
+    // would collide when publishing the symlink tree. The content includes
+    // the version so each version of a package has its own content hash.
     const file_txt_name = try std.fmt.allocPrint(ctx.allocator, "{s}.txt", .{name});
     defer ctx.allocator.free(file_txt_name);
     const file_txt_path = try std.fs.path.join(ctx.allocator, &.{ staging, file_txt_name });
     defer ctx.allocator.free(file_txt_path);
     var file_txt = try path.makePathAndOpenFile(file_txt_path);
-    try file_txt.writeStreamingAll(path.currentIo(), name);
+    try file_txt.writeStreamingAll(path.currentIo(), staging_name);
     file_txt.close(path.currentIo());
 
     const mere_dir_path = try std.fs.path.join(ctx.allocator, &.{ staging, manifest.META_DIR });
@@ -5422,6 +5467,283 @@ fn createSignedTestPackage(
 
     _ = try repo.db.insertPackageTransaction(&pkg, null);
 }
+
+/// Test fixtures shared with the CLI command tests. Not part of the supported
+/// library API.
+pub const test_support = struct {
+    /// A signed `file://` repository registered in `ctx.configuration`. Its
+    /// files live under `<root>/fixture-repo`, outside `<root>/mere`, so a
+    /// `StateSnapshot` of the root never includes them.
+    pub const Repo = struct {
+        ctx: *Context,
+        repo: Repository,
+        repo_dir: []const u8,
+        packages_dir: []const u8,
+        staging_root: []const u8,
+        key_path: []const u8,
+        owns_configuration: bool,
+
+        /// `ctx.home_dir` must point at a scratch directory: the public key is
+        /// installed in `<home>/.mere/keys` so repository verification finds it.
+        pub fn init(ctx: *Context) !Repo {
+            const allocator = ctx.allocator;
+            const home = ctx.home_dir orelse return error.InvalidInput;
+
+            const repo_dir = try std.fs.path.join(allocator, &.{ ctx.root_path, "fixture-repo" });
+            errdefer allocator.free(repo_dir);
+            const packages_dir = try std.fs.path.join(allocator, &.{ repo_dir, "packages" });
+            errdefer allocator.free(packages_dir);
+            const staging_root = try std.fs.path.join(allocator, &.{ ctx.root_path, "fixture-staging" });
+            errdefer allocator.free(staging_root);
+            const key_path = try std.fs.path.join(allocator, &.{ repo_dir, "repo.key" });
+            errdefer allocator.free(key_path);
+            try path.ensureDirExists(packages_dir);
+            try path.ensureDirExists(staging_root);
+
+            const keypair = try sign.generateKeyPair();
+            try keypair.secret_key.saveToFile(key_path);
+            const keys_dir = try std.fs.path.join(allocator, &.{ home, ".mere", "keys" });
+            defer allocator.free(keys_dir);
+            try path.ensureDirExists(keys_dir);
+            const pub_path = try std.fs.path.join(allocator, &.{ keys_dir, "fixture-repo.pub" });
+            defer allocator.free(pub_path);
+            try keypair.public_key.saveToFile(pub_path);
+
+            var repo = try Repository.init(ctx, repo_dir, false);
+            errdefer repo.deinit();
+
+            const owns_configuration = ctx.configuration == null;
+            if (owns_configuration) ctx.configuration = config_mod.Config.init(ctx, allocator);
+            errdefer if (owns_configuration) {
+                ctx.configuration.?.deinit();
+                ctx.configuration = null;
+            };
+
+            const fingerprint = try keypair.public_key.fingerprint(allocator);
+            defer allocator.free(fingerprint);
+            var fps: std.ArrayList([]const u8) = .empty;
+            try fps.append(allocator, try allocator.dupe(u8, fingerprint));
+            const repo_url = try std.fmt.allocPrint(allocator, "file://{s}", .{repo_dir});
+            errdefer allocator.free(repo_url);
+            try ctx.configuration.?.repos.append(allocator, config_mod.RepoConfig{
+                .name = try allocator.dupe(u8, "fixture"),
+                .url = repo_url,
+                .priority = 100,
+                .trusted_fingerprints = fps,
+            });
+
+            return .{
+                .ctx = ctx,
+                .repo = repo,
+                .repo_dir = repo_dir,
+                .packages_dir = packages_dir,
+                .staging_root = staging_root,
+                .key_path = key_path,
+                .owns_configuration = owns_configuration,
+            };
+        }
+
+        pub fn deinit(self: *Repo) void {
+            const allocator = self.ctx.allocator;
+            self.repo.deinit();
+            if (self.owns_configuration) {
+                if (self.ctx.configuration) |*cfg| cfg.deinit();
+                self.ctx.configuration = null;
+            }
+            if (self.ctx.signing_key_path) |key| {
+                if (key.ptr == self.key_path.ptr) self.ctx.signing_key_path = null;
+            }
+            allocator.free(self.repo_dir);
+            allocator.free(self.packages_dir);
+            allocator.free(self.staging_root);
+            allocator.free(self.key_path);
+        }
+
+        /// Add a signed package. Call `publish` before the next resolution.
+        pub fn addPackage(self: *Repo, name: []const u8, version: []const u8, deps: []const []const u8) !void {
+            try createSignedTestPackage(self.ctx, &self.repo, self.staging_root, self.packages_dir, self.key_path, name, version, deps);
+        }
+
+        /// Sign the repository database in its current state.
+        pub fn publish(self: *Repo) !void {
+            const allocator = self.ctx.allocator;
+            const db_path = try std.fs.path.join(allocator, &.{ self.repo_dir, "repo.db" });
+            defer allocator.free(db_path);
+            const sig_path = try std.fs.path.join(allocator, &.{ self.repo_dir, "repo.db.sig" });
+            defer allocator.free(sig_path);
+            self.ctx.signing_key_path = self.key_path;
+            _ = try sign.writeSignatureFileWithResolver(self.ctx, db_path, sig_path, null, null);
+        }
+    };
+
+    /// Everything under `<root>/mere`: the store, profiles and generations,
+    /// `current` selections, GC roots, and caches. Each entry records its kind,
+    /// mode, size, and modification time, plus the content digest of files and
+    /// the target of symlinks, so any write - including a temporary that was
+    /// created and then removed, which changes its directory's mtime - shows up.
+    pub const StateSnapshot = struct {
+        allocator: std.mem.Allocator,
+        entries: std.ArrayList([]u8) = .empty,
+
+        pub fn capture(allocator: std.mem.Allocator, root_path: []const u8) !StateSnapshot {
+            var snapshot = StateSnapshot{ .allocator = allocator };
+            errdefer snapshot.deinit();
+
+            const io = path.currentIo();
+            const mere_dir = try std.fs.path.join(allocator, &.{ root_path, "mere" });
+            defer allocator.free(mere_dir);
+            var dir = std.Io.Dir.openDirAbsolute(io, mere_dir, .{ .iterate = true }) catch |err| switch (err) {
+                error.FileNotFound => return snapshot,
+                else => return err,
+            };
+            defer dir.close(io);
+
+            try snapshot.add(dir, ".", .directory);
+            var walker = try dir.walk(allocator);
+            defer walker.deinit();
+            while (try walker.next(io)) |entry| try snapshot.add(dir, entry.path, entry.kind);
+
+            std.mem.sort([]u8, snapshot.entries.items, {}, struct {
+                fn lessThan(_: void, a: []u8, b: []u8) bool {
+                    return std.mem.order(u8, a, b) == .lt;
+                }
+            }.lessThan);
+            return snapshot;
+        }
+
+        fn add(self: *StateSnapshot, dir: std.Io.Dir, rel_path: []const u8, kind: std.Io.File.Kind) !void {
+            const io = path.currentIo();
+            const stat = try dir.statFile(io, rel_path, .{ .follow_symlinks = false });
+            var link_buf: [std.fs.max_path_bytes]u8 = undefined;
+            var digest_hex: [64]u8 = undefined;
+            const detail: []const u8 = switch (kind) {
+                .sym_link => link_buf[0..try dir.readLink(io, rel_path, &link_buf)],
+                .file => blk: {
+                    const data = try dir.readFileAlloc(io, rel_path, self.allocator, .limited(64 * 1024 * 1024));
+                    defer self.allocator.free(data);
+                    var digest: [32]u8 = undefined;
+                    std.crypto.hash.sha2.Sha256.hash(data, &digest, .{});
+                    digest_hex = std.fmt.bytesToHex(digest, .lower);
+                    break :blk &digest_hex;
+                },
+                else => "",
+            };
+            const line = try std.fmt.allocPrint(self.allocator, "{s} {s} mode={o} size={d} mtime={d} {s}", .{
+                rel_path,
+                @tagName(kind),
+                stat.permissions.toMode(),
+                stat.size,
+                stat.mtime.nanoseconds,
+                detail,
+            });
+            errdefer self.allocator.free(line);
+            try self.entries.append(self.allocator, line);
+        }
+
+        pub fn deinit(self: *StateSnapshot) void {
+            for (self.entries.items) |line| self.allocator.free(line);
+            self.entries.deinit(self.allocator);
+        }
+
+        pub fn equals(self: *const StateSnapshot, other: *const StateSnapshot) bool {
+            if (self.entries.items.len != other.entries.items.len) return false;
+            for (self.entries.items, other.entries.items) |a, b| {
+                if (!std.mem.eql(u8, a, b)) return false;
+            }
+            return true;
+        }
+
+        /// Fail, printing the entries that differ, unless `after` matches.
+        pub fn expectUnchanged(self: *const StateSnapshot, after: *const StateSnapshot) !void {
+            if (self.equals(after)) return;
+            var i: usize = 0;
+            var j: usize = 0;
+            while (i < self.entries.items.len or j < after.entries.items.len) {
+                const order: std.math.Order = if (i == self.entries.items.len)
+                    .gt
+                else if (j == after.entries.items.len)
+                    .lt
+                else
+                    std.mem.order(u8, self.entries.items[i], after.entries.items[j]);
+                switch (order) {
+                    .eq => {
+                        i += 1;
+                        j += 1;
+                    },
+                    .lt => {
+                        std.debug.print("- {s}\n", .{self.entries.items[i]});
+                        i += 1;
+                    },
+                    .gt => {
+                        std.debug.print("+ {s}\n", .{after.entries.items[j]});
+                        j += 1;
+                    },
+                }
+            }
+            return error.TestExpectedEqual;
+        }
+    };
+
+    /// Records log lines so tests can compare a preview with the transaction
+    /// summary a real operation reports.
+    pub const CaptureEmitter = struct {
+        emitter: ui.Emitter,
+        allocator: std.mem.Allocator,
+        lines: std.ArrayList([]const u8) = .empty,
+
+        pub fn init(allocator: std.mem.Allocator) CaptureEmitter {
+            return .{ .emitter = .{ .emitFn = onEmit }, .allocator = allocator };
+        }
+
+        pub fn deinit(self: *CaptureEmitter) void {
+            self.clear();
+            self.lines.deinit(self.allocator);
+        }
+
+        pub fn clear(self: *CaptureEmitter) void {
+            for (self.lines.items) |line| self.allocator.free(line);
+            self.lines.clearRetainingCapacity();
+        }
+
+        fn onEmit(emitter: *ui.Emitter, event: ui.Event) void {
+            const self: *CaptureEmitter = @fieldParentPtr("emitter", emitter);
+            var line: std.ArrayList(u8) = .empty;
+            defer line.deinit(self.allocator);
+            switch (event.kind) {
+                .log_line => line.appendSlice(self.allocator, event.message orelse return) catch return,
+                .log_segments => for (event.data.log_segments) |segment| {
+                    line.appendSlice(self.allocator, segment.text) catch return;
+                },
+                else => return,
+            }
+            const owned = line.toOwnedSlice(self.allocator) catch return;
+            self.lines.append(self.allocator, owned) catch self.allocator.free(owned);
+        }
+
+        pub fn contains(self: *const CaptureEmitter, needle: []const u8) bool {
+            for (self.lines.items) |line| {
+                if (std.mem.indexOf(u8, line, needle) != null) return true;
+            }
+            return false;
+        }
+
+        /// The profile-diff lines: what is installed, removed, upgraded, or
+        /// unchanged. Previews and real operations both report these.
+        pub fn transactionLines(self: *const CaptureEmitter, allocator: std.mem.Allocator) ![]const []const u8 {
+            var out: std.ArrayList([]const u8) = .empty;
+            errdefer out.deinit(allocator);
+            for (self.lines.items) |line| {
+                const is_transaction = std.mem.startsWith(u8, line, "installed: ") or
+                    std.mem.startsWith(u8, line, "uninstalled: ") or
+                    std.mem.startsWith(u8, line, "upgraded: ") or
+                    std.mem.endsWith(u8, line, " unchanged") or
+                    std.mem.endsWith(u8, line, " packages added");
+                if (is_transaction) try out.append(allocator, line);
+            }
+            return out.toOwnedSlice(allocator);
+        }
+    };
+};
 
 // Regression: uninstall --cascade with multiple package names only cascaded
 // the first one still required, then stopped checking entirely (a `break`
@@ -5509,7 +5831,7 @@ test "uninstallPackagesFromConfig cascade handles multiple independently-require
     const client = curl_client.client();
 
     // Install all four as roots of a named profile.
-    _ = try installPackagesFromConfig(ctx, &.{ "A", "C", "E", "F" }, client, false, false, false, "testprofile");
+    _ = try installPackagesFromConfig(ctx, &.{ "A", "C", "E", "F" }, client, "testprofile", .{});
 
     // Sanity: all four are actually present before we try to remove any.
     {
@@ -5940,4 +6262,292 @@ test "admitExistingStoreObject verifies an unprivileged existing object once" {
     const mode = (try dir.stat(io)).permissions.toMode();
     try std.testing.expectEqual(@as(std.posix.mode_t, 0), mode & 0o222);
     try dir.setPermissions(io, .fromMode(mode | 0o200));
+}
+
+const DryRunTestEnv = struct {
+    test_env: *@import("test_helpers.zig").TestEnv,
+    repo: test_support.Repo,
+    curl_client: *download.CurlTransferClient,
+    capture: test_support.CaptureEmitter,
+
+    fn init() !*DryRunTestEnv {
+        const th = @import("test_helpers.zig");
+        const self = try std.testing.allocator.create(DryRunTestEnv);
+        errdefer std.testing.allocator.destroy(self);
+        self.test_env = try th.createTestEnv();
+        errdefer {
+            self.test_env.cleanup();
+            std.testing.allocator.destroy(self.test_env);
+        }
+        const ctx = &self.test_env.ctx;
+        self.repo = try test_support.Repo.init(ctx);
+        errdefer self.repo.deinit();
+        self.curl_client = try download.CurlTransferClient.init(ctx, "mere");
+        self.capture = test_support.CaptureEmitter.init(ctx.allocator);
+        ctx.custom_emitter = &self.capture.emitter;
+        return self;
+    }
+
+    fn deinit(self: *DryRunTestEnv) void {
+        const ctx = &self.test_env.ctx;
+        ctx.custom_emitter = null;
+        self.capture.deinit();
+        download.CurlTransferClient.cleanupFn(ctx, self.curl_client);
+        self.repo.deinit();
+        self.test_env.cleanup();
+        std.testing.allocator.destroy(self.test_env);
+        std.testing.allocator.destroy(self);
+    }
+
+    fn context(self: *DryRunTestEnv) *Context {
+        return &self.test_env.ctx;
+    }
+
+    fn client(self: *DryRunTestEnv) download.TransferClient {
+        return self.curl_client.client();
+    }
+
+    fn snapshot(self: *DryRunTestEnv) !test_support.StateSnapshot {
+        return test_support.StateSnapshot.capture(self.context().allocator, self.context().root_path);
+    }
+
+    /// The transaction summary of the operation run since the last call.
+    fn takeTransactionLines(self: *DryRunTestEnv) ![]const []const u8 {
+        const allocator = self.context().allocator;
+        const borrowed = try self.capture.transactionLines(allocator);
+        defer allocator.free(borrowed);
+        const owned = try allocator.alloc([]const u8, borrowed.len);
+        var filled: usize = 0;
+        errdefer {
+            for (owned[0..filled]) |line| allocator.free(line);
+            allocator.free(owned);
+        }
+        for (borrowed) |line| {
+            owned[filled] = try allocator.dupe(u8, line);
+            filled += 1;
+        }
+        self.capture.clear();
+        return owned;
+    }
+
+    fn freeLines(self: *DryRunTestEnv, lines: []const []const u8) void {
+        for (lines) |line| self.context().allocator.free(line);
+        self.context().allocator.free(lines);
+    }
+
+    fn expectLines(expected: []const []const u8, actual: []const []const u8) !void {
+        try std.testing.expectEqual(expected.len, actual.len);
+        for (expected, actual) |e, a| try std.testing.expectEqualStrings(e, a);
+    }
+
+    fn profileVersion(self: *DryRunTestEnv, profile_name: []const u8, package_name: []const u8) !?[]const u8 {
+        const allocator = self.context().allocator;
+        const profile_dir = try getProfileDir(self.context(), profile_name);
+        defer allocator.free(profile_dir);
+        var current = (try loadCurrentManifest(self.context(), profile_name, profile_dir)) orelse return null;
+        defer current.deinit();
+        for (current.packages.items) |pkg| {
+            if (std.mem.eql(u8, pkg.name, package_name)) return try allocator.dupe(u8, pkg.version);
+        }
+        return null;
+    }
+};
+
+// Regression for #121: install --dry-run used to realize the profile anyway,
+// admitting packages and publishing the named-profile root.
+test "install dry-run into an empty named profile changes nothing and previews the real install" {
+    const env = try DryRunTestEnv.init();
+    defer env.deinit();
+    const ctx = env.context();
+
+    try env.repo.addPackage("B", "1.0.0", &.{});
+    try env.repo.addPackage("A", "1.0.0", &.{"B"});
+    try env.repo.publish();
+
+    const profiles_dir = try std.fs.path.join(ctx.allocator, &.{ ctx.root_path, "mere", "profiles" });
+    defer ctx.allocator.free(profiles_dir);
+    ctx.allocator.free(try profile.createProfile(ctx, profiles_dir, "empty"));
+
+    var before = try env.snapshot();
+    defer before.deinit();
+    env.capture.clear();
+
+    const outcome = try installPackagesFromConfig(ctx, &.{"A"}, env.client(), "empty", .{ .dry_run = true });
+    try std.testing.expectEqual(InstallCommandOutcome.completed, outcome);
+    try std.testing.expect(env.capture.contains("dry run: no changes made"));
+
+    var after = try env.snapshot();
+    defer after.deinit();
+    try before.expectUnchanged(&after);
+
+    const preview = try env.takeTransactionLines();
+    defer env.freeLines(preview);
+    try std.testing.expect(preview.len > 0);
+
+    _ = try installPackagesFromConfig(ctx, &.{"A"}, env.client(), "empty", .{});
+    const real = try env.takeTransactionLines();
+    defer env.freeLines(real);
+    try DryRunTestEnv.expectLines(preview, real);
+
+    var installed = try env.snapshot();
+    defer installed.deinit();
+    try std.testing.expect(!before.equals(&installed));
+    const version = (try env.profileVersion("empty", "A")).?;
+    defer ctx.allocator.free(version);
+    try std.testing.expectEqualStrings("1.0.0", version);
+}
+
+test "install dry-run into a populated profile holds unrelated packages and previews the real install" {
+    const env = try DryRunTestEnv.init();
+    defer env.deinit();
+    const ctx = env.context();
+
+    try env.repo.addPackage("A", "1.0.0", &.{});
+    try env.repo.addPackage("C", "1.0.0", &.{});
+    try env.repo.addPackage("D", "1.0.0", &.{});
+    try env.repo.publish();
+    _ = try installPackagesFromConfig(ctx, &.{ "A", "C" }, env.client(), "work", .{});
+
+    // A newer A must not be picked up when only D is requested.
+    try env.repo.addPackage("A", "2.0.0", &.{});
+    try env.repo.publish();
+
+    var before = try env.snapshot();
+    defer before.deinit();
+    env.capture.clear();
+
+    _ = try installPackagesFromConfig(ctx, &.{"D"}, env.client(), "work", .{ .dry_run = true });
+    var after = try env.snapshot();
+    defer after.deinit();
+    try before.expectUnchanged(&after);
+
+    const preview = try env.takeTransactionLines();
+    defer env.freeLines(preview);
+    try DryRunTestEnv.expectLines(&.{ "installed: D", "2 unchanged" }, preview);
+
+    _ = try installPackagesFromConfig(ctx, &.{"D"}, env.client(), "work", .{});
+    const real = try env.takeTransactionLines();
+    defer env.freeLines(real);
+    try DryRunTestEnv.expectLines(preview, real);
+
+    const version = (try env.profileVersion("work", "A")).?;
+    defer ctx.allocator.free(version);
+    try std.testing.expectEqualStrings("1.0.0", version);
+}
+
+test "install dry-run for the system profile and the store alone changes nothing" {
+    const env = try DryRunTestEnv.init();
+    defer env.deinit();
+    const ctx = env.context();
+
+    try env.repo.addPackage("B", "1.0.0", &.{});
+    try env.repo.addPackage("A", "1.0.0", &.{"B"});
+    try env.repo.addPackage("C", "1.0.0", &.{});
+    try env.repo.publish();
+    // Put A and B in the store so the preview can tell present from missing.
+    _ = try installPackagesFromConfig(ctx, &.{"A"}, env.client(), "seed", .{});
+
+    var before = try env.snapshot();
+    defer before.deinit();
+    env.capture.clear();
+
+    // The system profile's target depends on privilege: as root it is
+    // activated (in this scratch root), otherwise activation is deferred and
+    // only the store would change. Neither may happen in a dry run.
+    const system_outcome = try installPackagesFromConfig(ctx, &.{ "A", "C" }, env.client(), "system", .{ .dry_run = true });
+    if (store.isPrivileged()) {
+        try std.testing.expectEqual(InstallCommandOutcome.completed, system_outcome);
+        try std.testing.expect(env.capture.contains("packages added") or env.capture.contains("installed: "));
+    } else {
+        try std.testing.expectEqual(InstallCommandOutcome.store_only_system_activation_deferred, system_outcome);
+        try std.testing.expect(env.capture.contains("store additions: C"));
+        try std.testing.expect(env.capture.contains("2 already in store"));
+        try std.testing.expect(env.capture.contains("system activation would be deferred"));
+        // The request-only resolution must not be reported as a profile diff.
+        try std.testing.expect(!env.capture.contains("uninstalled: "));
+    }
+    env.capture.clear();
+
+    _ = try installPackagesFromConfig(ctx, &.{"C"}, env.client(), null, .{ .dry_run = true });
+    try std.testing.expect(env.capture.contains("store additions: C"));
+
+    var after = try env.snapshot();
+    defer after.deinit();
+    try before.expectUnchanged(&after);
+}
+
+test "upgrade dry-run changes nothing and previews the real upgrade" {
+    const env = try DryRunTestEnv.init();
+    defer env.deinit();
+    const ctx = env.context();
+
+    try env.repo.addPackage("A", "1.0.0", &.{});
+    try env.repo.addPackage("B", "1.0.0", &.{});
+    try env.repo.publish();
+    _ = try installPackagesFromConfig(ctx, &.{ "A", "B" }, env.client(), "work", .{});
+    try env.repo.addPackage("A", "2.0.0", &.{});
+    try env.repo.publish();
+
+    var before = try env.snapshot();
+    defer before.deinit();
+    env.capture.clear();
+
+    _ = try upgradePackagesFromConfig(ctx, &.{"A"}, env.client(), false, .automatic, "work", true);
+    var after = try env.snapshot();
+    defer after.deinit();
+    try before.expectUnchanged(&after);
+
+    const preview = try env.takeTransactionLines();
+    defer env.freeLines(preview);
+    try DryRunTestEnv.expectLines(&.{ "upgraded: A", "1 unchanged" }, preview);
+
+    _ = try upgradePackagesFromConfig(ctx, &.{"A"}, env.client(), false, .automatic, "work", false);
+    const real = try env.takeTransactionLines();
+    defer env.freeLines(real);
+    try DryRunTestEnv.expectLines(preview, real);
+
+    const version = (try env.profileVersion("work", "A")).?;
+    defer ctx.allocator.free(version);
+    try std.testing.expectEqualStrings("2.0.0", version);
+}
+
+test "uninstall dry-run changes nothing and previews the real uninstall" {
+    const env = try DryRunTestEnv.init();
+    defer env.deinit();
+    const ctx = env.context();
+
+    try env.repo.addPackage("A", "1.0.0", &.{});
+    try env.repo.addPackage("C", "1.0.0", &.{});
+    try env.repo.publish();
+    _ = try installPackagesFromConfig(ctx, &.{ "A", "C" }, env.client(), "work", .{});
+
+    var before = try env.snapshot();
+    defer before.deinit();
+    env.capture.clear();
+
+    const dry_message = try uninstallPackagesFromConfig(ctx, &.{"C"}, env.client(), false, .automatic, "work", false, true);
+    try std.testing.expect(dry_message == null);
+    var after = try env.snapshot();
+    defer after.deinit();
+    try before.expectUnchanged(&after);
+
+    const preview = try env.takeTransactionLines();
+    defer env.freeLines(preview);
+    try DryRunTestEnv.expectLines(&.{ "uninstalled: C", "1 unchanged" }, preview);
+
+    const real_message = try uninstallPackagesFromConfig(ctx, &.{"C"}, env.client(), false, .automatic, "work", false, false);
+    try std.testing.expect(real_message == null);
+    const real = try env.takeTransactionLines();
+    defer env.freeLines(real);
+    try DryRunTestEnv.expectLines(preview, real);
+
+    // Removing the last requested root takes a different path.
+    var before_last = try env.snapshot();
+    defer before_last.deinit();
+    const last_message = try uninstallPackagesFromConfig(ctx, &.{"A"}, env.client(), false, .automatic, "work", false, true);
+    try std.testing.expect(last_message == null);
+    try std.testing.expect(env.capture.contains("uninstalled: A"));
+    var after_last = try env.snapshot();
+    defer after_last.deinit();
+    try before_last.expectUnchanged(&after_last);
 }

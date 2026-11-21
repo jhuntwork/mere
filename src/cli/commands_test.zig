@@ -10,6 +10,9 @@ const mere = @import("mere");
 const types = @import("types.zig");
 const pin_cmd = @import("commands/pin.zig");
 const profile_cmd = @import("commands/profile.zig");
+const install_cmd = @import("commands/install.zig");
+const upgrade_cmd = @import("commands/upgrade.zig");
+const uninstall_cmd = @import("commands/uninstall.zig");
 const cli_mod = @import("cli.zig");
 const command = @import("command.zig");
 
@@ -142,13 +145,15 @@ test "pin add fails without ever touching gc-roots when the store lock can't be 
     defer testing.allocator.free(store_path);
     try std.Io.Dir.cwd().createDirPath(mere.path.currentIo(), store_path);
 
-    // mere/.lock is pre-created as a directory, so the store-lock file
-    // open must fail, before pin.create ever runs.
+    // mere/.lock is a dangling symlink into a missing directory, so the
+    // store-lock file can be neither opened nor created (even as root), and
+    // the lock fails before pin.create ever runs. A directory at that path no
+    // longer works: lock files are opened read-only, which succeeds for one.
     const mere_dir = try std.fs.path.join(testing.allocator, &.{ root_path, "mere" });
     defer testing.allocator.free(mere_dir);
-    const lock_path = try std.fs.path.join(testing.allocator, &.{ mere_dir, ".lock" });
-    defer testing.allocator.free(lock_path);
-    try std.Io.Dir.cwd().createDirPath(mere.path.currentIo(), lock_path);
+    var mere_handle = try mere.path.makePathAndOpenDir(mere_dir);
+    defer mere_handle.close(mere.path.currentIo());
+    try mere_handle.symLink(mere.path.currentIo(), "missing-dir/lock", ".lock", .{});
 
     var args = try makeArgs(&.{store_path});
     defer args.deinit();
@@ -316,4 +321,68 @@ test "profile packages rejects missing profiles and accepts existing empty profi
             "Profile 'tools' has no active realized state";
         try testing.expectEqualStrings(expected, empty.message.?);
     }
+}
+
+fn expectDryRunCommandUnchanged(
+    ctx: *mere.Context,
+    capture: *CaptureEmitter,
+    handler: *const fn (*mere.Context, *const types.ParsedArgs) mere.errors.MereError!types.CommandResult,
+    positional: []const []const u8,
+    profile_name: ?[]const u8,
+) !void {
+    const testing = std.testing;
+    var args = try makeArgs(positional);
+    defer args.deinit();
+    try args.flags.put("dry-run", .{ .bool = true });
+    if (profile_name) |name| try args.flags.put("profile", .{ .string = name });
+
+    var before = try mere.install.test_support.StateSnapshot.capture(testing.allocator, ctx.root_path);
+    defer before.deinit();
+    const result = try handler(ctx, &args);
+    defer if (result.message) |message| testing.allocator.free(message);
+    try testing.expect(result.success);
+    try testing.expect(capture.contains("dry run: no changes made"));
+    var after = try mere.install.test_support.StateSnapshot.capture(testing.allocator, ctx.root_path);
+    defer after.deinit();
+    try before.expectUnchanged(&after);
+}
+
+test "install, upgrade, and uninstall --dry-run leave the store, profiles, and GC roots unchanged" {
+    const testing = std.testing;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(mere.path.currentIo(), &path_buf);
+    var ctx = mere.Context.init(testing.allocator, path_buf[0..root_len]);
+    defer ctx.deinit();
+    ctx.home_dir = ctx.root_path;
+
+    var repo = try mere.install.test_support.Repo.init(&ctx);
+    defer repo.deinit();
+    try repo.addPackage("A", "1.0.0", &.{});
+    try repo.addPackage("C", "1.0.0", &.{});
+    try repo.publish();
+
+    var capture = CaptureEmitter.init(testing.allocator);
+    defer capture.deinit();
+    ctx.custom_emitter = &capture.emitter;
+    defer ctx.custom_emitter = null;
+
+    // An empty root: nothing may be admitted or published, for a named
+    // profile or for the default system profile.
+    try expectDryRunCommandUnchanged(&ctx, &capture, install_cmd.handleInstall, &.{"A"}, "work");
+    try expectDryRunCommandUnchanged(&ctx, &capture, install_cmd.handleInstall, &.{"A"}, null);
+
+    var curl_client = try mere.download.CurlTransferClient.init(&ctx, "mere");
+    defer mere.download.CurlTransferClient.cleanupFn(&ctx, curl_client);
+    _ = try mere.install.installPackagesFromConfig(&ctx, &.{ "A", "C" }, curl_client.client(), "work", .{});
+    try repo.addPackage("A", "2.0.0", &.{});
+    try repo.publish();
+
+    // A populated profile with an available upgrade.
+    try expectDryRunCommandUnchanged(&ctx, &capture, install_cmd.handleInstall, &.{"A"}, "work");
+    try expectDryRunCommandUnchanged(&ctx, &capture, upgrade_cmd.handleUpgrade, &.{"A"}, "work");
+    try testing.expect(capture.contains("upgraded: A"));
+    try expectDryRunCommandUnchanged(&ctx, &capture, uninstall_cmd.handleUninstall, &.{"C"}, "work");
+    try testing.expect(capture.contains("uninstalled: C"));
 }

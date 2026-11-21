@@ -196,7 +196,7 @@ test "install and activation performance baseline" {
         try resetInstallState(ctx, test_env.path);
         ctx.resetDiagnostics();
         const started_at = monotonicNs();
-        _ = try install.installPackagesFromConfig(ctx, &package_names, client, false, false, false, "benchmark");
+        _ = try install.installPackagesFromConfig(ctx, &package_names, client, "benchmark", .{});
         sample.* = elapsedNs(started_at);
     }
 
@@ -204,7 +204,7 @@ test "install and activation performance baseline" {
     for (&warm_times) |*sample| {
         ctx.resetDiagnostics();
         const started_at = monotonicNs();
-        _ = try install.installPackagesFromConfig(ctx, &package_names, client, false, false, false, "benchmark");
+        _ = try install.installPackagesFromConfig(ctx, &package_names, client, "benchmark", .{});
         sample.* = elapsedNs(started_at);
     }
 
@@ -216,7 +216,7 @@ test "install and activation performance baseline" {
         try resetProfileState(ctx, test_env.path);
         ctx.resetDiagnostics();
         const started_at = monotonicNs();
-        _ = try install.installPackagesFromConfig(ctx, &package_names, client, false, false, false, "benchmark");
+        _ = try install.installPackagesFromConfig(ctx, &package_names, client, "benchmark", .{});
         sample.* = elapsedNs(started_at);
     }
 

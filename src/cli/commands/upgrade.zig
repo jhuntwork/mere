@@ -42,13 +42,13 @@ const upgrade_meta = command.CommandMeta{
         },
         .{
             .name = "dry-run",
-            .description = "Show changes without creating or activating a generation",
+            .description = "Preview changes without downloading packages or changing the store, profiles, or GC roots; repository metadata follows the sync options",
             .flag_type = .bool,
         },
     },
 };
 
-fn handleUpgrade(ctx: *mere.Context, args: *const types.ParsedArgs) MereError!types.CommandResult {
+pub fn handleUpgrade(ctx: *mere.Context, args: *const types.ParsedArgs) MereError!types.CommandResult {
     const package_names = args.positional;
     const profile_name = args.getString("profile") orelse "system";
     const verify_store = args.getBool("verify-store");
